@@ -1,0 +1,13 @@
+/target
+xiaomaolv.db
+config/xiaomaolv.toml
+.DS_Store
+.env.realtest
+.env
+.env.*
+!.env.realtest.example
+config/.*.runtime.toml
+*.db
+*.sqlite
+*.sqlite3
+*.log

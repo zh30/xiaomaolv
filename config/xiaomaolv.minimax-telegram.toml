@@ -1,0 +1,44 @@
+[app]
+bind = "0.0.0.0:8080"
+default_provider = "minimax"
+max_history = 20
+concurrency_limit = 128
+
+[providers.minimax]
+kind = "openai-compatible"
+base_url = "https://api.minimaxi.com/v1"
+api_key = "${MINIMAX_API_KEY}"
+model = "MiniMax-M2.5"
+timeout_secs = 45
+max_retries = 2
+
+[channels.http]
+enabled = true
+
+# xiaomaolv-style default: polling mode, no public base URL required
+[channels.telegram]
+enabled = true
+bot_token = "${TELEGRAM_BOT_TOKEN}"
+mode = "polling"
+polling_timeout_secs = 30
+streaming_enabled = true
+streaming_edit_interval_ms = 900
+
+# Optional webhook mode (public HTTPS required)
+# mode = "webhook"
+# webhook_secret = "${TELEGRAM_WEBHOOK_SECRET}"
+
+[memory]
+backend = "sqlite-only" # sqlite-only | hybrid-sqlite-zvec
+max_recent_turns = 0 # 0 means fallback to app.max_history
+max_semantic_memories = 8
+semantic_lookback_days = 90
+
+[memory.zvec]
+endpoint = "${ZVEC_SIDECAR_ENDPOINT}"
+collection = "agent_memory_v1"
+query_topk = 20
+request_timeout_secs = 3
+upsert_path = "/v1/memory/upsert"
+query_path = "/v1/memory/query"
+# auth_bearer_token = "${ZVEC_SIDECAR_TOKEN}"

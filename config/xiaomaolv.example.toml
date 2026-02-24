@@ -1,0 +1,56 @@
+[app]
+bind = "0.0.0.0:8080"
+default_provider = "openai"
+max_history = 16
+concurrency_limit = 128
+
+[providers.openai]
+kind = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+api_key = "your-openai-api-key"
+model = "gpt-4o-mini"
+timeout_secs = 30
+max_retries = 2
+
+[channels.http]
+enabled = true
+
+# Telegram mode:
+# - polling (default): no public URL required
+# - webhook: requires public HTTPS + webhook_secret
+[channels.telegram]
+enabled = false
+bot_token = "your-telegram-bot-token"
+mode = "polling"
+polling_timeout_secs = 30
+streaming_enabled = true
+streaming_edit_interval_ms = 900
+# webhook_secret = "your-webhook-secret"
+
+[memory]
+backend = "sqlite-only" # sqlite-only | hybrid-sqlite-zvec
+max_recent_turns = 0 # 0 means fallback to app.max_history
+max_semantic_memories = 8
+semantic_lookback_days = 90
+
+[memory.zvec]
+endpoint = "${ZVEC_SIDECAR_ENDPOINT}"
+collection = "agent_memory_v1"
+query_topk = 20
+request_timeout_secs = 3
+upsert_path = "/v1/memory/upsert"
+query_path = "/v1/memory/query"
+# auth_bearer_token = "${ZVEC_SIDECAR_TOKEN}"
+
+# Custom provider/channel plugin example (requires registering factories in your startup code)
+# [providers.myprovider]
+# kind = "my-provider-kind"
+# [providers.myprovider.options]
+# endpoint = "https://api.example.com"
+# token = "secret"
+#
+# [channels.plugins.discord]
+# enabled = true
+# kind = "discord-webhook"
+# [channels.plugins.discord.settings]
+# signing_secret = "xxx"

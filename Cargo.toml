@@ -1,0 +1,30 @@
+[package]
+name = "xiaomaolv"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "xiaomaolv"
+path = "src/lib.rs"
+
+[[bin]]
+name = "xiaomaolv"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["macros"] }
+clap = { version = "4.5", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "signal", "fs"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+axum-test = "18"
+tempfile = "3"
