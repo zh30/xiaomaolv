@@ -29,6 +29,7 @@ Chinese version: `README.zh.md`
 - Telegram streaming prefers `sendMessageDraft` when supported, with automatic fallback
 - Telegram typing heartbeat: immediate `sendChatAction("typing")`, then every 5 seconds until completion
 - Telegram startup online status (via `setMyShortDescription`, configurable)
+- Telegram slash commands: `/start`, `/help`, `/whoami`, `/mcp ...` (admin/private-chat control)
 - Telegram group support: only replies when the bot is mentioned (`@bot_username`)
 - In groups, if a user replies to a bot message, bot replies in quoted-thread mode (`reply_to_message_id`)
 - Group session routing uses `message_thread_id` (topics) or `reply_to_message_id`
@@ -62,11 +63,18 @@ Optional model override:
 
 - `MINIMAX_MODEL` (default: `MiniMax-M2.5-highspeed`)
 - `TELEGRAM_BOT_USERNAME` (without `@`, recommended for group mention matching)
+- `TELEGRAM_ADMIN_USER_IDS` (comma-separated Telegram user IDs for `/mcp`, e.g. `123456789,987654321`)
 
 ### 3) Start MVP in one command
 
 ```bash
 ./scripts/run_mvp_minimax_telegram.sh
+```
+
+Development hot reload mode (auto rebuild + restart on code change):
+
+```bash
+./scripts/run_mvp_minimax_telegram.sh --hot-reload
 ```
 
 This script uses:
@@ -124,6 +132,10 @@ streaming_edit_interval_ms = 900
 streaming_prefer_draft = true
 startup_online_enabled = true
 startup_online_text = "${TELEGRAM_STARTUP_ONLINE_TEXT:-online}"
+commands_enabled = true
+commands_auto_register = true
+commands_private_only = true
+admin_user_ids = "${TELEGRAM_ADMIN_USER_IDS:-}"
 ```
 
 2. Fill in `.env.realtest`:
@@ -164,6 +176,10 @@ Key settings:
   - `bot_username = "your_bot_username"` (group mode: only reply when mentioned)
   - `startup_online_enabled = true|false` (set Telegram bot startup status text)
   - `startup_online_text = "online"` (uses Telegram `setMyShortDescription`)
+  - `commands_enabled = true|false` (enable slash command handling)
+  - `commands_auto_register = true|false` (startup calls Telegram `setMyCommands`)
+  - `commands_private_only = true|false` (`/mcp` only in private chat when true)
+  - `admin_user_ids = "${TELEGRAM_ADMIN_USER_IDS:-}"` (recommended: configure in `.env.realtest`)
 - Memory mode:
   - `backend = "sqlite-only"` (default)
   - `backend = "hybrid-sqlite-zvec"` (optional)
@@ -179,6 +195,12 @@ Key settings:
 
 ```bash
 ./scripts/run_mvp_minimax_telegram.sh --hybrid-memory
+```
+
+Hybrid memory + hot reload:
+
+```bash
+./scripts/run_mvp_minimax_telegram.sh --hybrid-memory --hot-reload
 ```
 
 ### Manual mode
@@ -267,6 +289,22 @@ curl -X POST http://127.0.0.1:8080/v1/mcp/tools/internal-http/search \
   -H 'content-type: application/json' \
   -d '{"query":"rust async mcp"}'
 ```
+
+### Telegram `/mcp` commands
+
+When Telegram command handling is enabled, bot supports:
+
+- `/start`
+- `/help`
+- `/whoami`
+- `/mcp ls [--scope merged|user|project]`
+- `/mcp test <name>`
+- `/mcp rm <name> [--scope all|user|project]`
+- `/mcp add <name> ...` (same flags as CLI, including `-- <cmd> <args...>`)
+
+`/mcp` runs only for allowed admin users (`TELEGRAM_ADMIN_USER_IDS`) and in private chat by default.
+`/whoami` returns the current Telegram user ID and a ready-to-copy env config snippet.
+After successful `/mcp add` or `/mcp rm`, MCP runtime is hot reloaded immediately.
 
 ### Agent auto tool loop
 

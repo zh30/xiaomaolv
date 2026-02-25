@@ -69,6 +69,24 @@ xiaomaolv mcp rm tavily --scope all
 
 `--scope` options: `all` (default), `user`, `project`.
 
+### 2.5 Telegram `/mcp` commands
+
+When Telegram command mode is enabled, bot command mapping is:
+
+- `/whoami` (show current Telegram user ID for allowlist config)
+- `/mcp ls [--scope merged|user|project]`
+- `/mcp test <name>`
+- `/mcp rm <name> [--scope all|user|project]`
+- `/mcp add <name> ...` (supports the same flags as CLI, including `-- <command> <args...>`)
+
+Defaults:
+
+- `/mcp` only accepts private chat
+- only users in `TELEGRAM_ADMIN_USER_IDS` can execute (`admin_user_ids = "${TELEGRAM_ADMIN_USER_IDS:-}"`)
+- unknown private slash commands return help guidance
+
+After successful `/mcp add` and `/mcp rm`, runtime MCP registry is hot reloaded immediately (no process restart required).
+
 ## 3. Config Scope and Precedence
 
 ### 3.1 Default file locations

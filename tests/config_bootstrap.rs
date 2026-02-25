@@ -56,4 +56,69 @@ streaming_prefer_draft = false
     assert!(!tg.streaming_prefer_draft);
     assert!(!tg.startup_online_enabled);
     assert_eq!(tg.startup_online_text, "online");
+    assert!(tg.commands_enabled);
+    assert!(tg.commands_auto_register);
+    assert!(tg.commands_private_only);
+    assert!(tg.admin_user_ids.to_csv().is_empty());
+}
+
+#[test]
+fn config_bootstrap_parses_telegram_command_fields() {
+    let toml = r#"
+[app]
+bind = "127.0.0.1:8080"
+default_provider = "openai"
+
+[providers.openai]
+kind = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+api_key = "test-key"
+model = "gpt-4o-mini"
+
+[channels.http]
+enabled = true
+
+[channels.telegram]
+enabled = true
+bot_token = "t"
+commands_enabled = true
+commands_auto_register = false
+commands_private_only = true
+admin_user_ids = [101, 202]
+"#;
+
+    let cfg = AppConfig::from_toml(toml).expect("config should parse");
+    let tg = cfg.channels.telegram.expect("telegram config");
+    assert!(tg.commands_enabled);
+    assert!(!tg.commands_auto_register);
+    assert!(tg.commands_private_only);
+    assert_eq!(tg.admin_user_ids.to_csv(), "101,202".to_string());
+}
+
+#[test]
+fn config_bootstrap_supports_telegram_admin_ids_from_env_csv() {
+    let toml = r#"
+[app]
+bind = "127.0.0.1:8080"
+default_provider = "openai"
+
+[providers.openai]
+kind = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+api_key = "test-key"
+model = "gpt-4o-mini"
+
+[channels.http]
+enabled = true
+
+[channels.telegram]
+enabled = true
+bot_token = "t"
+admin_user_ids = "${TELEGRAM_ADMIN_USER_IDS:-}"
+"#;
+
+    // Keep test deterministic by using fallback value syntax.
+    let cfg = AppConfig::from_toml(toml).expect("config should parse");
+    let tg = cfg.channels.telegram.expect("telegram config");
+    assert_eq!(tg.admin_user_ids.to_csv(), "".to_string());
 }

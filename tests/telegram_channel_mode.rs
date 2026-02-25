@@ -4,7 +4,7 @@ use std::sync::Arc;
 use axum_test::TestServer;
 use xiaomaolv::config::{
     AppConfig, AppSettings, ChannelsConfig, HttpChannelConfig, ProviderConfig,
-    TelegramChannelConfig,
+    TelegramAdminUserIds, TelegramChannelConfig,
 };
 use xiaomaolv::domain::MessageRole;
 use xiaomaolv::http::build_router;
@@ -62,6 +62,10 @@ async fn telegram_defaults_to_polling_and_webhook_endpoint_is_disabled() {
                 streaming_prefer_draft: true,
                 startup_online_enabled: false,
                 startup_online_text: "online".to_string(),
+                commands_enabled: true,
+                commands_auto_register: true,
+                commands_private_only: true,
+                admin_user_ids: TelegramAdminUserIds::List(vec![]),
             }),
             plugins: HashMap::new(),
         },
@@ -125,6 +129,10 @@ async fn telegram_mode_endpoint_reports_webhook_when_configured() {
                 streaming_prefer_draft: true,
                 startup_online_enabled: false,
                 startup_online_text: "online".to_string(),
+                commands_enabled: true,
+                commands_auto_register: true,
+                commands_private_only: true,
+                admin_user_ids: TelegramAdminUserIds::List(vec![]),
             }),
             plugins: HashMap::new(),
         },

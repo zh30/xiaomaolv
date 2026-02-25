@@ -5,9 +5,40 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
 MODE="sqlite-only"
-if [[ "${1:-}" == "--hybrid-memory" ]]; then
-  MODE="hybrid-sqlite-zvec"
-fi
+HOT_RELOAD="0"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  ./scripts/run_mvp_minimax_telegram.sh [--hybrid-memory] [--hot-reload]
+
+Options:
+  --hybrid-memory   Enable hybrid memory backend (sqlite + zvec sidecar)
+  --hot-reload      Watch source changes and auto-restart gateway (requires cargo-watch)
+  -h, --help        Show this help message
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --hybrid-memory)
+      MODE="hybrid-sqlite-zvec"
+      ;;
+    --hot-reload|--watch)
+      HOT_RELOAD="1"
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+  shift
+done
 
 ENV_FILE="${ROOT_DIR}/.env.realtest"
 if [[ ! -f "${ENV_FILE}" ]]; then
@@ -61,6 +92,22 @@ echo "[mvp] database=sqlite://xiaomaolv.db"
 echo "[mvp] minimax_model=${MINIMAX_MODEL}"
 echo "[mvp] telegram mode check after boot: curl -sS http://127.0.0.1:8080/v1/channels/telegram/mode"
 
-exec cargo run -- serve \
-  --config "${RUNTIME_CONFIG}" \
-  --database sqlite://xiaomaolv.db
+if [[ "${HOT_RELOAD}" == "1" ]]; then
+  if ! cargo watch --version >/dev/null 2>&1; then
+    echo "[mvp] hot reload requires cargo-watch, but it is not installed." >&2
+    echo "[mvp] install first: cargo install cargo-watch" >&2
+    exit 1
+  fi
+  echo "[mvp] hot reload enabled (cargo watch)"
+  cargo watch \
+    --clear \
+    -w src \
+    -w config \
+    -w Cargo.toml \
+    -w Cargo.lock \
+    -x "run -- serve --config ${RUNTIME_CONFIG} --database sqlite://xiaomaolv.db"
+else
+  cargo run -- serve \
+    --config "${RUNTIME_CONFIG}" \
+    --database sqlite://xiaomaolv.db
+fi

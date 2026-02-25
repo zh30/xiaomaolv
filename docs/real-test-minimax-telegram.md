@@ -29,6 +29,7 @@ Optional model override:
 - `MINIMAX_MODEL` (default: `MiniMax-M2.5-highspeed`)
 - `TELEGRAM_BOT_USERNAME` (without `@`, recommended for group mention matching)
 - `TELEGRAM_STARTUP_ONLINE_TEXT` (optional, default: `online`)
+- `TELEGRAM_ADMIN_USER_IDS` (optional, comma-separated Telegram user IDs for `/mcp`)
 
 ## 1.5 Fastest path (recommended)
 
@@ -38,10 +39,22 @@ SQLite memory MVP:
 ./scripts/run_mvp_minimax_telegram.sh
 ```
 
+Dev hot reload mode (requires `cargo-watch`):
+
+```bash
+./scripts/run_mvp_minimax_telegram.sh --hot-reload
+```
+
 Hybrid memory MVP (starts sidecar automatically):
 
 ```bash
 ./scripts/run_mvp_minimax_telegram.sh --hybrid-memory
+```
+
+Hybrid memory + hot reload:
+
+```bash
+./scripts/run_mvp_minimax_telegram.sh --hybrid-memory --hot-reload
 ```
 
 ## 2. Export env vars

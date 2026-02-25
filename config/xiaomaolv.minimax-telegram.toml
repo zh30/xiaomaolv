@@ -27,6 +27,10 @@ streaming_edit_interval_ms = 900
 streaming_prefer_draft = true
 startup_online_enabled = true
 startup_online_text = "${TELEGRAM_STARTUP_ONLINE_TEXT:-online}"
+commands_enabled = true
+commands_auto_register = true
+commands_private_only = true
+admin_user_ids = "${TELEGRAM_ADMIN_USER_IDS:-}"
 
 # Optional webhook mode (public HTTPS required)
 # mode = "webhook"

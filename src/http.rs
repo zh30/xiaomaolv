@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{RwLock, Semaphore, watch};
 use tracing::warn;
 
 use crate::channel::{
@@ -28,7 +28,7 @@ use crate::service::{AgentMcpSettings, MessageService};
 pub struct AppState {
     pub service: Arc<MessageService>,
     pub channel_plugins: Arc<HashMap<String, Arc<dyn ChannelPlugin>>>,
-    pub mcp_runtime: Arc<McpRuntime>,
+    pub mcp_runtime: Arc<RwLock<McpRuntime>>,
     pub semaphore: Arc<Semaphore>,
 }
 
@@ -173,7 +173,7 @@ async fn build_state(
         ),
     };
 
-    let mcp_runtime = Arc::new(load_mcp_runtime().await);
+    let mcp_runtime = Arc::new(RwLock::new(load_mcp_runtime().await));
     let service = Arc::new(MessageService::new_with_backend(
         provider,
         memory_backend,
@@ -314,6 +314,22 @@ fn load_channel_plugins(
             "startup_online_text".to_string(),
             telegram.startup_online_text.clone(),
         );
+        settings.insert(
+            "commands_enabled".to_string(),
+            telegram.commands_enabled.to_string(),
+        );
+        settings.insert(
+            "commands_auto_register".to_string(),
+            telegram.commands_auto_register.to_string(),
+        );
+        settings.insert(
+            "commands_private_only".to_string(),
+            telegram.commands_private_only.to_string(),
+        );
+        settings.insert(
+            "admin_user_ids".to_string(),
+            telegram.admin_user_ids.to_csv(),
+        );
 
         let cfg = ChannelPluginConfig {
             kind: "telegram".to_string(),
@@ -403,8 +419,9 @@ async fn get_mcp_servers(
         )
     })?;
 
+    let runtime = state.mcp_runtime.read().await.clone();
     Ok(Json(McpServersResponse {
-        servers: state.mcp_runtime.servers(),
+        servers: runtime.servers(),
     }))
 }
 
@@ -419,8 +436,8 @@ async fn get_mcp_tools(
         )
     })?;
 
-    let tools = state
-        .mcp_runtime
+    let runtime = state.mcp_runtime.read().await.clone();
+    let tools = runtime
         .list_tools(query.server.as_deref())
         .await
         .map_err(internal_err("failed to list mcp tools"))?;
@@ -440,8 +457,8 @@ async fn post_mcp_tool_call(
         )
     })?;
 
-    let result = state
-        .mcp_runtime
+    let runtime = state.mcp_runtime.read().await.clone();
+    let result = runtime
         .call_tool(&server, &tool, args)
         .await
         .map_err(internal_err("failed to call mcp tool"))?;

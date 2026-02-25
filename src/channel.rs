@@ -13,6 +13,9 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::domain::{IncomingMessage, ReplyTarget};
+use crate::mcp_commands::{
+    discover_mcp_registry, execute_mcp_command, mcp_help_text, parse_telegram_mcp_command,
+};
 use crate::provider::StreamSink;
 use crate::service::MessageService;
 
@@ -358,6 +361,54 @@ impl TelegramSender {
         if !body.ok || !body.result {
             bail!(
                 "telegram setMyShortDescription returned ok=false: {}",
+                body.description
+                    .unwrap_or_else(|| "unknown error".to_string())
+            );
+        }
+
+        Ok(())
+    }
+
+    pub async fn set_my_commands(
+        &self,
+        commands: &[(&str, &str)],
+        all_private_chats: bool,
+    ) -> anyhow::Result<()> {
+        let url = format!(
+            "https://api.telegram.org/bot{}/setMyCommands",
+            self.bot_token
+        );
+        let mut payload = serde_json::json!({
+            "commands": commands
+                .iter()
+                .map(|(command, description)| serde_json::json!({
+                    "command": command,
+                    "description": description
+                }))
+                .collect::<Vec<_>>()
+        });
+        if all_private_chats {
+            payload["scope"] = serde_json::json!({ "type": "all_private_chats" });
+        }
+
+        let response = self
+            .client
+            .post(url)
+            .json(&payload)
+            .send()
+            .await
+            .context("failed to call telegram setMyCommands")?
+            .error_for_status()
+            .context("telegram setMyCommands returned error")?;
+
+        let body: TelegramApiResponse<bool> = response
+            .json()
+            .await
+            .context("failed to decode telegram setMyCommands payload")?;
+
+        if !body.ok || !body.result {
+            bail!(
+                "telegram setMyCommands returned ok=false: {}",
                 body.description
                     .unwrap_or_else(|| "unknown error".to_string())
             );
@@ -728,6 +779,29 @@ impl ChannelFactory for TelegramChannelFactory {
             .map(|raw| raw.trim().to_string())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "online".to_string());
+        let commands_enabled = config
+            .settings
+            .get("commands_enabled")
+            .and_then(|raw| parse_bool(raw))
+            .unwrap_or(true);
+        let commands_auto_register = config
+            .settings
+            .get("commands_auto_register")
+            .and_then(|raw| parse_bool(raw))
+            .unwrap_or(true);
+        let commands_private_only = config
+            .settings
+            .get("commands_private_only")
+            .and_then(|raw| parse_bool(raw))
+            .unwrap_or(true);
+        let admin_user_ids = parse_admin_user_ids(
+            config
+                .settings
+                .get("admin_user_ids")
+                .map(String::as_str)
+                .unwrap_or_default(),
+        )
+        .context("failed to parse telegram settings.admin_user_ids")?;
 
         Ok(Arc::new(TelegramChannelPlugin {
             sender: TelegramSender::new(bot_token.clone()),
@@ -740,6 +814,10 @@ impl ChannelFactory for TelegramChannelFactory {
             streaming_prefer_draft,
             startup_online_enabled,
             startup_online_text,
+            commands_enabled,
+            commands_auto_register,
+            commands_private_only,
+            admin_user_ids,
             group_mention_bot_username_cache: Arc::new(tokio::sync::Mutex::new(
                 group_mention_bot_username,
             )),
@@ -761,8 +839,19 @@ struct TelegramChannelPlugin {
     streaming_prefer_draft: bool,
     startup_online_enabled: bool,
     startup_online_text: String,
+    commands_enabled: bool,
+    commands_auto_register: bool,
+    commands_private_only: bool,
+    admin_user_ids: Vec<i64>,
     group_mention_bot_username_cache: Arc<tokio::sync::Mutex<Option<String>>>,
     polling_diag_state: Arc<tokio::sync::Mutex<TelegramPollingDiagState>>,
+}
+
+#[derive(Clone)]
+struct TelegramCommandSettings {
+    enabled: bool,
+    private_only: bool,
+    admin_user_ids: Vec<i64>,
 }
 
 impl TelegramChannelPlugin {
@@ -772,6 +861,14 @@ impl TelegramChannelPlugin {
             &self.group_mention_bot_username_cache,
         )
         .await
+    }
+
+    fn command_settings(&self) -> TelegramCommandSettings {
+        TelegramCommandSettings {
+            enabled: self.commands_enabled,
+            private_only: self.commands_private_only,
+            admin_user_ids: self.admin_user_ids.clone(),
+        }
     }
 }
 
@@ -842,6 +939,7 @@ impl ChannelPlugin for TelegramChannelPlugin {
             self.streaming_edit_interval_ms,
             self.streaming_prefer_draft,
             self.resolve_group_mention_bot_username().await,
+            self.command_settings(),
         )
         .await
         .map_err(ChannelPluginError::internal)?;
@@ -900,6 +998,27 @@ impl ChannelPlugin for TelegramChannelPlugin {
             }
         }
 
+        if self.commands_enabled && self.commands_auto_register {
+            let commands = telegram_registered_commands();
+            if let Err(err) = self
+                .sender
+                .set_my_commands(&commands, self.commands_private_only)
+                .await
+            {
+                warn!(
+                    channel = %ctx.channel_name,
+                    error = %format!("{err:#}"),
+                    "failed to register telegram bot commands"
+                );
+            } else {
+                info!(
+                    channel = %ctx.channel_name,
+                    private_only = self.commands_private_only,
+                    "telegram bot commands registered"
+                );
+            }
+        }
+
         if !matches!(self.mode, TelegramIngressMode::Polling) {
             return Ok(None);
         }
@@ -913,6 +1032,7 @@ impl ChannelPlugin for TelegramChannelPlugin {
         let streaming_enabled = self.streaming_enabled;
         let streaming_edit_interval_ms = self.streaming_edit_interval_ms;
         let streaming_prefer_draft = self.streaming_prefer_draft;
+        let command_settings = self.command_settings();
         let group_mention_bot_username_cache = self.group_mention_bot_username_cache.clone();
         let polling_diag_state = self.polling_diag_state.clone();
         let worker_name = format!("{channel_name}-polling");
@@ -981,6 +1101,7 @@ impl ChannelPlugin for TelegramChannelPlugin {
                                 streaming_edit_interval_ms,
                                 streaming_prefer_draft,
                                 group_mention_bot_username.clone(),
+                                command_settings.clone(),
                             )
                             .await
                             {
@@ -1069,6 +1190,12 @@ impl ChannelPlugin for TelegramChannelPlugin {
             "channel": "telegram",
             "mode": self.mode(),
             "group_mention_bot_username_cached": cached_username,
+            "commands": {
+                "enabled": self.commands_enabled,
+                "auto_register": self.commands_auto_register,
+                "private_only": self.commands_private_only,
+                "admin_user_ids_count": self.admin_user_ids.len()
+            },
             "polling": polling,
             "get_me": get_me,
             "get_webhook_info": get_webhook_info
@@ -1091,9 +1218,10 @@ async fn process_telegram_update(
     streaming_edit_interval_ms: u64,
     streaming_prefer_draft: bool,
     group_mention_bot_username: Option<String>,
+    command_settings: TelegramCommandSettings,
 ) -> anyhow::Result<()> {
     if let Some(message) = update.message
-        && let Some(text) = message.text
+        && let Some(ref text) = message.text
     {
         let chat_id = message.chat.id;
         let message_id = message.message_id;
@@ -1136,19 +1264,33 @@ async fn process_telegram_update(
             text_preview = %text_preview,
             "telegram inbound message"
         );
+        if is_group && from_is_bot {
+            debug!(
+                chat_id,
+                message_id = message.message_id,
+                "skip telegram group message from bot account"
+            );
+            info!(
+                chat_id,
+                message_id, "telegram group message skipped: sender is bot"
+            );
+            return Ok(());
+        }
+
+        if maybe_handle_telegram_command(
+            &ctx,
+            sender,
+            &message,
+            text.trim(),
+            group_mention_bot_username.as_deref(),
+            &command_settings,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+
         if is_group {
-            if from_is_bot {
-                debug!(
-                    chat_id,
-                    message_id = message.message_id,
-                    "skip telegram group message from bot account"
-                );
-                info!(
-                    chat_id,
-                    message_id, "telegram group message skipped: sender is bot"
-                );
-                return Ok(());
-            }
             let bot_username = group_mention_bot_username.as_deref().unwrap_or("");
             let mentioned = if bot_username.is_empty() {
                 false
@@ -1218,7 +1360,7 @@ async fn process_telegram_update(
             channel: ctx.channel_name,
             session_id,
             user_id,
-            text,
+            text: text.to_string(),
             reply_target: Some(ReplyTarget::Telegram {
                 chat_id,
                 message_thread_id,
@@ -1282,6 +1424,292 @@ async fn process_telegram_update(
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TelegramSlashCommand {
+    Start,
+    Help,
+    WhoAmI,
+    Mcp { tail: String },
+    Unknown { name: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpCommandAccess {
+    Allowed,
+    RequirePrivateChat,
+    MissingAdminAllowlist,
+    Unauthorized,
+}
+
+async fn maybe_handle_telegram_command(
+    ctx: &ChannelContext,
+    sender: &TelegramSender,
+    message: &TelegramMessage,
+    text: &str,
+    bot_username: Option<&str>,
+    command_settings: &TelegramCommandSettings,
+) -> anyhow::Result<bool> {
+    let Some(command) = parse_telegram_slash_command(text, bot_username) else {
+        return Ok(false);
+    };
+    let is_private_chat = is_private_chat_type(message.chat.kind.as_deref());
+
+    match command {
+        TelegramSlashCommand::Start => {
+            send_telegram_command_reply(sender, message, &telegram_start_text()).await?;
+            Ok(true)
+        }
+        TelegramSlashCommand::Help => {
+            send_telegram_command_reply(sender, message, &telegram_help_text()).await?;
+            Ok(true)
+        }
+        TelegramSlashCommand::WhoAmI => {
+            send_telegram_command_reply(sender, message, &telegram_whoami_text(message)).await?;
+            Ok(true)
+        }
+        TelegramSlashCommand::Mcp { tail } => {
+            if !command_settings.enabled {
+                send_telegram_command_reply(sender, message, "命令功能未启用。").await?;
+                return Ok(true);
+            }
+            match evaluate_mcp_command_access(
+                is_private_chat,
+                message.from.as_ref().map(|u| u.id),
+                command_settings,
+            ) {
+                McpCommandAccess::Allowed => {}
+                McpCommandAccess::RequirePrivateChat => {
+                    send_telegram_command_reply(sender, message, "请私聊使用 /mcp 管理命令。")
+                        .await?;
+                    return Ok(true);
+                }
+                McpCommandAccess::MissingAdminAllowlist => {
+                    send_telegram_command_reply(
+                        sender,
+                        message,
+                        &format!(
+                            "管理员白名单未配置，命令不可用。\n{}\n\n请在 .env.realtest 中配置 TELEGRAM_ADMIN_USER_IDS，然后重启服务。",
+                            telegram_whoami_hint(message)
+                        ),
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+                McpCommandAccess::Unauthorized => {
+                    send_telegram_command_reply(
+                        sender,
+                        message,
+                        &format!(
+                            "无权限执行该命令。\n{}\n\n请将你的 ID 加到 TELEGRAM_ADMIN_USER_IDS。",
+                            telegram_whoami_hint(message)
+                        ),
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+            }
+
+            if tail.trim().is_empty() {
+                send_telegram_command_reply(sender, message, &mcp_help_text()).await?;
+                return Ok(true);
+            }
+
+            let parsed = match parse_telegram_mcp_command(&tail) {
+                Ok(command) => command,
+                Err(err) => {
+                    send_telegram_command_reply(
+                        sender,
+                        message,
+                        &format!("命令参数错误: {err}\n\n{}", mcp_help_text()),
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+            };
+
+            let registry = match discover_mcp_registry() {
+                Ok(registry) => registry,
+                Err(err) => {
+                    send_telegram_command_reply(
+                        sender,
+                        message,
+                        &format!("无法加载 MCP 配置路径: {err}"),
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+            };
+
+            match execute_mcp_command(&registry, parsed).await {
+                Ok(output) => {
+                    let mut out = if output.text.trim().is_empty() {
+                        "命令执行完成。".to_string()
+                    } else {
+                        output.text
+                    };
+                    if output.reload_runtime {
+                        match ctx
+                            .service
+                            .reload_mcp_runtime_from_registry(&registry)
+                            .await
+                        {
+                            Ok(()) => {
+                                out.push_str("\n\nMCP runtime 已热重载。");
+                            }
+                            Err(err) => {
+                                out.push_str(&format!("\n\nMCP runtime 热重载失败: {err}"));
+                            }
+                        }
+                    }
+                    send_telegram_command_reply(sender, message, &out).await?;
+                }
+                Err(err) => {
+                    send_telegram_command_reply(sender, message, &format!("命令执行失败: {err}"))
+                        .await?;
+                }
+            }
+            Ok(true)
+        }
+        TelegramSlashCommand::Unknown { name } => {
+            if is_private_chat {
+                send_telegram_command_reply(
+                    sender,
+                    message,
+                    &format!("未知命令 /{name}。可用命令见 /help。"),
+                )
+                .await?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+    }
+}
+
+fn evaluate_mcp_command_access(
+    is_private_chat: bool,
+    caller_user_id: Option<i64>,
+    command_settings: &TelegramCommandSettings,
+) -> McpCommandAccess {
+    if command_settings.private_only && !is_private_chat {
+        return McpCommandAccess::RequirePrivateChat;
+    }
+    if command_settings.admin_user_ids.is_empty() {
+        return McpCommandAccess::MissingAdminAllowlist;
+    }
+    if caller_user_id.is_none_or(|id| !command_settings.admin_user_ids.contains(&id)) {
+        return McpCommandAccess::Unauthorized;
+    }
+    McpCommandAccess::Allowed
+}
+
+fn parse_telegram_slash_command(
+    text: &str,
+    bot_username: Option<&str>,
+) -> Option<TelegramSlashCommand> {
+    let trimmed = text.trim();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+
+    let split_idx = trimmed
+        .char_indices()
+        .find_map(|(idx, ch)| ch.is_whitespace().then_some(idx))
+        .unwrap_or(trimmed.len());
+    let head = &trimmed[..split_idx];
+    let tail = trimmed[split_idx..].trim().to_string();
+    let raw = head.trim_start_matches('/');
+    if raw.is_empty() {
+        return None;
+    }
+
+    let (command, at_target) = raw.split_once('@').unwrap_or((raw, ""));
+    if !at_target.is_empty()
+        && bot_username.is_some_and(|v| {
+            let expect = v.trim().trim_start_matches('@');
+            !expect.is_empty() && !at_target.eq_ignore_ascii_case(expect)
+        })
+    {
+        return None;
+    }
+
+    let command = command.to_ascii_lowercase();
+    match command.as_str() {
+        "start" => Some(TelegramSlashCommand::Start),
+        "help" => Some(TelegramSlashCommand::Help),
+        "whoami" => Some(TelegramSlashCommand::WhoAmI),
+        "mcp" => Some(TelegramSlashCommand::Mcp { tail }),
+        _ => Some(TelegramSlashCommand::Unknown { name: command }),
+    }
+}
+
+fn telegram_start_text() -> String {
+    [
+        "你好，我是 xiaomaolv Telegram 机器人。",
+        "输入 /help 查看可用命令。",
+    ]
+    .join("\n")
+}
+
+fn telegram_help_text() -> String {
+    [
+        "可用命令:",
+        "/start - 查看欢迎信息",
+        "/help - 查看帮助",
+        "/whoami - 查看你的 Telegram 用户 ID",
+        "/mcp - 管理 MCP 服务器（仅私聊管理员）",
+    ]
+    .join("\n")
+}
+
+fn telegram_whoami_text(message: &TelegramMessage) -> String {
+    match message.from.as_ref().map(|u| u.id) {
+        Some(user_id) => format!(
+            "你的 Telegram 用户 ID: {user_id}\n建议配置:\nTELEGRAM_ADMIN_USER_IDS={user_id}"
+        ),
+        None => "无法识别当前用户 ID（message.from 缺失）。请使用普通用户账号私聊 bot 再试一次。"
+            .to_string(),
+    }
+}
+
+fn telegram_whoami_hint(message: &TelegramMessage) -> String {
+    match message.from.as_ref().map(|u| u.id) {
+        Some(user_id) => format!("你的当前用户 ID: {user_id}（也可发送 /whoami 查看）"),
+        None => "可发送 /whoami 查看你的 Telegram 用户 ID。".to_string(),
+    }
+}
+
+fn telegram_registered_commands() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("start", "启动与介绍"),
+        ("help", "查看帮助"),
+        ("whoami", "查看当前用户ID"),
+        ("mcp", "管理 MCP 服务器"),
+    ]
+}
+
+async fn send_telegram_command_reply(
+    sender: &TelegramSender,
+    message: &TelegramMessage,
+    text: &str,
+) -> anyhow::Result<()> {
+    sender
+        .send_message(
+            message.chat.id,
+            message.message_thread_id,
+            Some(message.message_id),
+            text,
+        )
+        .await
+}
+
+fn is_private_chat_type(kind: Option<&str>) -> bool {
+    matches!(
+        kind.map(|v| v.trim().to_ascii_lowercase()),
+        Some(v) if v == "private"
+    )
 }
 
 struct TelegramStreamSink<'a> {
@@ -1495,6 +1923,21 @@ fn parse_bool(raw: &str) -> Option<bool> {
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
     }
+}
+
+fn parse_admin_user_ids(raw: &str) -> anyhow::Result<Vec<i64>> {
+    if raw.trim().is_empty() {
+        return Ok(vec![]);
+    }
+
+    raw.split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| {
+            v.parse::<i64>()
+                .with_context(|| format!("invalid telegram admin user id '{v}'"))
+        })
+        .collect()
 }
 
 fn is_group_chat_type(kind: Option<&str>) -> bool {
@@ -1773,9 +2216,11 @@ async fn wait_for_shutdown_or_timeout(
 #[cfg(test)]
 mod tests {
     use super::{
-        TELEGRAM_MAX_TEXT_CHARS, TelegramReplyMessage, TelegramUser, build_draft_message_id,
-        is_reply_to_bot_message, message_mentions_bot, render_telegram_text_parts,
-        short_description_payload, telegram_session_id, truncate_chars, typing_action_payload,
+        McpCommandAccess, TELEGRAM_MAX_TEXT_CHARS, TelegramCommandSettings, TelegramReplyMessage,
+        TelegramSlashCommand, TelegramUser, build_draft_message_id, evaluate_mcp_command_access,
+        is_reply_to_bot_message, message_mentions_bot, parse_admin_user_ids,
+        parse_telegram_slash_command, render_telegram_text_parts, short_description_payload,
+        telegram_session_id, truncate_chars, typing_action_payload,
     };
 
     #[test]
@@ -1935,5 +2380,59 @@ mod tests {
         for part in &parts {
             assert!(part.text.chars().count() <= TELEGRAM_MAX_TEXT_CHARS);
         }
+    }
+
+    #[test]
+    fn parse_slash_command_supports_bot_username_suffix() {
+        let parsed = parse_telegram_slash_command(
+            "/mcp@xiaomaolv_bot ls --scope merged",
+            Some("xiaomaolv_bot"),
+        );
+        assert_eq!(
+            parsed,
+            Some(TelegramSlashCommand::Mcp {
+                tail: "ls --scope merged".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_slash_command_ignores_other_bot_username() {
+        let parsed = parse_telegram_slash_command("/mcp@other_bot ls", Some("xiaomaolv_bot"));
+        assert_eq!(parsed, None);
+    }
+
+    #[test]
+    fn parse_slash_command_supports_whoami() {
+        let parsed = parse_telegram_slash_command("/whoami", Some("xiaomaolv_bot"));
+        assert_eq!(parsed, Some(TelegramSlashCommand::WhoAmI));
+    }
+
+    #[test]
+    fn parse_admin_user_ids_supports_csv() {
+        let ids = parse_admin_user_ids("123, 456 ,789").expect("ids");
+        assert_eq!(ids, vec![123, 456, 789]);
+    }
+
+    #[test]
+    fn mcp_command_access_requires_private_chat_first() {
+        let settings = TelegramCommandSettings {
+            enabled: true,
+            private_only: true,
+            admin_user_ids: vec![42],
+        };
+        let access = evaluate_mcp_command_access(false, Some(42), &settings);
+        assert_eq!(access, McpCommandAccess::RequirePrivateChat);
+    }
+
+    #[test]
+    fn mcp_command_access_rejects_non_admin() {
+        let settings = TelegramCommandSettings {
+            enabled: true,
+            private_only: true,
+            admin_user_ids: vec![42],
+        };
+        let access = evaluate_mcp_command_access(true, Some(7), &settings);
+        assert_eq!(access, McpCommandAccess::Unauthorized);
     }
 }

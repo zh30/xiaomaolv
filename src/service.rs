@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use serde_json::Value;
+use tokio::sync::RwLock;
 use tracing::warn;
 
 use crate::domain::{IncomingMessage, MessageRole, OutgoingMessage, StoredMessage};
@@ -32,7 +33,7 @@ impl Default for AgentMcpSettings {
 pub struct MessageService {
     provider: Arc<dyn ChatProvider>,
     memory: Arc<dyn MemoryBackend>,
-    mcp_runtime: Option<Arc<McpRuntime>>,
+    mcp_runtime: Option<Arc<RwLock<McpRuntime>>>,
     agent_mcp: AgentMcpSettings,
     max_recent_turns: usize,
     max_semantic_memories: usize,
@@ -59,7 +60,7 @@ impl MessageService {
     pub fn new_with_backend(
         provider: Arc<dyn ChatProvider>,
         memory: Arc<dyn MemoryBackend>,
-        mcp_runtime: Option<Arc<McpRuntime>>,
+        mcp_runtime: Option<Arc<RwLock<McpRuntime>>>,
         agent_mcp: AgentMcpSettings,
         max_recent_turns: usize,
         max_semantic_memories: usize,
@@ -192,18 +193,13 @@ impl MessageService {
         &self,
         history: Vec<StoredMessage>,
     ) -> anyhow::Result<String> {
-        if !self.is_mcp_agent_enabled() {
+        let Some(runtime) = self.snapshot_mcp_runtime().await else {
             return self
                 .provider
                 .complete(CompletionRequest { messages: history })
                 .await
                 .context("provider completion failed");
-        }
-
-        let runtime = self
-            .mcp_runtime
-            .as_ref()
-            .expect("checked in is_mcp_agent_enabled");
+        };
         let tools = match runtime.list_tools(None).await {
             Ok(tools) => tools,
             Err(err) => {
@@ -224,18 +220,15 @@ impl MessageService {
                 .context("provider completion failed");
         }
 
-        self.complete_with_mcp_loop(history, tools).await
+        self.complete_with_mcp_loop(history, tools, runtime).await
     }
 
     async fn complete_with_mcp_loop(
         &self,
         mut history: Vec<StoredMessage>,
         tools: Vec<McpToolInfo>,
+        runtime: McpRuntime,
     ) -> anyhow::Result<String> {
-        let runtime = self
-            .mcp_runtime
-            .as_ref()
-            .expect("checked in is_mcp_agent_enabled");
         history.push(StoredMessage {
             role: MessageRole::System,
             content: build_mcp_system_prompt(&tools)?,
@@ -308,6 +301,27 @@ impl MessageService {
 
     fn is_mcp_agent_enabled(&self) -> bool {
         self.agent_mcp.enabled && self.mcp_runtime.is_some()
+    }
+
+    async fn snapshot_mcp_runtime(&self) -> Option<McpRuntime> {
+        if !self.is_mcp_agent_enabled() {
+            return None;
+        }
+        let runtime = self.mcp_runtime.as_ref()?;
+        Some(runtime.read().await.clone())
+    }
+
+    pub async fn reload_mcp_runtime_from_registry(
+        &self,
+        registry: &crate::mcp::McpRegistry,
+    ) -> anyhow::Result<()> {
+        let Some(runtime) = &self.mcp_runtime else {
+            return Ok(());
+        };
+        let next = McpRuntime::from_registry(registry).await?;
+        let mut guard = runtime.write().await;
+        *guard = next;
+        Ok(())
     }
 }
 

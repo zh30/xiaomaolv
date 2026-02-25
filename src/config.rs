@@ -56,6 +56,7 @@ impl AppConfig {
                 *mode = resolve_env_placeholder(mode);
             }
             telegram.startup_online_text = resolve_env_placeholder(&telegram.startup_online_text);
+            telegram.admin_user_ids.resolve_env_placeholders();
         }
 
         for channel in self.channels.plugins.values_mut() {
@@ -130,6 +131,46 @@ pub struct TelegramChannelConfig {
     pub startup_online_enabled: bool,
     #[serde(default = "default_telegram_startup_online_text")]
     pub startup_online_text: String,
+    #[serde(default = "default_telegram_commands_enabled")]
+    pub commands_enabled: bool,
+    #[serde(default = "default_telegram_commands_auto_register")]
+    pub commands_auto_register: bool,
+    #[serde(default = "default_telegram_commands_private_only")]
+    pub commands_private_only: bool,
+    #[serde(default)]
+    pub admin_user_ids: TelegramAdminUserIds,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum TelegramAdminUserIds {
+    Csv(String),
+    List(Vec<i64>),
+}
+
+impl Default for TelegramAdminUserIds {
+    fn default() -> Self {
+        Self::List(vec![])
+    }
+}
+
+impl TelegramAdminUserIds {
+    fn resolve_env_placeholders(&mut self) {
+        if let Self::Csv(raw) = self {
+            *raw = resolve_env_placeholder(raw);
+        }
+    }
+
+    pub fn to_csv(&self) -> String {
+        match self {
+            Self::Csv(raw) => raw.clone(),
+            Self::List(ids) => ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,6 +305,18 @@ fn default_telegram_startup_online_enabled() -> bool {
 
 fn default_telegram_startup_online_text() -> String {
     "online".to_string()
+}
+
+fn default_telegram_commands_enabled() -> bool {
+    true
+}
+
+fn default_telegram_commands_auto_register() -> bool {
+    true
+}
+
+fn default_telegram_commands_private_only() -> bool {
+    true
 }
 
 fn default_memory_backend() -> String {

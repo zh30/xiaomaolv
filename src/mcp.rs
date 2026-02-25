@@ -341,6 +341,7 @@ fn server_view(name: String, source: &str, cfg: McpServerConfig) -> McpServerVie
     }
 }
 
+#[derive(Clone)]
 pub struct McpRuntime {
     servers: HashMap<String, McpServerConfig>,
     http_client: reqwest::Client,

@@ -1,15 +1,12 @@
 use std::path::PathBuf;
 
-use anyhow::{Context, bail};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use anyhow::Context;
+use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use xiaomaolv::config::AppConfig;
 use xiaomaolv::http::build_app_runtime;
-use xiaomaolv::mcp::{
-    McpAddSpec, McpConfigPaths, McpListScope, McpRegistry, McpRemoveScope, McpScope, McpTransport,
-    parse_header_kv, parse_kv,
-};
+use xiaomaolv::mcp_commands::{McpCommands, discover_mcp_registry, execute_mcp_command};
 
 #[derive(Debug, Parser)]
 #[command(name = "xiaomaolv")]
@@ -38,101 +35,6 @@ enum Commands {
         #[command(subcommand)]
         command: McpCommands,
     },
-}
-
-#[derive(Debug, Subcommand)]
-enum McpCommands {
-    /// Add an MCP server
-    Add(McpAddArgs),
-    /// List configured MCP servers
-    Ls(McpLsArgs),
-    /// Remove an MCP server
-    Rm(McpRmArgs),
-    /// Test MCP server connectivity and list tools
-    Test(McpTestArgs),
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum McpScopeArg {
-    User,
-    Project,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum McpListScopeArg {
-    Merged,
-    User,
-    Project,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum McpRemoveScopeArg {
-    All,
-    User,
-    Project,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum McpTransportArg {
-    Stdio,
-    Http,
-}
-
-#[derive(Debug, Args)]
-struct McpAddArgs {
-    /// MCP server name (example: tavily, brave-search)
-    name: String,
-    /// Install scope. Default user-level avoids accidental repo commits.
-    #[arg(long, value_enum, default_value = "user")]
-    scope: McpScopeArg,
-    /// Transport type
-    #[arg(long, value_enum, default_value = "stdio")]
-    transport: McpTransportArg,
-    /// Command for stdio transport
-    #[arg(long)]
-    command: Option<String>,
-    /// Repeated argument for stdio command
-    #[arg(long = "arg")]
-    args: Vec<String>,
-    /// Claude-style command tail, for example: -- npx -y @modelcontextprotocol/server-fetch
-    #[arg(trailing_var_arg = true)]
-    exec: Vec<String>,
-    /// Working directory for stdio command
-    #[arg(long)]
-    cwd: Option<String>,
-    /// Repeated env entry: KEY=VALUE
-    #[arg(long = "env")]
-    envs: Vec<String>,
-    /// URL for http transport
-    #[arg(long)]
-    url: Option<String>,
-    /// Repeated header entry: KEY=VALUE or KEY: VALUE
-    #[arg(long = "header")]
-    headers: Vec<String>,
-    /// Request timeout seconds
-    #[arg(long, default_value_t = 20)]
-    timeout_secs: u64,
-    /// Add server as disabled
-    #[arg(long, default_value_t = false)]
-    disabled: bool,
-}
-
-#[derive(Debug, Args)]
-struct McpLsArgs {
-    #[arg(long, value_enum, default_value = "merged")]
-    scope: McpListScopeArg,
-}
-
-#[derive(Debug, Args)]
-struct McpRmArgs {
-    name: String,
-    #[arg(long, value_enum, default_value = "all")]
-    scope: McpRemoveScopeArg,
-}
-
-#[derive(Debug, Args)]
-struct McpTestArgs {
-    name: String,
 }
 
 #[tokio::main]
@@ -199,196 +101,12 @@ async fn serve(config_path: PathBuf, database_url: &str) -> anyhow::Result<()> {
 }
 
 async fn handle_mcp(command: McpCommands) -> anyhow::Result<()> {
-    let registry = mcp_registry()?;
-
-    match command {
-        McpCommands::Add(args) => {
-            let McpAddArgs {
-                name,
-                scope,
-                transport,
-                command,
-                args,
-                exec,
-                cwd,
-                envs,
-                url,
-                headers: header_args,
-                timeout_secs,
-                disabled,
-            } = args;
-
-            let mut env = std::collections::HashMap::new();
-            for raw in envs {
-                let (k, v) = parse_kv(&raw)?;
-                env.insert(k, v);
-            }
-
-            let mut headers = std::collections::HashMap::new();
-            for raw in header_args {
-                let (k, v) = parse_header_kv(&raw)?;
-                headers.insert(k, v);
-            }
-
-            let (command, args) = resolve_stdio_command(command, args, exec)?;
-            let transport = match transport {
-                McpTransportArg::Stdio => McpTransport::Stdio,
-                McpTransportArg::Http => McpTransport::Http,
-            };
-
-            match transport {
-                McpTransport::Stdio => {
-                    if url.is_some() {
-                        bail!("stdio transport does not use --url");
-                    }
-                }
-                McpTransport::Http => {
-                    if command.is_some() || !args.is_empty() || cwd.is_some() || !env.is_empty() {
-                        bail!(
-                            "http transport does not use stdio fields (--command/--arg/--cwd/--env/-- <cmd>)"
-                        );
-                    }
-                }
-            }
-
-            let spec = McpAddSpec {
-                transport,
-                command,
-                args,
-                cwd,
-                env,
-                url,
-                headers,
-                timeout_secs: timeout_secs.max(1),
-                enabled: !disabled,
-            };
-
-            registry
-                .add_server(
-                    match scope {
-                        McpScopeArg::User => McpScope::User,
-                        McpScopeArg::Project => McpScope::Project,
-                    },
-                    &name,
-                    spec,
-                )
-                .await?;
-
-            println!(
-                "mcp server '{}' installed ({})",
-                name,
-                match scope {
-                    McpScopeArg::User => "user",
-                    McpScopeArg::Project => "project",
-                }
-            );
-        }
-        McpCommands::Ls(args) => {
-            let rows = registry
-                .list_servers(match args.scope {
-                    McpListScopeArg::Merged => McpListScope::Merged,
-                    McpListScopeArg::User => McpListScope::User,
-                    McpListScopeArg::Project => McpListScope::Project,
-                })
-                .await?;
-
-            if rows.is_empty() {
-                println!("no mcp servers configured");
-                return Ok(());
-            }
-
-            println!(
-                "{:<20} {:<8} {:<8} {:<8} target",
-                "name", "source", "enabled", "transport"
-            );
-            for row in rows {
-                let target = row
-                    .command
-                    .map(|cmd| {
-                        if row.args.is_empty() {
-                            cmd
-                        } else {
-                            format!("{cmd} {}", row.args.join(" "))
-                        }
-                    })
-                    .or(row.url)
-                    .unwrap_or_else(|| "-".to_string());
-                println!(
-                    "{:<20} {:<8} {:<8} {:<8} {}",
-                    row.name,
-                    row.source,
-                    if row.enabled { "yes" } else { "no" },
-                    row.transport,
-                    target
-                );
-            }
-        }
-        McpCommands::Rm(args) => {
-            let removed = registry
-                .remove_server(
-                    match args.scope {
-                        McpRemoveScopeArg::All => McpRemoveScope::All,
-                        McpRemoveScopeArg::User => McpRemoveScope::User,
-                        McpRemoveScopeArg::Project => McpRemoveScope::Project,
-                    },
-                    &args.name,
-                )
-                .await?;
-            if removed {
-                println!("removed mcp server '{}'", args.name);
-            } else {
-                println!("mcp server '{}' not found", args.name);
-            }
-        }
-        McpCommands::Test(args) => {
-            let result = registry.test_server(&args.name).await?;
-            println!(
-                "mcp test ok: server={} transport={} elapsed={}ms tools={}",
-                result.server,
-                result.transport,
-                result.elapsed_ms,
-                result.tools.len()
-            );
-            for tool in result.tools {
-                println!(
-                    "- {}::{}{}",
-                    tool.server,
-                    tool.name,
-                    tool.description
-                        .map(|d| format!(" - {d}"))
-                        .unwrap_or_default()
-                );
-            }
-        }
+    let registry = discover_mcp_registry()?;
+    let output = execute_mcp_command(&registry, command).await?;
+    if !output.text.is_empty() {
+        println!("{}", output.text);
     }
-
     Ok(())
-}
-
-fn resolve_stdio_command(
-    command: Option<String>,
-    args: Vec<String>,
-    exec: Vec<String>,
-) -> anyhow::Result<(Option<String>, Vec<String>)> {
-    if exec.is_empty() {
-        return Ok((command, args));
-    }
-
-    if command.is_some() || !args.is_empty() {
-        bail!("use either --command/--arg or -- <command> <args...>, not both");
-    }
-
-    let mut iter = exec.into_iter();
-    let cmd = iter
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("missing stdio command after '--'"))?;
-    Ok((Some(cmd), iter.collect()))
-}
-
-fn mcp_registry() -> anyhow::Result<McpRegistry> {
-    let cwd = std::env::current_dir().context("failed to resolve current directory")?;
-    let paths = McpConfigPaths::discover(&cwd)?;
-    Ok(McpRegistry::new(paths))
 }
 
 async fn shutdown_signal() {
@@ -442,6 +160,10 @@ streaming_edit_interval_ms = 900
 streaming_prefer_draft = true
 startup_online_enabled = false
 startup_online_text = "online"
+commands_enabled = true
+commands_auto_register = true
+commands_private_only = true
+admin_user_ids = "${TELEGRAM_ADMIN_USER_IDS:-}"
 
 # Optional webhook mode (requires public HTTPS endpoint):
 # mode = "webhook"
@@ -467,34 +189,3 @@ mcp_enabled = true
 mcp_max_iterations = 4
 mcp_max_tool_result_chars = 4000
 "#;
-
-#[cfg(test)]
-mod tests {
-    use super::resolve_stdio_command;
-
-    #[test]
-    fn resolve_stdio_command_supports_claude_style_tail() {
-        let (command, args) = resolve_stdio_command(
-            None,
-            vec![],
-            vec!["npx".to_string(), "-y".to_string(), "demo-mcp".to_string()],
-        )
-        .expect("resolve");
-        assert_eq!(command.as_deref(), Some("npx"));
-        assert_eq!(args, vec!["-y".to_string(), "demo-mcp".to_string()]);
-    }
-
-    #[test]
-    fn resolve_stdio_command_rejects_mixed_styles() {
-        let err = resolve_stdio_command(
-            Some("npx".to_string()),
-            vec![],
-            vec!["uvx".to_string(), "demo-mcp".to_string()],
-        )
-        .expect_err("should fail");
-        assert!(
-            err.to_string()
-                .contains("either --command/--arg or -- <command> <args...>")
-        );
-    }
-}
