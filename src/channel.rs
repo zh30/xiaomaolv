@@ -1,10 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -48,6 +49,9 @@ pub struct TelegramChat {
 pub struct TelegramUser {
     pub id: i64,
     pub is_bot: Option<bool>,
+    pub username: Option<String>,
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,6 +94,7 @@ struct TelegramSentMessage {
 
 #[derive(Debug, Deserialize)]
 struct TelegramBotProfile {
+    id: i64,
     username: Option<String>,
     can_read_all_group_messages: Option<bool>,
 }
@@ -105,6 +110,10 @@ struct TelegramPollingDiagSnapshot {
     total_poll_err: u64,
     consecutive_poll_err: u64,
     total_updates_received: u64,
+    group_messages_total: u64,
+    group_decision_respond_total: u64,
+    group_decision_observe_total: u64,
+    group_decision_ignore_total: u64,
 }
 
 #[derive(Debug, Default)]
@@ -118,6 +127,10 @@ struct TelegramPollingDiagState {
     total_poll_err: u64,
     consecutive_poll_err: u64,
     total_updates_received: u64,
+    group_messages_total: u64,
+    group_decision_respond_total: u64,
+    group_decision_observe_total: u64,
+    group_decision_ignore_total: u64,
 }
 
 impl TelegramPollingDiagState {
@@ -132,6 +145,10 @@ impl TelegramPollingDiagState {
             total_poll_err: self.total_poll_err,
             consecutive_poll_err: self.consecutive_poll_err,
             total_updates_received: self.total_updates_received,
+            group_messages_total: self.group_messages_total,
+            group_decision_respond_total: self.group_decision_respond_total,
+            group_decision_observe_total: self.group_decision_observe_total,
+            group_decision_ignore_total: self.group_decision_ignore_total,
         }
     }
 }
@@ -708,6 +725,93 @@ impl TelegramIngressMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TelegramGroupTriggerMode {
+    Strict,
+    Smart,
+}
+
+impl TelegramGroupTriggerMode {
+    fn parse(raw: Option<&str>) -> anyhow::Result<Self> {
+        let value = raw.unwrap_or("strict").trim().to_ascii_lowercase();
+        match value.as_str() {
+            "strict" => Ok(Self::Strict),
+            "smart" => Ok(Self::Smart),
+            other => {
+                bail!("unsupported telegram group trigger mode '{other}', expected strict|smart")
+            }
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Smart => "smart",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TelegramGroupTriggerSettings {
+    mode: TelegramGroupTriggerMode,
+    followup_window_secs: u64,
+    cooldown_secs: u64,
+    rule_min_score: u32,
+    llm_gate_enabled: bool,
+}
+
+#[derive(Debug, Default)]
+struct TelegramGroupRuntimeState {
+    last_bot_response_unix_by_chat: HashMap<i64, u64>,
+    learned_aliases_by_chat: HashMap<i64, HashSet<String>>,
+    loaded_aliases_chats: HashSet<i64>,
+    user_profiles_by_chat: HashMap<i64, HashMap<i64, TelegramGroupUserProfile>>,
+    loaded_profile_chats: HashSet<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TelegramGroupUserProfile {
+    preferred_name: String,
+    username: Option<String>,
+    updated_at: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupDecisionKind {
+    Respond,
+    ObserveOnly,
+    Ignore,
+}
+
+impl GroupDecisionKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Respond => "respond",
+            Self::ObserveOnly => "observe_only",
+            Self::Ignore => "ignore",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GroupDecision {
+    kind: GroupDecisionKind,
+    score: i32,
+    reasons: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GroupSignalInput {
+    mentioned: bool,
+    replied_to_bot: bool,
+    recent_bot_participation: bool,
+    alias_hit: bool,
+    has_question_marker: bool,
+    points_to_other_bot: bool,
+    low_signal_noise: bool,
+    cooldown_active: bool,
+}
+
 pub struct TelegramChannelFactory;
 
 impl ChannelFactory for TelegramChannelFactory {
@@ -802,6 +906,36 @@ impl ChannelFactory for TelegramChannelFactory {
                 .unwrap_or_default(),
         )
         .context("failed to parse telegram settings.admin_user_ids")?;
+        let group_trigger_mode = TelegramGroupTriggerMode::parse(
+            config
+                .settings
+                .get("group_trigger_mode")
+                .map(String::as_str),
+        )
+        .context("failed to parse telegram settings.group_trigger_mode")?;
+        let group_followup_window_secs = config
+            .settings
+            .get("group_followup_window_secs")
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(180)
+            .clamp(10, 86_400);
+        let group_cooldown_secs = config
+            .settings
+            .get("group_cooldown_secs")
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(20)
+            .clamp(0, 3_600);
+        let group_rule_min_score = config
+            .settings
+            .get("group_rule_min_score")
+            .and_then(|raw| raw.parse::<u32>().ok())
+            .unwrap_or(70)
+            .clamp(1, 100);
+        let group_llm_gate_enabled = config
+            .settings
+            .get("group_llm_gate_enabled")
+            .and_then(|raw| parse_bool(raw))
+            .unwrap_or(false);
 
         Ok(Arc::new(TelegramChannelPlugin {
             sender: TelegramSender::new(bot_token.clone()),
@@ -818,11 +952,22 @@ impl ChannelFactory for TelegramChannelFactory {
             commands_auto_register,
             commands_private_only,
             admin_user_ids,
+            group_trigger_settings: TelegramGroupTriggerSettings {
+                mode: group_trigger_mode,
+                followup_window_secs: group_followup_window_secs,
+                cooldown_secs: group_cooldown_secs,
+                rule_min_score: group_rule_min_score,
+                llm_gate_enabled: group_llm_gate_enabled,
+            },
             group_mention_bot_username_cache: Arc::new(tokio::sync::Mutex::new(
                 group_mention_bot_username,
             )),
+            bot_user_id_cache: Arc::new(tokio::sync::Mutex::new(None)),
             polling_diag_state: Arc::new(tokio::sync::Mutex::new(
                 TelegramPollingDiagState::default(),
+            )),
+            group_runtime_state: Arc::new(tokio::sync::Mutex::new(
+                TelegramGroupRuntimeState::default(),
             )),
         }))
     }
@@ -843,8 +988,11 @@ struct TelegramChannelPlugin {
     commands_auto_register: bool,
     commands_private_only: bool,
     admin_user_ids: Vec<i64>,
+    group_trigger_settings: TelegramGroupTriggerSettings,
     group_mention_bot_username_cache: Arc<tokio::sync::Mutex<Option<String>>>,
+    bot_user_id_cache: Arc<tokio::sync::Mutex<Option<i64>>>,
     polling_diag_state: Arc<tokio::sync::Mutex<TelegramPollingDiagState>>,
+    group_runtime_state: Arc<tokio::sync::Mutex<TelegramGroupRuntimeState>>,
 }
 
 #[derive(Clone)]
@@ -861,6 +1009,10 @@ impl TelegramChannelPlugin {
             &self.group_mention_bot_username_cache,
         )
         .await
+    }
+
+    async fn resolve_bot_user_id(&self) -> Option<i64> {
+        resolve_bot_user_id_with_cache(&self.sender, &self.bot_user_id_cache).await
     }
 
     fn command_settings(&self) -> TelegramCommandSettings {
@@ -903,6 +1055,33 @@ async fn resolve_group_mention_bot_username_with_cache(
     }
 }
 
+async fn resolve_bot_user_id_with_cache(
+    sender: &TelegramSender,
+    cache: &Arc<tokio::sync::Mutex<Option<i64>>>,
+) -> Option<i64> {
+    {
+        let cached = cache.lock().await;
+        if let Some(user_id) = *cached {
+            return Some(user_id);
+        }
+    }
+
+    match sender.get_me_profile().await {
+        Ok(profile) => {
+            let mut cached = cache.lock().await;
+            *cached = Some(profile.id);
+            Some(profile.id)
+        }
+        Err(err) => {
+            warn!(
+                error = %format!("{err:#}"),
+                "failed to fetch telegram bot user id"
+            );
+            None
+        }
+    }
+}
+
 #[async_trait]
 impl ChannelPlugin for TelegramChannelPlugin {
     async fn handle_inbound(
@@ -939,7 +1118,11 @@ impl ChannelPlugin for TelegramChannelPlugin {
             self.streaming_edit_interval_ms,
             self.streaming_prefer_draft,
             self.resolve_group_mention_bot_username().await,
+            self.resolve_bot_user_id().await,
             self.command_settings(),
+            self.group_trigger_settings.clone(),
+            self.group_runtime_state.clone(),
+            self.polling_diag_state.clone(),
         )
         .await
         .map_err(ChannelPluginError::internal)?;
@@ -961,6 +1144,12 @@ impl ChannelPlugin for TelegramChannelPlugin {
                     let mut cached = self.group_mention_bot_username_cache.lock().await;
                     if cached.is_none() {
                         *cached = Some(username);
+                    }
+                }
+                {
+                    let mut cached = self.bot_user_id_cache.lock().await;
+                    if cached.is_none() {
+                        *cached = Some(profile.id);
                     }
                 }
 
@@ -1033,7 +1222,10 @@ impl ChannelPlugin for TelegramChannelPlugin {
         let streaming_edit_interval_ms = self.streaming_edit_interval_ms;
         let streaming_prefer_draft = self.streaming_prefer_draft;
         let command_settings = self.command_settings();
+        let group_trigger_settings = self.group_trigger_settings.clone();
+        let group_runtime_state = self.group_runtime_state.clone();
         let group_mention_bot_username_cache = self.group_mention_bot_username_cache.clone();
+        let bot_user_id_cache = self.bot_user_id_cache.clone();
         let polling_diag_state = self.polling_diag_state.clone();
         let worker_name = format!("{channel_name}-polling");
 
@@ -1089,6 +1281,8 @@ impl ChannelPlugin for TelegramChannelPlugin {
                                     &group_mention_bot_username_cache,
                                 )
                                 .await;
+                            let bot_user_id =
+                                resolve_bot_user_id_with_cache(&sender, &bot_user_id_cache).await;
 
                             if let Err(err) = process_telegram_update(
                                 ChannelContext {
@@ -1101,7 +1295,11 @@ impl ChannelPlugin for TelegramChannelPlugin {
                                 streaming_edit_interval_ms,
                                 streaming_prefer_draft,
                                 group_mention_bot_username.clone(),
+                                bot_user_id,
                                 command_settings.clone(),
+                                group_trigger_settings.clone(),
+                                group_runtime_state.clone(),
+                                polling_diag_state.clone(),
                             )
                             .await
                             {
@@ -1158,14 +1356,41 @@ impl ChannelPlugin for TelegramChannelPlugin {
             let cached = self.group_mention_bot_username_cache.lock().await;
             cached.clone()
         };
+        let cached_bot_user_id = {
+            let cached = self.bot_user_id_cache.lock().await;
+            *cached
+        };
         let polling = {
             let diag = self.polling_diag_state.lock().await;
             diag.snapshot()
+        };
+        let (
+            learned_alias_chats,
+            learned_alias_total,
+            learned_profile_chats,
+            learned_profile_total,
+        ) = {
+            let runtime = self.group_runtime_state.lock().await;
+            (
+                runtime.learned_aliases_by_chat.len(),
+                runtime
+                    .learned_aliases_by_chat
+                    .values()
+                    .map(|v| v.len())
+                    .sum::<usize>(),
+                runtime.user_profiles_by_chat.len(),
+                runtime
+                    .user_profiles_by_chat
+                    .values()
+                    .map(|v| v.len())
+                    .sum::<usize>(),
+            )
         };
 
         let get_me = match self.sender.get_me_profile().await {
             Ok(profile) => serde_json::json!({
                 "ok": true,
+                "id": profile.id,
                 "username": profile.username,
                 "can_read_all_group_messages": profile.can_read_all_group_messages,
             }),
@@ -1190,11 +1415,25 @@ impl ChannelPlugin for TelegramChannelPlugin {
             "channel": "telegram",
             "mode": self.mode(),
             "group_mention_bot_username_cached": cached_username,
+            "bot_user_id_cached": cached_bot_user_id,
             "commands": {
                 "enabled": self.commands_enabled,
                 "auto_register": self.commands_auto_register,
                 "private_only": self.commands_private_only,
                 "admin_user_ids_count": self.admin_user_ids.len()
+            },
+            "group_trigger": {
+                "mode": self.group_trigger_settings.mode.as_str(),
+                "followup_window_secs": self.group_trigger_settings.followup_window_secs,
+                "cooldown_secs": self.group_trigger_settings.cooldown_secs,
+                "rule_min_score": self.group_trigger_settings.rule_min_score,
+                "aliases_count": learned_alias_total,
+                "learned_alias_chats": learned_alias_chats,
+                "learned_alias_total": learned_alias_total,
+                "profiles_count": learned_profile_total,
+                "learned_profile_chats": learned_profile_chats,
+                "learned_profile_total": learned_profile_total,
+                "llm_gate_enabled": self.group_trigger_settings.llm_gate_enabled
             },
             "polling": polling,
             "get_me": get_me,
@@ -1218,7 +1457,11 @@ async fn process_telegram_update(
     streaming_edit_interval_ms: u64,
     streaming_prefer_draft: bool,
     group_mention_bot_username: Option<String>,
+    bot_user_id: Option<i64>,
     command_settings: TelegramCommandSettings,
+    group_trigger_settings: TelegramGroupTriggerSettings,
+    group_runtime_state: Arc<tokio::sync::Mutex<TelegramGroupRuntimeState>>,
+    diag_state: Arc<tokio::sync::Mutex<TelegramPollingDiagState>>,
 ) -> anyhow::Result<()> {
     if let Some(message) = update.message
         && let Some(ref text) = message.text
@@ -1232,13 +1475,20 @@ async fn process_telegram_update(
             .unwrap_or_else(|| "unknown".to_string());
         let message_thread_id = message.message_thread_id;
         let reply_to_message_id = message.reply_to_message.as_ref().map(|m| m.message_id);
-        let replied_to_bot = is_reply_to_bot_message(message.reply_to_message.as_ref());
+        let replied_to_bot =
+            is_reply_to_bot_message(message.reply_to_message.as_ref(), bot_user_id);
         let is_group = is_group_chat_type(message.chat.kind.as_deref());
+        let is_private_chat = is_private_chat_type(message.chat.kind.as_deref());
+        let from_id = message.from.as_ref().map(|u| u.id);
         let from_is_bot = message
             .from
             .as_ref()
             .and_then(|u| u.is_bot)
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || bot_user_id
+                .zip(from_id)
+                .map(|(bot_id, uid)| bot_id == uid)
+                .unwrap_or(false);
         let mention_entity_count = message
             .entities
             .as_ref()
@@ -1256,6 +1506,8 @@ async fn process_telegram_update(
             chat_type = %chat_kind,
             is_group,
             from_is_bot,
+            bot_user_id = ?bot_user_id,
+            from_id = ?from_id,
             message_thread_id = ?message_thread_id,
             reply_to_message_id = ?reply_to_message_id,
             replied_to_bot,
@@ -1264,7 +1516,13 @@ async fn process_telegram_update(
             text_preview = %text_preview,
             "telegram inbound message"
         );
+        if is_group {
+            let mut diag = diag_state.lock().await;
+            diag.group_messages_total += 1;
+        }
         if is_group && from_is_bot {
+            let mut diag = diag_state.lock().await;
+            diag.group_decision_ignore_total += 1;
             debug!(
                 chat_id,
                 message_id = message.message_id,
@@ -1275,6 +1533,41 @@ async fn process_telegram_update(
                 message_id, "telegram group message skipped: sender is bot"
             );
             return Ok(());
+        }
+
+        if is_private_chat {
+            match evaluate_private_chat_access(
+                message.from.as_ref().map(|u| u.id),
+                &command_settings.admin_user_ids,
+            ) {
+                PrivateChatAccess::Allowed => {}
+                PrivateChatAccess::MissingAdminAllowlist => {
+                    send_telegram_command_reply(
+                        sender,
+                        &message,
+                        &format!(
+                            "管理员白名单未配置，私聊功能未启用。\n{}\n\n请在 .env.realtest 中配置 TELEGRAM_ADMIN_USER_IDS，然后重启服务。",
+                            telegram_whoami_hint(&message)
+                        ),
+                    )
+                    .await
+                    .context("failed to send telegram private-chat deny message")?;
+                    return Ok(());
+                }
+                PrivateChatAccess::Unauthorized => {
+                    send_telegram_command_reply(
+                        sender,
+                        &message,
+                        &format!(
+                            "无权限使用该机器人。\n私聊仅开放给管理员。\n{}\n\n如需开通，请让管理员把你的 ID 加入 TELEGRAM_ADMIN_USER_IDS。",
+                            telegram_whoami_hint(&message)
+                        ),
+                    )
+                    .await
+                    .context("failed to send telegram private-chat unauthorized message")?;
+                    return Ok(());
+                }
+            }
         }
 
         if maybe_handle_telegram_command(
@@ -1290,22 +1583,295 @@ async fn process_telegram_update(
             return Ok(());
         }
 
+        let mut model_input_text = text.to_string();
         if is_group {
+            let (needs_alias_bootstrap, needs_profile_bootstrap) = {
+                let state = group_runtime_state.lock().await;
+                (
+                    !state.loaded_aliases_chats.contains(&chat_id),
+                    !state.loaded_profile_chats.contains(&chat_id),
+                )
+            };
+            if needs_alias_bootstrap {
+                match ctx
+                    .service
+                    .load_group_aliases(ctx.channel_name.clone(), chat_id, 64)
+                    .await
+                {
+                    Ok(stored_aliases) => {
+                        let mut state = group_runtime_state.lock().await;
+                        let chat_aliases =
+                            state.learned_aliases_by_chat.entry(chat_id).or_default();
+                        for alias in stored_aliases {
+                            let normalized = normalize_alias_token(&alias);
+                            if normalized.is_empty() || chat_aliases.len() >= 24 {
+                                continue;
+                            }
+                            chat_aliases.insert(normalized);
+                        }
+                        state.loaded_aliases_chats.insert(chat_id);
+                    }
+                    Err(err) => {
+                        warn!(
+                            chat_id,
+                            error = %format!("{err:#}"),
+                            "failed to bootstrap learned telegram group aliases"
+                        );
+                        let mut state = group_runtime_state.lock().await;
+                        state.loaded_aliases_chats.insert(chat_id);
+                    }
+                }
+            }
+            if needs_profile_bootstrap {
+                match ctx
+                    .service
+                    .load_group_user_profiles(ctx.channel_name.clone(), chat_id, 128)
+                    .await
+                {
+                    Ok(stored_profiles) => {
+                        let mut state = group_runtime_state.lock().await;
+                        let chat_profiles = state.user_profiles_by_chat.entry(chat_id).or_default();
+                        for profile in stored_profiles {
+                            if profile.preferred_name.trim().is_empty()
+                                || chat_profiles.len() >= 256
+                            {
+                                continue;
+                            }
+                            chat_profiles.insert(
+                                profile.user_id,
+                                TelegramGroupUserProfile {
+                                    preferred_name: profile.preferred_name,
+                                    username: normalize_telegram_username(
+                                        profile.username.as_deref(),
+                                    ),
+                                    updated_at: profile.updated_at.max(0) as u64,
+                                },
+                            );
+                        }
+                        state.loaded_profile_chats.insert(chat_id);
+                    }
+                    Err(err) => {
+                        warn!(
+                            chat_id,
+                            error = %format!("{err:#}"),
+                            "failed to bootstrap telegram group user profiles"
+                        );
+                        let mut state = group_runtime_state.lock().await;
+                        state.loaded_profile_chats.insert(chat_id);
+                    }
+                }
+            }
+
+            let sender_user_id = message.from.as_ref().map(|u| u.id).unwrap_or(chat_id);
+            let sender_username = normalize_telegram_username(
+                message.from.as_ref().and_then(|u| u.username.as_deref()),
+            );
+            let sender_observed_name = derive_telegram_user_display_name(message.from.as_ref())
+                .unwrap_or_else(|| format!("用户{sender_user_id}"));
+            let corrected_name = extract_realtime_name_correction(text);
+            let now = current_unix_timestamp();
+
+            let mut profile_persist_payload: Option<(i64, String, Option<String>)> = None;
+            let (sender_profile, roster_entries) = {
+                let mut state = group_runtime_state.lock().await;
+                let chat_profiles = state.user_profiles_by_chat.entry(chat_id).or_default();
+                let profile = chat_profiles.entry(sender_user_id).or_insert_with(|| {
+                    TelegramGroupUserProfile {
+                        preferred_name: sender_observed_name.clone(),
+                        username: sender_username.clone(),
+                        updated_at: now,
+                    }
+                });
+
+                let mut changed = false;
+                if profile.preferred_name.trim().is_empty() {
+                    profile.preferred_name = sender_observed_name.clone();
+                    changed = true;
+                }
+                if profile.username.is_none() && sender_username.is_some() {
+                    profile.username = sender_username.clone();
+                    changed = true;
+                }
+                if let Some(name) = corrected_name.as_ref()
+                    && profile.preferred_name != *name
+                {
+                    profile.preferred_name = name.clone();
+                    changed = true;
+                }
+                profile.updated_at = now;
+                if changed {
+                    profile_persist_payload = Some((
+                        sender_user_id,
+                        profile.preferred_name.clone(),
+                        profile.username.clone(),
+                    ));
+                }
+
+                let sender_profile = profile.clone();
+                let mut roster = chat_profiles
+                    .iter()
+                    .map(|(uid, p)| (*uid, p.clone()))
+                    .collect::<Vec<_>>();
+                roster.sort_by(|a, b| {
+                    b.1.updated_at
+                        .cmp(&a.1.updated_at)
+                        .then_with(|| a.0.cmp(&b.0))
+                });
+                (sender_profile, roster)
+            };
+
+            if let Some((profile_user_id, preferred_name, profile_username)) =
+                profile_persist_payload
+                && let Err(err) = ctx
+                    .service
+                    .upsert_group_user_profile(
+                        ctx.channel_name.clone(),
+                        chat_id,
+                        profile_user_id,
+                        preferred_name.clone(),
+                        profile_username.clone(),
+                    )
+                    .await
+            {
+                warn!(
+                    chat_id,
+                    user_id = profile_user_id,
+                    preferred_name = %preferred_name,
+                    username = ?profile_username,
+                    error = %format!("{err:#}"),
+                    "failed to persist telegram group user profile"
+                );
+            }
+            if let Some(name) = corrected_name.as_ref() {
+                info!(
+                    chat_id,
+                    message_id,
+                    user_id = sender_user_id,
+                    corrected_name = %name,
+                    "telegram group sender preferred name corrected in real time"
+                );
+            }
+            model_input_text = build_group_member_identity_context(
+                text,
+                sender_user_id,
+                &sender_profile,
+                &roster_entries,
+                8,
+            );
+
             let bot_username = group_mention_bot_username.as_deref().unwrap_or("");
             let mentioned = if bot_username.is_empty() {
                 false
             } else {
                 message_mentions_bot(&text, bot_username)
             };
-            let accepted = mentioned || replied_to_bot;
+            if (mentioned || replied_to_bot) && !bot_username.is_empty() {
+                let learned = extract_dynamic_alias_candidates(text, bot_username);
+                if !learned.is_empty() {
+                    let mut newly_added = Vec::new();
+                    let mut state = group_runtime_state.lock().await;
+                    let chat_aliases = state.learned_aliases_by_chat.entry(chat_id).or_default();
+                    for alias in learned {
+                        if chat_aliases.len() >= 24 {
+                            break;
+                        }
+                        if chat_aliases.insert(alias.clone()) {
+                            newly_added.push(alias);
+                        }
+                    }
+                    drop(state);
+                    if !newly_added.is_empty() {
+                        if let Err(err) = ctx
+                            .service
+                            .upsert_group_aliases(
+                                ctx.channel_name.clone(),
+                                chat_id,
+                                newly_added.clone(),
+                            )
+                            .await
+                        {
+                            warn!(
+                                chat_id,
+                                aliases = ?newly_added,
+                                error = %format!("{err:#}"),
+                                "failed to persist learned telegram group aliases"
+                            );
+                        }
+                    }
+                }
+            }
+            let (
+                recent_bot_participation,
+                cooldown_active,
+                seconds_since_last_bot_response,
+                learned_aliases,
+            ) = {
+                let state = group_runtime_state.lock().await;
+                let elapsed = state
+                    .last_bot_response_unix_by_chat
+                    .get(&chat_id)
+                    .map(|last| now.saturating_sub(*last));
+                let recent = elapsed
+                    .map(|secs| secs <= group_trigger_settings.followup_window_secs)
+                    .unwrap_or(false);
+                let cooldown = elapsed
+                    .map(|secs| secs <= group_trigger_settings.cooldown_secs)
+                    .unwrap_or(false);
+                let aliases = state
+                    .learned_aliases_by_chat
+                    .get(&chat_id)
+                    .map(|items| items.iter().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                (recent, cooldown, elapsed, aliases)
+            };
+            let alias_hit = message_contains_any_alias(text, &learned_aliases);
+            let has_question_marker = message_has_question_marker(text);
+            let points_to_other_bot = if bot_username.is_empty() {
+                false
+            } else {
+                message_mentions_other_handle(text, bot_username)
+            };
+            let low_signal_noise = is_low_signal_group_noise(text);
+            let decision = evaluate_group_decision(
+                group_trigger_settings.mode,
+                &GroupSignalInput {
+                    mentioned,
+                    replied_to_bot,
+                    recent_bot_participation,
+                    alias_hit,
+                    has_question_marker,
+                    points_to_other_bot,
+                    low_signal_noise,
+                    cooldown_active,
+                },
+                group_trigger_settings.rule_min_score,
+            );
+            {
+                let mut diag = diag_state.lock().await;
+                match decision.kind {
+                    GroupDecisionKind::Respond => diag.group_decision_respond_total += 1,
+                    GroupDecisionKind::ObserveOnly => diag.group_decision_observe_total += 1,
+                    GroupDecisionKind::Ignore => diag.group_decision_ignore_total += 1,
+                }
+            }
             debug!(
                 chat_id,
                 message_id = message.message_id,
                 bot_username = %bot_username,
                 mentioned,
                 replied_to_bot,
-                accepted,
+                alias_hit,
+                aliases_count = learned_aliases.len(),
+                has_question_marker,
+                recent_bot_participation,
+                cooldown_active,
+                seconds_since_last_bot_response = ?seconds_since_last_bot_response,
+                decision = %decision.kind.as_str(),
+                decision_score = decision.score,
+                reasons = ?decision.reasons,
                 text_len = text.chars().count(),
+                sender_user_id,
+                sender_preferred_name = %sender_profile.preferred_name,
                 "telegram group mention check"
             );
             info!(
@@ -1314,23 +1880,68 @@ async fn process_telegram_update(
                 bot_username = %bot_username,
                 mentioned,
                 replied_to_bot,
-                accepted,
+                alias_hit,
+                aliases_count = learned_aliases.len(),
+                has_question_marker,
+                recent_bot_participation,
+                cooldown_active,
+                seconds_since_last_bot_response = ?seconds_since_last_bot_response,
+                decision = %decision.kind.as_str(),
+                decision_score = decision.score,
+                reasons = ?decision.reasons,
                 mention_entity_count,
+                sender_user_id,
+                sender_preferred_name = %sender_profile.preferred_name,
                 "telegram group trigger decision"
             );
-            if !accepted {
-                if bot_username.is_empty() {
+            match decision.kind {
+                GroupDecisionKind::Respond => {}
+                GroupDecisionKind::ObserveOnly => {
+                    let user_id = message
+                        .from
+                        .as_ref()
+                        .map(|u| u.id.to_string())
+                        .unwrap_or_else(|| chat_id.to_string());
+                    let observe_session_id = format!(
+                        "{}:observe",
+                        telegram_session_id(chat_id, message_thread_id, reply_to_message_id)
+                    );
+                    ctx.service
+                        .observe(IncomingMessage {
+                            channel: ctx.channel_name.clone(),
+                            session_id: observe_session_id.clone(),
+                            user_id,
+                            text: model_input_text.clone(),
+                            reply_target: None,
+                        })
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to persist telegram observe-only message (session={observe_session_id})"
+                            )
+                        })?;
                     info!(
                         chat_id,
                         message_id,
-                        "telegram group message skipped: bot username unavailable and message is not a reply to bot"
+                        observe_session_id = %observe_session_id,
+                        "telegram group message observed silently: decision=observe_only"
                     );
+                    return Ok(());
                 }
-                info!(
-                    chat_id,
-                    message_id, "telegram group message skipped: no @mention and not reply-to-bot"
-                );
-                return Ok(());
+                GroupDecisionKind::Ignore => {
+                    if bot_username.is_empty() {
+                        info!(
+                            chat_id,
+                            message_id,
+                            "telegram group message skipped: bot username unavailable and message is not a reply to bot"
+                        );
+                    }
+                    info!(
+                        chat_id,
+                        message_id, "telegram group message skipped by trigger decision"
+                    );
+                    return Ok(());
+                }
             }
         }
         let user_id = message
@@ -1360,7 +1971,7 @@ async fn process_telegram_update(
             channel: ctx.channel_name,
             session_id,
             user_id,
-            text: text.to_string(),
+            text: model_input_text,
             reply_target: Some(ReplyTarget::Telegram {
                 chat_id,
                 message_thread_id,
@@ -1421,6 +2032,12 @@ async fn process_telegram_update(
         typing_task.abort();
         let _ = typing_task.await;
         result?;
+        if is_group {
+            let mut state = group_runtime_state.lock().await;
+            state
+                .last_bot_response_unix_by_chat
+                .insert(chat_id, current_unix_timestamp());
+        }
     }
 
     Ok(())
@@ -1439,6 +2056,13 @@ enum TelegramSlashCommand {
 enum McpCommandAccess {
     Allowed,
     RequirePrivateChat,
+    MissingAdminAllowlist,
+    Unauthorized,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrivateChatAccess {
+    Allowed,
     MissingAdminAllowlist,
     Unauthorized,
 }
@@ -1603,6 +2227,19 @@ fn evaluate_mcp_command_access(
         return McpCommandAccess::Unauthorized;
     }
     McpCommandAccess::Allowed
+}
+
+fn evaluate_private_chat_access(
+    caller_user_id: Option<i64>,
+    admin_user_ids: &[i64],
+) -> PrivateChatAccess {
+    if admin_user_ids.is_empty() {
+        return PrivateChatAccess::MissingAdminAllowlist;
+    }
+    if caller_user_id.is_none_or(|id| !admin_user_ids.contains(&id)) {
+        return PrivateChatAccess::Unauthorized;
+    }
+    PrivateChatAccess::Allowed
 }
 
 fn parse_telegram_slash_command(
@@ -1940,6 +2577,118 @@ fn parse_admin_user_ids(raw: &str) -> anyhow::Result<Vec<i64>> {
         .collect()
 }
 
+fn message_contains_any_alias(text: &str, aliases: &[String]) -> bool {
+    if aliases.is_empty() {
+        return false;
+    }
+    let lowered = text.to_lowercase();
+    aliases.iter().any(|alias| {
+        let trimmed = alias.trim().to_lowercase();
+        if trimmed.is_empty() {
+            return false;
+        }
+        lowered.contains(&trimmed)
+    })
+}
+
+fn message_has_question_marker(text: &str) -> bool {
+    text.contains('?') || text.contains('？')
+}
+
+fn message_mentions_other_handle(text: &str, bot_username: &str) -> bool {
+    let own = bot_username.trim().trim_start_matches('@').to_lowercase();
+    if own.is_empty() {
+        return false;
+    }
+    text.split(|ch: char| ch.is_whitespace() || ",.!?，。！？;:()[]{}<>\"'".contains(ch))
+        .filter_map(|token| token.strip_prefix('@'))
+        .map(|name| {
+            name.trim_matches(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+                .to_lowercase()
+        })
+        .any(|name| !name.is_empty() && name != own)
+}
+
+fn is_low_signal_group_noise(text: &str) -> bool {
+    let compact = text.trim();
+    if compact.is_empty() {
+        return true;
+    }
+    let len = compact.chars().count();
+    len <= 2
+}
+
+fn evaluate_group_decision(
+    mode: TelegramGroupTriggerMode,
+    input: &GroupSignalInput,
+    min_score: u32,
+) -> GroupDecision {
+    if input.mentioned {
+        return GroupDecision {
+            kind: GroupDecisionKind::Respond,
+            score: 100,
+            reasons: vec!["explicit_mention"],
+        };
+    }
+    if input.replied_to_bot {
+        return GroupDecision {
+            kind: GroupDecisionKind::Respond,
+            score: 100,
+            reasons: vec!["reply_to_bot"],
+        };
+    }
+    if matches!(mode, TelegramGroupTriggerMode::Strict) {
+        return GroupDecision {
+            kind: GroupDecisionKind::Ignore,
+            score: 0,
+            reasons: vec!["strict_no_explicit_trigger"],
+        };
+    }
+
+    let mut score: i32 = 0;
+    let mut reasons = Vec::new();
+    if input.recent_bot_participation {
+        score += 30;
+        reasons.push("recent_bot_participation");
+    }
+    if input.alias_hit {
+        score += 25;
+        reasons.push("alias_hit");
+    }
+    if input.has_question_marker {
+        score += 20;
+        reasons.push("question_marker");
+    }
+    if input.points_to_other_bot {
+        score -= 35;
+        reasons.push("points_to_other_bot");
+    }
+    if input.low_signal_noise {
+        score -= 25;
+        reasons.push("low_signal_noise");
+    }
+
+    let min = min_score.clamp(1, 100) as i32;
+    let observe_min = (min / 2).max(30);
+    let mut kind = if score >= min {
+        GroupDecisionKind::Respond
+    } else if score >= observe_min {
+        GroupDecisionKind::ObserveOnly
+    } else {
+        GroupDecisionKind::Ignore
+    };
+    if input.cooldown_active && matches!(kind, GroupDecisionKind::Respond) {
+        kind = GroupDecisionKind::ObserveOnly;
+        reasons.push("cooldown_active");
+    }
+
+    GroupDecision {
+        kind,
+        score,
+        reasons,
+    }
+}
+
 fn is_group_chat_type(kind: Option<&str>) -> bool {
     matches!(
         kind.map(|v| v.trim().to_ascii_lowercase()),
@@ -1947,11 +2696,261 @@ fn is_group_chat_type(kind: Option<&str>) -> bool {
     )
 }
 
-fn is_reply_to_bot_message(reply: Option<&TelegramReplyMessage>) -> bool {
+fn is_reply_to_bot_message(reply: Option<&TelegramReplyMessage>, bot_user_id: Option<i64>) -> bool {
     reply
         .and_then(|msg| msg.from.as_ref())
-        .and_then(|from| from.is_bot)
+        .map(|from| {
+            from.is_bot.unwrap_or(false)
+                || bot_user_id.map(|bot_id| bot_id == from.id).unwrap_or(false)
+        })
         .unwrap_or(false)
+}
+
+fn normalize_telegram_username(raw: Option<&str>) -> Option<String> {
+    raw.map(|v| v.trim().trim_start_matches('@').to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn normalize_display_name(raw: &str) -> Option<String> {
+    let normalized = raw
+        .trim()
+        .trim_start_matches('@')
+        .trim_matches(|ch: char| ",，。.!！？?;；:：()[]{}<>\"'`~|/\\ ".contains(ch))
+        .trim();
+    if normalized.is_empty() {
+        return None;
+    }
+    let len = normalized.chars().count();
+    if !(1..=24).contains(&len) {
+        return None;
+    }
+    if normalized.contains('\n') || normalized.contains('\r') || normalized.contains('\t') {
+        return None;
+    }
+    let lowered = normalized.to_ascii_lowercase();
+    if matches!(
+        lowered.as_str(),
+        "me" | "myself" | "bot" | "robot" | "assistant" | "question" | "reply" | "answer" | "sleep"
+    ) {
+        return None;
+    }
+    if matches!(
+        normalized,
+        "我" | "我们"
+            | "你"
+            | "你们"
+            | "他"
+            | "她"
+            | "它"
+            | "大家"
+            | "群友"
+            | "机器人"
+            | "助手"
+            | "问题"
+            | "一下"
+            | "起床"
+            | "看看"
+            | "帮忙"
+            | "分析"
+            | "解释"
+            | "回复"
+            | "回答"
+            | "处理"
+            | "来问"
+            | "问下"
+    ) {
+        return None;
+    }
+    if [
+        "来问", "请教", "问题", "帮忙", "看看", "分析", "解释", "回复", "回答", "处理",
+    ]
+    .iter()
+    .any(|kw| normalized.contains(kw))
+    {
+        return None;
+    }
+    Some(normalized.to_string())
+}
+
+fn derive_telegram_user_display_name(user: Option<&TelegramUser>) -> Option<String> {
+    let Some(user) = user else {
+        return None;
+    };
+
+    let first = user.first_name.as_deref().unwrap_or_default().trim();
+    let last = user.last_name.as_deref().unwrap_or_default().trim();
+    if !first.is_empty() || !last.is_empty() {
+        let full = if !first.is_empty() && !last.is_empty() {
+            format!("{first} {last}")
+        } else if !first.is_empty() {
+            first.to_string()
+        } else {
+            last.to_string()
+        };
+        if let Some(name) = normalize_display_name(&full) {
+            return Some(name);
+        }
+    }
+
+    if let Some(username) = normalize_telegram_username(user.username.as_deref()) {
+        return normalize_display_name(&username);
+    }
+
+    None
+}
+
+fn extract_name_candidate_from_tail(tail: &str) -> Option<String> {
+    let trimmed = tail.trim_start_matches(|ch: char| {
+        ch.is_whitespace() || "，,。.!！？?;；:：()[]{}<>\"'`~|/\\-=".contains(ch)
+    });
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let end = trimmed
+        .char_indices()
+        .find_map(|(idx, ch)| {
+            (ch.is_whitespace() || "，,。.!！？?;；:：()[]{}<>\"'`~|/\\=".contains(ch))
+                .then_some(idx)
+        })
+        .unwrap_or(trimmed.len());
+    normalize_display_name(&trimmed[..end])
+}
+
+fn extract_realtime_name_correction(text: &str) -> Option<String> {
+    let compact = text.trim();
+    if compact.is_empty() {
+        return None;
+    }
+
+    let markers = [
+        ("请叫我", true),
+        ("叫我", true),
+        ("我叫", false),
+        ("我是", false),
+    ];
+    for (marker, strong_signal) in markers {
+        let Some(start) = compact.rfind(marker) else {
+            continue;
+        };
+        if !strong_signal {
+            let allow_weak = compact.chars().count() <= 20
+                || compact.contains("不是")
+                || compact.contains("别叫")
+                || compact.contains("叫错");
+            if !allow_weak {
+                continue;
+            }
+        }
+        let tail = &compact[start + marker.len()..];
+        if let Some(candidate) = extract_name_candidate_from_tail(tail) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn build_group_member_identity_context(
+    raw_text: &str,
+    sender_user_id: i64,
+    sender_profile: &TelegramGroupUserProfile,
+    roster: &[(i64, TelegramGroupUserProfile)],
+    max_roster: usize,
+) -> String {
+    let mut lines = Vec::new();
+    lines.push("[群成员身份映射]".to_string());
+    lines.push(format!("当前发言账号: uid={sender_user_id}"));
+    lines.push(format!("当前发言称呼: {}", sender_profile.preferred_name));
+    if let Some(username) = sender_profile.username.as_deref() {
+        lines.push(format!("当前发言用户名: @{username}"));
+    }
+    lines.push("账号称呼映射:".to_string());
+
+    for (uid, profile) in roster.iter().take(max_roster.max(1)) {
+        if let Some(username) = profile.username.as_deref() {
+            lines.push(format!(
+                "uid={uid} -> {} (@{username})",
+                profile.preferred_name
+            ));
+        } else {
+            lines.push(format!("uid={uid} -> {}", profile.preferred_name));
+        }
+    }
+    lines.push(
+        "规则: 回复点名时，称呼必须和 uid 对应；若用户纠正称呼，立即使用最新称呼。".to_string(),
+    );
+    lines.push(format!("原始消息: {}", raw_text.trim()));
+    lines.push("[/群成员身份映射]".to_string());
+    lines.join("\n")
+}
+
+fn normalize_alias_token(raw: &str) -> String {
+    raw.trim()
+        .trim_matches(|ch: char| ch.is_whitespace() || ",，:：;；.!?！？()[]{}<>\"'@".contains(ch))
+        .to_lowercase()
+}
+
+fn extract_dynamic_alias_candidates(text: &str, bot_username: &str) -> Vec<String> {
+    let own = bot_username.trim().trim_start_matches('@').to_lowercase();
+    if own.is_empty() {
+        return vec![];
+    }
+    let own_handle = format!("@{own}");
+    let tokens = text
+        .split(|ch: char| ch.is_whitespace() || ",，:：;；.!?！？()[]{}<>\"'".contains(ch))
+        .map(normalize_alias_token)
+        .filter(|v| !v.is_empty())
+        .collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return vec![];
+    }
+
+    let mut out = Vec::new();
+    for (idx, token) in tokens.iter().enumerate() {
+        if token != &own_handle {
+            continue;
+        }
+        if idx > 0 {
+            let candidate = &tokens[idx - 1];
+            if is_dynamic_alias_candidate(candidate, &own) && !out.contains(candidate) {
+                out.push(candidate.clone());
+            }
+        }
+        if idx + 1 < tokens.len() {
+            let candidate = &tokens[idx + 1];
+            if is_dynamic_alias_candidate(candidate, &own) && !out.contains(candidate) {
+                out.push(candidate.clone());
+            }
+        }
+    }
+
+    if out.is_empty() {
+        let first = &tokens[0];
+        if is_dynamic_alias_candidate(first, &own) {
+            out.push(first.clone());
+        }
+    }
+    out
+}
+
+fn is_dynamic_alias_candidate(candidate: &str, bot_username: &str) -> bool {
+    if candidate.is_empty() || candidate.starts_with('@') || candidate == bot_username {
+        return false;
+    }
+    let len = candidate.chars().count();
+    if !(1..=16).contains(&len) {
+        return false;
+    }
+    let has_alpha = candidate
+        .chars()
+        .any(|ch| ch.is_alphabetic() || ('\u{4e00}'..='\u{9fff}').contains(&ch));
+    if !has_alpha {
+        return false;
+    }
+    !matches!(
+        candidate,
+        "hi" | "hello" | "hey" | "你好" | "您好" | "请问" | "请教" | "bot" | "机器人" | "助手"
+    )
 }
 
 fn message_mentions_bot(text: &str, bot_username: &str) -> bool {
@@ -2038,41 +3037,360 @@ fn build_draft_message_id(chat_id: i64, message_thread_id: Option<i64>) -> Strin
     format!("xm-{chat_id}-{thread}-{millis}")
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MarkdownListState {
+    ordered: bool,
+    next_index: usize,
+}
+
 fn render_telegram_text_parts(raw: &str, max_chars: usize) -> Vec<TelegramRenderedText> {
     let (think, body) = split_think_and_body(raw);
-    if think.trim().is_empty() {
-        return split_text_chunks(raw, max_chars.max(1))
-            .into_iter()
-            .map(|chunk| TelegramRenderedText {
-                text: chunk,
-                parse_mode: None,
-            })
-            .collect();
+    let source = if think.trim().is_empty() {
+        raw.trim()
+    } else {
+        body.trim()
+    };
+    if source.is_empty() {
+        return Vec::new();
     }
 
-    let think_prefix = "<blockquote>🧠 <tg-spoiler>";
-    let think_suffix = "</tg-spoiler></blockquote>";
-    let think_overhead = think_prefix.chars().count() + think_suffix.chars().count();
-    let think_chunk_max = max_chars.saturating_sub(think_overhead).max(1);
+    let source_chunk_max = (max_chars.max(1) / 2).max(512);
+    let mut parts = Vec::new();
+    for chunk in split_text_chunks(source, source_chunk_max) {
+        let rendered = render_markdown_to_telegram_markdown_v2(&chunk);
+        if rendered.trim().is_empty() {
+            continue;
+        }
+        if rendered.chars().count() <= max_chars.max(1) {
+            parts.push(TelegramRenderedText {
+                text: rendered,
+                parse_mode: Some("MarkdownV2"),
+            });
+            continue;
+        }
 
-    let mut out = Vec::new();
-    for think_chunk in split_text_chunks(think.trim(), think_chunk_max) {
-        out.push(TelegramRenderedText {
-            text: format!("{think_prefix}{}{think_suffix}", escape_html(&think_chunk)),
-            parse_mode: Some("HTML"),
-        });
-    }
-
-    let body_trimmed = body.trim();
-    if !body_trimmed.is_empty() {
-        for body_chunk in split_text_chunks(body_trimmed, max_chars.max(1)) {
-            out.push(TelegramRenderedText {
-                text: escape_html(&body_chunk),
-                parse_mode: Some("HTML"),
+        for split in split_text_chunks(&rendered, max_chars.max(1)) {
+            if split.trim().is_empty() {
+                continue;
+            }
+            parts.push(TelegramRenderedText {
+                text: split,
+                parse_mode: Some("MarkdownV2"),
             });
         }
     }
 
+    parts
+}
+
+fn render_markdown_to_telegram_markdown_v2(input: &str) -> String {
+    if input.trim().is_empty() {
+        return String::new();
+    }
+
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_FOOTNOTES);
+
+    let parser = Parser::new_ext(input, options);
+    let mut out = String::new();
+    let mut line_start = true;
+    let mut quote_depth = 0usize;
+    let mut in_code_block = false;
+    let mut list_stack: Vec<MarkdownListState> = Vec::new();
+    let mut link_stack: Vec<String> = Vec::new();
+
+    for event in parser {
+        match event {
+            Event::Start(tag) => match tag {
+                Tag::Paragraph => {}
+                Tag::Heading { .. } => {
+                    ensure_blank_line(&mut out, &mut line_start);
+                    out.push('*');
+                    line_start = false;
+                }
+                Tag::Strong => {
+                    out.push('*');
+                    line_start = false;
+                }
+                Tag::Emphasis => {
+                    out.push('_');
+                    line_start = false;
+                }
+                Tag::Strikethrough => {
+                    out.push('~');
+                    line_start = false;
+                }
+                Tag::CodeBlock(kind) => {
+                    ensure_blank_line(&mut out, &mut line_start);
+                    in_code_block = true;
+                    out.push_str("```");
+                    if let CodeBlockKind::Fenced(lang) = kind {
+                        let language = sanitize_code_fence_language(lang.as_ref());
+                        if !language.is_empty() {
+                            out.push_str(&language);
+                        }
+                    }
+                    out.push('\n');
+                    line_start = true;
+                }
+                Tag::List(start) => {
+                    ensure_line_break(&mut out, &mut line_start);
+                    list_stack.push(MarkdownListState {
+                        ordered: start.is_some(),
+                        next_index: start.unwrap_or(1) as usize,
+                    });
+                }
+                Tag::Item => {
+                    ensure_line_break(&mut out, &mut line_start);
+                    if let Some(top) = list_stack.last_mut() {
+                        if top.ordered {
+                            out.push_str(&format!("{}\\. ", top.next_index));
+                            top.next_index += 1;
+                        } else {
+                            out.push_str("• ");
+                        }
+                    } else {
+                        out.push_str("• ");
+                    }
+                    line_start = false;
+                }
+                Tag::Link { dest_url, .. } => {
+                    out.push('[');
+                    line_start = false;
+                    link_stack.push(dest_url.to_string());
+                }
+                Tag::BlockQuote(_) => {
+                    ensure_line_break(&mut out, &mut line_start);
+                    quote_depth += 1;
+                }
+                _ => {}
+            },
+            Event::End(tag_end) => match tag_end {
+                TagEnd::Paragraph => ensure_blank_line(&mut out, &mut line_start),
+                TagEnd::Heading(..) => {
+                    out.push('*');
+                    line_start = false;
+                    ensure_blank_line(&mut out, &mut line_start);
+                }
+                TagEnd::Strong => {
+                    out.push('*');
+                    line_start = false;
+                }
+                TagEnd::Emphasis => {
+                    out.push('_');
+                    line_start = false;
+                }
+                TagEnd::Strikethrough => {
+                    out.push('~');
+                    line_start = false;
+                }
+                TagEnd::CodeBlock => {
+                    if !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    out.push_str("```");
+                    line_start = false;
+                    in_code_block = false;
+                    ensure_blank_line(&mut out, &mut line_start);
+                }
+                TagEnd::List(_) => {
+                    list_stack.pop();
+                    ensure_blank_line(&mut out, &mut line_start);
+                }
+                TagEnd::Item => ensure_line_break(&mut out, &mut line_start),
+                TagEnd::Link => {
+                    let dest = link_stack.pop().unwrap_or_default();
+                    out.push_str("](");
+                    out.push_str(&escape_markdown_v2_link_destination(&dest));
+                    out.push(')');
+                    line_start = false;
+                }
+                TagEnd::BlockQuote(_) => {
+                    quote_depth = quote_depth.saturating_sub(1);
+                    ensure_line_break(&mut out, &mut line_start);
+                }
+                _ => {}
+            },
+            Event::Text(text) => {
+                if in_code_block {
+                    append_code_text(&mut out, text.as_ref(), &mut line_start, quote_depth, true);
+                } else {
+                    append_markdown_v2_text(&mut out, text.as_ref(), &mut line_start, quote_depth);
+                }
+            }
+            Event::Code(text) => {
+                maybe_push_quote_prefix(&mut out, &mut line_start, quote_depth);
+                out.push('`');
+                out.push_str(&escape_markdown_v2_code(text.as_ref()));
+                out.push('`');
+                line_start = false;
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                out.push('\n');
+                line_start = true;
+            }
+            Event::Rule => {
+                ensure_blank_line(&mut out, &mut line_start);
+                append_markdown_v2_text(&mut out, "────────", &mut line_start, quote_depth);
+                ensure_blank_line(&mut out, &mut line_start);
+            }
+            Event::TaskListMarker(checked) => {
+                let marker = if checked { "☑ " } else { "☐ " };
+                append_markdown_v2_text(&mut out, marker, &mut line_start, quote_depth);
+            }
+            Event::Html(html) | Event::InlineHtml(html) => {
+                append_markdown_v2_text(&mut out, html.as_ref(), &mut line_start, quote_depth);
+            }
+            Event::FootnoteReference(name) => {
+                append_markdown_v2_text(
+                    &mut out,
+                    format!("[{}]", name).as_str(),
+                    &mut line_start,
+                    quote_depth,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    out.trim().to_string()
+}
+
+fn sanitize_code_fence_language(raw: &str) -> String {
+    raw.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '+' | '.'))
+        .collect()
+}
+
+fn ensure_line_break(out: &mut String, line_start: &mut bool) {
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    *line_start = true;
+}
+
+fn ensure_blank_line(out: &mut String, line_start: &mut bool) {
+    if out.is_empty() {
+        *line_start = true;
+        return;
+    }
+    if out.ends_with("\n\n") {
+        *line_start = true;
+        return;
+    }
+    if out.ends_with('\n') {
+        out.push('\n');
+    } else {
+        out.push_str("\n\n");
+    }
+    *line_start = true;
+}
+
+fn maybe_push_quote_prefix(out: &mut String, line_start: &mut bool, quote_depth: usize) {
+    if *line_start && quote_depth > 0 {
+        for _ in 0..quote_depth {
+            out.push_str("> ");
+        }
+        *line_start = false;
+    }
+}
+
+fn append_code_text(
+    out: &mut String,
+    input: &str,
+    line_start: &mut bool,
+    quote_depth: usize,
+    in_code_block: bool,
+) {
+    for ch in input.chars() {
+        if ch == '\n' {
+            out.push('\n');
+            *line_start = true;
+            continue;
+        }
+        maybe_push_quote_prefix(out, line_start, quote_depth);
+        if in_code_block {
+            match ch {
+                '\\' => out.push_str("\\\\"),
+                '`' => out.push_str("\\`"),
+                _ => out.push(ch),
+            }
+        } else {
+            out.push(ch);
+        }
+        *line_start = false;
+    }
+}
+
+fn append_markdown_v2_text(
+    out: &mut String,
+    input: &str,
+    line_start: &mut bool,
+    quote_depth: usize,
+) {
+    for ch in input.chars() {
+        if ch == '\n' {
+            out.push('\n');
+            *line_start = true;
+            continue;
+        }
+        maybe_push_quote_prefix(out, line_start, quote_depth);
+        if needs_markdown_v2_escape(ch) {
+            out.push('\\');
+        }
+        out.push(ch);
+        *line_start = false;
+    }
+}
+
+fn needs_markdown_v2_escape(ch: char) -> bool {
+    matches!(
+        ch,
+        '\\' | '_'
+            | '*'
+            | '['
+            | ']'
+            | '('
+            | ')'
+            | '~'
+            | '`'
+            | '>'
+            | '#'
+            | '+'
+            | '-'
+            | '='
+            | '|'
+            | '{'
+            | '}'
+            | '.'
+            | '!'
+    )
+}
+
+fn escape_markdown_v2_code(input: &str) -> String {
+    let mut out = String::new();
+    for ch in input.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '`' => out.push_str("\\`"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn escape_markdown_v2_link_destination(input: &str) -> String {
+    let mut out = String::new();
+    for ch in input.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            ')' => out.push_str("\\)"),
+            _ => out.push(ch),
+        }
+    }
     out
 }
 
@@ -2125,13 +3443,6 @@ fn split_think_and_body(raw: &str) -> (String, String) {
 
     body.push_str(remaining);
     (think_parts.join("\n\n"), body)
-}
-
-fn escape_html(input: &str) -> String {
-    input
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }
 
 fn truncate_chars(input: &str, max_chars: usize) -> String {
@@ -2216,28 +3527,25 @@ async fn wait_for_shutdown_or_timeout(
 #[cfg(test)]
 mod tests {
     use super::{
-        McpCommandAccess, TELEGRAM_MAX_TEXT_CHARS, TelegramCommandSettings, TelegramReplyMessage,
-        TelegramSlashCommand, TelegramUser, build_draft_message_id, evaluate_mcp_command_access,
+        GroupDecisionKind, GroupSignalInput, McpCommandAccess, PrivateChatAccess,
+        TELEGRAM_MAX_TEXT_CHARS, TelegramCommandSettings, TelegramGroupTriggerMode,
+        TelegramGroupUserProfile, TelegramReplyMessage, TelegramSlashCommand, TelegramUser,
+        build_draft_message_id, build_group_member_identity_context, evaluate_group_decision,
+        evaluate_mcp_command_access, evaluate_private_chat_access,
+        extract_dynamic_alias_candidates, extract_realtime_name_correction,
         is_reply_to_bot_message, message_mentions_bot, parse_admin_user_ids,
         parse_telegram_slash_command, render_telegram_text_parts, short_description_payload,
         telegram_session_id, truncate_chars, typing_action_payload,
     };
 
     #[test]
-    fn think_block_is_rendered_with_brain_prefix_and_body() {
+    fn think_block_is_stripped_and_only_body_is_sent() {
         let raw = "<think>内部推理A\n内部推理B</think>\n\n最终回答";
         let parts = render_telegram_text_parts(raw, TELEGRAM_MAX_TEXT_CHARS);
+        assert_eq!(parts.len(), 1);
         let rendered = &parts[0];
-
-        assert_eq!(rendered.parse_mode, Some("HTML"));
-        assert!(rendered.text.contains("<blockquote>"));
-        assert!(rendered.text.contains("🧠 "));
-        assert!(rendered.text.contains("<tg-spoiler>"));
-        assert!(rendered.text.contains("🧠 <tg-spoiler>"));
-        assert!(parts.iter().any(|p| p.text.contains("最终回答")));
-        assert!(!rendered.text.contains("思考草稿（点击展开）"));
-        assert!(!rendered.text.contains("<think>"));
-        assert!(!rendered.text.contains("</think>"));
+        assert_eq!(rendered.parse_mode, Some("MarkdownV2"));
+        assert_eq!(rendered.text, "最终回答");
     }
 
     #[test]
@@ -2245,21 +3553,39 @@ mod tests {
         let raw = "你好，这里是正文。";
         let parts = render_telegram_text_parts(raw, TELEGRAM_MAX_TEXT_CHARS);
         let rendered = &parts[0];
-        assert_eq!(rendered.parse_mode, None);
+        assert_eq!(rendered.parse_mode, Some("MarkdownV2"));
         assert_eq!(rendered.text, raw);
     }
 
     #[test]
-    fn unclosed_think_is_rendered_with_brain_prefix() {
+    fn markdownv2_renderer_supports_common_markdown_features() {
+        let raw = "# 标题\n\n**加粗** `code` [链接](https://example.com)\n- 条目";
+        let parts = render_telegram_text_parts(raw, TELEGRAM_MAX_TEXT_CHARS);
+        assert_eq!(parts.len(), 1);
+        let rendered = &parts[0];
+        assert_eq!(rendered.parse_mode, Some("MarkdownV2"));
+        assert!(rendered.text.contains("*标题*"));
+        assert!(rendered.text.contains("*加粗*"));
+        assert!(rendered.text.contains("`code`"));
+        assert!(rendered.text.contains("[链接](https://example.com)"));
+        assert!(rendered.text.contains("• 条目"));
+    }
+
+    #[test]
+    fn markdownv2_renderer_escapes_special_chars() {
+        let raw = "a+b=c.";
+        let parts = render_telegram_text_parts(raw, TELEGRAM_MAX_TEXT_CHARS);
+        assert_eq!(parts.len(), 1);
+        let rendered = &parts[0];
+        assert_eq!(rendered.parse_mode, Some("MarkdownV2"));
+        assert_eq!(rendered.text, "a\\+b\\=c\\.");
+    }
+
+    #[test]
+    fn unclosed_think_is_suppressed() {
         let raw = "<think>这段还没闭合";
         let parts = render_telegram_text_parts(raw, TELEGRAM_MAX_TEXT_CHARS);
-        let rendered = &parts[0];
-        assert_eq!(rendered.parse_mode, Some("HTML"));
-        assert!(rendered.text.contains("<blockquote>"));
-        assert!(rendered.text.contains("🧠 "));
-        assert!(rendered.text.contains("<tg-spoiler>"));
-        assert!(rendered.text.contains("🧠 <tg-spoiler>"));
-        assert!(rendered.text.contains("这段还没闭合"));
+        assert!(parts.is_empty());
     }
 
     #[test]
@@ -2322,6 +3648,9 @@ mod tests {
             from: Some(TelegramUser {
                 id: 42,
                 is_bot: Some(true),
+                username: None,
+                first_name: None,
+                last_name: None,
             }),
         };
         let reply_from_user = TelegramReplyMessage {
@@ -2329,6 +3658,9 @@ mod tests {
             from: Some(TelegramUser {
                 id: 7,
                 is_bot: Some(false),
+                username: None,
+                first_name: None,
+                last_name: None,
             }),
         };
         let reply_without_from = TelegramReplyMessage {
@@ -2336,10 +3668,98 @@ mod tests {
             from: None,
         };
 
-        assert!(is_reply_to_bot_message(Some(&reply_from_bot)));
-        assert!(!is_reply_to_bot_message(Some(&reply_from_user)));
-        assert!(!is_reply_to_bot_message(Some(&reply_without_from)));
-        assert!(!is_reply_to_bot_message(None));
+        assert!(is_reply_to_bot_message(Some(&reply_from_bot), None));
+        assert!(!is_reply_to_bot_message(Some(&reply_from_user), None));
+        assert!(!is_reply_to_bot_message(Some(&reply_without_from), None));
+        assert!(!is_reply_to_bot_message(None, None));
+    }
+
+    #[test]
+    fn reply_to_bot_detection_falls_back_to_bot_user_id_when_is_bot_missing() {
+        let reply_without_flag = TelegramReplyMessage {
+            message_id: 7,
+            from: Some(TelegramUser {
+                id: 12345,
+                is_bot: None,
+                username: None,
+                first_name: None,
+                last_name: None,
+            }),
+        };
+        assert!(is_reply_to_bot_message(
+            Some(&reply_without_flag),
+            Some(12345)
+        ));
+        assert!(!is_reply_to_bot_message(
+            Some(&reply_without_flag),
+            Some(99999)
+        ));
+    }
+
+    #[test]
+    fn extract_dynamic_alias_candidates_learns_prefix_name() {
+        let aliases =
+            extract_dynamic_alias_candidates("小绿，@myxiaomaolvbot 你看看这个", "myxiaomaolvbot");
+        assert!(aliases.iter().any(|v| v == "小绿"));
+    }
+
+    #[test]
+    fn extract_realtime_name_correction_supports_jiaowo_pattern() {
+        let corrected = extract_realtime_name_correction("请叫我阿青");
+        assert_eq!(corrected, Some("阿青".to_string()));
+    }
+
+    #[test]
+    fn extract_realtime_name_correction_supports_wojiao_pattern() {
+        let corrected = extract_realtime_name_correction("我叫小陈");
+        assert_eq!(corrected, Some("小陈".to_string()));
+    }
+
+    #[test]
+    fn extract_realtime_name_correction_ignores_non_name_sentence() {
+        let corrected = extract_realtime_name_correction("我是来问一个问题的");
+        assert_eq!(corrected, None);
+    }
+
+    #[test]
+    fn group_member_identity_context_includes_sender_and_roster_mapping() {
+        let sender_profile = TelegramGroupUserProfile {
+            preferred_name: "阿青".to_string(),
+            username: Some("aqing_99".to_string()),
+            updated_at: 1700000000,
+        };
+        let roster = vec![
+            (
+                1001_i64,
+                TelegramGroupUserProfile {
+                    preferred_name: "阿青".to_string(),
+                    username: Some("aqing_99".to_string()),
+                    updated_at: 1700000000,
+                },
+            ),
+            (
+                1002_i64,
+                TelegramGroupUserProfile {
+                    preferred_name: "小米".to_string(),
+                    username: Some("xiaomi".to_string()),
+                    updated_at: 1699999999,
+                },
+            ),
+        ];
+
+        let context = build_group_member_identity_context(
+            "我们今天要评审需求",
+            1001,
+            &sender_profile,
+            &roster,
+            6,
+        );
+
+        assert!(context.contains("当前发言账号: uid=1001"));
+        assert!(context.contains("当前发言称呼: 阿青"));
+        assert!(context.contains("uid=1001 -> 阿青"));
+        assert!(context.contains("uid=1002 -> 小米"));
+        assert!(context.contains("原始消息: 我们今天要评审需求"));
     }
 
     #[test]
@@ -2365,18 +3785,18 @@ mod tests {
         assert!(parts.len() >= 2);
         for part in &parts {
             assert!(part.text.chars().count() <= TELEGRAM_MAX_TEXT_CHARS);
-            assert_eq!(part.parse_mode, None);
+            assert_eq!(part.parse_mode, Some("MarkdownV2"));
         }
     }
 
     #[test]
-    fn long_think_text_is_split_into_multiple_messages() {
+    fn long_think_text_only_keeps_final_body() {
         let think = "推理".repeat(TELEGRAM_MAX_TEXT_CHARS);
         let raw = format!("<think>{think}</think>\n\n最终结论");
         let parts = render_telegram_text_parts(&raw, TELEGRAM_MAX_TEXT_CHARS);
-        assert!(parts.len() >= 2);
-        assert!(parts[0].text.contains("<tg-spoiler>"));
-        assert!(parts[0].text.contains("🧠 "));
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].parse_mode, Some("MarkdownV2"));
+        assert_eq!(parts[0].text, "最终结论");
         for part in &parts {
             assert!(part.text.chars().count() <= TELEGRAM_MAX_TEXT_CHARS);
         }
@@ -2434,5 +3854,118 @@ mod tests {
         };
         let access = evaluate_mcp_command_access(true, Some(7), &settings);
         assert_eq!(access, McpCommandAccess::Unauthorized);
+    }
+
+    #[test]
+    fn private_chat_access_allows_admin() {
+        let access = evaluate_private_chat_access(Some(42), &[42, 99]);
+        assert_eq!(access, PrivateChatAccess::Allowed);
+    }
+
+    #[test]
+    fn private_chat_access_rejects_non_admin() {
+        let access = evaluate_private_chat_access(Some(7), &[42, 99]);
+        assert_eq!(access, PrivateChatAccess::Unauthorized);
+    }
+
+    #[test]
+    fn private_chat_access_rejects_when_allowlist_missing() {
+        let access = evaluate_private_chat_access(Some(7), &[]);
+        assert_eq!(access, PrivateChatAccess::MissingAdminAllowlist);
+    }
+
+    #[test]
+    fn group_decision_strict_only_allows_mention_or_reply() {
+        let decision = evaluate_group_decision(
+            TelegramGroupTriggerMode::Strict,
+            &GroupSignalInput {
+                mentioned: false,
+                replied_to_bot: false,
+                recent_bot_participation: true,
+                alias_hit: true,
+                has_question_marker: true,
+                points_to_other_bot: false,
+                low_signal_noise: false,
+                cooldown_active: false,
+            },
+            70,
+        );
+        assert_eq!(decision.kind, GroupDecisionKind::Ignore);
+    }
+
+    #[test]
+    fn group_decision_strict_allows_explicit_mention() {
+        let decision = evaluate_group_decision(
+            TelegramGroupTriggerMode::Strict,
+            &GroupSignalInput {
+                mentioned: true,
+                replied_to_bot: false,
+                recent_bot_participation: false,
+                alias_hit: false,
+                has_question_marker: false,
+                points_to_other_bot: false,
+                low_signal_noise: false,
+                cooldown_active: true,
+            },
+            70,
+        );
+        assert_eq!(decision.kind, GroupDecisionKind::Respond);
+    }
+
+    #[test]
+    fn group_decision_strict_allows_reply_to_bot() {
+        let decision = evaluate_group_decision(
+            TelegramGroupTriggerMode::Strict,
+            &GroupSignalInput {
+                mentioned: false,
+                replied_to_bot: true,
+                recent_bot_participation: false,
+                alias_hit: false,
+                has_question_marker: false,
+                points_to_other_bot: false,
+                low_signal_noise: false,
+                cooldown_active: true,
+            },
+            70,
+        );
+        assert_eq!(decision.kind, GroupDecisionKind::Respond);
+    }
+
+    #[test]
+    fn group_decision_smart_promotes_contextual_question_to_observe_or_respond() {
+        let decision = evaluate_group_decision(
+            TelegramGroupTriggerMode::Smart,
+            &GroupSignalInput {
+                mentioned: false,
+                replied_to_bot: false,
+                recent_bot_participation: true,
+                alias_hit: true,
+                has_question_marker: true,
+                points_to_other_bot: false,
+                low_signal_noise: false,
+                cooldown_active: false,
+            },
+            70,
+        );
+        assert_eq!(decision.kind, GroupDecisionKind::Respond);
+    }
+
+    #[test]
+    fn group_decision_smart_suppresses_other_bot_target() {
+        let decision = evaluate_group_decision(
+            TelegramGroupTriggerMode::Smart,
+            &GroupSignalInput {
+                mentioned: false,
+                replied_to_bot: false,
+                recent_bot_participation: false,
+                alias_hit: false,
+                has_question_marker: true,
+                points_to_other_bot: true,
+                low_signal_noise: false,
+                cooldown_active: false,
+            },
+            70,
+        );
+        assert_eq!(decision.kind, GroupDecisionKind::Ignore);
     }
 }

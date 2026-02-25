@@ -330,6 +330,26 @@ fn load_channel_plugins(
             "admin_user_ids".to_string(),
             telegram.admin_user_ids.to_csv(),
         );
+        settings.insert(
+            "group_trigger_mode".to_string(),
+            telegram.group_trigger_mode.clone(),
+        );
+        settings.insert(
+            "group_followup_window_secs".to_string(),
+            telegram.group_followup_window_secs.to_string(),
+        );
+        settings.insert(
+            "group_cooldown_secs".to_string(),
+            telegram.group_cooldown_secs.to_string(),
+        );
+        settings.insert(
+            "group_rule_min_score".to_string(),
+            telegram.group_rule_min_score.to_string(),
+        );
+        settings.insert(
+            "group_llm_gate_enabled".to_string(),
+            telegram.group_llm_gate_enabled.to_string(),
+        );
 
         let cfg = ChannelPluginConfig {
             kind: "telegram".to_string(),

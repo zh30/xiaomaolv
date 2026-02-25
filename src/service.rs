@@ -8,7 +8,9 @@ use tracing::warn;
 use crate::domain::{IncomingMessage, MessageRole, OutgoingMessage, StoredMessage};
 use crate::mcp::{McpRuntime, McpToolInfo};
 use crate::memory::{
-    MemoryBackend, MemoryContextRequest, MemoryWriteRequest, SqliteMemoryBackend, SqliteMemoryStore,
+    GroupAliasLoadRequest, GroupAliasUpsertRequest, GroupUserProfileLoadRequest,
+    GroupUserProfileRecord, GroupUserProfileUpsertRequest, MemoryBackend, MemoryContextRequest,
+    MemoryWriteRequest, SqliteMemoryBackend, SqliteMemoryStore,
 };
 use crate::provider::{ChatProvider, CompletionRequest, StreamSink};
 
@@ -187,6 +189,95 @@ impl MessageService {
             text,
             reply_target: incoming.reply_target,
         })
+    }
+
+    pub async fn observe(&self, incoming: IncomingMessage) -> anyhow::Result<()> {
+        self.memory
+            .append(MemoryWriteRequest {
+                session_id: incoming.session_id,
+                user_id: incoming.user_id,
+                channel: incoming.channel,
+                message: StoredMessage {
+                    role: MessageRole::User,
+                    content: incoming.text,
+                },
+            })
+            .await
+            .context("failed to persist observed user message")
+    }
+
+    pub async fn upsert_group_aliases(
+        &self,
+        channel: String,
+        chat_id: i64,
+        aliases: Vec<String>,
+    ) -> anyhow::Result<()> {
+        if aliases.is_empty() {
+            return Ok(());
+        }
+        self.memory
+            .upsert_group_aliases(GroupAliasUpsertRequest {
+                channel,
+                chat_id,
+                aliases,
+            })
+            .await
+            .context("failed to persist telegram group aliases")
+    }
+
+    pub async fn load_group_aliases(
+        &self,
+        channel: String,
+        chat_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<String>> {
+        self.memory
+            .load_group_aliases(GroupAliasLoadRequest {
+                channel,
+                chat_id,
+                limit,
+            })
+            .await
+            .context("failed to load telegram group aliases")
+    }
+
+    pub async fn upsert_group_user_profile(
+        &self,
+        channel: String,
+        chat_id: i64,
+        user_id: i64,
+        preferred_name: String,
+        username: Option<String>,
+    ) -> anyhow::Result<()> {
+        if preferred_name.trim().is_empty() {
+            return Ok(());
+        }
+        self.memory
+            .upsert_group_user_profile(GroupUserProfileUpsertRequest {
+                channel,
+                chat_id,
+                user_id,
+                preferred_name,
+                username,
+            })
+            .await
+            .context("failed to persist telegram group user profile")
+    }
+
+    pub async fn load_group_user_profiles(
+        &self,
+        channel: String,
+        chat_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<GroupUserProfileRecord>> {
+        self.memory
+            .load_group_user_profiles(GroupUserProfileLoadRequest {
+                channel,
+                chat_id,
+                limit,
+            })
+            .await
+            .context("failed to load telegram group user profiles")
     }
 
     async fn complete_with_optional_mcp(

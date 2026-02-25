@@ -92,6 +92,13 @@ echo "[mvp] database=sqlite://xiaomaolv.db"
 echo "[mvp] minimax_model=${MINIMAX_MODEL}"
 echo "[mvp] telegram mode check after boot: curl -sS http://127.0.0.1:8080/v1/channels/telegram/mode"
 
+if lsof -nP -iTCP:8080 -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "[mvp] port 8080 is already in use. current listeners:" >&2
+  lsof -nP -iTCP:8080 -sTCP:LISTEN >&2 || true
+  echo "[mvp] stop the existing process (or change [app].bind) and retry." >&2
+  exit 1
+fi
+
 if [[ "${HOT_RELOAD}" == "1" ]]; then
   if ! cargo watch --version >/dev/null 2>&1; then
     echo "[mvp] hot reload requires cargo-watch, but it is not installed." >&2

@@ -56,6 +56,7 @@ impl AppConfig {
                 *mode = resolve_env_placeholder(mode);
             }
             telegram.startup_online_text = resolve_env_placeholder(&telegram.startup_online_text);
+            telegram.group_trigger_mode = resolve_env_placeholder(&telegram.group_trigger_mode);
             telegram.admin_user_ids.resolve_env_placeholders();
         }
 
@@ -139,6 +140,16 @@ pub struct TelegramChannelConfig {
     pub commands_private_only: bool,
     #[serde(default)]
     pub admin_user_ids: TelegramAdminUserIds,
+    #[serde(default = "default_telegram_group_trigger_mode")]
+    pub group_trigger_mode: String,
+    #[serde(default = "default_telegram_group_followup_window_secs")]
+    pub group_followup_window_secs: u64,
+    #[serde(default = "default_telegram_group_cooldown_secs")]
+    pub group_cooldown_secs: u64,
+    #[serde(default = "default_telegram_group_rule_min_score")]
+    pub group_rule_min_score: u32,
+    #[serde(default = "default_telegram_group_llm_gate_enabled")]
+    pub group_llm_gate_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -317,6 +328,26 @@ fn default_telegram_commands_auto_register() -> bool {
 
 fn default_telegram_commands_private_only() -> bool {
     true
+}
+
+fn default_telegram_group_trigger_mode() -> String {
+    "smart".to_string()
+}
+
+fn default_telegram_group_followup_window_secs() -> u64 {
+    180
+}
+
+fn default_telegram_group_cooldown_secs() -> u64 {
+    20
+}
+
+fn default_telegram_group_rule_min_score() -> u32 {
+    70
+}
+
+fn default_telegram_group_llm_gate_enabled() -> bool {
+    false
 }
 
 fn default_memory_backend() -> String {

@@ -23,12 +23,15 @@
 - 消息通道：HTTP + Telegram
 - Telegram 双模式：`polling`（默认）和 `webhook`（可选）
 - Telegram 流式回复（通过 `editMessageText` 增量更新）
+- Telegram 回复统一使用 `MarkdownV2` 渲染（支持加粗/斜体/代码/链接/列表/引用）
 - Telegram 启动在线状态（通过 `setMyShortDescription`，可配置）
 - Telegram `/` 命令：`/start`、`/help`、`/whoami`、`/mcp ...`（私聊管理员控制）
-- Telegram 群组支持：仅在被 `@bot_username` 时回复
+- Telegram 群组支持：
+  - `strict` 模式：仅在 `@bot_username` 或 reply-to-bot 时回复
+  - `smart` 模式：基于上下文规则的 `Respond/ObserveOnly/Ignore` 决策
 - 群组里如果用户 reply 了 bot 消息，bot 会引用该用户消息继续回复（`reply_to_message_id`）
 - 群组会话分组：优先按 `message_thread_id`（话题），否则按 `reply_to_message_id`
-- `<think>...</think>` 自动渲染为 Telegram 可折叠 spoiler
+- Telegram 回复会剥离 `<think>...</think>`，仅发送正文
 - 记忆系统：`sqlite-only`（默认）和 `hybrid-sqlite-zvec`（可选）
 - 插件式扩展 API（Provider/Channel/Memory）
 
@@ -56,7 +59,7 @@ cp .env.realtest.example .env.realtest
 
 - `MINIMAX_MODEL`（默认：`MiniMax-M2.5-highspeed`）
 - `TELEGRAM_BOT_USERNAME`（不带 `@`，建议填写，用于群组@匹配）
-- `TELEGRAM_ADMIN_USER_IDS`（`/mcp` 管理员用户 ID，逗号分隔，如 `123456789,987654321`）
+- `TELEGRAM_ADMIN_USER_IDS`（私聊访问 + `/mcp` 管理员用户 ID，逗号分隔，如 `123456789,987654321`）
 
 ### 3) 一键启动 MVP
 
@@ -126,6 +129,11 @@ commands_enabled = true
 commands_auto_register = true
 commands_private_only = true
 admin_user_ids = "${TELEGRAM_ADMIN_USER_IDS:-}"
+group_trigger_mode = "${TELEGRAM_GROUP_TRIGGER_MODE:-smart}"
+group_followup_window_secs = 180
+group_cooldown_secs = 20
+group_rule_min_score = 70
+group_llm_gate_enabled = false
 ```
 
 2. 在 `.env.realtest` 中补齐：
@@ -162,13 +170,19 @@ Webhook 回调地址：
 - Telegram 流式：
   - `streaming_enabled = true`
   - `streaming_edit_interval_ms = 900`
-  - `bot_username = "your_bot_username"`（群组仅@回复）
+  - `bot_username = "your_bot_username"`（用于@匹配与群组决策上下文）
+  - `group_trigger_mode = "${TELEGRAM_GROUP_TRIGGER_MODE:-smart}"`（`strict` 仅@/reply触发；`smart` 上下文触发；默认 `smart`）
+  - `group_followup_window_secs = 180`（smart 模式下“最近上下文”窗口）
+  - `group_cooldown_secs = 20`（smart 模式自动发言冷却）
+  - `group_rule_min_score = 70`（smart 规则阈值）
+  - `smart` 模式会基于群上下文自动学习召唤别名（不需要手工配置）
+  - `group_llm_gate_enabled = false`（预留：灰区判定开关）
   - `startup_online_enabled = true|false`（启动时写入 Bot 在线状态文案）
   - `startup_online_text = "online"`（调用 Telegram `setMyShortDescription`）
   - `commands_enabled = true|false`（是否启用 `/` 命令处理）
   - `commands_auto_register = true|false`（启动时是否自动注册 Telegram 命令菜单）
   - `commands_private_only = true|false`（为 true 时 `/mcp` 仅允许私聊）
-  - `admin_user_ids = "${TELEGRAM_ADMIN_USER_IDS:-}"`（推荐在 `.env.realtest` 配置）
+  - `admin_user_ids = "${TELEGRAM_ADMIN_USER_IDS:-}"`（私聊访问 + `/mcp` 白名单，推荐在 `.env.realtest` 配置）
 - 记忆模式：
   - `backend = "sqlite-only"`（默认）
   - `backend = "hybrid-sqlite-zvec"`（可选）

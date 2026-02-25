@@ -34,6 +34,15 @@ commands_enabled = true
 commands_auto_register = true
 commands_private_only = true
 admin_user_ids = "${TELEGRAM_ADMIN_USER_IDS:-}"
+# Group trigger policy:
+# - strict: only @mention or reply-to-bot can trigger response
+# - smart: rule-based contextual trigger (with cooldown + observe-only path)
+group_trigger_mode = "${TELEGRAM_GROUP_TRIGGER_MODE:-smart}"
+group_followup_window_secs = 180
+group_cooldown_secs = 20
+group_rule_min_score = 70
+# Reserved for future gray-zone LLM arbitration
+group_llm_gate_enabled = false
 # webhook_secret = "your-webhook-secret"
 
 [memory]

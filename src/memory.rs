@@ -57,6 +57,34 @@ impl SqliteMemoryStore {
         .await
         .context("failed to initialize memory_chunks table")?;
 
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS telegram_group_aliases (
+                channel TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                alias TEXT NOT NULL,
+                learned_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                PRIMARY KEY (channel, chat_id, alias)
+            );",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize telegram_group_aliases table")?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS telegram_group_user_profiles (
+                channel TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                preferred_name TEXT NOT NULL,
+                username TEXT,
+                updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                PRIMARY KEY (channel, chat_id, user_id)
+            );",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize telegram_group_user_profiles table")?;
+
         Ok(Self { pool })
     }
 
@@ -120,6 +148,125 @@ impl SqliteMemoryStore {
         .context("failed to upsert memory chunk")?;
         Ok(())
     }
+
+    pub async fn upsert_group_aliases(
+        &self,
+        channel: &str,
+        chat_id: i64,
+        aliases: &[String],
+    ) -> anyhow::Result<()> {
+        for alias in aliases {
+            let normalized = alias.trim();
+            if normalized.is_empty() {
+                continue;
+            }
+            sqlx::query(
+                "INSERT OR IGNORE INTO telegram_group_aliases
+                 (channel, chat_id, alias, learned_at)
+                 VALUES (?1, ?2, ?3, unixepoch())",
+            )
+            .bind(channel)
+            .bind(chat_id)
+            .bind(normalized)
+            .execute(&self.pool)
+            .await
+            .context("failed to upsert telegram group alias")?;
+        }
+        Ok(())
+    }
+
+    pub async fn load_group_aliases(
+        &self,
+        channel: &str,
+        chat_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT alias FROM telegram_group_aliases
+             WHERE channel = ?1 AND chat_id = ?2
+             ORDER BY learned_at DESC
+             LIMIT ?3",
+        )
+        .bind(channel)
+        .bind(chat_id)
+        .bind(limit.max(1) as i64)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to load telegram group aliases")?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| row.get::<String, _>("alias"))
+            .collect())
+    }
+
+    pub async fn upsert_group_user_profile(
+        &self,
+        channel: &str,
+        chat_id: i64,
+        user_id: i64,
+        preferred_name: &str,
+        username: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let normalized_name = preferred_name.trim();
+        if normalized_name.is_empty() {
+            return Ok(());
+        }
+        let normalized_username = username
+            .map(|v| v.trim().trim_start_matches('@'))
+            .filter(|v| !v.is_empty());
+
+        sqlx::query(
+            "INSERT INTO telegram_group_user_profiles
+             (channel, chat_id, user_id, preferred_name, username, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, unixepoch())
+             ON CONFLICT(channel, chat_id, user_id) DO UPDATE SET
+               preferred_name=excluded.preferred_name,
+               username=COALESCE(excluded.username, telegram_group_user_profiles.username),
+               updated_at=unixepoch()",
+        )
+        .bind(channel)
+        .bind(chat_id)
+        .bind(user_id)
+        .bind(normalized_name)
+        .bind(normalized_username)
+        .execute(&self.pool)
+        .await
+        .context("failed to upsert telegram group user profile")?;
+
+        Ok(())
+    }
+
+    pub async fn load_group_user_profiles(
+        &self,
+        channel: &str,
+        chat_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<GroupUserProfileRecord>> {
+        let rows = sqlx::query(
+            "SELECT user_id, preferred_name, username, updated_at
+             FROM telegram_group_user_profiles
+             WHERE channel = ?1 AND chat_id = ?2
+             ORDER BY updated_at DESC
+             LIMIT ?3",
+        )
+        .bind(channel)
+        .bind(chat_id)
+        .bind(limit.max(1) as i64)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to load telegram group user profiles")?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| GroupUserProfileRecord {
+                user_id: row.get("user_id"),
+                preferred_name: row.get("preferred_name"),
+                username: row.get("username"),
+                updated_at: row.get("updated_at"),
+            })
+            .collect())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -152,10 +299,66 @@ pub struct MemoryContextRequest {
     pub semantic_lookback_days: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct GroupAliasUpsertRequest {
+    pub channel: String,
+    pub chat_id: i64,
+    pub aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GroupAliasLoadRequest {
+    pub channel: String,
+    pub chat_id: i64,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupUserProfileRecord {
+    pub user_id: i64,
+    pub preferred_name: String,
+    pub username: Option<String>,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct GroupUserProfileUpsertRequest {
+    pub channel: String,
+    pub chat_id: i64,
+    pub user_id: i64,
+    pub preferred_name: String,
+    pub username: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GroupUserProfileLoadRequest {
+    pub channel: String,
+    pub chat_id: i64,
+    pub limit: usize,
+}
+
 #[async_trait]
 pub trait MemoryBackend: Send + Sync {
     async fn append(&self, req: MemoryWriteRequest) -> anyhow::Result<()>;
     async fn load_context(&self, req: MemoryContextRequest) -> anyhow::Result<Vec<StoredMessage>>;
+    async fn upsert_group_aliases(&self, _req: GroupAliasUpsertRequest) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn load_group_aliases(&self, _req: GroupAliasLoadRequest) -> anyhow::Result<Vec<String>> {
+        Ok(vec![])
+    }
+    async fn upsert_group_user_profile(
+        &self,
+        _req: GroupUserProfileUpsertRequest,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn load_group_user_profiles(
+        &self,
+        _req: GroupUserProfileLoadRequest,
+    ) -> anyhow::Result<Vec<GroupUserProfileRecord>> {
+        Ok(vec![])
+    }
 }
 
 #[derive(Clone)]
@@ -178,6 +381,42 @@ impl MemoryBackend for SqliteMemoryBackend {
     async fn load_context(&self, req: MemoryContextRequest) -> anyhow::Result<Vec<StoredMessage>> {
         self.store
             .load_recent(&req.session_id, req.max_recent_turns)
+            .await
+    }
+
+    async fn upsert_group_aliases(&self, req: GroupAliasUpsertRequest) -> anyhow::Result<()> {
+        self.store
+            .upsert_group_aliases(&req.channel, req.chat_id, &req.aliases)
+            .await
+    }
+
+    async fn load_group_aliases(&self, req: GroupAliasLoadRequest) -> anyhow::Result<Vec<String>> {
+        self.store
+            .load_group_aliases(&req.channel, req.chat_id, req.limit)
+            .await
+    }
+
+    async fn upsert_group_user_profile(
+        &self,
+        req: GroupUserProfileUpsertRequest,
+    ) -> anyhow::Result<()> {
+        self.store
+            .upsert_group_user_profile(
+                &req.channel,
+                req.chat_id,
+                req.user_id,
+                &req.preferred_name,
+                req.username.as_deref(),
+            )
+            .await
+    }
+
+    async fn load_group_user_profiles(
+        &self,
+        req: GroupUserProfileLoadRequest,
+    ) -> anyhow::Result<Vec<GroupUserProfileRecord>> {
+        self.store
+            .load_group_user_profiles(&req.channel, req.chat_id, req.limit)
             .await
     }
 }
@@ -389,6 +628,42 @@ impl MemoryBackend for HybridSqliteZvecMemoryBackend {
         }
         merged.extend(recent);
         Ok(merged)
+    }
+
+    async fn upsert_group_aliases(&self, req: GroupAliasUpsertRequest) -> anyhow::Result<()> {
+        self.store
+            .upsert_group_aliases(&req.channel, req.chat_id, &req.aliases)
+            .await
+    }
+
+    async fn load_group_aliases(&self, req: GroupAliasLoadRequest) -> anyhow::Result<Vec<String>> {
+        self.store
+            .load_group_aliases(&req.channel, req.chat_id, req.limit)
+            .await
+    }
+
+    async fn upsert_group_user_profile(
+        &self,
+        req: GroupUserProfileUpsertRequest,
+    ) -> anyhow::Result<()> {
+        self.store
+            .upsert_group_user_profile(
+                &req.channel,
+                req.chat_id,
+                req.user_id,
+                &req.preferred_name,
+                req.username.as_deref(),
+            )
+            .await
+    }
+
+    async fn load_group_user_profiles(
+        &self,
+        req: GroupUserProfileLoadRequest,
+    ) -> anyhow::Result<Vec<GroupUserProfileRecord>> {
+        self.store
+            .load_group_user_profiles(&req.channel, req.chat_id, req.limit)
+            .await
     }
 }
 

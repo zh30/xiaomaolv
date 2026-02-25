@@ -64,7 +64,7 @@
 - `group_followup_window_secs` (default `180`)
 - `group_cooldown_secs` (default `20`)
 - `group_rule_min_score` (default `70`)
-- `group_aliases` (CSV string, optional)
+- dynamic alias learning from group context (no manual alias list)
 - `group_llm_gate_enabled` (default `false`)
 
 **Step 2: Pass config through channel plugin settings**
@@ -90,7 +90,7 @@
   - explicit `@bot` mention
   - reply-to-bot
   - recent bot participation in same thread (within `group_followup_window_secs`)
-  - alias hit (`group_aliases`)
+  - learned alias hit (auto-learned from group context)
   - explicit question markers (`?`, `？`)
   - negative signals: message from bot, clear mention to another bot/user, very low-content noise
 

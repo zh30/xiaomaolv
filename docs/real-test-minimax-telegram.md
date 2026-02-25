@@ -6,9 +6,13 @@ This project now follows xiaomaolv-style Telegram behavior:
 - In polling mode, you do **not** need a public base URL.
 - Webhook mode is optional and requires public HTTPS + `webhook_secret`.
 - Telegram reply supports streaming by default (`streaming_enabled = true`).
-- When provider output contains `<think>...</think>`, Telegram will show it as click-to-expand spoiler content.
+- Telegram replies are rendered in `MarkdownV2` to preserve markdown structure.
+- When provider output contains `<think>...</think>`, Telegram strips it and only sends final body text.
 - Startup can set bot profile short description to `online` (configurable).
-- Group chats are supported: bot replies only when explicitly `@mentioned`.
+- Group chats are supported:
+  - `group_trigger_mode = "${TELEGRAM_GROUP_TRIGGER_MODE:-smart}"`: default is `smart`
+  - `strict`: reply only on explicit `@mention` or reply-to-bot
+  - `smart`: contextual rule-based trigger with silent observe fallback
 - In groups, replying to a bot message also triggers a reply; bot response will quote the user reply message.
 - In group chats, session routing uses `message_thread_id` (topic) or `reply_to_message_id`.
 
@@ -29,7 +33,8 @@ Optional model override:
 - `MINIMAX_MODEL` (default: `MiniMax-M2.5-highspeed`)
 - `TELEGRAM_BOT_USERNAME` (without `@`, recommended for group mention matching)
 - `TELEGRAM_STARTUP_ONLINE_TEXT` (optional, default: `online`)
-- `TELEGRAM_ADMIN_USER_IDS` (optional, comma-separated Telegram user IDs for `/mcp`)
+- `TELEGRAM_GROUP_TRIGGER_MODE` (optional, `strict|smart`, default: `smart`)
+- `TELEGRAM_ADMIN_USER_IDS` (optional, comma-separated Telegram user IDs for private chat access and `/mcp`)
 
 ## 1.5 Fastest path (recommended)
 
