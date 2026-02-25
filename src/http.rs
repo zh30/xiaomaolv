@@ -218,7 +218,6 @@ fn build_axum_router(state: AppState, http_enabled: bool) -> Router {
             "/v1/channels/{channel}/inbound/{secret}",
             post(post_channel_inbound_with_secret),
         )
-        .route("/v1/telegram/webhook/{secret}", post(post_telegram_webhook))
         .with_state(state)
 }
 
@@ -276,18 +275,6 @@ fn load_channel_plugins(
             && !username.trim().is_empty()
         {
             settings.insert("bot_username".to_string(), username.clone());
-        }
-
-        if let Some(secret) = &telegram.webhook_secret
-            && !secret.trim().is_empty()
-        {
-            settings.insert("webhook_secret".to_string(), secret.clone());
-        }
-
-        if let Some(mode) = &telegram.mode
-            && !mode.trim().is_empty()
-        {
-            settings.insert("mode".to_string(), mode.clone());
         }
 
         settings.insert(
@@ -622,14 +609,6 @@ async fn post_channel_inbound_with_secret(
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     dispatch_channel_inbound(state, channel, Some(secret), payload).await
-}
-
-async fn post_telegram_webhook(
-    State(state): State<AppState>,
-    Path(secret): Path<String>,
-    Json(payload): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    dispatch_channel_inbound(state, "telegram".to_string(), Some(secret), payload).await
 }
 
 async fn dispatch_channel_inbound(

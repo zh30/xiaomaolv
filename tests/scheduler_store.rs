@@ -24,6 +24,7 @@ async fn scheduler_store_create_list_and_status_update() {
             timezone: "Asia/Shanghai".to_string(),
             run_at_unix: Some(1_900_000_000),
             cron_expr: None,
+            policy_json: None,
             next_run_at_unix: Some(1_900_000_000),
             max_runs: Some(1),
         })
@@ -96,6 +97,7 @@ async fn scheduler_store_claims_due_jobs_and_completes_once_job() {
             timezone: "Asia/Shanghai".to_string(),
             run_at_unix: Some(now - 10),
             cron_expr: None,
+            policy_json: None,
             next_run_at_unix: Some(now - 10),
             max_runs: Some(1),
         })
@@ -116,6 +118,7 @@ async fn scheduler_store_claims_due_jobs_and_completes_once_job() {
             timezone: "Asia/Shanghai".to_string(),
             run_at_unix: Some(now + 600),
             cron_expr: None,
+            policy_json: None,
             next_run_at_unix: Some(now + 600),
             max_runs: Some(1),
         })
@@ -218,6 +221,7 @@ async fn scheduler_store_queries_stats_with_due_jobs() {
                 timezone: "Asia/Shanghai".to_string(),
                 run_at_unix: next_run_at_unix,
                 cron_expr: None,
+                policy_json: None,
                 next_run_at_unix,
                 max_runs: Some(1),
             }

@@ -15,12 +15,10 @@ max_retries = 2
 [channels.http]
 enabled = true
 
-# xiaomaolv-style default: polling mode, no public base URL required
 [channels.telegram]
 enabled = true
 bot_token = "${TELEGRAM_BOT_TOKEN}"
 bot_username = "${TELEGRAM_BOT_USERNAME:-}"
-mode = "polling"
 polling_timeout_secs = 30
 streaming_enabled = true
 streaming_edit_interval_ms = 900
@@ -50,10 +48,6 @@ scheduler_nl_enabled = true
 scheduler_nl_min_confidence = 0.78
 scheduler_require_confirm = true
 scheduler_max_jobs_per_owner = 64
-
-# Optional webhook mode (public HTTPS required)
-# mode = "webhook"
-# webhook_secret = "${TELEGRAM_WEBHOOK_SECRET}"
 
 [memory]
 backend = "sqlite-only" # sqlite-only | hybrid-sqlite-zvec

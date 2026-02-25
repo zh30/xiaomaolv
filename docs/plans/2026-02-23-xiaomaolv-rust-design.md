@@ -95,7 +95,7 @@
 
 **Step 1: Write failing tests**
 - POST `/v1/messages` returns assistant response.
-- Telegram webhook route parses update and triggers pipeline.
+- Telegram polling route and worker trigger pipeline.
 
 **Step 2: Verify failing**
 - Run: `cargo test http_api -- --nocapture`

@@ -26,7 +26,13 @@ use crate::memory::{
     UpsertTelegramSchedulerPendingIntentRequest,
 };
 use crate::provider::StreamSink;
-use crate::scheduler::{ScheduleSpec, compute_next_run_at_unix, compute_retry_backoff_secs};
+use crate::scheduler::{
+    ScheduleSpec, SchedulerExecutionEvent, SchedulerExecutionState, SchedulerPolicy,
+    SchedulerPolicyTrigger, apply_scheduler_state_transition, compute_next_run_at_unix,
+    compute_retry_backoff_secs, default_scheduler_policy, encode_scheduler_policy_json,
+    parse_scheduler_policy_json, plan_failure_transition, plan_success_transition,
+    scheduler_policy_json_schema,
+};
 use crate::service::{MessageService, TelegramSchedulerIntent};
 
 pub use crate::config::ChannelPluginConfig;
@@ -538,36 +544,6 @@ impl TelegramSender {
         Ok(body.result)
     }
 
-    async fn get_webhook_info(&self) -> anyhow::Result<Value> {
-        let url = format!(
-            "https://api.telegram.org/bot{}/getWebhookInfo",
-            self.bot_token
-        );
-        let response = self
-            .client
-            .post(url)
-            .send()
-            .await
-            .context("failed to call telegram getWebhookInfo")?
-            .error_for_status()
-            .context("telegram getWebhookInfo returned error")?;
-
-        let body: TelegramApiResponse<Value> = response
-            .json()
-            .await
-            .context("failed to decode telegram getWebhookInfo payload")?;
-
-        if !body.ok {
-            bail!(
-                "telegram getWebhookInfo returned ok=false: {}",
-                body.description
-                    .unwrap_or_else(|| "unknown error".to_string())
-            );
-        }
-
-        Ok(body.result)
-    }
-
     pub async fn edit_message(
         &self,
         chat_id: i64,
@@ -771,30 +747,6 @@ impl ChannelRegistry {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TelegramIngressMode {
-    Polling,
-    Webhook,
-}
-
-impl TelegramIngressMode {
-    fn resolve(mode: Option<&str>, has_webhook_secret: bool) -> anyhow::Result<Self> {
-        let raw = mode.unwrap_or("polling").trim().to_ascii_lowercase();
-        match raw.as_str() {
-            "polling" => Ok(Self::Polling),
-            "webhook" => Ok(Self::Webhook),
-            "auto" => {
-                if has_webhook_secret {
-                    Ok(Self::Webhook)
-                } else {
-                    Ok(Self::Polling)
-                }
-            }
-            other => bail!("unsupported telegram mode '{other}', expected polling|webhook|auto"),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TelegramGroupTriggerMode {
     Strict,
     Smart,
@@ -862,6 +814,16 @@ enum SchedulerJobOperation {
     Delete,
 }
 
+impl SchedulerJobOperation {
+    fn as_event(self) -> SchedulerExecutionEvent {
+        match self {
+            Self::Pause => SchedulerExecutionEvent::ManualPause,
+            Self::Resume => SchedulerExecutionEvent::ManualResume,
+            Self::Delete => SchedulerExecutionEvent::ManualCancel,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum SchedulerJobTargetResolution {
     Selected {
@@ -872,6 +834,24 @@ enum SchedulerJobTargetResolution {
         options: Vec<TelegramSchedulerJobRecord>,
     },
     Empty,
+}
+
+fn scheduler_state_from_job_status(status: TelegramSchedulerJobStatus) -> SchedulerExecutionState {
+    match status {
+        TelegramSchedulerJobStatus::Active => SchedulerExecutionState::Active,
+        TelegramSchedulerJobStatus::Paused => SchedulerExecutionState::Paused,
+        TelegramSchedulerJobStatus::Completed => SchedulerExecutionState::Completed,
+        TelegramSchedulerJobStatus::Canceled => SchedulerExecutionState::Canceled,
+    }
+}
+
+fn scheduler_state_to_job_status(state: SchedulerExecutionState) -> TelegramSchedulerJobStatus {
+    match state {
+        SchedulerExecutionState::Active => TelegramSchedulerJobStatus::Active,
+        SchedulerExecutionState::Paused => TelegramSchedulerJobStatus::Paused,
+        SchedulerExecutionState::Completed => TelegramSchedulerJobStatus::Completed,
+        SchedulerExecutionState::Canceled => TelegramSchedulerJobStatus::Canceled,
+    }
 }
 
 #[derive(Debug, Default)]
@@ -944,25 +924,11 @@ impl ChannelFactory for TelegramChannelFactory {
             .cloned()
             .context("telegram channel requires settings.bot_token")?;
 
-        let webhook_secret = config
-            .settings
-            .get("webhook_secret")
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
         let group_mention_bot_username = config
             .settings
             .get("bot_username")
             .map(|value| value.trim().trim_start_matches('@').to_string())
             .filter(|value| !value.is_empty());
-
-        let mode = TelegramIngressMode::resolve(
-            config.settings.get("mode").map(String::as_str),
-            webhook_secret.is_some(),
-        )?;
-
-        if matches!(mode, TelegramIngressMode::Webhook) && webhook_secret.is_none() {
-            bail!("telegram webhook mode requires settings.webhook_secret");
-        }
 
         let polling_timeout_secs = config
             .settings
@@ -1105,8 +1071,6 @@ impl ChannelFactory for TelegramChannelFactory {
         Ok(Arc::new(TelegramChannelPlugin {
             sender: TelegramSender::new(bot_token.clone()),
             bot_token,
-            webhook_secret,
-            mode,
             polling_timeout_secs,
             streaming_enabled,
             streaming_edit_interval_ms,
@@ -1155,8 +1119,6 @@ impl ChannelFactory for TelegramChannelFactory {
 struct TelegramChannelPlugin {
     sender: TelegramSender,
     bot_token: String,
-    webhook_secret: Option<String>,
-    mode: TelegramIngressMode,
     polling_timeout_secs: u64,
     streaming_enabled: bool,
     streaming_edit_interval_ms: u64,
@@ -1185,18 +1147,6 @@ struct TelegramCommandSettings {
 }
 
 impl TelegramChannelPlugin {
-    async fn resolve_group_mention_bot_username(&self) -> Option<String> {
-        resolve_group_mention_bot_username_with_cache(
-            &self.sender,
-            &self.group_mention_bot_username_cache,
-        )
-        .await
-    }
-
-    async fn resolve_bot_user_id(&self) -> Option<i64> {
-        resolve_bot_user_id_with_cache(&self.sender, &self.bot_user_id_cache).await
-    }
-
     fn command_settings(&self) -> TelegramCommandSettings {
         TelegramCommandSettings {
             enabled: self.commands_enabled,
@@ -1269,48 +1219,12 @@ async fn resolve_bot_user_id_with_cache(
 impl ChannelPlugin for TelegramChannelPlugin {
     async fn handle_inbound(
         &self,
-        ctx: ChannelContext,
-        inbound: ChannelInbound,
+        _ctx: ChannelContext,
+        _inbound: ChannelInbound,
     ) -> Result<ChannelResponse, ChannelPluginError> {
-        if !matches!(self.mode, TelegramIngressMode::Webhook) {
-            return Err(ChannelPluginError::BadRequest(
-                "telegram webhook endpoint is disabled because mode is polling".to_string(),
-            ));
-        }
-
-        let expected_secret = self.webhook_secret.as_ref().ok_or_else(|| {
-            ChannelPluginError::BadRequest("telegram webhook secret is not configured".to_string())
-        })?;
-
-        let incoming_secret = inbound.path_secret.as_deref().unwrap_or("");
-        if incoming_secret != expected_secret {
-            return Err(ChannelPluginError::Unauthorized(
-                "invalid webhook secret".to_string(),
-            ));
-        }
-
-        let update: TelegramUpdate = serde_json::from_value(inbound.payload).map_err(|err| {
-            ChannelPluginError::BadRequest(format!("invalid telegram payload: {err}"))
-        })?;
-
-        process_telegram_update(
-            ctx,
-            &self.sender,
-            update,
-            self.streaming_enabled,
-            self.streaming_edit_interval_ms,
-            self.streaming_prefer_draft,
-            self.resolve_group_mention_bot_username().await,
-            self.resolve_bot_user_id().await,
-            self.command_settings(),
-            self.group_trigger_settings.clone(),
-            self.group_runtime_state.clone(),
-            self.polling_diag_state.clone(),
-        )
-        .await
-        .map_err(ChannelPluginError::internal)?;
-
-        Ok(ChannelResponse::json(serde_json::json!({ "ok": true })))
+        Err(ChannelPluginError::BadRequest(
+            "telegram inbound webhook is no longer supported; use polling mode".to_string(),
+        ))
     }
 
     async fn start_background(
@@ -1393,34 +1307,6 @@ impl ChannelPlugin for TelegramChannelPlugin {
 
         let scheduler_settings = self.scheduler_settings.clone();
         let scheduler_diag_state = self.scheduler_diag_state.clone();
-
-        if !matches!(self.mode, TelegramIngressMode::Polling) {
-            if !scheduler_settings.enabled {
-                return Ok(None);
-            }
-            let channel_name = ctx.channel_name.clone();
-            let worker_name = format!("{channel_name}-scheduler");
-            let service = ctx.service.clone();
-            let sender = self.sender.clone();
-            let shutdown = ctx.shutdown.clone();
-
-            let task = tokio::spawn(async move {
-                run_telegram_scheduler_loop(
-                    channel_name,
-                    service,
-                    sender,
-                    scheduler_settings,
-                    shutdown,
-                    scheduler_diag_state,
-                )
-                .await;
-            });
-
-            return Ok(Some(ChannelWorker {
-                name: worker_name,
-                task,
-            }));
-        }
 
         let channel_name = ctx.channel_name.clone();
         let service = ctx.service.clone();
@@ -1641,17 +1527,6 @@ impl ChannelPlugin for TelegramChannelPlugin {
             }),
         };
 
-        let get_webhook_info = match self.sender.get_webhook_info().await {
-            Ok(result) => serde_json::json!({
-                "ok": true,
-                "result": result
-            }),
-            Err(err) => serde_json::json!({
-                "ok": false,
-                "error": format!("{err:#}")
-            }),
-        };
-
         Ok(Some(serde_json::json!({
             "channel": "telegram",
             "mode": self.mode(),
@@ -1686,19 +1561,16 @@ impl ChannelPlugin for TelegramChannelPlugin {
                 "nl_min_confidence": self.scheduler_settings.nl_min_confidence,
                 "require_confirm": self.scheduler_settings.require_confirm,
                 "max_jobs_per_owner": self.scheduler_settings.max_jobs_per_owner,
+                "policy_schema": scheduler_policy_json_schema(),
                 "diag": scheduler
             },
             "polling": polling,
-            "get_me": get_me,
-            "get_webhook_info": get_webhook_info
+            "get_me": get_me
         })))
     }
 
     fn mode(&self) -> Option<&'static str> {
-        Some(match self.mode {
-            TelegramIngressMode::Polling => "polling",
-            TelegramIngressMode::Webhook => "webhook",
-        })
+        Some("polling")
     }
 }
 
@@ -2669,31 +2541,22 @@ async fn handle_telegram_task_command(
                 .await?;
                 return Ok(());
             }
-            let status = match action.as_str() {
-                "pause" => TelegramSchedulerJobStatus::Paused,
-                "resume" => TelegramSchedulerJobStatus::Active,
-                _ => TelegramSchedulerJobStatus::Canceled,
+            let op = match action.as_str() {
+                "pause" => SchedulerJobOperation::Pause,
+                "resume" => SchedulerJobOperation::Resume,
+                _ => SchedulerJobOperation::Delete,
             };
-            let updated = ctx
-                .service
-                .update_telegram_scheduler_job_status(
-                    ctx.channel_name.clone(),
-                    chat_id,
-                    owner_user_id,
-                    job_id.to_string(),
-                    status,
-                )
-                .await?;
-            let text = if updated {
-                match action.as_str() {
-                    "pause" => format!("任务已暂停: {job_id}"),
-                    "resume" => format!("任务已恢复: {job_id}"),
-                    _ => format!("任务已删除: {job_id}"),
-                }
-            } else {
-                format!("未找到可更新的任务: {job_id}")
-            };
-            send_telegram_command_reply(sender, message, &text).await?;
+            execute_scheduler_job_operation(
+                ctx,
+                sender,
+                message,
+                chat_id,
+                owner_user_id,
+                op,
+                job_id,
+                false,
+            )
+            .await?;
         }
         _ => {
             send_telegram_command_reply(
@@ -3076,7 +2939,12 @@ async fn resolve_scheduler_job_target(
         .filter(|job| match op {
             SchedulerJobOperation::Pause => job.status == TelegramSchedulerJobStatus::Active,
             SchedulerJobOperation::Resume => job.status == TelegramSchedulerJobStatus::Paused,
-            SchedulerJobOperation::Delete => job.status != TelegramSchedulerJobStatus::Canceled,
+            SchedulerJobOperation::Delete => {
+                matches!(
+                    job.status,
+                    TelegramSchedulerJobStatus::Active | TelegramSchedulerJobStatus::Paused
+                )
+            }
         })
         .collect::<Vec<_>>();
 
@@ -3171,17 +3039,54 @@ async fn execute_scheduler_job_operation(
     job_id: &str,
     inferred: bool,
 ) -> anyhow::Result<()> {
-    let status = match op {
-        SchedulerJobOperation::Pause => TelegramSchedulerJobStatus::Paused,
-        SchedulerJobOperation::Resume => TelegramSchedulerJobStatus::Active,
-        SchedulerJobOperation::Delete => TelegramSchedulerJobStatus::Canceled,
-    };
-
     let text_prefix = match op {
         SchedulerJobOperation::Pause => "任务已暂停",
         SchedulerJobOperation::Resume => "任务已恢复",
         SchedulerJobOperation::Delete => "任务已删除",
     };
+
+    let loaded = ctx
+        .service
+        .load_telegram_scheduler_job(ctx.channel_name.clone(), job_id.to_string())
+        .await?;
+    let Some(job) = loaded else {
+        send_telegram_command_reply(sender, message, &format!("未找到可更新的任务: {job_id}"))
+            .await?;
+        return Ok(());
+    };
+    if job.chat_id != chat_id || job.owner_user_id != owner_user_id {
+        send_telegram_command_reply(sender, message, &format!("未找到可更新的任务: {job_id}"))
+            .await?;
+        return Ok(());
+    }
+
+    let current_state = scheduler_state_from_job_status(job.status);
+    let event = op.as_event();
+    let next_state = match apply_scheduler_state_transition(current_state, event) {
+        Ok(state) => state,
+        Err(_) => {
+            send_telegram_command_reply(
+                sender,
+                message,
+                &format!(
+                    "任务当前状态为 `{}`，不支持执行该操作。",
+                    current_state.as_str()
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    if next_state == current_state {
+        send_telegram_command_reply(
+            sender,
+            message,
+            &format!("任务 `{job_id}` 当前已是 `{}`。", current_state.as_str()),
+        )
+        .await?;
+        return Ok(());
+    }
+    let status = scheduler_state_to_job_status(next_state);
 
     let updated = ctx
         .service
@@ -3518,6 +3423,68 @@ fn build_scheduler_draft_from_intent(
     }))
 }
 
+fn build_scheduler_policy_from_draft(
+    draft: &TelegramSchedulerIntentDraft,
+) -> anyhow::Result<SchedulerPolicy> {
+    let trigger = match draft.schedule_kind {
+        TelegramSchedulerScheduleKind::Once => {
+            let run_at_unix = draft.run_at_unix.context("once draft missing run_at")?;
+            SchedulerPolicyTrigger::Once {
+                run_at_unix,
+                timezone: draft.timezone.clone(),
+            }
+        }
+        TelegramSchedulerScheduleKind::Cron => {
+            let expr = draft
+                .cron_expr
+                .clone()
+                .context("cron draft missing cron_expr")?;
+            SchedulerPolicyTrigger::Cron {
+                expr,
+                timezone: draft.timezone.clone(),
+            }
+        }
+    };
+    Ok(default_scheduler_policy(trigger))
+}
+
+fn resolve_scheduler_policy_for_job(
+    job: &TelegramSchedulerJobRecord,
+    default_timezone: &str,
+) -> anyhow::Result<SchedulerPolicy> {
+    if let Some(raw) = job.policy_json.as_deref()
+        && !raw.trim().is_empty()
+    {
+        return parse_scheduler_policy_json(raw);
+    }
+
+    let timezone = if job.timezone.trim().is_empty() {
+        default_timezone.to_string()
+    } else {
+        job.timezone.clone()
+    };
+    let trigger = match job.schedule_kind {
+        TelegramSchedulerScheduleKind::Once => {
+            let run_at_unix = job
+                .run_at_unix
+                .or(job.next_run_at_unix)
+                .context("once scheduler job missing run_at")?;
+            SchedulerPolicyTrigger::Once {
+                run_at_unix,
+                timezone,
+            }
+        }
+        TelegramSchedulerScheduleKind::Cron => {
+            let expr = job
+                .cron_expr
+                .clone()
+                .context("cron scheduler job missing cron_expr")?;
+            SchedulerPolicyTrigger::Cron { expr, timezone }
+        }
+    };
+    Ok(default_scheduler_policy(trigger))
+}
+
 async fn create_scheduler_job_from_draft(
     ctx: &ChannelContext,
     chat_id: i64,
@@ -3534,6 +3501,8 @@ async fn create_scheduler_job_from_draft(
     )
     .await?;
 
+    let policy = build_scheduler_policy_from_draft(draft)?;
+    let policy_json = encode_scheduler_policy_json(&policy)?;
     let next_run_at_unix = match draft.schedule_kind {
         TelegramSchedulerScheduleKind::Once => {
             draft.run_at_unix.context("once draft missing run_at")?
@@ -3571,6 +3540,7 @@ async fn create_scheduler_job_from_draft(
                 None
             },
             cron_expr: draft.cron_expr.clone(),
+            policy_json: Some(policy_json),
             next_run_at_unix: Some(next_run_at_unix),
             max_runs: if matches!(draft.schedule_kind, TelegramSchedulerScheduleKind::Once) {
                 Some(1)
@@ -5086,6 +5056,8 @@ async fn run_telegram_scheduler_loop(
         for job in claimed {
             let started_at_unix = current_unix_timestamp_i64();
             let execution: anyhow::Result<()> = async {
+                let policy =
+                    resolve_scheduler_policy_for_job(&job, &scheduler_settings.default_timezone)?;
                 let outbound_text = match job.task_kind {
                     TelegramSchedulerTaskKind::Reminder => job.payload.clone(),
                     TelegramSchedulerTaskKind::Agent => {
@@ -5114,34 +5086,14 @@ async fn run_telegram_scheduler_loop(
                     .context("failed to send scheduler telegram message")?;
 
                 let finished_at_unix = current_unix_timestamp_i64();
-                let next_run = match job.schedule_kind {
-                    TelegramSchedulerScheduleKind::Once => None,
-                    TelegramSchedulerScheduleKind::Cron => {
-                        let expr = job
-                            .cron_expr
-                            .clone()
-                            .context("cron scheduler job missing cron_expr")?;
-                        let timezone = if job.timezone.trim().is_empty() {
-                            scheduler_settings.default_timezone.clone()
-                        } else {
-                            job.timezone.clone()
-                        };
-                        compute_next_run_at_unix(
-                            &ScheduleSpec::Cron { expr },
-                            finished_at_unix,
-                            &timezone,
-                        )?
-                    }
-                };
                 let run_count_after = job.run_count.saturating_add(1);
-                let max_runs_reached = job
-                    .max_runs
-                    .map(|max| run_count_after >= max)
-                    .unwrap_or(false);
-                let mark_completed =
-                    matches!(job.schedule_kind, TelegramSchedulerScheduleKind::Once)
-                        || max_runs_reached
-                        || next_run.is_none();
+                let success_plan = plan_success_transition(
+                    &policy,
+                    finished_at_unix,
+                    run_count_after,
+                    job.max_runs,
+                )
+                .context("failed to plan scheduler success transition")?;
 
                 service
                     .complete_telegram_scheduler_job_run(CompleteTelegramSchedulerJobRunRequest {
@@ -5151,8 +5103,8 @@ async fn run_telegram_scheduler_loop(
                         lease_token: lease_token.clone(),
                         started_at_unix,
                         finished_at_unix,
-                        next_run_at_unix: if mark_completed { None } else { next_run },
-                        mark_completed,
+                        next_run_at_unix: success_plan.next_run_at_unix,
+                        mark_completed: success_plan.mark_completed,
                     })
                     .await
                     .context("failed to mark scheduler job success")?;
@@ -5170,13 +5122,48 @@ async fn run_telegram_scheduler_loop(
                 Err(err) => {
                     let err_text = format!("{err:#}");
                     let finished_at_unix = current_unix_timestamp_i64();
-                    let attempt = (job.run_count.max(0) as u32).saturating_add(1);
-                    let backoff = compute_retry_backoff_secs(attempt);
-                    let pause_job = attempt >= 8;
+                    let failure_plan = match resolve_scheduler_policy_for_job(
+                        &job,
+                        &scheduler_settings.default_timezone,
+                    )
+                    .and_then(|policy| {
+                        let failure_streak_after = job.failure_streak.saturating_add(1);
+                        plan_failure_transition(&policy, finished_at_unix, failure_streak_after)
+                    }) {
+                        Ok(plan) => plan,
+                        Err(plan_err) => {
+                            let attempt = (job.failure_streak.max(0) as u32).saturating_add(1);
+                            let backoff = compute_retry_backoff_secs(attempt);
+                            warn!(
+                                channel = %channel_name,
+                                job_id = %job.job_id,
+                                error = %format!("{plan_err:#}"),
+                                "scheduler policy invalid, fallback to legacy retry policy"
+                            );
+                            if attempt >= 8 {
+                                crate::scheduler::SchedulerFailurePlan {
+                                    next_state: SchedulerExecutionState::Paused,
+                                    pause_job: true,
+                                    next_run_at_unix: None,
+                                    backoff_secs: None,
+                                }
+                            } else {
+                                crate::scheduler::SchedulerFailurePlan {
+                                    next_state: SchedulerExecutionState::Active,
+                                    pause_job: false,
+                                    next_run_at_unix: Some(finished_at_unix + backoff),
+                                    backoff_secs: Some(backoff),
+                                }
+                            }
+                        }
+                    };
+                    let pause_job =
+                        matches!(failure_plan.next_state, SchedulerExecutionState::Paused)
+                            || failure_plan.pause_job;
                     let next_run_at_unix = if pause_job {
                         None
                     } else {
-                        Some(finished_at_unix + backoff)
+                        failure_plan.next_run_at_unix
                     };
 
                     if let Err(mark_err) = service

@@ -4,7 +4,6 @@ This project now follows xiaomaolv-style Telegram behavior:
 
 - Default mode is `polling`.
 - In polling mode, you do **not** need a public base URL.
-- Webhook mode is optional and requires public HTTPS + `webhook_secret`.
 - Telegram reply supports streaming by default (`streaming_enabled = true`).
 - Telegram replies are rendered in `MarkdownV2` to preserve markdown structure.
 - When provider output contains `<think>...</think>`, Telegram strips it and only sends final body text.
@@ -154,7 +153,6 @@ This checks:
 
 - API reachability
 - `getMe`
-- `getWebhookInfo`
 - `getUpdates`
 
 If `getMe` shows `"can_read_all_group_messages": false`, group messages may not be delivered.
@@ -185,47 +183,6 @@ It includes:
 - cached bot username used for mention matching
 - polling worker health (`last_poll_ok_at_unix`, `last_poll_error`, counters)
 - current `getMe` result (including `can_read_all_group_messages`)
-- current `getWebhookInfo` result
-
----
-
-## Optional: Webhook mode (requires public URL)
-
-If you want webhook mode:
-
-1. In `config/xiaomaolv.minimax-telegram.toml`, set:
-
-```toml
-[channels.telegram]
-enabled = true
-bot_token = "${TELEGRAM_BOT_TOKEN}"
-bot_username = "${TELEGRAM_BOT_USERNAME:-}"
-mode = "webhook"
-webhook_secret = "${TELEGRAM_WEBHOOK_SECRET}"
-streaming_enabled = true
-streaming_edit_interval_ms = 900
-streaming_prefer_draft = true
-startup_online_enabled = true
-startup_online_text = "${TELEGRAM_STARTUP_ONLINE_TEXT:-online}"
-```
-
-2. Fill in `.env.realtest`:
-
-- `TELEGRAM_WEBHOOK_SECRET`
-- `PUBLIC_BASE_URL`
-
-3. Set Telegram webhook:
-
-```bash
-./scripts/set_telegram_webhook.sh
-```
-
-4. Verify:
-
-```bash
-curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo"
-curl -sS http://127.0.0.1:8080/v1/channels/telegram/mode
-```
 
 ## Notes
 

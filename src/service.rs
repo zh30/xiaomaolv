@@ -339,6 +339,17 @@ impl MessageService {
             .context("failed to query telegram scheduler stats")
     }
 
+    pub async fn load_telegram_scheduler_job(
+        &self,
+        channel: String,
+        job_id: String,
+    ) -> anyhow::Result<Option<TelegramSchedulerJobRecord>> {
+        self.memory
+            .load_telegram_scheduler_job(channel, job_id)
+            .await
+            .context("failed to load telegram scheduler job")
+    }
+
     pub async fn update_telegram_scheduler_job_status(
         &self,
         channel: String,

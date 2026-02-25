@@ -15,15 +15,11 @@ max_retries = 2
 [channels.http]
 enabled = true
 
-# Telegram mode:
-# - polling (default): no public URL required
-# - webhook: requires public HTTPS + webhook_secret
 [channels.telegram]
 enabled = false
 bot_token = "your-telegram-bot-token"
 # Optional: your bot username without '@', used for group @mention filtering
 # bot_username = "your_bot_username"
-mode = "polling"
 polling_timeout_secs = 30
 streaming_enabled = true
 streaming_edit_interval_ms = 900
@@ -54,7 +50,6 @@ scheduler_nl_enabled = true
 scheduler_nl_min_confidence = 0.78
 scheduler_require_confirm = true
 scheduler_max_jobs_per_owner = 64
-# webhook_secret = "your-webhook-secret"
 
 [memory]
 backend = "sqlite-only" # sqlite-only | hybrid-sqlite-zvec

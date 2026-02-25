@@ -99,10 +99,12 @@ impl SqliteMemoryStore {
                 timezone TEXT NOT NULL,
                 run_at_unix INTEGER,
                 cron_expr TEXT,
+                policy_json TEXT,
                 next_run_at_unix INTEGER,
                 last_run_at_unix INTEGER,
                 last_error TEXT,
                 run_count INTEGER NOT NULL DEFAULT 0,
+                failure_streak INTEGER NOT NULL DEFAULT 0,
                 max_runs INTEGER,
                 lease_token TEXT,
                 lease_until_unix INTEGER,
@@ -129,6 +131,13 @@ impl SqliteMemoryStore {
         .execute(&pool)
         .await
         .context("failed to initialize telegram_scheduler_jobs owner index")?;
+
+        maybe_add_scheduler_jobs_column(&pool, "policy_json TEXT")
+            .await
+            .context("failed to add telegram_scheduler_jobs.policy_json")?;
+        maybe_add_scheduler_jobs_column(&pool, "failure_streak INTEGER NOT NULL DEFAULT 0")
+            .await
+            .context("failed to add telegram_scheduler_jobs.failure_streak")?;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS telegram_scheduler_runs (
@@ -360,9 +369,9 @@ impl SqliteMemoryStore {
         sqlx::query(
             "INSERT INTO telegram_scheduler_jobs
              (job_id, channel, chat_id, message_thread_id, owner_user_id, status, task_kind,
-              payload, schedule_kind, timezone, run_at_unix, cron_expr, next_run_at_unix, max_runs,
-              lease_token, lease_until_unix, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL, NULL, unixepoch(), unixepoch())",
+              payload, schedule_kind, timezone, run_at_unix, cron_expr, policy_json, next_run_at_unix, max_runs,
+              run_count, failure_streak, lease_token, lease_until_unix, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 0, 0, NULL, NULL, unixepoch(), unixepoch())",
         )
         .bind(req.job_id)
         .bind(req.channel)
@@ -376,6 +385,7 @@ impl SqliteMemoryStore {
         .bind(req.timezone)
         .bind(req.run_at_unix)
         .bind(req.cron_expr)
+        .bind(req.policy_json)
         .bind(req.next_run_at_unix)
         .bind(req.max_runs)
         .execute(&self.pool)
@@ -393,8 +403,8 @@ impl SqliteMemoryStore {
     ) -> anyhow::Result<Vec<TelegramSchedulerJobRecord>> {
         let rows = sqlx::query(
             "SELECT job_id, channel, chat_id, message_thread_id, owner_user_id, status, task_kind,
-                    payload, schedule_kind, timezone, run_at_unix, cron_expr, next_run_at_unix,
-                    last_run_at_unix, last_error, run_count, max_runs, lease_token,
+                    payload, schedule_kind, timezone, run_at_unix, cron_expr, policy_json, next_run_at_unix,
+                    last_run_at_unix, last_error, run_count, failure_streak, max_runs, lease_token,
                     lease_until_unix, created_at, updated_at
              FROM telegram_scheduler_jobs
              WHERE channel = ?1 AND chat_id = ?2 AND owner_user_id = ?3
@@ -459,8 +469,8 @@ impl SqliteMemoryStore {
     ) -> anyhow::Result<Option<TelegramSchedulerJobRecord>> {
         let row = sqlx::query(
             "SELECT job_id, channel, chat_id, message_thread_id, owner_user_id, status, task_kind,
-                    payload, schedule_kind, timezone, run_at_unix, cron_expr, next_run_at_unix,
-                    last_run_at_unix, last_error, run_count, max_runs, lease_token,
+                    payload, schedule_kind, timezone, run_at_unix, cron_expr, policy_json, next_run_at_unix,
+                    last_run_at_unix, last_error, run_count, failure_streak, max_runs, lease_token,
                     lease_until_unix, created_at, updated_at
              FROM telegram_scheduler_jobs
              WHERE channel = ?1 AND job_id = ?2
@@ -522,8 +532,8 @@ impl SqliteMemoryStore {
             .context("failed to begin scheduler tx")?;
         let rows = sqlx::query(
             "SELECT job_id, channel, chat_id, message_thread_id, owner_user_id, status, task_kind,
-                    payload, schedule_kind, timezone, run_at_unix, cron_expr, next_run_at_unix,
-                    last_run_at_unix, last_error, run_count, max_runs, lease_token,
+                    payload, schedule_kind, timezone, run_at_unix, cron_expr, policy_json, next_run_at_unix,
+                    last_run_at_unix, last_error, run_count, failure_streak, max_runs, lease_token,
                     lease_until_unix, created_at, updated_at
              FROM telegram_scheduler_jobs
              WHERE channel = ?1
@@ -617,6 +627,7 @@ impl SqliteMemoryStore {
                  last_run_at_unix = ?3,
                  last_error = NULL,
                  run_count = run_count + 1,
+                 failure_streak = 0,
                  lease_token = NULL,
                  lease_until_unix = NULL,
                  updated_at = unixepoch()
@@ -681,6 +692,7 @@ impl SqliteMemoryStore {
                  last_run_at_unix = ?3,
                  last_error = ?4,
                  run_count = run_count + 1,
+                 failure_streak = failure_streak + 1,
                  lease_token = NULL,
                  lease_until_unix = NULL,
                  updated_at = unixepoch()
@@ -787,6 +799,24 @@ impl SqliteMemoryStore {
         .context("failed to delete telegram scheduler pending intent")?;
 
         Ok(deleted.rows_affected() > 0)
+    }
+}
+
+async fn maybe_add_scheduler_jobs_column(
+    pool: &SqlitePool,
+    column_def: &str,
+) -> anyhow::Result<()> {
+    let sql = format!("ALTER TABLE telegram_scheduler_jobs ADD COLUMN {column_def}");
+    match sqlx::query(&sql).execute(pool).await {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            let lower = err.to_string().to_ascii_lowercase();
+            if lower.contains("duplicate column name") {
+                Ok(())
+            } else {
+                Err(err).context("failed to alter telegram_scheduler_jobs table")
+            }
+        }
     }
 }
 
@@ -944,10 +974,12 @@ pub struct TelegramSchedulerJobRecord {
     pub timezone: String,
     pub run_at_unix: Option<i64>,
     pub cron_expr: Option<String>,
+    pub policy_json: Option<String>,
     pub next_run_at_unix: Option<i64>,
     pub last_run_at_unix: Option<i64>,
     pub last_error: Option<String>,
     pub run_count: i64,
+    pub failure_streak: i64,
     pub max_runs: Option<i64>,
     pub lease_token: Option<String>,
     pub lease_until_unix: Option<i64>,
@@ -969,6 +1001,7 @@ pub struct CreateTelegramSchedulerJobRequest {
     pub timezone: String,
     pub run_at_unix: Option<i64>,
     pub cron_expr: Option<String>,
+    pub policy_json: Option<String>,
     pub next_run_at_unix: Option<i64>,
     pub max_runs: Option<i64>,
 }
@@ -1081,10 +1114,12 @@ fn telegram_scheduler_job_from_row(
         timezone: row.get("timezone"),
         run_at_unix: row.get("run_at_unix"),
         cron_expr: row.get("cron_expr"),
+        policy_json: row.get("policy_json"),
         next_run_at_unix: row.get("next_run_at_unix"),
         last_run_at_unix: row.get("last_run_at_unix"),
         last_error: row.get("last_error"),
         run_count: row.get("run_count"),
+        failure_streak: row.get("failure_streak"),
         max_runs: row.get("max_runs"),
         lease_token: row.get("lease_token"),
         lease_until_unix: row.get("lease_until_unix"),

@@ -24,7 +24,7 @@ Chinese version: `README.zh.md`
 
 - OpenAI-compatible provider abstraction (MiniMax/OpenAI/other compatible APIs)
 - Message channels: HTTP + Telegram
-- Telegram dual mode: `polling` (default) and `webhook` (optional)
+- Telegram mode: `polling` only
 - Telegram streaming replies (incremental updates via `editMessageText`)
 - Telegram replies rendered in `MarkdownV2` (supports bold/italic/code/link/list/quote formatting)
 - Telegram streaming prefers `sendMessageDraft` when supported, with automatic fallback
@@ -100,78 +100,22 @@ Then send a message to your Telegram bot.
 
 After MVP is running, use these docs in order:
 
-- `docs/real-test-minimax-telegram.md`: real MiniMax + Telegram integration (webhook setup/verification included)
+- `docs/real-test-minimax-telegram.md`: real MiniMax + Telegram integration guide
 - `docs/zvec-sidecar.md`: zvec sidecar protocol, startup, compatibility details
 - `docs/mcp-integration.md`: MCP install model, CLI usage, HTTP tool-call API
 - `config/xiaomaolv.minimax-telegram.toml`: recommended MVP config
 - `config/xiaomaolv.example.toml`: generic template for custom provider/channel setups
 - `scripts/perf_smoke.sh`: machine sizing smoke test script
-- `scripts/debug_telegram_polling.sh`: one-command Telegram polling diagnostics (`getMe/getWebhookInfo/getUpdates`)
+- `scripts/debug_telegram_polling.sh`: one-command Telegram polling diagnostics (`getMe/getUpdates`)
 
 <a id="run-modes"></a>
 ## Runtime Modes
 
-### Telegram `polling` (default)
+### Telegram `polling`
 
 - No public URL required
 - Service pulls updates via Telegram `getUpdates`
-- Startup calls `deleteWebhook` to prevent webhook/polling conflicts
-
-### Telegram `webhook` (optional)
-
-Recommended for public production deployments.
-
-1. Enable webhook in config:
-
-```toml
-[channels.telegram]
-enabled = true
-bot_token = "${TELEGRAM_BOT_TOKEN}"
-bot_username = "${TELEGRAM_BOT_USERNAME:-}"
-mode = "webhook"
-webhook_secret = "${TELEGRAM_WEBHOOK_SECRET}"
-streaming_enabled = true
-streaming_edit_interval_ms = 900
-streaming_prefer_draft = true
-startup_online_enabled = true
-startup_online_text = "${TELEGRAM_STARTUP_ONLINE_TEXT:-online}"
-commands_enabled = true
-commands_auto_register = true
-commands_private_only = true
-admin_user_ids = "${TELEGRAM_ADMIN_USER_IDS:-}"
-group_trigger_mode = "${TELEGRAM_GROUP_TRIGGER_MODE:-smart}"
-group_followup_window_secs = 180
-group_cooldown_secs = 20
-group_rule_min_score = 70
-group_llm_gate_enabled = false
-scheduler_enabled = true
-scheduler_tick_secs = 2
-scheduler_batch_size = 8
-scheduler_lease_secs = 30
-scheduler_default_timezone = "${TELEGRAM_SCHEDULER_DEFAULT_TIMEZONE:-Asia/Shanghai}"
-scheduler_nl_enabled = true
-scheduler_nl_min_confidence = 0.78
-scheduler_require_confirm = true
-scheduler_max_jobs_per_owner = 64
-```
-
-2. Fill in `.env.realtest`:
-
-- `TELEGRAM_WEBHOOK_SECRET`
-- `PUBLIC_BASE_URL` (public HTTPS URL)
-
-3. Register webhook:
-
-```bash
-set -a
-source .env.realtest
-set +a
-./scripts/set_telegram_webhook.sh
-```
-
-Webhook endpoint:
-
-`POST /v1/telegram/webhook/{webhook_secret}`
+- Startup calls `deleteWebhook` once to clear historical webhook settings and avoid polling conflicts
 
 <a id="config-overview"></a>
 ## Configuration Overview
@@ -259,7 +203,6 @@ Core endpoints:
 - `GET /v1/channels/{channel}/diag`
 - `POST /v1/channels/{channel}/inbound`
 - `POST /v1/channels/{channel}/inbound/{secret}`
-- `POST /v1/telegram/webhook/{secret}`
 
 Example:
 

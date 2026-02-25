@@ -24,7 +24,7 @@ API_BASE="${API_BASE%/}"
 BOT_API="${API_BASE}/bot${TELEGRAM_BOT_TOKEN}"
 
 echo "[debug] telegram api base: ${API_BASE}"
-echo "[debug] step 1/4: reachability check"
+echo "[debug] step 1/3: reachability check"
 if curl -sS --max-time 10 "${API_BASE}" >/dev/null; then
   echo "[ok] reachable: ${API_BASE}"
 else
@@ -32,7 +32,7 @@ else
 fi
 
 echo
-echo "[debug] step 2/4: getMe"
+echo "[debug] step 2/3: getMe"
 GETME_RAW="$(curl -sS --max-time 15 -X POST "${BOT_API}/getMe" || true)"
 echo "${GETME_RAW}"
 if [[ "${GETME_RAW}" == *"\"can_read_all_group_messages\":false"* ]]; then
@@ -42,12 +42,7 @@ fi
 echo
 
 echo
-echo "[debug] step 3/4: getWebhookInfo"
-curl -sS --max-time 15 -X POST "${BOT_API}/getWebhookInfo" || true
-echo
-
-echo
-echo "[debug] step 4/4: getUpdates (short polling)"
+echo "[debug] step 3/3: getUpdates (short polling)"
 curl -sS --max-time 20 -X POST "${BOT_API}/getUpdates" \
   -H "content-type: application/json" \
   -d '{"timeout":1,"allowed_updates":["message"]}' || true
@@ -55,4 +50,3 @@ echo
 
 echo
 echo "[debug] if getMe/getUpdates fail with connection or timeout, check outbound network to api.telegram.org."
-echo "[debug] if getUpdates returns ok=false with webhook conflict, clear webhook and keep polling mode."

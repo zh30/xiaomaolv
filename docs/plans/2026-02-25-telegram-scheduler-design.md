@@ -153,7 +153,7 @@ Expected:
 - Create: `tests/telegram_scheduler_worker.rs`
 
 **Step 1: 在 `start_background` 增加 scheduler loop**
-- 无论 `polling` 还是 `webhook`，只要 `scheduler_enabled=true` 都运行。
+- 在 `polling` 模式下，只要 `scheduler_enabled=true` 都运行。
 - 与 polling 解耦：使用子任务并行，避免 `getUpdates` 长轮询阻塞定时触发。
 
 **Step 2: 执行路径**

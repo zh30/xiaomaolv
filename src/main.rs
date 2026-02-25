@@ -153,7 +153,6 @@ enabled = false
 bot_token = "${TELEGRAM_BOT_TOKEN}"
 # Optional: your bot username without '@', used for group @mention filtering
 # bot_username = "${TELEGRAM_BOT_USERNAME}"
-mode = "polling"
 polling_timeout_secs = 30
 streaming_enabled = true
 streaming_edit_interval_ms = 900
@@ -164,10 +163,6 @@ commands_enabled = true
 commands_auto_register = true
 commands_private_only = true
 admin_user_ids = "${TELEGRAM_ADMIN_USER_IDS:-}"
-
-# Optional webhook mode (requires public HTTPS endpoint):
-# mode = "webhook"
-# webhook_secret = "${TELEGRAM_WEBHOOK_SECRET}"
 
 [memory]
 backend = "sqlite-only" # sqlite-only | hybrid-sqlite-zvec

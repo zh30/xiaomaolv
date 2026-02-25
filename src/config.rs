@@ -49,12 +49,6 @@ impl AppConfig {
             if let Some(username) = telegram.bot_username.as_mut() {
                 *username = resolve_env_placeholder(username);
             }
-            if let Some(secret) = telegram.webhook_secret.as_mut() {
-                *secret = resolve_env_placeholder(secret);
-            }
-            if let Some(mode) = telegram.mode.as_mut() {
-                *mode = resolve_env_placeholder(mode);
-            }
             telegram.startup_online_text = resolve_env_placeholder(&telegram.startup_online_text);
             telegram.group_trigger_mode = resolve_env_placeholder(&telegram.group_trigger_mode);
             telegram.scheduler_default_timezone =
@@ -120,8 +114,6 @@ pub struct TelegramChannelConfig {
     pub enabled: bool,
     pub bot_token: String,
     pub bot_username: Option<String>,
-    pub webhook_secret: Option<String>,
-    pub mode: Option<String>,
     #[serde(default = "default_polling_timeout_secs")]
     pub polling_timeout_secs: u64,
     #[serde(default = "default_telegram_streaming_enabled")]

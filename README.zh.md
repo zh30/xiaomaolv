@@ -21,7 +21,7 @@
 
 - OpenAI-compatible Provider 抽象（MiniMax/OpenAI/其他兼容接口）
 - 消息通道：HTTP + Telegram
-- Telegram 双模式：`polling`（默认）和 `webhook`（可选）
+- Telegram 仅支持 `polling` 模式
 - Telegram 流式回复（通过 `editMessageText` 增量更新）
 - Telegram 回复统一使用 `MarkdownV2` 渲染（支持加粗/斜体/代码/链接/列表/引用）
 - Telegram 启动在线状态（通过 `setMyShortDescription`，可配置）
@@ -93,7 +93,7 @@ curl -sS http://127.0.0.1:8080/v1/channels/telegram/mode
 
 如果你已经能跑通 MVP，下面这些文档按使用频率排列：
 
-- `docs/real-test-minimax-telegram.md`：真实 MiniMax + Telegram 联调（含 webhook 配置与验证）
+- `docs/real-test-minimax-telegram.md`：真实 MiniMax + Telegram 联调指南
 - `docs/zvec-sidecar.md`：zvec sidecar 协议、启动方式与兼容行为
 - `config/xiaomaolv.minimax-telegram.toml`：MVP 推荐配置（可直接拷贝改值）
 - `config/xiaomaolv.example.toml`：通用模板（适合自定义 Provider/Channel）
@@ -102,66 +102,11 @@ curl -sS http://127.0.0.1:8080/v1/channels/telegram/mode
 <a id="run-modes"></a>
 ## 运行模式说明
 
-### Telegram `polling`（默认）
+### Telegram `polling`
 
 - 不需要公网地址
 - 服务内部通过 `getUpdates` 拉取消息
-- 启动时会先 `deleteWebhook` 避免 webhook/polling 冲突
-
-### Telegram `webhook`（可选）
-
-适用于生产公网部署：
-
-1. 在配置中启用 webhook：
-
-```toml
-[channels.telegram]
-enabled = true
-bot_token = "${TELEGRAM_BOT_TOKEN}"
-bot_username = "${TELEGRAM_BOT_USERNAME:-}"
-mode = "webhook"
-webhook_secret = "${TELEGRAM_WEBHOOK_SECRET}"
-streaming_enabled = true
-streaming_edit_interval_ms = 900
-startup_online_enabled = true
-startup_online_text = "${TELEGRAM_STARTUP_ONLINE_TEXT:-online}"
-commands_enabled = true
-commands_auto_register = true
-commands_private_only = true
-admin_user_ids = "${TELEGRAM_ADMIN_USER_IDS:-}"
-group_trigger_mode = "${TELEGRAM_GROUP_TRIGGER_MODE:-smart}"
-group_followup_window_secs = 180
-group_cooldown_secs = 20
-group_rule_min_score = 70
-group_llm_gate_enabled = false
-scheduler_enabled = true
-scheduler_tick_secs = 2
-scheduler_batch_size = 8
-scheduler_lease_secs = 30
-scheduler_default_timezone = "${TELEGRAM_SCHEDULER_DEFAULT_TIMEZONE:-Asia/Shanghai}"
-scheduler_nl_enabled = true
-scheduler_nl_min_confidence = 0.78
-scheduler_require_confirm = true
-scheduler_max_jobs_per_owner = 64
-```
-
-2. 在 `.env.realtest` 中补齐：
-
-- `TELEGRAM_WEBHOOK_SECRET`
-- `PUBLIC_BASE_URL`（公网 HTTPS 地址）
-
-3. 注册 webhook：
-
-```bash
-set -a
-source .env.realtest
-set +a
-./scripts/set_telegram_webhook.sh
-```
-
-Webhook 回调地址：
-
-`POST /v1/telegram/webhook/{webhook_secret}`
+- 启动时会先调用 `deleteWebhook` 清除历史 webhook 设置，避免与 polling 冲突
 
 <a id="config-overview"></a>
 ## 配置速览
@@ -243,7 +188,6 @@ Webhook 回调地址：
 - `GET /v1/channels/{channel}/mode`
 - `POST /v1/channels/{channel}/inbound`
 - `POST /v1/channels/{channel}/inbound/{secret}`
-- `POST /v1/telegram/webhook/{secret}`
 
 示例：
 
