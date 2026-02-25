@@ -8,6 +8,8 @@ config/xiaomaolv.toml
 !.env.realtest.example
 config/.*.runtime.toml
 *.db
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite3
 *.log

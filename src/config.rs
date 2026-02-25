@@ -455,10 +455,10 @@ fn resolve_env_placeholder(value: &str) -> String {
             (body, None)
         };
 
-        if let Ok(env_value) = std::env::var(key) {
-            if !env_value.is_empty() {
-                return env_value;
-            }
+        if let Ok(env_value) = std::env::var(key)
+            && !env_value.is_empty()
+        {
+            return env_value;
         }
 
         if let Some(default) = default_value {

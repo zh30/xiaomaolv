@@ -11,6 +11,9 @@ use serde_json::Value;
 use crate::config::ProviderConfig;
 use crate::domain::StoredMessage;
 
+const RETRY_BACKOFF_BASE_MS: u64 = 100;
+const ERROR_BODY_MAX_CHARS: usize = 512;
+
 #[derive(Debug, Clone)]
 pub struct CompletionRequest {
     pub messages: Vec<StoredMessage>,
@@ -206,10 +209,10 @@ impl OpenAiCompatibleProvider {
             messages: req.messages,
         };
 
-        let retries = self.max_retries.max(1);
+        let attempts = retry_attempts(self.max_retries);
         let mut last_error = None;
 
-        for attempt in 0..retries {
+        for attempt in 0..attempts {
             let response = self
                 .client
                 .post(&url)
@@ -221,10 +224,13 @@ impl OpenAiCompatibleProvider {
 
             match response {
                 Ok(resp) => {
-                    if !resp.status().is_success() {
+                    let status = resp.status();
+                    if !status.is_success() {
+                        let body = resp.text().await.unwrap_or_default();
                         last_error = Some(anyhow::anyhow!(
-                            "provider returned status {}",
-                            resp.status()
+                            "provider returned status {}{}",
+                            status,
+                            format_error_body_suffix(&body)
                         ));
                     } else {
                         let body: OpenAiResponse = resp
@@ -243,8 +249,9 @@ impl OpenAiCompatibleProvider {
                 }
             }
 
-            let delay = Duration::from_millis(100 * (attempt as u64 + 1));
-            tokio::time::sleep(delay).await;
+            if attempt + 1 < attempts {
+                tokio::time::sleep(retry_backoff_delay(attempt)).await;
+            }
         }
 
         Err(last_error
@@ -258,10 +265,10 @@ impl OpenAiCompatibleProvider {
     ) -> anyhow::Result<String> {
         let url = format!("{}/chat/completions", self.base_url);
         let messages = req.messages;
-        let retries = self.max_retries.max(1);
+        let attempts = retry_attempts(self.max_retries);
         let mut last_error = None;
 
-        for attempt in 0..retries {
+        for attempt in 0..attempts {
             // Streamed long-form replies can exceed regular request timeout.
             let stream_timeout_secs = self.timeout_secs.saturating_mul(10).max(300);
             let response = self
@@ -279,10 +286,13 @@ impl OpenAiCompatibleProvider {
 
             match response {
                 Ok(mut resp) => {
-                    if !resp.status().is_success() {
+                    let status = resp.status();
+                    if !status.is_success() {
+                        let body = resp.text().await.unwrap_or_default();
                         last_error = Some(anyhow::anyhow!(
-                            "provider returned status {}",
-                            resp.status()
+                            "provider returned status {}{}",
+                            status,
+                            format_error_body_suffix(&body)
                         ));
                     } else {
                         let mut assembled = String::new();
@@ -330,8 +340,9 @@ impl OpenAiCompatibleProvider {
                 }
             }
 
-            let delay = Duration::from_millis(100 * (attempt as u64 + 1));
-            tokio::time::sleep(delay).await;
+            if attempt + 1 < attempts {
+                tokio::time::sleep(retry_backoff_delay(attempt)).await;
+            }
         }
 
         let fallback = self
@@ -350,6 +361,34 @@ impl OpenAiCompatibleProvider {
             Err(fallback_err) => Err(last_error.unwrap_or(fallback_err)),
         }
     }
+}
+
+fn retry_attempts(max_retries: usize) -> usize {
+    max_retries.saturating_add(1).max(1)
+}
+
+fn retry_backoff_delay(attempt: usize) -> Duration {
+    Duration::from_millis(RETRY_BACKOFF_BASE_MS * (attempt as u64 + 1))
+}
+
+fn format_error_body_suffix(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", truncate_chars(trimmed, ERROR_BODY_MAX_CHARS))
+    }
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let total_chars = value.chars().count();
+    if total_chars <= max_chars {
+        return value.to_string();
+    }
+
+    let mut out = value.chars().take(max_chars).collect::<String>();
+    out.push_str("...(truncated)");
+    out
 }
 
 fn extract_stream_delta(line: &str) -> anyhow::Result<Option<String>> {
@@ -414,4 +453,28 @@ fn extract_content_from_event(event: &Value) -> Option<String> {
         .get("text")
         .and_then(|text| text.as_str())
         .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_stream_delta, retry_attempts, truncate_chars};
+
+    #[test]
+    fn retry_attempts_include_initial_request() {
+        assert_eq!(retry_attempts(0), 1);
+        assert_eq!(retry_attempts(2), 3);
+    }
+
+    #[test]
+    fn truncate_chars_appends_marker_when_limited() {
+        assert_eq!(truncate_chars("abcdef", 3), "abc...(truncated)");
+        assert_eq!(truncate_chars("abc", 3), "abc");
+    }
+
+    #[test]
+    fn extract_stream_delta_reads_openai_sse_payload() {
+        let line = r#"data: {"choices":[{"delta":{"content":"hello"}}]}"#;
+        let delta = extract_stream_delta(line).expect("extract delta");
+        assert_eq!(delta.as_deref(), Some("hello"));
+    }
 }

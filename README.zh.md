@@ -13,6 +13,7 @@
 - [HTTP API](#http-api)
 - [插件扩展（Provider / Channel）](#plugin-system)
 - [本地开发](#local-dev)
+- [工程质量门禁](#engineering-quality)
 - [性能冒烟测试](#perf-smoke)
 - [安全建议（开源前必看）](#security)
 
@@ -95,6 +96,7 @@ curl -sS http://127.0.0.1:8080/v1/channels/telegram/mode
 
 - `docs/real-test-minimax-telegram.md`：真实 MiniMax + Telegram 联调指南
 - `docs/zvec-sidecar.md`：zvec sidecar 协议、启动方式与兼容行为
+- `docs/engineering-quality.md`：架构约束、质量门禁与性能基线
 - `config/xiaomaolv.minimax-telegram.toml`：MVP 推荐配置（可直接拷贝改值）
 - `config/xiaomaolv.example.toml`：通用模板（适合自定义 Provider/Channel）
 - `scripts/perf_smoke.sh`：机器性能冒烟测试脚本（评估最低部署规格）
@@ -220,6 +222,24 @@ curl -X POST http://127.0.0.1:8080/v1/messages \
 cargo fmt --all
 cargo test -- --nocapture
 ```
+
+<a id="engineering-quality"></a>
+## 工程质量门禁
+
+在合并或发布前，请统一执行：
+
+```bash
+cargo fmt --all --check
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
+```
+
+生产构建配置（`Cargo.toml` 的 `[profile.release]`）：
+
+- `codegen-units = 1`
+- `lto = "thin"`
+- `opt-level = 3`
+- `strip = "symbols"`
 
 <a id="perf-smoke"></a>
 ## 性能冒烟测试

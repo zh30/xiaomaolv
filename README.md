@@ -16,6 +16,7 @@ Chinese version: `README.zh.md`
 - [MCP Integration](#mcp-integration)
 - [Plugin Extensions (Provider / Channel)](#plugin-system)
 - [Local Development](#local-dev)
+- [Engineering Quality Gates](#engineering-quality)
 - [Performance Smoke Test](#perf-smoke)
 - [Security Notes (Before Open Source)](#security)
 
@@ -103,6 +104,7 @@ After MVP is running, use these docs in order:
 - `docs/real-test-minimax-telegram.md`: real MiniMax + Telegram integration guide
 - `docs/zvec-sidecar.md`: zvec sidecar protocol, startup, compatibility details
 - `docs/mcp-integration.md`: MCP install model, CLI usage, HTTP tool-call API
+- `docs/engineering-quality.md`: architecture constraints, quality gates, and performance baselines
 - `config/xiaomaolv.minimax-telegram.toml`: recommended MVP config
 - `config/xiaomaolv.example.toml`: generic template for custom provider/channel setups
 - `scripts/perf_smoke.sh`: machine sizing smoke test script
@@ -326,6 +328,26 @@ Reference tests:
 cargo fmt --all
 cargo test -- --nocapture
 ```
+
+<a id="engineering-quality"></a>
+## Engineering Quality Gates
+
+Before merging or releasing, run:
+
+```bash
+cargo fmt --all --check
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
+```
+
+Production build profile:
+
+- `codegen-units = 1`
+- `lto = "thin"`
+- `opt-level = 3`
+- `strip = "symbols"`
+
+This is configured in `Cargo.toml` under `[profile.release]`.
 
 <a id="perf-smoke"></a>
 ## Performance Smoke Test

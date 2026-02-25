@@ -1,14 +1,14 @@
 use std::collections::{HashSet, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
 use reqwest::Client;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::SqliteConnectOptions;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
 use sqlx::{Row, SqlitePool};
 use tracing::warn;
 
@@ -21,9 +21,16 @@ pub struct SqliteMemoryStore {
 
 impl SqliteMemoryStore {
     pub async fn new(database_url: &str) -> anyhow::Result<Self> {
-        let options = SqliteConnectOptions::from_str(database_url)
+        let mut options = SqliteConnectOptions::from_str(database_url)
             .with_context(|| format!("failed to parse sqlite database URL: {database_url}"))?
-            .create_if_missing(true);
+            .create_if_missing(true)
+            .busy_timeout(Duration::from_secs(5));
+
+        if !is_in_memory_sqlite_url(database_url) {
+            options = options
+                .journal_mode(SqliteJournalMode::Wal)
+                .synchronous(SqliteSynchronous::Normal);
+        }
 
         let pool = SqlitePool::connect_with(options)
             .await
@@ -43,6 +50,14 @@ impl SqliteMemoryStore {
         .context("failed to initialize messages table")?;
 
         sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_messages_session_id_id_desc
+             ON messages(session_id, id DESC);",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize messages session index")?;
+
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS memory_chunks (
                 chunk_id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
@@ -56,6 +71,14 @@ impl SqliteMemoryStore {
         .execute(&pool)
         .await
         .context("failed to initialize memory_chunks table")?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_memory_chunks_session_created
+             ON memory_chunks(session_id, created_at DESC);",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize memory_chunks session index")?;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS telegram_group_aliases (
@@ -249,6 +272,12 @@ impl SqliteMemoryStore {
         chat_id: i64,
         aliases: &[String],
     ) -> anyhow::Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to begin telegram group alias tx")?;
+
         for alias in aliases {
             let normalized = alias.trim();
             if normalized.is_empty() {
@@ -262,10 +291,14 @@ impl SqliteMemoryStore {
             .bind(channel)
             .bind(chat_id)
             .bind(normalized)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .context("failed to upsert telegram group alias")?;
         }
+
+        tx.commit()
+            .await
+            .context("failed to commit telegram group alias tx")?;
         Ok(())
     }
 
@@ -818,6 +851,10 @@ async fn maybe_add_scheduler_jobs_column(
             }
         }
     }
+}
+
+fn is_in_memory_sqlite_url(database_url: &str) -> bool {
+    database_url.contains(":memory:") || database_url.to_ascii_lowercase().contains("mode=memory")
 }
 
 #[derive(Debug, Clone)]
