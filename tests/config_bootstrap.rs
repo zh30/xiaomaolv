@@ -65,6 +65,15 @@ streaming_prefer_draft = false
     assert_eq!(tg.group_cooldown_secs, 20);
     assert_eq!(tg.group_rule_min_score, 70);
     assert!(!tg.group_llm_gate_enabled);
+    assert!(tg.scheduler_enabled);
+    assert_eq!(tg.scheduler_tick_secs, 2);
+    assert_eq!(tg.scheduler_batch_size, 8);
+    assert_eq!(tg.scheduler_lease_secs, 30);
+    assert_eq!(tg.scheduler_default_timezone, "Asia/Shanghai");
+    assert!(tg.scheduler_nl_enabled);
+    assert_eq!(tg.scheduler_nl_min_confidence, 0.78);
+    assert!(tg.scheduler_require_confirm);
+    assert_eq!(tg.scheduler_max_jobs_per_owner, 64);
 }
 
 #[test]
@@ -188,4 +197,47 @@ group_trigger_mode = "${TELEGRAM_GROUP_TRIGGER_MODE:-smart}"
     let cfg = AppConfig::from_toml(toml).expect("config should parse");
     let tg = cfg.channels.telegram.expect("telegram config");
     assert_eq!(tg.group_trigger_mode, "smart");
+}
+
+#[test]
+fn config_bootstrap_parses_telegram_scheduler_fields() {
+    let toml = r#"
+[app]
+bind = "127.0.0.1:8080"
+default_provider = "openai"
+
+[providers.openai]
+kind = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+api_key = "test-key"
+model = "gpt-4o-mini"
+
+[channels.http]
+enabled = true
+
+[channels.telegram]
+enabled = true
+bot_token = "t"
+scheduler_enabled = false
+scheduler_tick_secs = 5
+scheduler_batch_size = 20
+scheduler_lease_secs = 45
+scheduler_default_timezone = "${TELEGRAM_SCHEDULER_DEFAULT_TIMEZONE:-Asia/Tokyo}"
+scheduler_nl_enabled = false
+scheduler_nl_min_confidence = 0.9
+scheduler_require_confirm = false
+scheduler_max_jobs_per_owner = 120
+"#;
+
+    let cfg = AppConfig::from_toml(toml).expect("config should parse");
+    let tg = cfg.channels.telegram.expect("telegram config");
+    assert!(!tg.scheduler_enabled);
+    assert_eq!(tg.scheduler_tick_secs, 5);
+    assert_eq!(tg.scheduler_batch_size, 20);
+    assert_eq!(tg.scheduler_lease_secs, 45);
+    assert_eq!(tg.scheduler_default_timezone, "Asia/Tokyo");
+    assert!(!tg.scheduler_nl_enabled);
+    assert_eq!(tg.scheduler_nl_min_confidence, 0.9);
+    assert!(!tg.scheduler_require_confirm);
+    assert_eq!(tg.scheduler_max_jobs_per_owner, 120);
 }

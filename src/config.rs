@@ -57,6 +57,8 @@ impl AppConfig {
             }
             telegram.startup_online_text = resolve_env_placeholder(&telegram.startup_online_text);
             telegram.group_trigger_mode = resolve_env_placeholder(&telegram.group_trigger_mode);
+            telegram.scheduler_default_timezone =
+                resolve_env_placeholder(&telegram.scheduler_default_timezone);
             telegram.admin_user_ids.resolve_env_placeholders();
         }
 
@@ -150,6 +152,24 @@ pub struct TelegramChannelConfig {
     pub group_rule_min_score: u32,
     #[serde(default = "default_telegram_group_llm_gate_enabled")]
     pub group_llm_gate_enabled: bool,
+    #[serde(default = "default_telegram_scheduler_enabled")]
+    pub scheduler_enabled: bool,
+    #[serde(default = "default_telegram_scheduler_tick_secs")]
+    pub scheduler_tick_secs: u64,
+    #[serde(default = "default_telegram_scheduler_batch_size")]
+    pub scheduler_batch_size: usize,
+    #[serde(default = "default_telegram_scheduler_lease_secs")]
+    pub scheduler_lease_secs: u64,
+    #[serde(default = "default_telegram_scheduler_default_timezone")]
+    pub scheduler_default_timezone: String,
+    #[serde(default = "default_telegram_scheduler_nl_enabled")]
+    pub scheduler_nl_enabled: bool,
+    #[serde(default = "default_telegram_scheduler_nl_min_confidence")]
+    pub scheduler_nl_min_confidence: f32,
+    #[serde(default = "default_telegram_scheduler_require_confirm")]
+    pub scheduler_require_confirm: bool,
+    #[serde(default = "default_telegram_scheduler_max_jobs_per_owner")]
+    pub scheduler_max_jobs_per_owner: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -348,6 +368,42 @@ fn default_telegram_group_rule_min_score() -> u32 {
 
 fn default_telegram_group_llm_gate_enabled() -> bool {
     false
+}
+
+fn default_telegram_scheduler_enabled() -> bool {
+    true
+}
+
+fn default_telegram_scheduler_tick_secs() -> u64 {
+    2
+}
+
+fn default_telegram_scheduler_batch_size() -> usize {
+    8
+}
+
+fn default_telegram_scheduler_lease_secs() -> u64 {
+    30
+}
+
+fn default_telegram_scheduler_default_timezone() -> String {
+    "Asia/Shanghai".to_string()
+}
+
+fn default_telegram_scheduler_nl_enabled() -> bool {
+    true
+}
+
+fn default_telegram_scheduler_nl_min_confidence() -> f32 {
+    0.78
+}
+
+fn default_telegram_scheduler_require_confirm() -> bool {
+    true
+}
+
+fn default_telegram_scheduler_max_jobs_per_owner() -> usize {
+    64
 }
 
 fn default_memory_backend() -> String {

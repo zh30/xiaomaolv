@@ -6,4 +6,5 @@ pub mod mcp;
 pub mod mcp_commands;
 pub mod memory;
 pub mod provider;
+pub mod scheduler;
 pub mod service;

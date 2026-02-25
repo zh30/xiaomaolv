@@ -350,6 +350,42 @@ fn load_channel_plugins(
             "group_llm_gate_enabled".to_string(),
             telegram.group_llm_gate_enabled.to_string(),
         );
+        settings.insert(
+            "scheduler_enabled".to_string(),
+            telegram.scheduler_enabled.to_string(),
+        );
+        settings.insert(
+            "scheduler_tick_secs".to_string(),
+            telegram.scheduler_tick_secs.to_string(),
+        );
+        settings.insert(
+            "scheduler_batch_size".to_string(),
+            telegram.scheduler_batch_size.to_string(),
+        );
+        settings.insert(
+            "scheduler_lease_secs".to_string(),
+            telegram.scheduler_lease_secs.to_string(),
+        );
+        settings.insert(
+            "scheduler_default_timezone".to_string(),
+            telegram.scheduler_default_timezone.clone(),
+        );
+        settings.insert(
+            "scheduler_nl_enabled".to_string(),
+            telegram.scheduler_nl_enabled.to_string(),
+        );
+        settings.insert(
+            "scheduler_nl_min_confidence".to_string(),
+            telegram.scheduler_nl_min_confidence.to_string(),
+        );
+        settings.insert(
+            "scheduler_require_confirm".to_string(),
+            telegram.scheduler_require_confirm.to_string(),
+        );
+        settings.insert(
+            "scheduler_max_jobs_per_owner".to_string(),
+            telegram.scheduler_max_jobs_per_owner.to_string(),
+        );
 
         let cfg = ChannelPluginConfig {
             kind: "telegram".to_string(),

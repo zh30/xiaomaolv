@@ -134,6 +134,15 @@ group_followup_window_secs = 180
 group_cooldown_secs = 20
 group_rule_min_score = 70
 group_llm_gate_enabled = false
+scheduler_enabled = true
+scheduler_tick_secs = 2
+scheduler_batch_size = 8
+scheduler_lease_secs = 30
+scheduler_default_timezone = "${TELEGRAM_SCHEDULER_DEFAULT_TIMEZONE:-Asia/Shanghai}"
+scheduler_nl_enabled = true
+scheduler_nl_min_confidence = 0.78
+scheduler_require_confirm = true
+scheduler_max_jobs_per_owner = 64
 ```
 
 2. 在 `.env.realtest` 中补齐：
@@ -177,6 +186,20 @@ Webhook 回调地址：
   - `group_rule_min_score = 70`（smart 规则阈值）
   - `smart` 模式会基于群上下文自动学习召唤别名（不需要手工配置）
   - `group_llm_gate_enabled = false`（预留：灰区判定开关）
+  - 定时任务：
+    - `scheduler_enabled = true`
+    - `scheduler_tick_secs = 2`
+    - `scheduler_batch_size = 8`
+    - `scheduler_lease_secs = 30`
+    - `scheduler_default_timezone = "${TELEGRAM_SCHEDULER_DEFAULT_TIMEZONE:-Asia/Shanghai}"`
+    - `scheduler_nl_enabled = true`
+    - `scheduler_nl_min_confidence = 0.78`
+    - `scheduler_require_confirm = true`
+    - `scheduler_max_jobs_per_owner = 64`
+    - 私聊管理员命令：`/task list|add|every|pause|resume|del`
+    - 当 `scheduler_nl_enabled=true` 时，支持私聊自然语言创建/修改定时任务
+    - 当 `scheduler_require_confirm=true` 时，先生成草案，等待用户回复“确认”或“取消”
+    - 自然语言也支持管理已有任务（暂停/恢复/删除，需带任务 ID，例如：`暂停任务 task-...`）
   - `startup_online_enabled = true|false`（启动时写入 Bot 在线状态文案）
   - `startup_online_text = "online"`（调用 Telegram `setMyShortDescription`）
   - `commands_enabled = true|false`（是否启用 `/` 命令处理）

@@ -144,6 +144,15 @@ group_followup_window_secs = 180
 group_cooldown_secs = 20
 group_rule_min_score = 70
 group_llm_gate_enabled = false
+scheduler_enabled = true
+scheduler_tick_secs = 2
+scheduler_batch_size = 8
+scheduler_lease_secs = 30
+scheduler_default_timezone = "${TELEGRAM_SCHEDULER_DEFAULT_TIMEZONE:-Asia/Shanghai}"
+scheduler_nl_enabled = true
+scheduler_nl_min_confidence = 0.78
+scheduler_require_confirm = true
+scheduler_max_jobs_per_owner = 64
 ```
 
 2. Fill in `.env.realtest`:
@@ -188,6 +197,20 @@ Key settings:
   - `group_rule_min_score = 70` (rule threshold for smart mode response)
   - `smart` mode learns summon aliases from chat context automatically (no manual alias config needed)
   - `group_llm_gate_enabled = false` (reserved switch for future gray-zone arbitration)
+  - Scheduler:
+    - `scheduler_enabled = true`
+    - `scheduler_tick_secs = 2`
+    - `scheduler_batch_size = 8`
+    - `scheduler_lease_secs = 30`
+    - `scheduler_default_timezone = "${TELEGRAM_SCHEDULER_DEFAULT_TIMEZONE:-Asia/Shanghai}"`
+    - `scheduler_nl_enabled = true`
+    - `scheduler_nl_min_confidence = 0.78`
+    - `scheduler_require_confirm = true`
+    - `scheduler_max_jobs_per_owner = 64`
+    - admin commands in private chat: `/task list|add|every|pause|resume|del`
+    - natural-language scheduling in private chat is enabled when `scheduler_nl_enabled=true`
+    - with `scheduler_require_confirm=true`, bot sends a draft and waits for `确认` / `取消`
+    - natural-language task control also supports pause/resume/delete with task id (for example: `暂停任务 task-...`)
   - `startup_online_enabled = true|false` (set Telegram bot startup status text)
   - `startup_online_text = "online"` (uses Telegram `setMyShortDescription`)
   - `commands_enabled = true|false` (enable slash command handling)

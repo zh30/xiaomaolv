@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use async_trait::async_trait;
 use reqwest::Client;
 use reqwest::StatusCode;
@@ -84,6 +84,91 @@ impl SqliteMemoryStore {
         .execute(&pool)
         .await
         .context("failed to initialize telegram_group_user_profiles table")?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS telegram_scheduler_jobs (
+                job_id TEXT PRIMARY KEY,
+                channel TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                message_thread_id INTEGER,
+                owner_user_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                task_kind TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                schedule_kind TEXT NOT NULL,
+                timezone TEXT NOT NULL,
+                run_at_unix INTEGER,
+                cron_expr TEXT,
+                next_run_at_unix INTEGER,
+                last_run_at_unix INTEGER,
+                last_error TEXT,
+                run_count INTEGER NOT NULL DEFAULT 0,
+                max_runs INTEGER,
+                lease_token TEXT,
+                lease_until_unix INTEGER,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize telegram_scheduler_jobs table")?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_scheduler_jobs_due
+             ON telegram_scheduler_jobs(channel, status, next_run_at_unix, lease_until_unix);",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize telegram_scheduler_jobs due index")?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_scheduler_jobs_owner
+             ON telegram_scheduler_jobs(channel, chat_id, owner_user_id, created_at);",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize telegram_scheduler_jobs owner index")?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS telegram_scheduler_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                started_at_unix INTEGER NOT NULL,
+                finished_at_unix INTEGER NOT NULL,
+                ok INTEGER NOT NULL,
+                error TEXT
+            );",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize telegram_scheduler_runs table")?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS telegram_scheduler_pending_intents (
+                intent_id TEXT PRIMARY KEY,
+                channel TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                owner_user_id INTEGER NOT NULL,
+                draft_json TEXT NOT NULL,
+                expires_at_unix INTEGER NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize telegram_scheduler_pending_intents table")?;
+
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_scheduler_pending_owner
+             ON telegram_scheduler_pending_intents(channel, chat_id, owner_user_id);",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize telegram_scheduler_pending_intents owner index")?;
 
         Ok(Self { pool })
     }
@@ -267,6 +352,442 @@ impl SqliteMemoryStore {
             })
             .collect())
     }
+
+    pub async fn create_telegram_scheduler_job(
+        &self,
+        req: CreateTelegramSchedulerJobRequest,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO telegram_scheduler_jobs
+             (job_id, channel, chat_id, message_thread_id, owner_user_id, status, task_kind,
+              payload, schedule_kind, timezone, run_at_unix, cron_expr, next_run_at_unix, max_runs,
+              lease_token, lease_until_unix, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL, NULL, unixepoch(), unixepoch())",
+        )
+        .bind(req.job_id)
+        .bind(req.channel)
+        .bind(req.chat_id)
+        .bind(req.message_thread_id)
+        .bind(req.owner_user_id)
+        .bind(req.status.as_str())
+        .bind(req.task_kind.as_str())
+        .bind(req.payload)
+        .bind(req.schedule_kind.as_str())
+        .bind(req.timezone)
+        .bind(req.run_at_unix)
+        .bind(req.cron_expr)
+        .bind(req.next_run_at_unix)
+        .bind(req.max_runs)
+        .execute(&self.pool)
+        .await
+        .context("failed to create telegram scheduler job")?;
+        Ok(())
+    }
+
+    pub async fn list_telegram_scheduler_jobs_by_owner(
+        &self,
+        channel: &str,
+        chat_id: i64,
+        owner_user_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<TelegramSchedulerJobRecord>> {
+        let rows = sqlx::query(
+            "SELECT job_id, channel, chat_id, message_thread_id, owner_user_id, status, task_kind,
+                    payload, schedule_kind, timezone, run_at_unix, cron_expr, next_run_at_unix,
+                    last_run_at_unix, last_error, run_count, max_runs, lease_token,
+                    lease_until_unix, created_at, updated_at
+             FROM telegram_scheduler_jobs
+             WHERE channel = ?1 AND chat_id = ?2 AND owner_user_id = ?3
+             ORDER BY created_at DESC
+             LIMIT ?4",
+        )
+        .bind(channel)
+        .bind(chat_id)
+        .bind(owner_user_id)
+        .bind(limit.max(1) as i64)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list telegram scheduler jobs by owner")?;
+
+        rows.into_iter()
+            .map(telegram_scheduler_job_from_row)
+            .collect()
+    }
+
+    pub async fn query_telegram_scheduler_stats(
+        &self,
+        channel: &str,
+        now_unix: i64,
+    ) -> anyhow::Result<TelegramSchedulerStats> {
+        let row = sqlx::query(
+            "SELECT
+                COUNT(*) AS jobs_total,
+                SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS jobs_active,
+                SUM(CASE WHEN status = 'paused' THEN 1 ELSE 0 END) AS jobs_paused,
+                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS jobs_completed,
+                SUM(CASE WHEN status = 'canceled' THEN 1 ELSE 0 END) AS jobs_canceled,
+                SUM(CASE
+                    WHEN status = 'active'
+                     AND next_run_at_unix IS NOT NULL
+                     AND next_run_at_unix <= ?2
+                     AND (lease_until_unix IS NULL OR lease_until_unix <= ?2)
+                    THEN 1 ELSE 0 END
+                ) AS jobs_due
+             FROM telegram_scheduler_jobs
+             WHERE channel = ?1",
+        )
+        .bind(channel)
+        .bind(now_unix)
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to query telegram scheduler stats")?;
+
+        Ok(TelegramSchedulerStats {
+            jobs_total: row.get::<i64, _>("jobs_total"),
+            jobs_active: row.get::<Option<i64>, _>("jobs_active").unwrap_or(0),
+            jobs_paused: row.get::<Option<i64>, _>("jobs_paused").unwrap_or(0),
+            jobs_completed: row.get::<Option<i64>, _>("jobs_completed").unwrap_or(0),
+            jobs_canceled: row.get::<Option<i64>, _>("jobs_canceled").unwrap_or(0),
+            jobs_due: row.get::<Option<i64>, _>("jobs_due").unwrap_or(0),
+        })
+    }
+
+    pub async fn load_telegram_scheduler_job(
+        &self,
+        channel: &str,
+        job_id: &str,
+    ) -> anyhow::Result<Option<TelegramSchedulerJobRecord>> {
+        let row = sqlx::query(
+            "SELECT job_id, channel, chat_id, message_thread_id, owner_user_id, status, task_kind,
+                    payload, schedule_kind, timezone, run_at_unix, cron_expr, next_run_at_unix,
+                    last_run_at_unix, last_error, run_count, max_runs, lease_token,
+                    lease_until_unix, created_at, updated_at
+             FROM telegram_scheduler_jobs
+             WHERE channel = ?1 AND job_id = ?2
+             LIMIT 1",
+        )
+        .bind(channel)
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load telegram scheduler job")?;
+
+        row.map(telegram_scheduler_job_from_row).transpose()
+    }
+
+    pub async fn update_telegram_scheduler_job_status(
+        &self,
+        channel: &str,
+        chat_id: i64,
+        owner_user_id: i64,
+        job_id: &str,
+        status: TelegramSchedulerJobStatus,
+    ) -> anyhow::Result<bool> {
+        let updated = sqlx::query(
+            "UPDATE telegram_scheduler_jobs
+             SET status = ?1,
+                 lease_token = NULL,
+                 lease_until_unix = NULL,
+                 updated_at = unixepoch()
+             WHERE channel = ?2
+               AND chat_id = ?3
+               AND owner_user_id = ?4
+               AND job_id = ?5
+               AND status NOT IN ('completed', 'canceled')",
+        )
+        .bind(status.as_str())
+        .bind(channel)
+        .bind(chat_id)
+        .bind(owner_user_id)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to update telegram scheduler job status")?;
+
+        Ok(updated.rows_affected() > 0)
+    }
+
+    pub async fn claim_due_telegram_scheduler_jobs(
+        &self,
+        channel: &str,
+        now_unix: i64,
+        limit: usize,
+        lease_secs: i64,
+        lease_token: &str,
+    ) -> anyhow::Result<Vec<TelegramSchedulerJobRecord>> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to begin scheduler tx")?;
+        let rows = sqlx::query(
+            "SELECT job_id, channel, chat_id, message_thread_id, owner_user_id, status, task_kind,
+                    payload, schedule_kind, timezone, run_at_unix, cron_expr, next_run_at_unix,
+                    last_run_at_unix, last_error, run_count, max_runs, lease_token,
+                    lease_until_unix, created_at, updated_at
+             FROM telegram_scheduler_jobs
+             WHERE channel = ?1
+               AND status = 'active'
+               AND next_run_at_unix IS NOT NULL
+               AND next_run_at_unix <= ?2
+               AND (lease_until_unix IS NULL OR lease_until_unix <= ?2)
+             ORDER BY next_run_at_unix ASC
+             LIMIT ?3",
+        )
+        .bind(channel)
+        .bind(now_unix)
+        .bind(limit.max(1) as i64)
+        .fetch_all(&mut *tx)
+        .await
+        .context("failed to query due telegram scheduler jobs")?;
+
+        let lease_until_unix = now_unix + lease_secs.max(1);
+        let mut claimed = Vec::new();
+        for row in rows {
+            let job = telegram_scheduler_job_from_row(row)
+                .context("failed to decode due telegram scheduler job")?;
+            let updated = sqlx::query(
+                "UPDATE telegram_scheduler_jobs
+                 SET lease_token = ?1,
+                     lease_until_unix = ?2,
+                     updated_at = unixepoch()
+                 WHERE channel = ?3
+                   AND job_id = ?4
+                   AND status = 'active'
+                   AND (lease_until_unix IS NULL OR lease_until_unix <= ?5)",
+            )
+            .bind(lease_token)
+            .bind(lease_until_unix)
+            .bind(channel)
+            .bind(&job.job_id)
+            .bind(now_unix)
+            .execute(&mut *tx)
+            .await
+            .context("failed to claim telegram scheduler job")?;
+
+            if updated.rows_affected() == 0 {
+                continue;
+            }
+
+            claimed.push(TelegramSchedulerJobRecord {
+                lease_token: Some(lease_token.to_string()),
+                lease_until_unix: Some(lease_until_unix),
+                ..job
+            });
+        }
+
+        tx.commit()
+            .await
+            .context("failed to commit scheduler claim tx")?;
+        Ok(claimed)
+    }
+
+    pub async fn complete_telegram_scheduler_job_run(
+        &self,
+        req: CompleteTelegramSchedulerJobRunRequest,
+    ) -> anyhow::Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to begin scheduler complete tx")?;
+        sqlx::query(
+            "INSERT INTO telegram_scheduler_runs
+             (job_id, channel, chat_id, started_at_unix, finished_at_unix, ok, error)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, NULL)",
+        )
+        .bind(&req.job_id)
+        .bind(&req.channel)
+        .bind(req.chat_id)
+        .bind(req.started_at_unix)
+        .bind(req.finished_at_unix)
+        .execute(&mut *tx)
+        .await
+        .context("failed to insert scheduler success run")?;
+
+        let next_status = if req.mark_completed {
+            TelegramSchedulerJobStatus::Completed
+        } else {
+            TelegramSchedulerJobStatus::Active
+        };
+        let updated = sqlx::query(
+            "UPDATE telegram_scheduler_jobs
+             SET status = ?1,
+                 next_run_at_unix = ?2,
+                 last_run_at_unix = ?3,
+                 last_error = NULL,
+                 run_count = run_count + 1,
+                 lease_token = NULL,
+                 lease_until_unix = NULL,
+                 updated_at = unixepoch()
+             WHERE channel = ?4
+               AND chat_id = ?5
+               AND job_id = ?6
+               AND lease_token = ?7",
+        )
+        .bind(next_status.as_str())
+        .bind(req.next_run_at_unix)
+        .bind(req.finished_at_unix)
+        .bind(&req.channel)
+        .bind(req.chat_id)
+        .bind(&req.job_id)
+        .bind(&req.lease_token)
+        .execute(&mut *tx)
+        .await
+        .context("failed to update scheduler job after success")?;
+        if updated.rows_affected() == 0 {
+            bail!("scheduler job completion rejected due to missing lease");
+        }
+
+        tx.commit()
+            .await
+            .context("failed to commit scheduler complete tx")?;
+        Ok(())
+    }
+
+    pub async fn fail_telegram_scheduler_job_run(
+        &self,
+        req: FailTelegramSchedulerJobRunRequest,
+    ) -> anyhow::Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to begin scheduler fail tx")?;
+        sqlx::query(
+            "INSERT INTO telegram_scheduler_runs
+             (job_id, channel, chat_id, started_at_unix, finished_at_unix, ok, error)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
+        )
+        .bind(&req.job_id)
+        .bind(&req.channel)
+        .bind(req.chat_id)
+        .bind(req.started_at_unix)
+        .bind(req.finished_at_unix)
+        .bind(&req.error)
+        .execute(&mut *tx)
+        .await
+        .context("failed to insert scheduler failure run")?;
+
+        let status = if req.pause_job {
+            TelegramSchedulerJobStatus::Paused
+        } else {
+            TelegramSchedulerJobStatus::Active
+        };
+        let updated = sqlx::query(
+            "UPDATE telegram_scheduler_jobs
+             SET status = ?1,
+                 next_run_at_unix = ?2,
+                 last_run_at_unix = ?3,
+                 last_error = ?4,
+                 run_count = run_count + 1,
+                 lease_token = NULL,
+                 lease_until_unix = NULL,
+                 updated_at = unixepoch()
+             WHERE channel = ?5
+               AND chat_id = ?6
+               AND job_id = ?7
+               AND lease_token = ?8",
+        )
+        .bind(status.as_str())
+        .bind(req.next_run_at_unix)
+        .bind(req.finished_at_unix)
+        .bind(&req.error)
+        .bind(&req.channel)
+        .bind(req.chat_id)
+        .bind(&req.job_id)
+        .bind(&req.lease_token)
+        .execute(&mut *tx)
+        .await
+        .context("failed to update scheduler job after failure")?;
+        if updated.rows_affected() == 0 {
+            bail!("scheduler job failure update rejected due to missing lease");
+        }
+
+        tx.commit()
+            .await
+            .context("failed to commit scheduler fail tx")?;
+        Ok(())
+    }
+
+    pub async fn upsert_telegram_scheduler_pending_intent(
+        &self,
+        req: UpsertTelegramSchedulerPendingIntentRequest,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO telegram_scheduler_pending_intents
+             (intent_id, channel, chat_id, owner_user_id, draft_json, expires_at_unix, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, unixepoch(), unixepoch())
+             ON CONFLICT(channel, chat_id, owner_user_id) DO UPDATE SET
+               intent_id=excluded.intent_id,
+               draft_json=excluded.draft_json,
+               expires_at_unix=excluded.expires_at_unix,
+               updated_at=unixepoch()",
+        )
+        .bind(req.intent_id)
+        .bind(req.channel)
+        .bind(req.chat_id)
+        .bind(req.owner_user_id)
+        .bind(req.draft_json)
+        .bind(req.expires_at_unix)
+        .execute(&self.pool)
+        .await
+        .context("failed to upsert telegram scheduler pending intent")?;
+        Ok(())
+    }
+
+    pub async fn load_telegram_scheduler_pending_intent(
+        &self,
+        channel: &str,
+        chat_id: i64,
+        owner_user_id: i64,
+        now_unix: i64,
+    ) -> anyhow::Result<Option<TelegramSchedulerPendingIntentRecord>> {
+        let row = sqlx::query(
+            "SELECT intent_id, channel, chat_id, owner_user_id, draft_json, expires_at_unix, created_at, updated_at
+             FROM telegram_scheduler_pending_intents
+             WHERE channel = ?1 AND chat_id = ?2 AND owner_user_id = ?3 AND expires_at_unix > ?4
+             LIMIT 1",
+        )
+        .bind(channel)
+        .bind(chat_id)
+        .bind(owner_user_id)
+        .bind(now_unix)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load telegram scheduler pending intent")?;
+
+        Ok(row.map(|row| TelegramSchedulerPendingIntentRecord {
+            intent_id: row.get("intent_id"),
+            channel: row.get("channel"),
+            chat_id: row.get("chat_id"),
+            owner_user_id: row.get("owner_user_id"),
+            draft_json: row.get("draft_json"),
+            expires_at_unix: row.get("expires_at_unix"),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+        }))
+    }
+
+    pub async fn delete_telegram_scheduler_pending_intent(
+        &self,
+        channel: &str,
+        chat_id: i64,
+        owner_user_id: i64,
+    ) -> anyhow::Result<bool> {
+        let deleted = sqlx::query(
+            "DELETE FROM telegram_scheduler_pending_intents
+             WHERE channel = ?1 AND chat_id = ?2 AND owner_user_id = ?3",
+        )
+        .bind(channel)
+        .bind(chat_id)
+        .bind(owner_user_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to delete telegram scheduler pending intent")?;
+
+        Ok(deleted.rows_affected() > 0)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -337,6 +858,241 @@ pub struct GroupUserProfileLoadRequest {
     pub limit: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TelegramSchedulerJobStatus {
+    Active,
+    Paused,
+    Completed,
+    Canceled,
+}
+
+impl TelegramSchedulerJobStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Paused => "paused",
+            Self::Completed => "completed",
+            Self::Canceled => "canceled",
+        }
+    }
+
+    fn from_db(value: &str) -> Self {
+        match value {
+            "paused" => Self::Paused,
+            "completed" => Self::Completed,
+            "canceled" => Self::Canceled,
+            _ => Self::Active,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TelegramSchedulerTaskKind {
+    Reminder,
+    Agent,
+}
+
+impl TelegramSchedulerTaskKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Reminder => "reminder",
+            Self::Agent => "agent",
+        }
+    }
+
+    fn from_db(value: &str) -> Self {
+        match value {
+            "agent" => Self::Agent,
+            _ => Self::Reminder,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TelegramSchedulerScheduleKind {
+    Once,
+    Cron,
+}
+
+impl TelegramSchedulerScheduleKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Once => "once",
+            Self::Cron => "cron",
+        }
+    }
+
+    fn from_db(value: &str) -> Self {
+        match value {
+            "cron" => Self::Cron,
+            _ => Self::Once,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramSchedulerJobRecord {
+    pub job_id: String,
+    pub channel: String,
+    pub chat_id: i64,
+    pub message_thread_id: Option<i64>,
+    pub owner_user_id: i64,
+    pub status: TelegramSchedulerJobStatus,
+    pub task_kind: TelegramSchedulerTaskKind,
+    pub payload: String,
+    pub schedule_kind: TelegramSchedulerScheduleKind,
+    pub timezone: String,
+    pub run_at_unix: Option<i64>,
+    pub cron_expr: Option<String>,
+    pub next_run_at_unix: Option<i64>,
+    pub last_run_at_unix: Option<i64>,
+    pub last_error: Option<String>,
+    pub run_count: i64,
+    pub max_runs: Option<i64>,
+    pub lease_token: Option<String>,
+    pub lease_until_unix: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateTelegramSchedulerJobRequest {
+    pub job_id: String,
+    pub channel: String,
+    pub chat_id: i64,
+    pub message_thread_id: Option<i64>,
+    pub owner_user_id: i64,
+    pub status: TelegramSchedulerJobStatus,
+    pub task_kind: TelegramSchedulerTaskKind,
+    pub payload: String,
+    pub schedule_kind: TelegramSchedulerScheduleKind,
+    pub timezone: String,
+    pub run_at_unix: Option<i64>,
+    pub cron_expr: Option<String>,
+    pub next_run_at_unix: Option<i64>,
+    pub max_runs: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TelegramSchedulerJobListRequest {
+    pub channel: String,
+    pub chat_id: i64,
+    pub owner_user_id: i64,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct TelegramSchedulerStatsRequest {
+    pub channel: String,
+    pub now_unix: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelegramSchedulerStats {
+    pub jobs_total: i64,
+    pub jobs_active: i64,
+    pub jobs_paused: i64,
+    pub jobs_completed: i64,
+    pub jobs_canceled: i64,
+    pub jobs_due: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateTelegramSchedulerJobStatusRequest {
+    pub channel: String,
+    pub chat_id: i64,
+    pub owner_user_id: i64,
+    pub job_id: String,
+    pub status: TelegramSchedulerJobStatus,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClaimDueTelegramSchedulerJobsRequest {
+    pub channel: String,
+    pub now_unix: i64,
+    pub limit: usize,
+    pub lease_secs: i64,
+    pub lease_token: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompleteTelegramSchedulerJobRunRequest {
+    pub channel: String,
+    pub chat_id: i64,
+    pub job_id: String,
+    pub lease_token: String,
+    pub started_at_unix: i64,
+    pub finished_at_unix: i64,
+    pub next_run_at_unix: Option<i64>,
+    pub mark_completed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct FailTelegramSchedulerJobRunRequest {
+    pub channel: String,
+    pub chat_id: i64,
+    pub job_id: String,
+    pub lease_token: String,
+    pub started_at_unix: i64,
+    pub finished_at_unix: i64,
+    pub next_run_at_unix: Option<i64>,
+    pub pause_job: bool,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramSchedulerPendingIntentRecord {
+    pub intent_id: String,
+    pub channel: String,
+    pub chat_id: i64,
+    pub owner_user_id: i64,
+    pub draft_json: String,
+    pub expires_at_unix: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertTelegramSchedulerPendingIntentRequest {
+    pub intent_id: String,
+    pub channel: String,
+    pub chat_id: i64,
+    pub owner_user_id: i64,
+    pub draft_json: String,
+    pub expires_at_unix: i64,
+}
+
+fn telegram_scheduler_job_from_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> anyhow::Result<TelegramSchedulerJobRecord> {
+    let status: String = row.get("status");
+    let task_kind: String = row.get("task_kind");
+    let schedule_kind: String = row.get("schedule_kind");
+    Ok(TelegramSchedulerJobRecord {
+        job_id: row.get("job_id"),
+        channel: row.get("channel"),
+        chat_id: row.get("chat_id"),
+        message_thread_id: row.get("message_thread_id"),
+        owner_user_id: row.get("owner_user_id"),
+        status: TelegramSchedulerJobStatus::from_db(&status),
+        task_kind: TelegramSchedulerTaskKind::from_db(&task_kind),
+        payload: row.get("payload"),
+        schedule_kind: TelegramSchedulerScheduleKind::from_db(&schedule_kind),
+        timezone: row.get("timezone"),
+        run_at_unix: row.get("run_at_unix"),
+        cron_expr: row.get("cron_expr"),
+        next_run_at_unix: row.get("next_run_at_unix"),
+        last_run_at_unix: row.get("last_run_at_unix"),
+        last_error: row.get("last_error"),
+        run_count: row.get("run_count"),
+        max_runs: row.get("max_runs"),
+        lease_token: row.get("lease_token"),
+        lease_until_unix: row.get("lease_until_unix"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
 #[async_trait]
 pub trait MemoryBackend: Send + Sync {
     async fn append(&self, req: MemoryWriteRequest) -> anyhow::Result<()>;
@@ -358,6 +1114,78 @@ pub trait MemoryBackend: Send + Sync {
         _req: GroupUserProfileLoadRequest,
     ) -> anyhow::Result<Vec<GroupUserProfileRecord>> {
         Ok(vec![])
+    }
+    async fn create_telegram_scheduler_job(
+        &self,
+        _req: CreateTelegramSchedulerJobRequest,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn list_telegram_scheduler_jobs_by_owner(
+        &self,
+        _req: TelegramSchedulerJobListRequest,
+    ) -> anyhow::Result<Vec<TelegramSchedulerJobRecord>> {
+        Ok(vec![])
+    }
+    async fn query_telegram_scheduler_stats(
+        &self,
+        _req: TelegramSchedulerStatsRequest,
+    ) -> anyhow::Result<TelegramSchedulerStats> {
+        Ok(TelegramSchedulerStats::default())
+    }
+    async fn update_telegram_scheduler_job_status(
+        &self,
+        _req: UpdateTelegramSchedulerJobStatusRequest,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+    async fn load_telegram_scheduler_job(
+        &self,
+        _channel: String,
+        _job_id: String,
+    ) -> anyhow::Result<Option<TelegramSchedulerJobRecord>> {
+        Ok(None)
+    }
+    async fn claim_due_telegram_scheduler_jobs(
+        &self,
+        _req: ClaimDueTelegramSchedulerJobsRequest,
+    ) -> anyhow::Result<Vec<TelegramSchedulerJobRecord>> {
+        Ok(vec![])
+    }
+    async fn complete_telegram_scheduler_job_run(
+        &self,
+        _req: CompleteTelegramSchedulerJobRunRequest,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn fail_telegram_scheduler_job_run(
+        &self,
+        _req: FailTelegramSchedulerJobRunRequest,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn upsert_telegram_scheduler_pending_intent(
+        &self,
+        _req: UpsertTelegramSchedulerPendingIntentRequest,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn load_telegram_scheduler_pending_intent(
+        &self,
+        _channel: String,
+        _chat_id: i64,
+        _owner_user_id: i64,
+        _now_unix: i64,
+    ) -> anyhow::Result<Option<TelegramSchedulerPendingIntentRecord>> {
+        Ok(None)
+    }
+    async fn delete_telegram_scheduler_pending_intent(
+        &self,
+        _channel: String,
+        _chat_id: i64,
+        _owner_user_id: i64,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
     }
 }
 
@@ -417,6 +1245,122 @@ impl MemoryBackend for SqliteMemoryBackend {
     ) -> anyhow::Result<Vec<GroupUserProfileRecord>> {
         self.store
             .load_group_user_profiles(&req.channel, req.chat_id, req.limit)
+            .await
+    }
+
+    async fn create_telegram_scheduler_job(
+        &self,
+        req: CreateTelegramSchedulerJobRequest,
+    ) -> anyhow::Result<()> {
+        self.store.create_telegram_scheduler_job(req).await
+    }
+
+    async fn list_telegram_scheduler_jobs_by_owner(
+        &self,
+        req: TelegramSchedulerJobListRequest,
+    ) -> anyhow::Result<Vec<TelegramSchedulerJobRecord>> {
+        self.store
+            .list_telegram_scheduler_jobs_by_owner(
+                &req.channel,
+                req.chat_id,
+                req.owner_user_id,
+                req.limit,
+            )
+            .await
+    }
+
+    async fn query_telegram_scheduler_stats(
+        &self,
+        req: TelegramSchedulerStatsRequest,
+    ) -> anyhow::Result<TelegramSchedulerStats> {
+        self.store
+            .query_telegram_scheduler_stats(&req.channel, req.now_unix)
+            .await
+    }
+
+    async fn update_telegram_scheduler_job_status(
+        &self,
+        req: UpdateTelegramSchedulerJobStatusRequest,
+    ) -> anyhow::Result<bool> {
+        self.store
+            .update_telegram_scheduler_job_status(
+                &req.channel,
+                req.chat_id,
+                req.owner_user_id,
+                &req.job_id,
+                req.status,
+            )
+            .await
+    }
+
+    async fn load_telegram_scheduler_job(
+        &self,
+        channel: String,
+        job_id: String,
+    ) -> anyhow::Result<Option<TelegramSchedulerJobRecord>> {
+        self.store
+            .load_telegram_scheduler_job(&channel, &job_id)
+            .await
+    }
+
+    async fn claim_due_telegram_scheduler_jobs(
+        &self,
+        req: ClaimDueTelegramSchedulerJobsRequest,
+    ) -> anyhow::Result<Vec<TelegramSchedulerJobRecord>> {
+        self.store
+            .claim_due_telegram_scheduler_jobs(
+                &req.channel,
+                req.now_unix,
+                req.limit,
+                req.lease_secs,
+                &req.lease_token,
+            )
+            .await
+    }
+
+    async fn complete_telegram_scheduler_job_run(
+        &self,
+        req: CompleteTelegramSchedulerJobRunRequest,
+    ) -> anyhow::Result<()> {
+        self.store.complete_telegram_scheduler_job_run(req).await
+    }
+
+    async fn fail_telegram_scheduler_job_run(
+        &self,
+        req: FailTelegramSchedulerJobRunRequest,
+    ) -> anyhow::Result<()> {
+        self.store.fail_telegram_scheduler_job_run(req).await
+    }
+
+    async fn upsert_telegram_scheduler_pending_intent(
+        &self,
+        req: UpsertTelegramSchedulerPendingIntentRequest,
+    ) -> anyhow::Result<()> {
+        self.store
+            .upsert_telegram_scheduler_pending_intent(req)
+            .await
+    }
+
+    async fn load_telegram_scheduler_pending_intent(
+        &self,
+        channel: String,
+        chat_id: i64,
+        owner_user_id: i64,
+        now_unix: i64,
+    ) -> anyhow::Result<Option<TelegramSchedulerPendingIntentRecord>> {
+        self.store
+            .load_telegram_scheduler_pending_intent(&channel, chat_id, owner_user_id, now_unix)
+            .await
+    }
+
+    async fn delete_telegram_scheduler_pending_intent(
+        &self,
+        channel: String,
+        chat_id: i64,
+        owner_user_id: i64,
+    ) -> anyhow::Result<bool> {
+        self.store
+            .delete_telegram_scheduler_pending_intent(&channel, chat_id, owner_user_id)
             .await
     }
 }
@@ -663,6 +1607,122 @@ impl MemoryBackend for HybridSqliteZvecMemoryBackend {
     ) -> anyhow::Result<Vec<GroupUserProfileRecord>> {
         self.store
             .load_group_user_profiles(&req.channel, req.chat_id, req.limit)
+            .await
+    }
+
+    async fn create_telegram_scheduler_job(
+        &self,
+        req: CreateTelegramSchedulerJobRequest,
+    ) -> anyhow::Result<()> {
+        self.store.create_telegram_scheduler_job(req).await
+    }
+
+    async fn list_telegram_scheduler_jobs_by_owner(
+        &self,
+        req: TelegramSchedulerJobListRequest,
+    ) -> anyhow::Result<Vec<TelegramSchedulerJobRecord>> {
+        self.store
+            .list_telegram_scheduler_jobs_by_owner(
+                &req.channel,
+                req.chat_id,
+                req.owner_user_id,
+                req.limit,
+            )
+            .await
+    }
+
+    async fn query_telegram_scheduler_stats(
+        &self,
+        req: TelegramSchedulerStatsRequest,
+    ) -> anyhow::Result<TelegramSchedulerStats> {
+        self.store
+            .query_telegram_scheduler_stats(&req.channel, req.now_unix)
+            .await
+    }
+
+    async fn update_telegram_scheduler_job_status(
+        &self,
+        req: UpdateTelegramSchedulerJobStatusRequest,
+    ) -> anyhow::Result<bool> {
+        self.store
+            .update_telegram_scheduler_job_status(
+                &req.channel,
+                req.chat_id,
+                req.owner_user_id,
+                &req.job_id,
+                req.status,
+            )
+            .await
+    }
+
+    async fn load_telegram_scheduler_job(
+        &self,
+        channel: String,
+        job_id: String,
+    ) -> anyhow::Result<Option<TelegramSchedulerJobRecord>> {
+        self.store
+            .load_telegram_scheduler_job(&channel, &job_id)
+            .await
+    }
+
+    async fn claim_due_telegram_scheduler_jobs(
+        &self,
+        req: ClaimDueTelegramSchedulerJobsRequest,
+    ) -> anyhow::Result<Vec<TelegramSchedulerJobRecord>> {
+        self.store
+            .claim_due_telegram_scheduler_jobs(
+                &req.channel,
+                req.now_unix,
+                req.limit,
+                req.lease_secs,
+                &req.lease_token,
+            )
+            .await
+    }
+
+    async fn complete_telegram_scheduler_job_run(
+        &self,
+        req: CompleteTelegramSchedulerJobRunRequest,
+    ) -> anyhow::Result<()> {
+        self.store.complete_telegram_scheduler_job_run(req).await
+    }
+
+    async fn fail_telegram_scheduler_job_run(
+        &self,
+        req: FailTelegramSchedulerJobRunRequest,
+    ) -> anyhow::Result<()> {
+        self.store.fail_telegram_scheduler_job_run(req).await
+    }
+
+    async fn upsert_telegram_scheduler_pending_intent(
+        &self,
+        req: UpsertTelegramSchedulerPendingIntentRequest,
+    ) -> anyhow::Result<()> {
+        self.store
+            .upsert_telegram_scheduler_pending_intent(req)
+            .await
+    }
+
+    async fn load_telegram_scheduler_pending_intent(
+        &self,
+        channel: String,
+        chat_id: i64,
+        owner_user_id: i64,
+        now_unix: i64,
+    ) -> anyhow::Result<Option<TelegramSchedulerPendingIntentRecord>> {
+        self.store
+            .load_telegram_scheduler_pending_intent(&channel, chat_id, owner_user_id, now_unix)
+            .await
+    }
+
+    async fn delete_telegram_scheduler_pending_intent(
+        &self,
+        channel: String,
+        chat_id: i64,
+        owner_user_id: i64,
+    ) -> anyhow::Result<bool> {
+        self.store
+            .delete_telegram_scheduler_pending_intent(&channel, chat_id, owner_user_id)
             .await
     }
 }

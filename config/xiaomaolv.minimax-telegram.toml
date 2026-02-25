@@ -39,6 +39,17 @@ group_followup_window_secs = 180
 group_cooldown_secs = 20
 group_rule_min_score = 70
 group_llm_gate_enabled = false
+# Scheduler:
+scheduler_enabled = true
+scheduler_tick_secs = 2
+scheduler_batch_size = 8
+scheduler_lease_secs = 30
+scheduler_default_timezone = "${TELEGRAM_SCHEDULER_DEFAULT_TIMEZONE:-Asia/Shanghai}"
+scheduler_nl_enabled = true
+# When true, bot sends draft then waits for "确认"/"取消"
+scheduler_nl_min_confidence = 0.78
+scheduler_require_confirm = true
+scheduler_max_jobs_per_owner = 64
 
 # Optional webhook mode (public HTTPS required)
 # mode = "webhook"

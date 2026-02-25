@@ -5,6 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use chrono_tz::Tz;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -17,8 +19,15 @@ use crate::domain::{IncomingMessage, ReplyTarget};
 use crate::mcp_commands::{
     discover_mcp_registry, execute_mcp_command, mcp_help_text, parse_telegram_mcp_command,
 };
+use crate::memory::{
+    CompleteTelegramSchedulerJobRunRequest, CreateTelegramSchedulerJobRequest,
+    FailTelegramSchedulerJobRunRequest, TelegramSchedulerJobRecord, TelegramSchedulerJobStatus,
+    TelegramSchedulerScheduleKind, TelegramSchedulerTaskKind,
+    UpsertTelegramSchedulerPendingIntentRequest,
+};
 use crate::provider::StreamSink;
-use crate::service::MessageService;
+use crate::scheduler::{ScheduleSpec, compute_next_run_at_unix, compute_retry_backoff_secs};
+use crate::service::{MessageService, TelegramSchedulerIntent};
 
 pub use crate::config::ChannelPluginConfig;
 
@@ -149,6 +158,66 @@ impl TelegramPollingDiagState {
             group_decision_respond_total: self.group_decision_respond_total,
             group_decision_observe_total: self.group_decision_observe_total,
             group_decision_ignore_total: self.group_decision_ignore_total,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TelegramSchedulerDiagSnapshot {
+    worker_started_at_unix: Option<u64>,
+    last_tick_at_unix: Option<u64>,
+    last_claimed_jobs: usize,
+    total_claimed_jobs: u64,
+    jobs_total: i64,
+    jobs_active: i64,
+    jobs_paused: i64,
+    jobs_completed: i64,
+    jobs_canceled: i64,
+    jobs_due: i64,
+    total_runs_ok: u64,
+    total_runs_err: u64,
+    last_run_ok_at_unix: Option<u64>,
+    last_run_err_at_unix: Option<u64>,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct TelegramSchedulerDiagState {
+    worker_started_at_unix: Option<u64>,
+    last_tick_at_unix: Option<u64>,
+    last_claimed_jobs: usize,
+    total_claimed_jobs: u64,
+    jobs_total: i64,
+    jobs_active: i64,
+    jobs_paused: i64,
+    jobs_completed: i64,
+    jobs_canceled: i64,
+    jobs_due: i64,
+    total_runs_ok: u64,
+    total_runs_err: u64,
+    last_run_ok_at_unix: Option<u64>,
+    last_run_err_at_unix: Option<u64>,
+    last_error: Option<String>,
+}
+
+impl TelegramSchedulerDiagState {
+    fn snapshot(&self) -> TelegramSchedulerDiagSnapshot {
+        TelegramSchedulerDiagSnapshot {
+            worker_started_at_unix: self.worker_started_at_unix,
+            last_tick_at_unix: self.last_tick_at_unix,
+            last_claimed_jobs: self.last_claimed_jobs,
+            total_claimed_jobs: self.total_claimed_jobs,
+            jobs_total: self.jobs_total,
+            jobs_active: self.jobs_active,
+            jobs_paused: self.jobs_paused,
+            jobs_completed: self.jobs_completed,
+            jobs_canceled: self.jobs_canceled,
+            jobs_due: self.jobs_due,
+            total_runs_ok: self.total_runs_ok,
+            total_runs_err: self.total_runs_err,
+            last_run_ok_at_unix: self.last_run_ok_at_unix,
+            last_run_err_at_unix: self.last_run_err_at_unix,
+            last_error: self.last_error.clone(),
         }
     }
 }
@@ -760,6 +829,51 @@ struct TelegramGroupTriggerSettings {
     llm_gate_enabled: bool,
 }
 
+#[derive(Clone, Debug)]
+struct TelegramSchedulerSettings {
+    enabled: bool,
+    tick_secs: u64,
+    batch_size: usize,
+    lease_secs: u64,
+    default_timezone: String,
+    nl_enabled: bool,
+    nl_min_confidence: f32,
+    require_confirm: bool,
+    max_jobs_per_owner: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TelegramSchedulerIntentDraft {
+    task_kind: TelegramSchedulerTaskKind,
+    schedule_kind: TelegramSchedulerScheduleKind,
+    payload: String,
+    timezone: String,
+    run_at_unix: Option<i64>,
+    cron_expr: Option<String>,
+    source_text: String,
+}
+
+const TELEGRAM_SCHEDULER_PENDING_TTL_SECS: i64 = 15 * 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchedulerJobOperation {
+    Pause,
+    Resume,
+    Delete,
+}
+
+#[derive(Debug, Clone)]
+enum SchedulerJobTargetResolution {
+    Selected {
+        job_id: String,
+        inferred: bool,
+    },
+    Ambiguous {
+        options: Vec<TelegramSchedulerJobRecord>,
+    },
+    Empty,
+}
+
 #[derive(Debug, Default)]
 struct TelegramGroupRuntimeState {
     last_bot_response_unix_by_chat: HashMap<i64, u64>,
@@ -936,6 +1050,57 @@ impl ChannelFactory for TelegramChannelFactory {
             .get("group_llm_gate_enabled")
             .and_then(|raw| parse_bool(raw))
             .unwrap_or(false);
+        let scheduler_enabled = config
+            .settings
+            .get("scheduler_enabled")
+            .and_then(|raw| parse_bool(raw))
+            .unwrap_or(true);
+        let scheduler_tick_secs = config
+            .settings
+            .get("scheduler_tick_secs")
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(2)
+            .clamp(1, 60);
+        let scheduler_batch_size = config
+            .settings
+            .get("scheduler_batch_size")
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .unwrap_or(8)
+            .clamp(1, 128);
+        let scheduler_lease_secs = config
+            .settings
+            .get("scheduler_lease_secs")
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(30)
+            .clamp(5, 600);
+        let scheduler_default_timezone = config
+            .settings
+            .get("scheduler_default_timezone")
+            .map(|raw| raw.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "Asia/Shanghai".to_string());
+        let scheduler_nl_enabled = config
+            .settings
+            .get("scheduler_nl_enabled")
+            .and_then(|raw| parse_bool(raw))
+            .unwrap_or(true);
+        let scheduler_nl_min_confidence = config
+            .settings
+            .get("scheduler_nl_min_confidence")
+            .and_then(|raw| raw.parse::<f32>().ok())
+            .unwrap_or(0.78)
+            .clamp(0.0, 1.0);
+        let scheduler_require_confirm = config
+            .settings
+            .get("scheduler_require_confirm")
+            .and_then(|raw| parse_bool(raw))
+            .unwrap_or(true);
+        let scheduler_max_jobs_per_owner = config
+            .settings
+            .get("scheduler_max_jobs_per_owner")
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .unwrap_or(64)
+            .clamp(1, 1024);
 
         Ok(Arc::new(TelegramChannelPlugin {
             sender: TelegramSender::new(bot_token.clone()),
@@ -959,6 +1124,17 @@ impl ChannelFactory for TelegramChannelFactory {
                 rule_min_score: group_rule_min_score,
                 llm_gate_enabled: group_llm_gate_enabled,
             },
+            scheduler_settings: TelegramSchedulerSettings {
+                enabled: scheduler_enabled,
+                tick_secs: scheduler_tick_secs,
+                batch_size: scheduler_batch_size,
+                lease_secs: scheduler_lease_secs,
+                default_timezone: scheduler_default_timezone,
+                nl_enabled: scheduler_nl_enabled,
+                nl_min_confidence: scheduler_nl_min_confidence,
+                require_confirm: scheduler_require_confirm,
+                max_jobs_per_owner: scheduler_max_jobs_per_owner,
+            },
             group_mention_bot_username_cache: Arc::new(tokio::sync::Mutex::new(
                 group_mention_bot_username,
             )),
@@ -968,6 +1144,9 @@ impl ChannelFactory for TelegramChannelFactory {
             )),
             group_runtime_state: Arc::new(tokio::sync::Mutex::new(
                 TelegramGroupRuntimeState::default(),
+            )),
+            scheduler_diag_state: Arc::new(tokio::sync::Mutex::new(
+                TelegramSchedulerDiagState::default(),
             )),
         }))
     }
@@ -989,10 +1168,12 @@ struct TelegramChannelPlugin {
     commands_private_only: bool,
     admin_user_ids: Vec<i64>,
     group_trigger_settings: TelegramGroupTriggerSettings,
+    scheduler_settings: TelegramSchedulerSettings,
     group_mention_bot_username_cache: Arc<tokio::sync::Mutex<Option<String>>>,
     bot_user_id_cache: Arc<tokio::sync::Mutex<Option<i64>>>,
     polling_diag_state: Arc<tokio::sync::Mutex<TelegramPollingDiagState>>,
     group_runtime_state: Arc<tokio::sync::Mutex<TelegramGroupRuntimeState>>,
+    scheduler_diag_state: Arc<tokio::sync::Mutex<TelegramSchedulerDiagState>>,
 }
 
 #[derive(Clone)]
@@ -1000,6 +1181,7 @@ struct TelegramCommandSettings {
     enabled: bool,
     private_only: bool,
     admin_user_ids: Vec<i64>,
+    scheduler: TelegramSchedulerSettings,
 }
 
 impl TelegramChannelPlugin {
@@ -1020,6 +1202,7 @@ impl TelegramChannelPlugin {
             enabled: self.commands_enabled,
             private_only: self.commands_private_only,
             admin_user_ids: self.admin_user_ids.clone(),
+            scheduler: self.scheduler_settings.clone(),
         }
     }
 }
@@ -1208,8 +1391,35 @@ impl ChannelPlugin for TelegramChannelPlugin {
             }
         }
 
+        let scheduler_settings = self.scheduler_settings.clone();
+        let scheduler_diag_state = self.scheduler_diag_state.clone();
+
         if !matches!(self.mode, TelegramIngressMode::Polling) {
-            return Ok(None);
+            if !scheduler_settings.enabled {
+                return Ok(None);
+            }
+            let channel_name = ctx.channel_name.clone();
+            let worker_name = format!("{channel_name}-scheduler");
+            let service = ctx.service.clone();
+            let sender = self.sender.clone();
+            let shutdown = ctx.shutdown.clone();
+
+            let task = tokio::spawn(async move {
+                run_telegram_scheduler_loop(
+                    channel_name,
+                    service,
+                    sender,
+                    scheduler_settings,
+                    shutdown,
+                    scheduler_diag_state,
+                )
+                .await;
+            });
+
+            return Ok(Some(ChannelWorker {
+                name: worker_name,
+                task,
+            }));
         }
 
         let channel_name = ctx.channel_name.clone();
@@ -1231,6 +1441,28 @@ impl ChannelPlugin for TelegramChannelPlugin {
 
         let task = tokio::spawn(async move {
             info!(channel = %channel_name, "telegram polling worker started");
+            let mut scheduler_task = if scheduler_settings.enabled {
+                let scheduler_channel_name = channel_name.clone();
+                let scheduler_service = service.clone();
+                let scheduler_sender = sender.clone();
+                let scheduler_shutdown = shutdown.clone();
+                let scheduler_diag = scheduler_diag_state.clone();
+                let scheduler_cfg = scheduler_settings.clone();
+                Some(tokio::spawn(async move {
+                    run_telegram_scheduler_loop(
+                        scheduler_channel_name,
+                        scheduler_service,
+                        scheduler_sender,
+                        scheduler_cfg,
+                        scheduler_shutdown,
+                        scheduler_diag,
+                    )
+                    .await;
+                }))
+            } else {
+                None
+            };
+
             let client = Client::new();
             let mut offset: i64 = 0;
             {
@@ -1342,6 +1574,11 @@ impl ChannelPlugin for TelegramChannelPlugin {
                 }
             }
 
+            if let Some(task) = scheduler_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+
             info!(channel = %channel_name, "telegram polling worker stopped");
         });
 
@@ -1362,6 +1599,10 @@ impl ChannelPlugin for TelegramChannelPlugin {
         };
         let polling = {
             let diag = self.polling_diag_state.lock().await;
+            diag.snapshot()
+        };
+        let scheduler = {
+            let diag = self.scheduler_diag_state.lock().await;
             diag.snapshot()
         };
         let (
@@ -1434,6 +1675,18 @@ impl ChannelPlugin for TelegramChannelPlugin {
                 "learned_profile_chats": learned_profile_chats,
                 "learned_profile_total": learned_profile_total,
                 "llm_gate_enabled": self.group_trigger_settings.llm_gate_enabled
+            },
+            "scheduler": {
+                "enabled": self.scheduler_settings.enabled,
+                "tick_secs": self.scheduler_settings.tick_secs,
+                "batch_size": self.scheduler_settings.batch_size,
+                "lease_secs": self.scheduler_settings.lease_secs,
+                "default_timezone": self.scheduler_settings.default_timezone,
+                "nl_enabled": self.scheduler_settings.nl_enabled,
+                "nl_min_confidence": self.scheduler_settings.nl_min_confidence,
+                "require_confirm": self.scheduler_settings.require_confirm,
+                "max_jobs_per_owner": self.scheduler_settings.max_jobs_per_owner,
+                "diag": scheduler
             },
             "polling": polling,
             "get_me": get_me,
@@ -1579,6 +1832,21 @@ async fn process_telegram_update(
             &command_settings,
         )
         .await?
+        {
+            return Ok(());
+        }
+
+        if is_private_chat
+            && command_settings.scheduler.enabled
+            && command_settings.scheduler.nl_enabled
+            && maybe_handle_telegram_scheduler_natural_language(
+                &ctx,
+                sender,
+                &message,
+                text.trim(),
+                &command_settings.scheduler,
+            )
+            .await?
         {
             return Ok(());
         }
@@ -2049,6 +2317,7 @@ enum TelegramSlashCommand {
     Help,
     WhoAmI,
     Mcp { tail: String },
+    Task { tail: String },
     Unknown { name: String },
 }
 
@@ -2196,6 +2465,18 @@ async fn maybe_handle_telegram_command(
             }
             Ok(true)
         }
+        TelegramSlashCommand::Task { tail } => {
+            handle_telegram_task_command(
+                ctx,
+                sender,
+                message,
+                tail.as_str(),
+                is_private_chat,
+                command_settings,
+            )
+            .await?;
+            Ok(true)
+        }
         TelegramSlashCommand::Unknown { name } => {
             if is_private_chat {
                 send_telegram_command_reply(
@@ -2210,6 +2491,1223 @@ async fn maybe_handle_telegram_command(
             }
         }
     }
+}
+
+async fn handle_telegram_task_command(
+    ctx: &ChannelContext,
+    sender: &TelegramSender,
+    message: &TelegramMessage,
+    tail: &str,
+    is_private_chat: bool,
+    command_settings: &TelegramCommandSettings,
+) -> anyhow::Result<()> {
+    if !command_settings.scheduler.enabled {
+        send_telegram_command_reply(sender, message, "定时任务功能未启用。").await?;
+        return Ok(());
+    }
+
+    if !is_private_chat {
+        send_telegram_command_reply(sender, message, "请私聊使用 /task 定时任务命令。").await?;
+        return Ok(());
+    }
+
+    match evaluate_private_chat_access(
+        message.from.as_ref().map(|u| u.id),
+        &command_settings.admin_user_ids,
+    ) {
+        PrivateChatAccess::Allowed => {}
+        PrivateChatAccess::MissingAdminAllowlist => {
+            send_telegram_command_reply(
+                sender,
+                message,
+                &format!(
+                    "管理员白名单未配置，定时任务不可用。\n{}\n\n请在 .env.realtest 中配置 TELEGRAM_ADMIN_USER_IDS。",
+                    telegram_whoami_hint(message)
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+        PrivateChatAccess::Unauthorized => {
+            send_telegram_command_reply(
+                sender,
+                message,
+                &format!(
+                    "无权限管理定时任务。\n{}\n\n如需开通，请让管理员把你的 ID 加入 TELEGRAM_ADMIN_USER_IDS。",
+                    telegram_whoami_hint(message)
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
+    let owner_user_id = message
+        .from
+        .as_ref()
+        .map(|u| u.id)
+        .unwrap_or(message.chat.id);
+    let chat_id = message.chat.id;
+    let tail = tail.trim();
+    if tail.is_empty() {
+        send_telegram_command_reply(
+            sender,
+            message,
+            &telegram_task_help_text(&command_settings.scheduler.default_timezone),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let mut tokens = tail.split_whitespace();
+    let action = tokens
+        .next()
+        .map(|v| v.to_ascii_lowercase())
+        .unwrap_or_default();
+    let rest = tail[action.len()..].trim();
+
+    match action.as_str() {
+        "list" => {
+            let jobs = ctx
+                .service
+                .list_telegram_scheduler_jobs_by_owner(
+                    ctx.channel_name.clone(),
+                    chat_id,
+                    owner_user_id,
+                    64,
+                )
+                .await?;
+            let text = telegram_task_list_text(&jobs, &command_settings.scheduler.default_timezone);
+            send_telegram_command_reply(sender, message, &text).await?;
+        }
+        "add" => {
+            let (when_raw, payload) = parse_task_schedule_and_payload(rest)?;
+            let run_at_unix = parse_scheduler_once_time(
+                when_raw.as_str(),
+                &command_settings.scheduler.default_timezone,
+            )?;
+            let now = current_unix_timestamp_i64();
+            if run_at_unix <= now {
+                send_telegram_command_reply(sender, message, "目标时间已过，请设置未来时间。")
+                    .await?;
+                return Ok(());
+            }
+            let draft = TelegramSchedulerIntentDraft {
+                task_kind: TelegramSchedulerTaskKind::Reminder,
+                schedule_kind: TelegramSchedulerScheduleKind::Once,
+                payload: payload.to_string(),
+                timezone: command_settings.scheduler.default_timezone.clone(),
+                run_at_unix: Some(run_at_unix),
+                cron_expr: None,
+                source_text: tail.to_string(),
+            };
+            let (job_id, next_run_at_unix) = create_scheduler_job_from_draft(
+                ctx,
+                chat_id,
+                message.message_thread_id,
+                owner_user_id,
+                &command_settings.scheduler,
+                &draft,
+            )
+            .await?;
+            let time_text = format_scheduler_time(
+                Some(next_run_at_unix),
+                &command_settings.scheduler.default_timezone,
+            );
+            send_telegram_command_reply(
+                sender,
+                message,
+                &format!(
+                    "已创建一次性任务。\nID: {job_id}\n执行时间: {time_text}\n内容: {}",
+                    payload
+                ),
+            )
+            .await?;
+        }
+        "every" => {
+            let (cron_raw, payload) = parse_task_schedule_and_payload(rest)?;
+            let draft = TelegramSchedulerIntentDraft {
+                task_kind: TelegramSchedulerTaskKind::Reminder,
+                schedule_kind: TelegramSchedulerScheduleKind::Cron,
+                payload: payload.to_string(),
+                timezone: command_settings.scheduler.default_timezone.clone(),
+                run_at_unix: None,
+                cron_expr: Some(cron_raw.to_string()),
+                source_text: tail.to_string(),
+            };
+            let (job_id, next_run_at_unix) = create_scheduler_job_from_draft(
+                ctx,
+                chat_id,
+                message.message_thread_id,
+                owner_user_id,
+                &command_settings.scheduler,
+                &draft,
+            )
+            .await?;
+            let next_time = format_scheduler_time(
+                Some(next_run_at_unix),
+                &command_settings.scheduler.default_timezone,
+            );
+            send_telegram_command_reply(
+                sender,
+                message,
+                &format!(
+                    "已创建周期任务。\nID: {job_id}\nCron: {cron_raw}\n下次执行: {next_time}\n内容: {}",
+                    payload
+                ),
+            )
+            .await?;
+        }
+        "pause" | "resume" | "del" => {
+            let job_id = rest.trim();
+            if job_id.is_empty() {
+                send_telegram_command_reply(
+                    sender,
+                    message,
+                    "缺少任务 ID。\n示例: /task pause <job_id>",
+                )
+                .await?;
+                return Ok(());
+            }
+            let status = match action.as_str() {
+                "pause" => TelegramSchedulerJobStatus::Paused,
+                "resume" => TelegramSchedulerJobStatus::Active,
+                _ => TelegramSchedulerJobStatus::Canceled,
+            };
+            let updated = ctx
+                .service
+                .update_telegram_scheduler_job_status(
+                    ctx.channel_name.clone(),
+                    chat_id,
+                    owner_user_id,
+                    job_id.to_string(),
+                    status,
+                )
+                .await?;
+            let text = if updated {
+                match action.as_str() {
+                    "pause" => format!("任务已暂停: {job_id}"),
+                    "resume" => format!("任务已恢复: {job_id}"),
+                    _ => format!("任务已删除: {job_id}"),
+                }
+            } else {
+                format!("未找到可更新的任务: {job_id}")
+            };
+            send_telegram_command_reply(sender, message, &text).await?;
+        }
+        _ => {
+            send_telegram_command_reply(
+                sender,
+                message,
+                &format!(
+                    "未知 task 子命令: {action}\n\n{}",
+                    telegram_task_help_text(&command_settings.scheduler.default_timezone)
+                ),
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn maybe_handle_telegram_scheduler_natural_language(
+    ctx: &ChannelContext,
+    sender: &TelegramSender,
+    message: &TelegramMessage,
+    text: &str,
+    scheduler_settings: &TelegramSchedulerSettings,
+) -> anyhow::Result<bool> {
+    let owner_user_id = message
+        .from
+        .as_ref()
+        .map(|u| u.id)
+        .unwrap_or(message.chat.id);
+    let chat_id = message.chat.id;
+    let now_unix = current_unix_timestamp_i64();
+    let channel_name = ctx.channel_name.clone();
+
+    let pending = ctx
+        .service
+        .load_telegram_scheduler_pending_intent(
+            channel_name.clone(),
+            chat_id,
+            owner_user_id,
+            now_unix,
+        )
+        .await?;
+
+    if let Some(pending) = pending {
+        if is_scheduler_confirm_text(text) {
+            let draft: TelegramSchedulerIntentDraft =
+                match serde_json::from_str(pending.draft_json.as_str()) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        let _ = ctx
+                            .service
+                            .delete_telegram_scheduler_pending_intent(
+                                channel_name.clone(),
+                                chat_id,
+                                owner_user_id,
+                            )
+                            .await;
+                        send_telegram_command_reply(
+                            sender,
+                            message,
+                            &format!("待确认任务草案已损坏，已清理。请重新描述任务。\n错误: {err}"),
+                        )
+                        .await?;
+                        return Ok(true);
+                    }
+                };
+
+            match create_scheduler_job_from_draft(
+                ctx,
+                chat_id,
+                message.message_thread_id,
+                owner_user_id,
+                scheduler_settings,
+                &draft,
+            )
+            .await
+            {
+                Ok((job_id, next_run_at_unix)) => {
+                    let _ = ctx
+                        .service
+                        .delete_telegram_scheduler_pending_intent(
+                            channel_name.clone(),
+                            chat_id,
+                            owner_user_id,
+                        )
+                        .await;
+                    let next_time = format_scheduler_time(Some(next_run_at_unix), &draft.timezone);
+                    send_telegram_command_reply(
+                        sender,
+                        message,
+                        &format!(
+                            "已确认并创建任务。\nID: {job_id}\n类型: {}\n下次执行: {next_time}\n内容: {}",
+                            draft.schedule_kind.as_str(),
+                            draft.payload
+                        ),
+                    )
+                    .await?;
+                }
+                Err(err) => {
+                    send_telegram_command_reply(
+                        sender,
+                        message,
+                        &format!("确认失败: {err}\n你可以修改后重试，或回复“取消”丢弃草案。"),
+                    )
+                    .await?;
+                }
+            }
+            return Ok(true);
+        }
+
+        if is_scheduler_cancel_text(text) {
+            let _ = ctx
+                .service
+                .delete_telegram_scheduler_pending_intent(
+                    channel_name.clone(),
+                    chat_id,
+                    owner_user_id,
+                )
+                .await;
+            send_telegram_command_reply(sender, message, "已取消当前待确认定时任务。").await?;
+            return Ok(true);
+        }
+
+        if try_handle_scheduler_management_text(
+            ctx,
+            sender,
+            message,
+            text,
+            scheduler_settings,
+            chat_id,
+            owner_user_id,
+        )
+        .await?
+        {
+            return Ok(true);
+        }
+
+        if let Some(intent) = ctx
+            .service
+            .detect_telegram_scheduler_intent(
+                text,
+                scheduler_settings.default_timezone.as_str(),
+                now_unix,
+                Some(pending.draft_json.as_str()),
+            )
+            .await?
+            && intent.confidence >= scheduler_settings.nl_min_confidence
+            && matches!(intent.action.as_str(), "create" | "update")
+            && let Some(updated_draft) = build_scheduler_draft_from_intent(
+                &intent,
+                text,
+                scheduler_settings.default_timezone.as_str(),
+                now_unix,
+            )?
+        {
+            upsert_scheduler_pending_intent(
+                ctx,
+                chat_id,
+                owner_user_id,
+                &updated_draft,
+                now_unix + TELEGRAM_SCHEDULER_PENDING_TTL_SECS,
+            )
+            .await?;
+            send_telegram_command_reply(
+                sender,
+                message,
+                &format!(
+                    "已更新任务草案:\n{}\n\n回复“确认”创建任务，回复“取消”放弃草案。",
+                    describe_scheduler_draft(&updated_draft)
+                ),
+            )
+            .await?;
+            return Ok(true);
+        }
+    }
+
+    if try_handle_scheduler_management_text(
+        ctx,
+        sender,
+        message,
+        text,
+        scheduler_settings,
+        chat_id,
+        owner_user_id,
+    )
+    .await?
+    {
+        return Ok(true);
+    }
+
+    let Some(intent) = ctx
+        .service
+        .detect_telegram_scheduler_intent(
+            text,
+            scheduler_settings.default_timezone.as_str(),
+            now_unix,
+            None,
+        )
+        .await?
+    else {
+        return Ok(false);
+    };
+
+    if intent.confidence < scheduler_settings.nl_min_confidence {
+        return Ok(false);
+    }
+
+    match intent.action.as_str() {
+        "list" => {
+            let jobs = ctx
+                .service
+                .list_telegram_scheduler_jobs_by_owner(channel_name, chat_id, owner_user_id, 64)
+                .await?;
+            let text = telegram_task_list_text(&jobs, &scheduler_settings.default_timezone);
+            send_telegram_command_reply(sender, message, &text).await?;
+            Ok(true)
+        }
+        "delete" | "pause" | "resume" | "cancel" => {
+            let op = resolve_scheduler_job_operation_from_intent(&intent).or_else(|| {
+                if intent.action == "cancel" {
+                    Some(SchedulerJobOperation::Delete)
+                } else {
+                    None
+                }
+            });
+            let Some(op) = op else {
+                return Ok(false);
+            };
+            let explicit_job_id = intent
+                .job_id
+                .as_deref()
+                .and_then(normalize_scheduler_job_id)
+                .or_else(|| extract_scheduler_job_id(text));
+            let resolved = resolve_scheduler_job_target(
+                ctx,
+                chat_id,
+                owner_user_id,
+                op,
+                explicit_job_id,
+                text,
+            )
+            .await?;
+            execute_scheduler_job_operation_with_resolution(
+                ctx,
+                sender,
+                message,
+                scheduler_settings,
+                chat_id,
+                owner_user_id,
+                op,
+                resolved,
+            )
+            .await?;
+            Ok(true)
+        }
+        "create" | "update" => {
+            let Some(draft) = build_scheduler_draft_from_intent(
+                &intent,
+                text,
+                scheduler_settings.default_timezone.as_str(),
+                now_unix,
+            )?
+            else {
+                return Ok(false);
+            };
+
+            if scheduler_settings.require_confirm {
+                upsert_scheduler_pending_intent(
+                    ctx,
+                    chat_id,
+                    owner_user_id,
+                    &draft,
+                    now_unix + TELEGRAM_SCHEDULER_PENDING_TTL_SECS,
+                )
+                .await?;
+                send_telegram_command_reply(
+                    sender,
+                    message,
+                    &format!(
+                        "识别到定时任务草案:\n{}\n\n回复“确认”创建任务，回复“取消”放弃草案。",
+                        describe_scheduler_draft(&draft)
+                    ),
+                )
+                .await?;
+                Ok(true)
+            } else {
+                let (job_id, next_run_at_unix) = create_scheduler_job_from_draft(
+                    ctx,
+                    chat_id,
+                    message.message_thread_id,
+                    owner_user_id,
+                    scheduler_settings,
+                    &draft,
+                )
+                .await?;
+                send_telegram_command_reply(
+                    sender,
+                    message,
+                    &format!(
+                        "已创建任务。\nID: {job_id}\n下次执行: {}\n内容: {}",
+                        format_scheduler_time(Some(next_run_at_unix), &draft.timezone),
+                        draft.payload
+                    ),
+                )
+                .await?;
+                Ok(true)
+            }
+        }
+        _ => Ok(false),
+    }
+}
+
+async fn try_handle_scheduler_management_text(
+    ctx: &ChannelContext,
+    sender: &TelegramSender,
+    message: &TelegramMessage,
+    text: &str,
+    scheduler_settings: &TelegramSchedulerSettings,
+    chat_id: i64,
+    owner_user_id: i64,
+) -> anyhow::Result<bool> {
+    if looks_like_scheduler_list_text(text) {
+        let jobs = ctx
+            .service
+            .list_telegram_scheduler_jobs_by_owner(
+                ctx.channel_name.clone(),
+                chat_id,
+                owner_user_id,
+                64,
+            )
+            .await?;
+        let text = telegram_task_list_text(&jobs, &scheduler_settings.default_timezone);
+        send_telegram_command_reply(sender, message, &text).await?;
+        return Ok(true);
+    }
+
+    let Some(op) = detect_scheduler_job_operation_keyword(text) else {
+        return Ok(false);
+    };
+    let explicit_job_id = extract_scheduler_job_id(text);
+    let resolved =
+        resolve_scheduler_job_target(ctx, chat_id, owner_user_id, op, explicit_job_id, text)
+            .await?;
+    execute_scheduler_job_operation_with_resolution(
+        ctx,
+        sender,
+        message,
+        scheduler_settings,
+        chat_id,
+        owner_user_id,
+        op,
+        resolved,
+    )
+    .await?;
+    Ok(true)
+}
+
+async fn resolve_scheduler_job_target(
+    ctx: &ChannelContext,
+    chat_id: i64,
+    owner_user_id: i64,
+    op: SchedulerJobOperation,
+    explicit_job_id: Option<String>,
+    raw_text: &str,
+) -> anyhow::Result<SchedulerJobTargetResolution> {
+    if let Some(job_id) = explicit_job_id {
+        return Ok(SchedulerJobTargetResolution::Selected {
+            job_id,
+            inferred: false,
+        });
+    }
+
+    let jobs = ctx
+        .service
+        .list_telegram_scheduler_jobs_by_owner(ctx.channel_name.clone(), chat_id, owner_user_id, 64)
+        .await?;
+
+    let mut candidates = jobs
+        .into_iter()
+        .filter(|job| match op {
+            SchedulerJobOperation::Pause => job.status == TelegramSchedulerJobStatus::Active,
+            SchedulerJobOperation::Resume => job.status == TelegramSchedulerJobStatus::Paused,
+            SchedulerJobOperation::Delete => job.status != TelegramSchedulerJobStatus::Canceled,
+        })
+        .collect::<Vec<_>>();
+
+    if candidates.is_empty() {
+        return Ok(SchedulerJobTargetResolution::Empty);
+    }
+    if candidates.len() == 1 {
+        return Ok(SchedulerJobTargetResolution::Selected {
+            job_id: candidates.remove(0).job_id,
+            inferred: true,
+        });
+    }
+
+    if text_implies_latest_target(raw_text)
+        || matches!(
+            op,
+            SchedulerJobOperation::Pause | SchedulerJobOperation::Resume
+        )
+    {
+        return Ok(SchedulerJobTargetResolution::Selected {
+            job_id: candidates.remove(0).job_id,
+            inferred: true,
+        });
+    }
+
+    Ok(SchedulerJobTargetResolution::Ambiguous {
+        options: candidates.into_iter().take(5).collect(),
+    })
+}
+
+async fn execute_scheduler_job_operation_with_resolution(
+    ctx: &ChannelContext,
+    sender: &TelegramSender,
+    message: &TelegramMessage,
+    scheduler_settings: &TelegramSchedulerSettings,
+    chat_id: i64,
+    owner_user_id: i64,
+    op: SchedulerJobOperation,
+    resolved: SchedulerJobTargetResolution,
+) -> anyhow::Result<()> {
+    match resolved {
+        SchedulerJobTargetResolution::Empty => {
+            send_telegram_command_reply(
+                sender,
+                message,
+                "没有找到可操作的任务。可先发送 `/task list` 查看。",
+            )
+            .await?;
+        }
+        SchedulerJobTargetResolution::Ambiguous { options } => {
+            let hint = format_scheduler_operation_hint(op);
+            let choices = format_scheduler_operation_candidates(
+                &options,
+                &scheduler_settings.default_timezone,
+            );
+            send_telegram_command_reply(
+                sender,
+                message,
+                &format!(
+                    "匹配到多个任务，暂未自动执行 {}。\n{}\n\n请补充任务 ID（例如：`{} task-...`）。",
+                    hint,
+                    choices,
+                    hint
+                ),
+            )
+            .await?;
+        }
+        SchedulerJobTargetResolution::Selected { job_id, inferred } => {
+            execute_scheduler_job_operation(
+                ctx,
+                sender,
+                message,
+                chat_id,
+                owner_user_id,
+                op,
+                &job_id,
+                inferred,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn execute_scheduler_job_operation(
+    ctx: &ChannelContext,
+    sender: &TelegramSender,
+    message: &TelegramMessage,
+    chat_id: i64,
+    owner_user_id: i64,
+    op: SchedulerJobOperation,
+    job_id: &str,
+    inferred: bool,
+) -> anyhow::Result<()> {
+    let status = match op {
+        SchedulerJobOperation::Pause => TelegramSchedulerJobStatus::Paused,
+        SchedulerJobOperation::Resume => TelegramSchedulerJobStatus::Active,
+        SchedulerJobOperation::Delete => TelegramSchedulerJobStatus::Canceled,
+    };
+
+    let text_prefix = match op {
+        SchedulerJobOperation::Pause => "任务已暂停",
+        SchedulerJobOperation::Resume => "任务已恢复",
+        SchedulerJobOperation::Delete => "任务已删除",
+    };
+
+    let updated = ctx
+        .service
+        .update_telegram_scheduler_job_status(
+            ctx.channel_name.clone(),
+            chat_id,
+            owner_user_id,
+            job_id.to_string(),
+            status,
+        )
+        .await?;
+
+    let text = if updated {
+        if inferred {
+            format!("{text_prefix}: {job_id}\n已自动定位目标任务。")
+        } else {
+            format!("{text_prefix}: {job_id}")
+        }
+    } else {
+        format!("未找到可更新的任务: {job_id}")
+    };
+    send_telegram_command_reply(sender, message, &text).await?;
+    Ok(())
+}
+
+async fn upsert_scheduler_pending_intent(
+    ctx: &ChannelContext,
+    chat_id: i64,
+    owner_user_id: i64,
+    draft: &TelegramSchedulerIntentDraft,
+    expires_at_unix: i64,
+) -> anyhow::Result<()> {
+    let intent_id = format!("pending:{}:{}:{}", ctx.channel_name, chat_id, owner_user_id);
+    let draft_json = serde_json::to_string(draft).context("failed to encode scheduler draft")?;
+    ctx.service
+        .upsert_telegram_scheduler_pending_intent(UpsertTelegramSchedulerPendingIntentRequest {
+            intent_id,
+            channel: ctx.channel_name.clone(),
+            chat_id,
+            owner_user_id,
+            draft_json,
+            expires_at_unix,
+        })
+        .await
+}
+
+fn describe_scheduler_draft(draft: &TelegramSchedulerIntentDraft) -> String {
+    let schedule = match draft.schedule_kind {
+        TelegramSchedulerScheduleKind::Once => {
+            format!(
+                "一次性 @ {}",
+                format_scheduler_time(draft.run_at_unix, &draft.timezone)
+            )
+        }
+        TelegramSchedulerScheduleKind::Cron => format!(
+            "周期 cron({}) next @ {}",
+            draft.cron_expr.clone().unwrap_or_else(|| "-".to_string()),
+            format_scheduler_time(draft.run_at_unix, &draft.timezone)
+        ),
+    };
+    format!(
+        "类型: {}\n时区: {}\n内容: {}\n原始: {}",
+        schedule, draft.timezone, draft.payload, draft.source_text
+    )
+}
+
+fn is_scheduler_confirm_text(text: &str) -> bool {
+    matches!(
+        text.trim().to_ascii_lowercase().as_str(),
+        "确认" | "确定" | "yes" | "y" | "ok" | "okay" | "confirm"
+    )
+}
+
+fn is_scheduler_cancel_text(text: &str) -> bool {
+    matches!(
+        text.trim().to_ascii_lowercase().as_str(),
+        "取消" | "不用了" | "算了" | "no" | "n" | "cancel" | "stop"
+    )
+}
+
+fn looks_like_scheduler_list_text(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    let zh_hit = ["任务列表", "查看任务", "列出任务", "有哪些任务", "看看任务"]
+        .iter()
+        .any(|k| text.contains(k));
+    if zh_hit {
+        return true;
+    }
+    let en_hit = ["list task", "list tasks", "show tasks", "show task"]
+        .iter()
+        .any(|k| lower.contains(k));
+    en_hit
+}
+
+fn detect_scheduler_job_operation_keyword(text: &str) -> Option<SchedulerJobOperation> {
+    let lower = text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+    let pause_hit = ["暂停任务", "停用任务", "pause task", "pause任务"]
+        .iter()
+        .any(|k| text.contains(k) || lower.contains(k));
+    if pause_hit {
+        return Some(SchedulerJobOperation::Pause);
+    }
+    let resume_hit = [
+        "恢复任务",
+        "继续任务",
+        "启用任务",
+        "resume task",
+        "start task",
+    ]
+    .iter()
+    .any(|k| text.contains(k) || lower.contains(k));
+    if resume_hit {
+        return Some(SchedulerJobOperation::Resume);
+    }
+    let delete_hit = [
+        "删除任务",
+        "删掉任务",
+        "取消任务",
+        "delete task",
+        "remove task",
+        "cancel task",
+    ]
+    .iter()
+    .any(|k| text.contains(k) || lower.contains(k));
+    if delete_hit {
+        return Some(SchedulerJobOperation::Delete);
+    }
+    None
+}
+
+fn extract_scheduler_job_id(text: &str) -> Option<String> {
+    if let Some(found) = normalize_scheduler_job_id(text) {
+        return Some(found);
+    }
+    for (start, _) in text.match_indices("task-") {
+        let mut end = start;
+        for (idx, ch) in text[start..].char_indices() {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':') {
+                end = start + idx + ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if end > start {
+            let candidate = &text[start..end];
+            if let Some(normalized) = normalize_scheduler_job_id(candidate) {
+                return Some(normalized);
+            }
+        }
+    }
+    None
+}
+
+fn normalize_scheduler_job_id(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_matches(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '`' | '"' | '\'' | ',' | '，' | '.' | '。' | ';' | '；' | ')' | '(' | '[' | ']'
+            )
+    });
+    if !trimmed.starts_with("task-") || trimmed.len() <= 5 {
+        return None;
+    }
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':'))
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn resolve_scheduler_job_operation_from_intent(
+    intent: &TelegramSchedulerIntent,
+) -> Option<SchedulerJobOperation> {
+    if let Some(op) = intent.job_operation.as_deref() {
+        match op {
+            "pause" => return Some(SchedulerJobOperation::Pause),
+            "resume" => return Some(SchedulerJobOperation::Resume),
+            "delete" => return Some(SchedulerJobOperation::Delete),
+            _ => {}
+        }
+    }
+    match intent.action.as_str() {
+        "pause" => Some(SchedulerJobOperation::Pause),
+        "resume" => Some(SchedulerJobOperation::Resume),
+        "delete" => Some(SchedulerJobOperation::Delete),
+        _ => None,
+    }
+}
+
+fn text_implies_latest_target(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    [
+        "最新",
+        "最近",
+        "刚刚",
+        "上一个",
+        "上次",
+        "latest",
+        "recent",
+        "last",
+    ]
+    .iter()
+    .any(|k| text.contains(k) || lower.contains(k))
+}
+
+fn format_scheduler_operation_hint(op: SchedulerJobOperation) -> &'static str {
+    match op {
+        SchedulerJobOperation::Pause => "pause",
+        SchedulerJobOperation::Resume => "resume",
+        SchedulerJobOperation::Delete => "del",
+    }
+}
+
+fn format_scheduler_operation_candidates(
+    options: &[TelegramSchedulerJobRecord],
+    timezone: &str,
+) -> String {
+    if options.is_empty() {
+        return "-".to_string();
+    }
+    let mut lines = vec!["候选任务:".to_string()];
+    for item in options.iter().take(5) {
+        let schedule = match item.schedule_kind {
+            TelegramSchedulerScheduleKind::Once => {
+                format!(
+                    "once@{}",
+                    format_scheduler_time(item.next_run_at_unix, timezone)
+                )
+            }
+            TelegramSchedulerScheduleKind::Cron => format!(
+                "cron({}) next@{}",
+                item.cron_expr.clone().unwrap_or_else(|| "-".to_string()),
+                format_scheduler_time(item.next_run_at_unix, timezone)
+            ),
+        };
+        lines.push(format!(
+            "- {} [{}] {} | {}",
+            item.job_id,
+            item.status.as_str(),
+            schedule,
+            truncate_chars(item.payload.trim(), 60)
+        ));
+    }
+    lines.join("\n")
+}
+
+fn build_scheduler_draft_from_intent(
+    intent: &TelegramSchedulerIntent,
+    source_text: &str,
+    default_timezone: &str,
+    now_unix: i64,
+) -> anyhow::Result<Option<TelegramSchedulerIntentDraft>> {
+    let schedule_kind = match intent
+        .schedule_kind
+        .as_deref()
+        .map(|v| v.trim().to_ascii_lowercase())
+    {
+        Some(v) if v == "cron" => TelegramSchedulerScheduleKind::Cron,
+        Some(v) if v == "once" => TelegramSchedulerScheduleKind::Once,
+        _ => return Ok(None),
+    };
+    let task_kind = match intent
+        .task_kind
+        .as_deref()
+        .map(|v| v.trim().to_ascii_lowercase())
+    {
+        Some(v) if v == "agent" => TelegramSchedulerTaskKind::Agent,
+        _ => TelegramSchedulerTaskKind::Reminder,
+    };
+    let payload = match intent.payload.as_deref().map(str::trim) {
+        Some(v) if !v.is_empty() => v.to_string(),
+        _ => return Ok(None),
+    };
+    let timezone = intent
+        .timezone
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or(default_timezone)
+        .to_string();
+
+    let (run_at_unix, cron_expr) = match schedule_kind {
+        TelegramSchedulerScheduleKind::Once => {
+            let Some(run_at_raw) = intent.run_at.as_deref() else {
+                return Ok(None);
+            };
+            let run_at_unix = parse_scheduler_once_time(run_at_raw, timezone.as_str())?;
+            if run_at_unix <= now_unix {
+                return Ok(None);
+            }
+            (Some(run_at_unix), None)
+        }
+        TelegramSchedulerScheduleKind::Cron => {
+            let Some(expr) = intent.cron_expr.as_deref().map(str::trim) else {
+                return Ok(None);
+            };
+            if expr.is_empty() {
+                return Ok(None);
+            }
+            let next = compute_next_run_at_unix(
+                &ScheduleSpec::Cron {
+                    expr: expr.to_string(),
+                },
+                now_unix,
+                timezone.as_str(),
+            )?;
+            let Some(next_run) = next else {
+                return Ok(None);
+            };
+            (Some(next_run), Some(expr.to_string()))
+        }
+    };
+
+    Ok(Some(TelegramSchedulerIntentDraft {
+        task_kind,
+        schedule_kind,
+        payload,
+        timezone,
+        run_at_unix,
+        cron_expr,
+        source_text: source_text.trim().to_string(),
+    }))
+}
+
+async fn create_scheduler_job_from_draft(
+    ctx: &ChannelContext,
+    chat_id: i64,
+    message_thread_id: Option<i64>,
+    owner_user_id: i64,
+    scheduler_settings: &TelegramSchedulerSettings,
+    draft: &TelegramSchedulerIntentDraft,
+) -> anyhow::Result<(String, i64)> {
+    enforce_scheduler_job_quota(
+        ctx,
+        chat_id,
+        owner_user_id,
+        scheduler_settings.max_jobs_per_owner,
+    )
+    .await?;
+
+    let next_run_at_unix = match draft.schedule_kind {
+        TelegramSchedulerScheduleKind::Once => {
+            draft.run_at_unix.context("once draft missing run_at")?
+        }
+        TelegramSchedulerScheduleKind::Cron => {
+            let expr = draft
+                .cron_expr
+                .clone()
+                .context("cron draft missing cron_expr")?;
+            compute_next_run_at_unix(
+                &ScheduleSpec::Cron { expr },
+                current_unix_timestamp_i64(),
+                draft.timezone.as_str(),
+            )?
+            .context("failed to compute next run time for cron draft")?
+        }
+    };
+    let job_id = build_scheduler_job_id(chat_id, owner_user_id);
+
+    ctx.service
+        .create_telegram_scheduler_job(CreateTelegramSchedulerJobRequest {
+            job_id: job_id.clone(),
+            channel: ctx.channel_name.clone(),
+            chat_id,
+            message_thread_id,
+            owner_user_id,
+            status: TelegramSchedulerJobStatus::Active,
+            task_kind: draft.task_kind,
+            payload: draft.payload.clone(),
+            schedule_kind: draft.schedule_kind,
+            timezone: draft.timezone.clone(),
+            run_at_unix: if matches!(draft.schedule_kind, TelegramSchedulerScheduleKind::Once) {
+                Some(next_run_at_unix)
+            } else {
+                None
+            },
+            cron_expr: draft.cron_expr.clone(),
+            next_run_at_unix: Some(next_run_at_unix),
+            max_runs: if matches!(draft.schedule_kind, TelegramSchedulerScheduleKind::Once) {
+                Some(1)
+            } else {
+                None
+            },
+        })
+        .await?;
+
+    Ok((job_id, next_run_at_unix))
+}
+
+async fn enforce_scheduler_job_quota(
+    ctx: &ChannelContext,
+    chat_id: i64,
+    owner_user_id: i64,
+    max_jobs_per_owner: usize,
+) -> anyhow::Result<()> {
+    let jobs = ctx
+        .service
+        .list_telegram_scheduler_jobs_by_owner(
+            ctx.channel_name.clone(),
+            chat_id,
+            owner_user_id,
+            max_jobs_per_owner.saturating_add(1),
+        )
+        .await?;
+    let used = jobs
+        .iter()
+        .filter(|job| {
+            matches!(
+                job.status,
+                TelegramSchedulerJobStatus::Active | TelegramSchedulerJobStatus::Paused
+            )
+        })
+        .count();
+    if used >= max_jobs_per_owner {
+        bail!("任务数量已达上限({max_jobs_per_owner})，请先删除/暂停部分任务后再创建。");
+    }
+    Ok(())
+}
+
+fn parse_task_schedule_and_payload(raw: &str) -> anyhow::Result<(String, String)> {
+    let (left, right) = raw
+        .split_once('|')
+        .context("格式错误，缺少 `|` 分隔符。示例: /task add 2026-03-01 09:00 | 提醒我开会")?;
+    let schedule = left.trim();
+    let payload = right.trim();
+    if schedule.is_empty() || payload.is_empty() {
+        bail!("格式错误，时间和内容都不能为空。");
+    }
+    Ok((schedule.to_string(), payload.to_string()))
+}
+
+fn parse_scheduler_once_time(raw: &str, default_timezone: &str) -> anyhow::Result<i64> {
+    let input = raw.trim();
+    if input.is_empty() {
+        bail!("缺少执行时间。");
+    }
+    if let Ok(unix) = input.parse::<i64>() {
+        return Ok(unix);
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(input) {
+        return Ok(dt.timestamp());
+    }
+
+    let timezone = default_timezone
+        .parse::<Tz>()
+        .with_context(|| format!("invalid timezone '{default_timezone}'"))?;
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y/%m/%d %H:%M",
+    ] {
+        if let Ok(local_naive) = NaiveDateTime::parse_from_str(input, fmt)
+            && let Some(local_dt) = timezone.from_local_datetime(&local_naive).single()
+        {
+            return Ok(local_dt.with_timezone(&Utc).timestamp());
+        }
+    }
+
+    bail!(
+        "不支持的时间格式。支持: Unix 秒时间戳 / RFC3339 / YYYY-MM-DD HH:MM（默认时区 {}）",
+        default_timezone
+    );
+}
+
+fn build_scheduler_job_id(chat_id: i64, owner_user_id: i64) -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("task-{chat_id}-{owner_user_id}-{millis}")
+}
+
+fn format_scheduler_time(unix: Option<i64>, timezone: &str) -> String {
+    let Some(unix) = unix else {
+        return "-".to_string();
+    };
+    let tz: Tz = timezone.parse().unwrap_or(chrono_tz::UTC);
+    match tz.timestamp_opt(unix, 0).single() {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M:%S %Z").to_string(),
+        None => unix.to_string(),
+    }
+}
+
+fn telegram_task_list_text(jobs: &[TelegramSchedulerJobRecord], timezone: &str) -> String {
+    if jobs.is_empty() {
+        return "当前没有定时任务。".to_string();
+    }
+    let mut lines = vec!["你的定时任务:".to_string()];
+    for job in jobs.iter().take(64) {
+        let schedule_text = match job.schedule_kind {
+            TelegramSchedulerScheduleKind::Once => {
+                format!(
+                    "once@{}",
+                    format_scheduler_time(job.next_run_at_unix, timezone)
+                )
+            }
+            TelegramSchedulerScheduleKind::Cron => {
+                format!(
+                    "cron({}) next@{}",
+                    job.cron_expr.clone().unwrap_or_else(|| "-".to_string()),
+                    format_scheduler_time(job.next_run_at_unix, timezone)
+                )
+            }
+        };
+        lines.push(format!(
+            "- {} [{}] {} | {}",
+            job.job_id,
+            job.status.as_str(),
+            schedule_text,
+            truncate_chars(job.payload.trim(), 80)
+        ));
+    }
+    lines.join("\n")
 }
 
 fn evaluate_mcp_command_access(
@@ -2278,6 +3776,7 @@ fn parse_telegram_slash_command(
         "help" => Some(TelegramSlashCommand::Help),
         "whoami" => Some(TelegramSlashCommand::WhoAmI),
         "mcp" => Some(TelegramSlashCommand::Mcp { tail }),
+        "task" => Some(TelegramSlashCommand::Task { tail }),
         _ => Some(TelegramSlashCommand::Unknown { name: command }),
     }
 }
@@ -2297,6 +3796,29 @@ fn telegram_help_text() -> String {
         "/help - 查看帮助",
         "/whoami - 查看你的 Telegram 用户 ID",
         "/mcp - 管理 MCP 服务器（仅私聊管理员）",
+        "/task - 管理定时任务（仅私聊管理员）",
+    ]
+    .join("\n")
+}
+
+fn telegram_task_help_text(default_timezone: &str) -> String {
+    [
+        "定时任务命令:",
+        "/task list",
+        "/task add <时间> | <内容>",
+        "/task every <cron> | <内容>",
+        "/task pause <job_id>",
+        "/task resume <job_id>",
+        "/task del <job_id>",
+        "",
+        "时间支持:",
+        "- Unix 秒时间戳",
+        "- RFC3339，例如 2026-03-01T09:00:00+08:00",
+        &format!("- YYYY-MM-DD HH:MM（默认时区 {default_timezone}）"),
+        "",
+        "示例:",
+        "/task add 2026-03-01 09:00 | 提醒我参加晨会",
+        "/task every 0 9 * * * | 每天提醒我写日报",
     ]
     .join("\n")
 }
@@ -2324,6 +3846,7 @@ fn telegram_registered_commands() -> Vec<(&'static str, &'static str)> {
         ("help", "查看帮助"),
         ("whoami", "查看当前用户ID"),
         ("mcp", "管理 MCP 服务器"),
+        ("task", "管理定时任务"),
     ]
 }
 
@@ -3028,6 +4551,10 @@ fn current_unix_timestamp() -> u64 {
         .unwrap_or(0)
 }
 
+fn current_unix_timestamp_i64() -> i64 {
+    current_unix_timestamp() as i64
+}
+
 fn build_draft_message_id(chat_id: i64, message_thread_id: Option<i64>) -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3449,6 +4976,260 @@ fn truncate_chars(input: &str, max_chars: usize) -> String {
     input.chars().take(max_chars.max(1)).collect()
 }
 
+async fn run_telegram_scheduler_loop(
+    channel_name: String,
+    service: Arc<MessageService>,
+    sender: TelegramSender,
+    scheduler_settings: TelegramSchedulerSettings,
+    mut shutdown: watch::Receiver<bool>,
+    scheduler_diag_state: Arc<tokio::sync::Mutex<TelegramSchedulerDiagState>>,
+) {
+    info!(
+        channel = %channel_name,
+        tick_secs = scheduler_settings.tick_secs,
+        batch_size = scheduler_settings.batch_size,
+        lease_secs = scheduler_settings.lease_secs,
+        "telegram scheduler worker started"
+    );
+    {
+        let mut diag = scheduler_diag_state.lock().await;
+        diag.worker_started_at_unix = Some(current_unix_timestamp());
+    }
+
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+
+        let now_unix = current_unix_timestamp_i64();
+        let lease_token = format!(
+            "lease-{}-{}-{}",
+            channel_name,
+            now_unix,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        );
+
+        let claimed = match service
+            .claim_due_telegram_scheduler_jobs(
+                channel_name.clone(),
+                now_unix,
+                scheduler_settings.batch_size,
+                scheduler_settings.lease_secs as i64,
+                lease_token.clone(),
+            )
+            .await
+        {
+            Ok(items) => items,
+            Err(err) => {
+                let err_text = format!("{err:#}");
+                {
+                    let mut diag = scheduler_diag_state.lock().await;
+                    diag.last_tick_at_unix = Some(current_unix_timestamp());
+                    diag.last_error = Some(err_text.clone());
+                    diag.total_runs_err += 1;
+                    diag.last_run_err_at_unix = Some(current_unix_timestamp());
+                }
+                warn!(
+                    channel = %channel_name,
+                    error = %err_text,
+                    "telegram scheduler claim failed"
+                );
+                if wait_for_shutdown_or_timeout(
+                    &mut shutdown,
+                    Duration::from_secs(scheduler_settings.tick_secs),
+                )
+                .await
+                {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        {
+            let mut diag = scheduler_diag_state.lock().await;
+            diag.last_tick_at_unix = Some(current_unix_timestamp());
+            diag.last_claimed_jobs = claimed.len();
+            diag.total_claimed_jobs += claimed.len() as u64;
+        }
+
+        match service
+            .query_telegram_scheduler_stats(channel_name.clone(), now_unix)
+            .await
+        {
+            Ok(stats) => {
+                let mut diag = scheduler_diag_state.lock().await;
+                diag.jobs_total = stats.jobs_total;
+                diag.jobs_active = stats.jobs_active;
+                diag.jobs_paused = stats.jobs_paused;
+                diag.jobs_completed = stats.jobs_completed;
+                diag.jobs_canceled = stats.jobs_canceled;
+                diag.jobs_due = stats.jobs_due;
+            }
+            Err(err) => {
+                let err_text = format!("{err:#}");
+                {
+                    let mut diag = scheduler_diag_state.lock().await;
+                    diag.last_error = Some(err_text.clone());
+                }
+                warn!(
+                    channel = %channel_name,
+                    error = %err_text,
+                    "telegram scheduler stats query failed"
+                );
+            }
+        }
+
+        for job in claimed {
+            let started_at_unix = current_unix_timestamp_i64();
+            let execution: anyhow::Result<()> = async {
+                let outbound_text = match job.task_kind {
+                    TelegramSchedulerTaskKind::Reminder => job.payload.clone(),
+                    TelegramSchedulerTaskKind::Agent => {
+                        let session_id = format!("tg:{}:scheduler:{}", job.chat_id, job.job_id);
+                        let user_id = format!("scheduler:{}", job.owner_user_id);
+                        let reply = service
+                            .handle(IncomingMessage {
+                                channel: channel_name.clone(),
+                                session_id,
+                                user_id,
+                                text: job.payload.clone(),
+                                reply_target: Some(ReplyTarget::Telegram {
+                                    chat_id: job.chat_id,
+                                    message_thread_id: job.message_thread_id,
+                                }),
+                            })
+                            .await
+                            .context("failed to generate scheduler agent output")?;
+                        reply.text
+                    }
+                };
+
+                sender
+                    .send_message(job.chat_id, job.message_thread_id, None, &outbound_text)
+                    .await
+                    .context("failed to send scheduler telegram message")?;
+
+                let finished_at_unix = current_unix_timestamp_i64();
+                let next_run = match job.schedule_kind {
+                    TelegramSchedulerScheduleKind::Once => None,
+                    TelegramSchedulerScheduleKind::Cron => {
+                        let expr = job
+                            .cron_expr
+                            .clone()
+                            .context("cron scheduler job missing cron_expr")?;
+                        let timezone = if job.timezone.trim().is_empty() {
+                            scheduler_settings.default_timezone.clone()
+                        } else {
+                            job.timezone.clone()
+                        };
+                        compute_next_run_at_unix(
+                            &ScheduleSpec::Cron { expr },
+                            finished_at_unix,
+                            &timezone,
+                        )?
+                    }
+                };
+                let run_count_after = job.run_count.saturating_add(1);
+                let max_runs_reached = job
+                    .max_runs
+                    .map(|max| run_count_after >= max)
+                    .unwrap_or(false);
+                let mark_completed =
+                    matches!(job.schedule_kind, TelegramSchedulerScheduleKind::Once)
+                        || max_runs_reached
+                        || next_run.is_none();
+
+                service
+                    .complete_telegram_scheduler_job_run(CompleteTelegramSchedulerJobRunRequest {
+                        channel: channel_name.clone(),
+                        chat_id: job.chat_id,
+                        job_id: job.job_id.clone(),
+                        lease_token: lease_token.clone(),
+                        started_at_unix,
+                        finished_at_unix,
+                        next_run_at_unix: if mark_completed { None } else { next_run },
+                        mark_completed,
+                    })
+                    .await
+                    .context("failed to mark scheduler job success")?;
+                Ok(())
+            }
+            .await;
+
+            match execution {
+                Ok(()) => {
+                    let mut diag = scheduler_diag_state.lock().await;
+                    diag.total_runs_ok += 1;
+                    diag.last_run_ok_at_unix = Some(current_unix_timestamp());
+                    diag.last_error = None;
+                }
+                Err(err) => {
+                    let err_text = format!("{err:#}");
+                    let finished_at_unix = current_unix_timestamp_i64();
+                    let attempt = (job.run_count.max(0) as u32).saturating_add(1);
+                    let backoff = compute_retry_backoff_secs(attempt);
+                    let pause_job = attempt >= 8;
+                    let next_run_at_unix = if pause_job {
+                        None
+                    } else {
+                        Some(finished_at_unix + backoff)
+                    };
+
+                    if let Err(mark_err) = service
+                        .fail_telegram_scheduler_job_run(FailTelegramSchedulerJobRunRequest {
+                            channel: channel_name.clone(),
+                            chat_id: job.chat_id,
+                            job_id: job.job_id.clone(),
+                            lease_token: lease_token.clone(),
+                            started_at_unix,
+                            finished_at_unix,
+                            next_run_at_unix,
+                            pause_job,
+                            error: err_text.clone(),
+                        })
+                        .await
+                    {
+                        warn!(
+                            channel = %channel_name,
+                            job_id = %job.job_id,
+                            error = %format!("{mark_err:#}"),
+                            "failed to mark scheduler job failure"
+                        );
+                    }
+
+                    {
+                        let mut diag = scheduler_diag_state.lock().await;
+                        diag.total_runs_err += 1;
+                        diag.last_run_err_at_unix = Some(current_unix_timestamp());
+                        diag.last_error = Some(err_text.clone());
+                    }
+                    warn!(
+                        channel = %channel_name,
+                        job_id = %job.job_id,
+                        error = %err_text,
+                        "telegram scheduler job execution failed"
+                    );
+                }
+            }
+        }
+
+        if wait_for_shutdown_or_timeout(
+            &mut shutdown,
+            Duration::from_secs(scheduler_settings.tick_secs),
+        )
+        .await
+        {
+            break;
+        }
+    }
+
+    info!(channel = %channel_name, "telegram scheduler worker stopped");
+}
+
 async fn fetch_telegram_updates(
     client: &Client,
     bot_token: &str,
@@ -3529,14 +5310,31 @@ mod tests {
     use super::{
         GroupDecisionKind, GroupSignalInput, McpCommandAccess, PrivateChatAccess,
         TELEGRAM_MAX_TEXT_CHARS, TelegramCommandSettings, TelegramGroupTriggerMode,
-        TelegramGroupUserProfile, TelegramReplyMessage, TelegramSlashCommand, TelegramUser,
-        build_draft_message_id, build_group_member_identity_context, evaluate_group_decision,
-        evaluate_mcp_command_access, evaluate_private_chat_access,
+        TelegramGroupUserProfile, TelegramReplyMessage, TelegramSchedulerSettings,
+        TelegramSlashCommand, TelegramUser, build_draft_message_id,
+        build_group_member_identity_context, detect_scheduler_job_operation_keyword,
+        evaluate_group_decision, evaluate_mcp_command_access, evaluate_private_chat_access,
         extract_dynamic_alias_candidates, extract_realtime_name_correction,
-        is_reply_to_bot_message, message_mentions_bot, parse_admin_user_ids,
-        parse_telegram_slash_command, render_telegram_text_parts, short_description_payload,
-        telegram_session_id, truncate_chars, typing_action_payload,
+        extract_scheduler_job_id, is_reply_to_bot_message, looks_like_scheduler_list_text,
+        message_mentions_bot, parse_admin_user_ids, parse_telegram_slash_command,
+        render_telegram_text_parts, short_description_payload, telegram_help_text,
+        telegram_registered_commands, telegram_session_id, text_implies_latest_target,
+        truncate_chars, typing_action_payload,
     };
+
+    fn test_scheduler_settings() -> TelegramSchedulerSettings {
+        TelegramSchedulerSettings {
+            enabled: true,
+            tick_secs: 2,
+            batch_size: 8,
+            lease_secs: 30,
+            default_timezone: "Asia/Shanghai".to_string(),
+            nl_enabled: true,
+            nl_min_confidence: 0.78,
+            require_confirm: true,
+            max_jobs_per_owner: 64,
+        }
+    }
 
     #[test]
     fn think_block_is_stripped_and_only_body_is_sent() {
@@ -3829,6 +5627,64 @@ mod tests {
     }
 
     #[test]
+    fn parse_slash_command_supports_task() {
+        let parsed = parse_telegram_slash_command(
+            "/task add 2026-03-01T09:00:00+08:00 | 会议提醒",
+            Some("xiaomaolv_bot"),
+        );
+        assert_eq!(
+            parsed,
+            Some(TelegramSlashCommand::Task {
+                tail: "add 2026-03-01T09:00:00+08:00 | 会议提醒".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn telegram_help_and_registered_commands_include_task() {
+        let help = telegram_help_text();
+        assert!(help.contains("/task"));
+        let commands = telegram_registered_commands();
+        assert!(commands.iter().any(|(name, _)| *name == "task"));
+    }
+
+    #[test]
+    fn parse_task_schedule_and_payload_supports_pipe_format() {
+        let (schedule, payload) =
+            super::parse_task_schedule_and_payload("2026-03-01 09:00 | 提醒开会").expect("parse");
+        assert_eq!(schedule, "2026-03-01 09:00");
+        assert_eq!(payload, "提醒开会");
+    }
+
+    #[test]
+    fn parse_scheduler_once_time_supports_default_timezone_local_format() {
+        let unix = super::parse_scheduler_once_time("2026-03-01 09:00", "Asia/Shanghai")
+            .expect("parse time");
+        assert!(unix > 0);
+    }
+
+    #[test]
+    fn detect_scheduler_management_keywords_and_job_id() {
+        let text = "请帮我暂停任务 task-100-200-300";
+        let op = detect_scheduler_job_operation_keyword(text).expect("op");
+        assert_eq!(op, super::SchedulerJobOperation::Pause);
+        let job_id = extract_scheduler_job_id(text).expect("job id");
+        assert_eq!(job_id, "task-100-200-300");
+    }
+
+    #[test]
+    fn looks_like_scheduler_list_text_supports_cn_and_en() {
+        assert!(looks_like_scheduler_list_text("帮我看看任务列表"));
+        assert!(looks_like_scheduler_list_text("list tasks"));
+    }
+
+    #[test]
+    fn text_implies_latest_target_supports_cn_and_en() {
+        assert!(text_implies_latest_target("暂停最近那个任务"));
+        assert!(text_implies_latest_target("delete latest task"));
+    }
+
+    #[test]
     fn parse_admin_user_ids_supports_csv() {
         let ids = parse_admin_user_ids("123, 456 ,789").expect("ids");
         assert_eq!(ids, vec![123, 456, 789]);
@@ -3840,6 +5696,7 @@ mod tests {
             enabled: true,
             private_only: true,
             admin_user_ids: vec![42],
+            scheduler: test_scheduler_settings(),
         };
         let access = evaluate_mcp_command_access(false, Some(42), &settings);
         assert_eq!(access, McpCommandAccess::RequirePrivateChat);
@@ -3851,6 +5708,7 @@ mod tests {
             enabled: true,
             private_only: true,
             admin_user_ids: vec![42],
+            scheduler: test_scheduler_settings(),
         };
         let access = evaluate_mcp_command_access(true, Some(7), &settings);
         assert_eq!(access, McpCommandAccess::Unauthorized);
