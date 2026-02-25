@@ -11,6 +11,8 @@ pub struct AppConfig {
     pub channels: ChannelsConfig,
     #[serde(default)]
     pub memory: MemoryConfig,
+    #[serde(default)]
+    pub agent: AgentConfig,
 }
 
 impl AppConfig {
@@ -44,12 +46,16 @@ impl AppConfig {
 
         if let Some(telegram) = self.channels.telegram.as_mut() {
             telegram.bot_token = resolve_env_placeholder(&telegram.bot_token);
+            if let Some(username) = telegram.bot_username.as_mut() {
+                *username = resolve_env_placeholder(username);
+            }
             if let Some(secret) = telegram.webhook_secret.as_mut() {
                 *secret = resolve_env_placeholder(secret);
             }
             if let Some(mode) = telegram.mode.as_mut() {
                 *mode = resolve_env_placeholder(mode);
             }
+            telegram.startup_online_text = resolve_env_placeholder(&telegram.startup_online_text);
         }
 
         for channel in self.channels.plugins.values_mut() {
@@ -109,6 +115,7 @@ pub struct TelegramChannelConfig {
     #[serde(default = "default_disabled")]
     pub enabled: bool,
     pub bot_token: String,
+    pub bot_username: Option<String>,
     pub webhook_secret: Option<String>,
     pub mode: Option<String>,
     #[serde(default = "default_polling_timeout_secs")]
@@ -117,6 +124,12 @@ pub struct TelegramChannelConfig {
     pub streaming_enabled: bool,
     #[serde(default = "default_telegram_streaming_edit_interval_ms")]
     pub streaming_edit_interval_ms: u64,
+    #[serde(default = "default_telegram_streaming_prefer_draft")]
+    pub streaming_prefer_draft: bool,
+    #[serde(default = "default_telegram_startup_online_enabled")]
+    pub startup_online_enabled: bool,
+    #[serde(default = "default_telegram_startup_online_text")]
+    pub startup_online_text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +163,26 @@ impl Default for MemoryConfig {
             max_semantic_memories: default_max_semantic_memories(),
             semantic_lookback_days: default_semantic_lookback_days(),
             zvec: ZvecSidecarMemoryConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentConfig {
+    #[serde(default = "default_agent_mcp_enabled")]
+    pub mcp_enabled: bool,
+    #[serde(default = "default_agent_mcp_max_iterations")]
+    pub mcp_max_iterations: usize,
+    #[serde(default = "default_agent_mcp_max_tool_result_chars")]
+    pub mcp_max_tool_result_chars: usize,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            mcp_enabled: default_agent_mcp_enabled(),
+            mcp_max_iterations: default_agent_mcp_max_iterations(),
+            mcp_max_tool_result_chars: default_agent_mcp_max_tool_result_chars(),
         }
     }
 }
@@ -221,6 +254,18 @@ fn default_telegram_streaming_edit_interval_ms() -> u64 {
     900
 }
 
+fn default_telegram_streaming_prefer_draft() -> bool {
+    true
+}
+
+fn default_telegram_startup_online_enabled() -> bool {
+    false
+}
+
+fn default_telegram_startup_online_text() -> String {
+    "online".to_string()
+}
+
 fn default_memory_backend() -> String {
     "sqlite-only".to_string()
 }
@@ -257,11 +302,35 @@ fn default_zvec_query_path() -> String {
     "/v1/memory/query".to_string()
 }
 
+fn default_agent_mcp_enabled() -> bool {
+    true
+}
+
+fn default_agent_mcp_max_iterations() -> usize {
+    4
+}
+
+fn default_agent_mcp_max_tool_result_chars() -> usize {
+    4000
+}
+
 fn resolve_env_placeholder(value: &str) -> String {
     if value.starts_with("${") && value.ends_with('}') {
-        let key = &value[2..value.len() - 1];
+        let body = &value[2..value.len() - 1];
+        let (key, default_value) = if let Some((k, default)) = body.split_once(":-") {
+            (k, Some(default))
+        } else {
+            (body, None)
+        };
+
         if let Ok(env_value) = std::env::var(key) {
-            return env_value;
+            if !env_value.is_empty() {
+                return env_value;
+            }
+        }
+
+        if let Some(default) = default_value {
+            return default.to_string();
         }
     }
     value.to_string()
@@ -270,5 +339,37 @@ fn resolve_env_placeholder(value: &str) -> String {
 fn resolve_env_map(map: &mut HashMap<String, String>) {
     for value in map.values_mut() {
         *value = resolve_env_placeholder(value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_env_placeholder;
+
+    #[test]
+    fn resolve_env_placeholder_keeps_literal_for_missing_env_without_default() {
+        let value = "${XIAOMAOLV_TEST_UNSET_KEY_001}";
+        assert_eq!(resolve_env_placeholder(value), value);
+    }
+
+    #[test]
+    fn resolve_env_placeholder_uses_default_for_missing_env() {
+        let value = "${XIAOMAOLV_TEST_UNSET_KEY_002:-MiniMax-M2.5-highspeed}";
+        assert_eq!(
+            resolve_env_placeholder(value),
+            "MiniMax-M2.5-highspeed".to_string()
+        );
+    }
+
+    #[test]
+    fn resolve_env_placeholder_prefers_existing_env_over_default() {
+        let (key, expected_value) = std::env::vars()
+            .find(|(_, value)| !value.is_empty())
+            .expect("expected at least one env var");
+        let placeholder_with_default = format!("${{{key}:-fallback_value}}");
+        assert_eq!(
+            resolve_env_placeholder(&placeholder_with_default),
+            expected_value
+        );
     }
 }

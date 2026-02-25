@@ -23,6 +23,10 @@
 - 消息通道：HTTP + Telegram
 - Telegram 双模式：`polling`（默认）和 `webhook`（可选）
 - Telegram 流式回复（通过 `editMessageText` 增量更新）
+- Telegram 启动在线状态（通过 `setMyShortDescription`，可配置）
+- Telegram 群组支持：仅在被 `@bot_username` 时回复
+- 群组里如果用户 reply 了 bot 消息，bot 会引用该用户消息继续回复（`reply_to_message_id`）
+- 群组会话分组：优先按 `message_thread_id`（话题），否则按 `reply_to_message_id`
 - `<think>...</think>` 自动渲染为 Telegram 可折叠 spoiler
 - 记忆系统：`sqlite-only`（默认）和 `hybrid-sqlite-zvec`（可选）
 - 插件式扩展 API（Provider/Channel/Memory）
@@ -46,6 +50,11 @@ cp .env.realtest.example .env.realtest
 
 - `MINIMAX_API_KEY`
 - `TELEGRAM_BOT_TOKEN`
+
+可选模型覆盖：
+
+- `MINIMAX_MODEL`（默认：`MiniMax-M2.5-highspeed`）
+- `TELEGRAM_BOT_USERNAME`（不带 `@`，建议填写，用于群组@匹配）
 
 ### 3) 一键启动 MVP
 
@@ -98,10 +107,13 @@ curl -sS http://127.0.0.1:8080/v1/channels/telegram/mode
 [channels.telegram]
 enabled = true
 bot_token = "${TELEGRAM_BOT_TOKEN}"
+bot_username = "${TELEGRAM_BOT_USERNAME:-}"
 mode = "webhook"
 webhook_secret = "${TELEGRAM_WEBHOOK_SECRET}"
 streaming_enabled = true
 streaming_edit_interval_ms = 900
+startup_online_enabled = true
+startup_online_text = "${TELEGRAM_STARTUP_ONLINE_TEXT:-online}"
 ```
 
 2. 在 `.env.realtest` 中补齐：
@@ -134,9 +146,13 @@ Webhook 回调地址：
 
 - Provider：`[providers.<name>]`
 - 默认 Provider：`[app].default_provider`
+- MiniMax 模型（MVP 模板）：`model = "${MINIMAX_MODEL:-MiniMax-M2.5-highspeed}"`
 - Telegram 流式：
   - `streaming_enabled = true`
   - `streaming_edit_interval_ms = 900`
+  - `bot_username = "your_bot_username"`（群组仅@回复）
+  - `startup_online_enabled = true|false`（启动时写入 Bot 在线状态文案）
+  - `startup_online_text = "online"`（调用 Telegram `setMyShortDescription`）
 - 记忆模式：
   - `backend = "sqlite-only"`（默认）
   - `backend = "hybrid-sqlite-zvec"`（可选）

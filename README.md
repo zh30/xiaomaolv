@@ -13,6 +13,7 @@ Chinese version: `README.zh.md`
 - [Configuration Overview](#config-overview)
 - [Optional: Hybrid Memory (SQLite + zvec sidecar)](#hybrid-memory)
 - [HTTP API](#http-api)
+- [MCP Integration](#mcp-integration)
 - [Plugin Extensions (Provider / Channel)](#plugin-system)
 - [Local Development](#local-dev)
 - [Performance Smoke Test](#perf-smoke)
@@ -25,9 +26,17 @@ Chinese version: `README.zh.md`
 - Message channels: HTTP + Telegram
 - Telegram dual mode: `polling` (default) and `webhook` (optional)
 - Telegram streaming replies (incremental updates via `editMessageText`)
+- Telegram streaming prefers `sendMessageDraft` when supported, with automatic fallback
+- Telegram typing heartbeat: immediate `sendChatAction("typing")`, then every 5 seconds until completion
+- Telegram startup online status (via `setMyShortDescription`, configurable)
+- Telegram group support: only replies when the bot is mentioned (`@bot_username`)
+- In groups, if a user replies to a bot message, bot replies in quoted-thread mode (`reply_to_message_id`)
+- Group session routing uses `message_thread_id` (topics) or `reply_to_message_id`
+- Telegram long replies are auto-split when text exceeds 4096 characters
 - `<think>...</think>` auto-rendered as collapsible Telegram spoiler content
 - Memory backends: `sqlite-only` (default) and `hybrid-sqlite-zvec` (optional)
 - Plugin-style extension API for Provider/Channel/Memory
+- Agent MCP auto tool loop (configurable max iterations/result size)
 
 <a id="quick-start"></a>
 ## Quick Start (Recommended: MiniMax + Telegram)
@@ -48,6 +57,11 @@ Edit `.env.realtest` and fill at least:
 
 - `MINIMAX_API_KEY`
 - `TELEGRAM_BOT_TOKEN`
+
+Optional model override:
+
+- `MINIMAX_MODEL` (default: `MiniMax-M2.5-highspeed`)
+- `TELEGRAM_BOT_USERNAME` (without `@`, recommended for group mention matching)
 
 ### 3) Start MVP in one command
 
@@ -77,9 +91,11 @@ After MVP is running, use these docs in order:
 
 - `docs/real-test-minimax-telegram.md`: real MiniMax + Telegram integration (webhook setup/verification included)
 - `docs/zvec-sidecar.md`: zvec sidecar protocol, startup, compatibility details
+- `docs/mcp-integration.md`: MCP install model, CLI usage, HTTP tool-call API
 - `config/xiaomaolv.minimax-telegram.toml`: recommended MVP config
 - `config/xiaomaolv.example.toml`: generic template for custom provider/channel setups
 - `scripts/perf_smoke.sh`: machine sizing smoke test script
+- `scripts/debug_telegram_polling.sh`: one-command Telegram polling diagnostics (`getMe/getWebhookInfo/getUpdates`)
 
 <a id="run-modes"></a>
 ## Runtime Modes
@@ -100,10 +116,14 @@ Recommended for public production deployments.
 [channels.telegram]
 enabled = true
 bot_token = "${TELEGRAM_BOT_TOKEN}"
+bot_username = "${TELEGRAM_BOT_USERNAME:-}"
 mode = "webhook"
 webhook_secret = "${TELEGRAM_WEBHOOK_SECRET}"
 streaming_enabled = true
 streaming_edit_interval_ms = 900
+streaming_prefer_draft = true
+startup_online_enabled = true
+startup_online_text = "${TELEGRAM_STARTUP_ONLINE_TEXT:-online}"
 ```
 
 2. Fill in `.env.realtest`:
@@ -136,12 +156,21 @@ Key settings:
 
 - Provider config: `[providers.<name>]`
 - Default provider: `[app].default_provider`
+- MiniMax model (MVP template): `model = "${MINIMAX_MODEL:-MiniMax-M2.5-highspeed}"`
 - Telegram streaming:
   - `streaming_enabled = true`
   - `streaming_edit_interval_ms = 900`
+  - `streaming_prefer_draft = true` (fallback to `sendMessage` + `editMessageText` on unsupported chats/bots)
+  - `bot_username = "your_bot_username"` (group mode: only reply when mentioned)
+  - `startup_online_enabled = true|false` (set Telegram bot startup status text)
+  - `startup_online_text = "online"` (uses Telegram `setMyShortDescription`)
 - Memory mode:
   - `backend = "sqlite-only"` (default)
   - `backend = "hybrid-sqlite-zvec"` (optional)
+- Agent MCP:
+  - `mcp_enabled = true`
+  - `mcp_max_iterations = 4`
+  - `mcp_max_tool_result_chars = 4000`
 
 <a id="hybrid-memory"></a>
 ## Optional: Hybrid Memory (SQLite + zvec sidecar)
@@ -168,6 +197,7 @@ Core endpoints:
 - `GET /health`
 - `POST /v1/messages`
 - `GET /v1/channels/{channel}/mode`
+- `GET /v1/channels/{channel}/diag`
 - `POST /v1/channels/{channel}/inbound`
 - `POST /v1/channels/{channel}/inbound/{secret}`
 - `POST /v1/telegram/webhook/{secret}`
@@ -178,6 +208,80 @@ Example:
 curl -X POST http://127.0.0.1:8080/v1/messages \
   -H 'content-type: application/json' \
   -d '{"session_id":"demo-1","user_id":"u1","text":"hello"}'
+```
+
+<a id="mcp-integration"></a>
+## MCP Integration
+
+xiaomaolv supports MCP server management with a Claude-style install habit and exposes MCP runtime APIs.
+
+### CLI install/manage
+
+Claude-style stdio install (recommended):
+
+```bash
+xiaomaolv mcp add tavily --scope user -- npx -y @tavily/mcp-server
+```
+
+Classic explicit flags (still supported):
+
+```bash
+xiaomaolv mcp add brave --scope user --command npx --arg -y --arg @brave/mcp-server
+```
+
+HTTP transport install:
+
+```bash
+xiaomaolv mcp add internal-http --transport http --url http://127.0.0.1:8787/mcp \
+  --header "Authorization=Bearer YOUR_TOKEN"
+```
+
+Other operations:
+
+```bash
+xiaomaolv mcp ls --scope merged
+xiaomaolv mcp test tavily
+xiaomaolv mcp rm tavily --scope all
+```
+
+### Config locations
+
+- User scope: `$XDG_CONFIG_HOME/xiaomaolv/mcp.toml` (macOS default: `~/Library/Application Support/xiaomaolv/mcp.toml`)
+- Project scope: `./.xiaomaolv/mcp.toml`
+- Override env:
+  - `XIAOMAOLV_MCP_USER_CONFIG`
+  - `XIAOMAOLV_MCP_PROJECT_CONFIG`
+
+Merged priority: `project > user`.
+
+### Runtime MCP HTTP endpoints
+
+- `GET /v1/mcp/servers`
+- `GET /v1/mcp/tools?server=<optional_server_name>`
+- `POST /v1/mcp/tools/{server}/{tool}`
+
+Example call:
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/mcp/tools/internal-http/search \
+  -H 'content-type: application/json' \
+  -d '{"query":"rust async mcp"}'
+```
+
+### Agent auto tool loop
+
+When `agent.mcp_enabled = true`, message handling will:
+
+1. discover available MCP tools from configured servers  
+2. ask model to emit strict JSON for tool calls  
+3. execute MCP tools and feed results back to model  
+4. stop at final answer or `mcp_max_iterations`
+
+You can disable this globally:
+
+```toml
+[agent]
+mcp_enabled = false
 ```
 
 <a id="plugin-system"></a>

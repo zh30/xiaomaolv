@@ -9,7 +9,7 @@ use xiaomaolv::memory::{
     HybridSqliteZvecMemoryBackend, SqliteMemoryStore, ZvecSidecarClient, ZvecSidecarConfig,
 };
 use xiaomaolv::provider::{ChatProvider, CompletionRequest};
-use xiaomaolv::service::MessageService;
+use xiaomaolv::service::{AgentMcpSettings, MessageService};
 
 struct CaptureProvider;
 
@@ -63,7 +63,15 @@ async fn hybrid_backend_merges_sidecar_memories_into_context() {
     });
 
     let backend = Arc::new(HybridSqliteZvecMemoryBackend::new(store, sidecar));
-    let service = MessageService::new_with_backend(Arc::new(CaptureProvider), backend, 16, 4, 90);
+    let service = MessageService::new_with_backend(
+        Arc::new(CaptureProvider),
+        backend,
+        None,
+        AgentMcpSettings::default(),
+        16,
+        4,
+        90,
+    );
 
     let out = service
         .handle(IncomingMessage {
@@ -110,7 +118,15 @@ async fn hybrid_backend_supports_legacy_search_endpoint_and_content_field() {
     });
 
     let backend = Arc::new(HybridSqliteZvecMemoryBackend::new(store, sidecar));
-    let service = MessageService::new_with_backend(Arc::new(CaptureProvider), backend, 16, 4, 90);
+    let service = MessageService::new_with_backend(
+        Arc::new(CaptureProvider),
+        backend,
+        None,
+        AgentMcpSettings::default(),
+        16,
+        4,
+        90,
+    );
 
     let out = service
         .handle(IncomingMessage {
@@ -158,7 +174,15 @@ async fn hybrid_backend_can_send_bearer_token_to_sidecar() {
     });
 
     let backend = Arc::new(HybridSqliteZvecMemoryBackend::new(store, sidecar));
-    let service = MessageService::new_with_backend(Arc::new(CaptureProvider), backend, 16, 4, 90);
+    let service = MessageService::new_with_backend(
+        Arc::new(CaptureProvider),
+        backend,
+        None,
+        AgentMcpSettings::default(),
+        16,
+        4,
+        90,
+    );
 
     let out = service
         .handle(IncomingMessage {
@@ -193,7 +217,15 @@ async fn hybrid_backend_falls_back_to_recent_context_when_sidecar_unavailable() 
     });
 
     let backend = Arc::new(HybridSqliteZvecMemoryBackend::new(store, sidecar));
-    let service = MessageService::new_with_backend(Arc::new(CountProvider), backend, 16, 4, 90);
+    let service = MessageService::new_with_backend(
+        Arc::new(CountProvider),
+        backend,
+        None,
+        AgentMcpSettings::default(),
+        16,
+        4,
+        90,
+    );
 
     let out = service
         .handle(IncomingMessage {

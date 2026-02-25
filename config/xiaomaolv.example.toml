@@ -21,10 +21,15 @@ enabled = true
 [channels.telegram]
 enabled = false
 bot_token = "your-telegram-bot-token"
+# Optional: your bot username without '@', used for group @mention filtering
+# bot_username = "your_bot_username"
 mode = "polling"
 polling_timeout_secs = 30
 streaming_enabled = true
 streaming_edit_interval_ms = 900
+streaming_prefer_draft = true
+startup_online_enabled = false
+startup_online_text = "online"
 # webhook_secret = "your-webhook-secret"
 
 [memory]
@@ -41,6 +46,11 @@ request_timeout_secs = 3
 upsert_path = "/v1/memory/upsert"
 query_path = "/v1/memory/query"
 # auth_bearer_token = "${ZVEC_SIDECAR_TOKEN}"
+
+[agent]
+mcp_enabled = true
+mcp_max_iterations = 4
+mcp_max_tool_result_chars = 4000
 
 # Custom provider/channel plugin example (requires registering factories in your startup code)
 # [providers.myprovider]

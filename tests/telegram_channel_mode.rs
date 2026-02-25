@@ -53,15 +53,20 @@ async fn telegram_defaults_to_polling_and_webhook_endpoint_is_disabled() {
             telegram: Some(TelegramChannelConfig {
                 enabled: true,
                 bot_token: "fake-token".to_string(),
+                bot_username: None,
                 webhook_secret: None,
                 mode: None,
                 polling_timeout_secs: 1,
                 streaming_enabled: true,
                 streaming_edit_interval_ms: 900,
+                streaming_prefer_draft: true,
+                startup_online_enabled: false,
+                startup_online_text: "online".to_string(),
             }),
             plugins: HashMap::new(),
         },
         memory: Default::default(),
+        agent: Default::default(),
     };
 
     let app = build_router(cfg, "sqlite::memory:", Some(Arc::new(FakeProvider)))
@@ -111,15 +116,20 @@ async fn telegram_mode_endpoint_reports_webhook_when_configured() {
             telegram: Some(TelegramChannelConfig {
                 enabled: true,
                 bot_token: "fake-token".to_string(),
+                bot_username: None,
                 webhook_secret: Some("hook-secret".to_string()),
                 mode: Some("webhook".to_string()),
                 polling_timeout_secs: 1,
                 streaming_enabled: true,
                 streaming_edit_interval_ms: 900,
+                streaming_prefer_draft: true,
+                startup_online_enabled: false,
+                startup_online_text: "online".to_string(),
             }),
             plugins: HashMap::new(),
         },
         memory: Default::default(),
+        agent: Default::default(),
     };
 
     let app = build_router(cfg, "sqlite::memory:", Some(Arc::new(FakeProvider)))

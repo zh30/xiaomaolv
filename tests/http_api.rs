@@ -26,7 +26,44 @@ impl ChatProvider for FakeProvider {
 
 #[tokio::test]
 async fn post_messages_returns_assistant_reply() {
-    let cfg = AppConfig {
+    let cfg = test_config();
+
+    let app = build_router(cfg, "sqlite::memory:", Some(Arc::new(FakeProvider)))
+        .await
+        .expect("router");
+    let server = TestServer::new(app).expect("test server");
+
+    let response = server
+        .post("/v1/messages")
+        .json(&serde_json::json!({
+            "session_id": "s-http",
+            "user_id": "u-http",
+            "text": "hello"
+        }))
+        .await;
+
+    response.assert_status_ok();
+}
+
+#[tokio::test]
+async fn get_mcp_servers_returns_json_payload() {
+    let cfg = test_config();
+
+    let app = build_router(cfg, "sqlite::memory:", Some(Arc::new(FakeProvider)))
+        .await
+        .expect("router");
+    let server = TestServer::new(app).expect("test server");
+
+    let response = server.get("/v1/mcp/servers").await;
+    response.assert_status_ok();
+
+    let payload: serde_json::Value = response.json();
+    assert!(payload.get("servers").is_some());
+    assert!(payload.get("servers").and_then(|v| v.as_array()).is_some());
+}
+
+fn test_config() -> AppConfig {
+    AppConfig {
         app: AppSettings {
             bind: "127.0.0.1:0".to_string(),
             default_provider: "openai".to_string(),
@@ -52,21 +89,6 @@ async fn post_messages_returns_assistant_reply() {
             plugins: std::collections::HashMap::new(),
         },
         memory: Default::default(),
-    };
-
-    let app = build_router(cfg, "sqlite::memory:", Some(Arc::new(FakeProvider)))
-        .await
-        .expect("router");
-    let server = TestServer::new(app).expect("test server");
-
-    let response = server
-        .post("/v1/messages")
-        .json(&serde_json::json!({
-            "session_id": "s-http",
-            "user_id": "u-http",
-            "text": "hello"
-        }))
-        .await;
-
-    response.assert_status_ok();
+        agent: Default::default(),
+    }
 }

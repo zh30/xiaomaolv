@@ -34,7 +34,10 @@ pub struct StoredMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ReplyTarget {
-    Telegram { chat_id: i64 },
+    Telegram {
+        chat_id: i64,
+        message_thread_id: Option<i64>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

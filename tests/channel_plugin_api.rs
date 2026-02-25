@@ -122,6 +122,7 @@ async fn custom_channel_plugin_can_receive_messages_via_unified_endpoint() {
             .collect(),
         },
         memory: Default::default(),
+        agent: Default::default(),
     };
 
     let mut channel_registry = ChannelRegistry::new();

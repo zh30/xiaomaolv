@@ -2,12 +2,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, watch};
+use tracing::warn;
 
 use crate::channel::{
     ChannelContext, ChannelInbound, ChannelPlugin, ChannelPluginConfig, ChannelPluginError,
@@ -15,17 +16,19 @@ use crate::channel::{
 };
 use crate::config::AppConfig;
 use crate::domain::IncomingMessage;
+use crate::mcp::{McpConfigPaths, McpRegistry, McpRuntime};
 use crate::memory::{
     HybridSqliteZvecMemoryBackend, MemoryBackend, SqliteMemoryBackend, SqliteMemoryStore,
     ZvecSidecarClient, ZvecSidecarConfig,
 };
 use crate::provider::{ChatProvider, ProviderRegistry};
-use crate::service::MessageService;
+use crate::service::{AgentMcpSettings, MessageService};
 
 #[derive(Clone)]
 pub struct AppState {
     pub service: Arc<MessageService>,
     pub channel_plugins: Arc<HashMap<String, Arc<dyn ChannelPlugin>>>,
+    pub mcp_runtime: Arc<McpRuntime>,
     pub semaphore: Arc<Semaphore>,
 }
 
@@ -170,9 +173,16 @@ async fn build_state(
         ),
     };
 
+    let mcp_runtime = Arc::new(load_mcp_runtime().await);
     let service = Arc::new(MessageService::new_with_backend(
         provider,
         memory_backend,
+        Some(mcp_runtime.clone()),
+        AgentMcpSettings {
+            enabled: config.agent.mcp_enabled,
+            max_iterations: config.agent.mcp_max_iterations,
+            max_tool_result_chars: config.agent.mcp_max_tool_result_chars,
+        },
         max_recent_turns,
         config.memory.max_semantic_memories,
         config.memory.semantic_lookback_days,
@@ -183,6 +193,7 @@ async fn build_state(
     let state = AppState {
         service,
         channel_plugins: Arc::new(channel_plugins),
+        mcp_runtime,
         semaphore: Arc::new(Semaphore::new(config.app.concurrency_limit.max(1))),
     };
 
@@ -197,7 +208,11 @@ fn build_axum_router(state: AppState, http_enabled: bool) -> Router {
     }
 
     router
+        .route("/v1/mcp/servers", get(get_mcp_servers))
+        .route("/v1/mcp/tools", get(get_mcp_tools))
+        .route("/v1/mcp/tools/{server}/{tool}", post(post_mcp_tool_call))
         .route("/v1/channels/{channel}/mode", get(get_channel_mode))
+        .route("/v1/channels/{channel}/diag", get(get_channel_diag))
         .route("/v1/channels/{channel}/inbound", post(post_channel_inbound))
         .route(
             "/v1/channels/{channel}/inbound/{secret}",
@@ -257,6 +272,11 @@ fn load_channel_plugins(
 
         let mut settings = HashMap::new();
         settings.insert("bot_token".to_string(), telegram.bot_token.clone());
+        if let Some(username) = &telegram.bot_username
+            && !username.trim().is_empty()
+        {
+            settings.insert("bot_username".to_string(), username.clone());
+        }
 
         if let Some(secret) = &telegram.webhook_secret
             && !secret.trim().is_empty()
@@ -282,6 +302,18 @@ fn load_channel_plugins(
             "streaming_edit_interval_ms".to_string(),
             telegram.streaming_edit_interval_ms.to_string(),
         );
+        settings.insert(
+            "streaming_prefer_draft".to_string(),
+            telegram.streaming_prefer_draft.to_string(),
+        );
+        settings.insert(
+            "startup_online_enabled".to_string(),
+            telegram.startup_online_enabled.to_string(),
+        );
+        settings.insert(
+            "startup_online_text".to_string(),
+            telegram.startup_online_text.clone(),
+        );
 
         let cfg = ChannelPluginConfig {
             kind: "telegram".to_string(),
@@ -300,6 +332,33 @@ async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
+async fn load_mcp_runtime() -> McpRuntime {
+    let cwd = match std::env::current_dir() {
+        Ok(path) => path,
+        Err(err) => {
+            warn!(error = %err, "failed to resolve current dir while loading mcp registry, using empty runtime");
+            return McpRuntime::default();
+        }
+    };
+
+    let paths = match McpConfigPaths::discover(&cwd) {
+        Ok(paths) => paths,
+        Err(err) => {
+            warn!(error = %err, "failed to resolve mcp config paths, using empty runtime");
+            return McpRuntime::default();
+        }
+    };
+
+    let registry = McpRegistry::new(paths);
+    match McpRuntime::from_registry(&registry).await {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            warn!(error = %err, "failed to load mcp runtime, using empty runtime");
+            McpRuntime::default()
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct HttpMessageRequest {
     session_id: String,
@@ -310,6 +369,88 @@ struct HttpMessageRequest {
 #[derive(Debug, Serialize)]
 struct HttpMessageResponse {
     reply: String,
+}
+
+#[derive(Debug, Serialize)]
+struct McpServersResponse {
+    servers: Vec<crate::mcp::McpServerView>,
+}
+
+#[derive(Debug, Deserialize)]
+struct McpToolsQuery {
+    server: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct McpToolsResponse {
+    tools: Vec<crate::mcp::McpToolInfo>,
+}
+
+#[derive(Debug, Serialize)]
+struct McpCallResponse {
+    server: String,
+    tool: String,
+    result: serde_json::Value,
+}
+
+async fn get_mcp_servers(
+    State(state): State<AppState>,
+) -> Result<Json<McpServersResponse>, (StatusCode, String)> {
+    let _permit = state.semaphore.acquire().await.map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("concurrency semaphore closed: {err}"),
+        )
+    })?;
+
+    Ok(Json(McpServersResponse {
+        servers: state.mcp_runtime.servers(),
+    }))
+}
+
+async fn get_mcp_tools(
+    State(state): State<AppState>,
+    Query(query): Query<McpToolsQuery>,
+) -> Result<Json<McpToolsResponse>, (StatusCode, String)> {
+    let _permit = state.semaphore.acquire().await.map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("concurrency semaphore closed: {err}"),
+        )
+    })?;
+
+    let tools = state
+        .mcp_runtime
+        .list_tools(query.server.as_deref())
+        .await
+        .map_err(internal_err("failed to list mcp tools"))?;
+
+    Ok(Json(McpToolsResponse { tools }))
+}
+
+async fn post_mcp_tool_call(
+    State(state): State<AppState>,
+    Path((server, tool)): Path<(String, String)>,
+    Json(args): Json<serde_json::Value>,
+) -> Result<Json<McpCallResponse>, (StatusCode, String)> {
+    let _permit = state.semaphore.acquire().await.map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("concurrency semaphore closed: {err}"),
+        )
+    })?;
+
+    let result = state
+        .mcp_runtime
+        .call_tool(&server, &tool, args)
+        .await
+        .map_err(internal_err("failed to call mcp tool"))?;
+
+    Ok(Json(McpCallResponse {
+        server,
+        tool,
+        result,
+    }))
 }
 
 async fn post_message(
@@ -374,6 +515,32 @@ async fn get_channel_mode(
         channel,
         mode: mode.to_string(),
     }))
+}
+
+async fn get_channel_diag(
+    State(state): State<AppState>,
+    Path(channel): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let plugin = state.channel_plugins.get(&channel).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("channel '{}' is not configured", channel),
+        )
+    })?;
+
+    let diag = plugin
+        .diagnostics()
+        .await
+        .map_err(internal_err("failed to collect channel diagnostics"))?;
+
+    let body = diag.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("channel '{}' does not expose diagnostics", channel),
+        )
+    })?;
+
+    Ok(Json(body))
 }
 
 async fn post_channel_inbound_with_secret(

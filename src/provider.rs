@@ -113,13 +113,13 @@ pub struct OpenAiCompatibleProvider {
     base_url: String,
     api_key: String,
     model: String,
+    timeout_secs: u64,
     max_retries: usize,
 }
 
 impl OpenAiCompatibleProvider {
     pub fn from_config(cfg: &ProviderConfig) -> anyhow::Result<Self> {
         let client = Client::builder()
-            .timeout(Duration::from_secs(cfg.timeout_secs))
             .build()
             .context("failed to build reqwest client")?;
 
@@ -132,6 +132,7 @@ impl OpenAiCompatibleProvider {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
             model,
+            timeout_secs: cfg.timeout_secs.max(1),
             max_retries: cfg.max_retries,
         })
     }
@@ -212,6 +213,7 @@ impl OpenAiCompatibleProvider {
             let response = self
                 .client
                 .post(&url)
+                .timeout(Duration::from_secs(self.timeout_secs))
                 .bearer_auth(&self.api_key)
                 .json(&payload)
                 .send()
@@ -260,9 +262,12 @@ impl OpenAiCompatibleProvider {
         let mut last_error = None;
 
         for attempt in 0..retries {
+            // Streamed long-form replies can exceed regular request timeout.
+            let stream_timeout_secs = self.timeout_secs.saturating_mul(10).max(300);
             let response = self
                 .client
                 .post(&url)
+                .timeout(Duration::from_secs(stream_timeout_secs))
                 .bearer_auth(&self.api_key)
                 .json(&serde_json::json!({
                     "model": self.model.clone(),

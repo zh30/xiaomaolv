@@ -8,7 +8,7 @@ concurrency_limit = 128
 kind = "openai-compatible"
 base_url = "https://api.minimaxi.com/v1"
 api_key = "${MINIMAX_API_KEY}"
-model = "MiniMax-M2.5"
+model = "${MINIMAX_MODEL:-MiniMax-M2.5-highspeed}"
 timeout_secs = 45
 max_retries = 2
 
@@ -19,10 +19,14 @@ enabled = true
 [channels.telegram]
 enabled = true
 bot_token = "${TELEGRAM_BOT_TOKEN}"
+bot_username = "${TELEGRAM_BOT_USERNAME:-}"
 mode = "polling"
 polling_timeout_secs = 30
 streaming_enabled = true
 streaming_edit_interval_ms = 900
+streaming_prefer_draft = true
+startup_online_enabled = true
+startup_online_text = "${TELEGRAM_STARTUP_ONLINE_TEXT:-online}"
 
 # Optional webhook mode (public HTTPS required)
 # mode = "webhook"
@@ -42,3 +46,8 @@ request_timeout_secs = 3
 upsert_path = "/v1/memory/upsert"
 query_path = "/v1/memory/query"
 # auth_bearer_token = "${ZVEC_SIDECAR_TOKEN}"
+
+[agent]
+mcp_enabled = true
+mcp_max_iterations = 4
+mcp_max_tool_result_chars = 4000
