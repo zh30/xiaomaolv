@@ -14,6 +14,9 @@ max_retries = 2
 
 [channels.http]
 enabled = true
+# Required for GET /v1/code-mode/diag (Bearer token)
+# diag_bearer_token = "${HTTP_DIAG_BEARER_TOKEN}"
+diag_rate_limit_per_minute = 120
 
 [channels.telegram]
 enabled = true
@@ -82,3 +85,21 @@ skills_max_selected = 3
 skills_max_prompt_chars = 8000
 skills_match_min_score = 0.45
 skills_llm_rerank_enabled = false
+
+[agent.code_mode]
+enabled = true
+shadow_mode = false
+max_calls = 6
+max_parallel = 2
+max_runtime_ms = 2500
+max_call_timeout_ms = 1200
+timeout_warn_ratio = 0.4
+timeout_auto_shadow_enabled = true
+timeout_auto_shadow_probe_every = 5
+timeout_auto_shadow_streak = 3
+max_result_chars = 12000
+execution_mode = "local" # local | subprocess
+subprocess_timeout_secs = 8
+allow_network = false
+allow_filesystem = false
+allow_env = false

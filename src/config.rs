@@ -4,6 +4,8 @@ use std::path::Path;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
+use crate::code_mode::AgentCodeModeSettings;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub app: AppSettings,
@@ -31,6 +33,10 @@ impl AppConfig {
     }
 
     fn resolve_env_placeholders(&mut self) {
+        if let Some(token) = self.channels.http.diag_bearer_token.as_mut() {
+            *token = resolve_env_placeholder(token);
+        }
+
         for provider in self.providers.values_mut() {
             if let Some(api_key) = provider.api_key.as_mut() {
                 *api_key = resolve_env_placeholder(api_key);
@@ -106,6 +112,9 @@ pub struct ChannelsConfig {
 pub struct HttpChannelConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    pub diag_bearer_token: Option<String>,
+    #[serde(default = "default_http_diag_rate_limit_per_minute")]
+    pub diag_rate_limit_per_minute: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -276,6 +285,8 @@ pub struct AgentConfig {
     pub skills_match_min_score: f32,
     #[serde(default = "default_agent_skills_llm_rerank_enabled")]
     pub skills_llm_rerank_enabled: bool,
+    #[serde(default)]
+    pub code_mode: AgentCodeModeSettings,
 }
 
 impl Default for AgentConfig {
@@ -289,6 +300,7 @@ impl Default for AgentConfig {
             skills_max_prompt_chars: default_agent_skills_max_prompt_chars(),
             skills_match_min_score: default_agent_skills_match_min_score(),
             skills_llm_rerank_enabled: default_agent_skills_llm_rerank_enabled(),
+            code_mode: AgentCodeModeSettings::default(),
         }
     }
 }
@@ -342,6 +354,10 @@ fn default_retries() -> usize {
 
 fn default_enabled() -> bool {
     true
+}
+
+fn default_http_diag_rate_limit_per_minute() -> usize {
+    120
 }
 
 fn default_disabled() -> bool {

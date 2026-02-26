@@ -48,7 +48,11 @@ fn test_config() -> AppConfig {
         ))
         .collect(),
         channels: ChannelsConfig {
-            http: HttpChannelConfig { enabled: true },
+            http: HttpChannelConfig {
+                enabled: true,
+                diag_bearer_token: None,
+                diag_rate_limit_per_minute: 120,
+            },
             telegram: Some(TelegramChannelConfig {
                 enabled: true,
                 bot_token: "fake-token".to_string(),

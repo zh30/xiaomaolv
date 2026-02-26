@@ -1,12 +1,19 @@
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Instant;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::RwLock;
-use tracing::warn;
+use tracing::{info, warn};
 
+use crate::code_mode::{
+    AgentCodeModeSettings, CodeModeAuditRecord, CodeModeExecutionMode, CodeModeExecutor,
+    CodeModePlanner, DisabledCodeModePlanner, execute_plan_via_subprocess,
+};
 use crate::domain::{IncomingMessage, MessageRole, OutgoingMessage, StoredMessage};
 use crate::mcp::{McpRuntime, McpToolInfo};
 use crate::memory::{
@@ -36,6 +43,43 @@ pub struct AgentSkillsSettings {
     pub max_prompt_chars: usize,
     pub match_min_score: f32,
     pub llm_rerank_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeModeDiagnostics {
+    pub policy: CodeModeDiagnosticsPolicy,
+    pub runtime: CodeModeDiagnosticsRuntime,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeModeDiagnosticsPolicy {
+    pub enabled: bool,
+    pub shadow_mode: bool,
+    pub execution_mode: CodeModeExecutionMode,
+    pub timeout_warn_ratio: f64,
+    pub timeout_auto_shadow_enabled: bool,
+    pub timeout_auto_shadow_streak: usize,
+    pub timeout_auto_shadow_probe_every: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeModeDiagnosticsRuntime {
+    pub circuit_open: bool,
+    pub timeout_alert_streak: usize,
+    pub probe_counter: usize,
+    pub counters: CodeModeDiagnosticsCounters,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeModeDiagnosticsCounters {
+    pub attempts_total: usize,
+    pub used_total: usize,
+    pub fallback_total: usize,
+    pub timed_out_calls_total: usize,
+    pub failed_calls_total: usize,
+    pub probe_attempt_total: usize,
+    pub circuit_open_total: usize,
+    pub circuit_close_total: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -79,9 +123,22 @@ pub struct MessageService {
     provider: Arc<dyn ChatProvider>,
     memory: Arc<dyn MemoryBackend>,
     mcp_runtime: Option<Arc<RwLock<McpRuntime>>>,
+    code_mode_planner: Arc<dyn CodeModePlanner>,
     skills_runtime: Option<Arc<RwLock<SkillRuntime>>>,
     agent_mcp: AgentMcpSettings,
+    agent_code_mode: AgentCodeModeSettings,
     agent_skills: AgentSkillsSettings,
+    code_mode_timeout_alert_streak: Arc<AtomicUsize>,
+    code_mode_timeout_circuit_open: Arc<AtomicBool>,
+    code_mode_timeout_probe_counter: Arc<AtomicUsize>,
+    code_mode_attempts_total: Arc<AtomicUsize>,
+    code_mode_used_total: Arc<AtomicUsize>,
+    code_mode_fallback_total: Arc<AtomicUsize>,
+    code_mode_timed_out_calls_total: Arc<AtomicUsize>,
+    code_mode_failed_calls_total: Arc<AtomicUsize>,
+    code_mode_probe_attempt_total: Arc<AtomicUsize>,
+    code_mode_circuit_open_total: Arc<AtomicUsize>,
+    code_mode_circuit_close_total: Arc<AtomicUsize>,
     max_recent_turns: usize,
     max_semantic_memories: usize,
     semantic_lookback_days: u32,
@@ -89,6 +146,19 @@ pub struct MessageService {
     context_reserved_tokens: usize,
     context_memory_budget_ratio: u8,
     context_min_recent_messages: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodeModeAttempt {
+    Normal,
+    Probe,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodeModeCircuitChange {
+    None,
+    Opened,
+    Closed,
 }
 
 impl MessageService {
@@ -121,9 +191,22 @@ impl MessageService {
             provider,
             memory,
             mcp_runtime,
+            code_mode_planner: Arc::new(DisabledCodeModePlanner),
             skills_runtime: None,
             agent_mcp,
+            agent_code_mode: AgentCodeModeSettings::default(),
             agent_skills: AgentSkillsSettings::default(),
+            code_mode_timeout_alert_streak: Arc::new(AtomicUsize::new(0)),
+            code_mode_timeout_circuit_open: Arc::new(AtomicBool::new(false)),
+            code_mode_timeout_probe_counter: Arc::new(AtomicUsize::new(0)),
+            code_mode_attempts_total: Arc::new(AtomicUsize::new(0)),
+            code_mode_used_total: Arc::new(AtomicUsize::new(0)),
+            code_mode_fallback_total: Arc::new(AtomicUsize::new(0)),
+            code_mode_timed_out_calls_total: Arc::new(AtomicUsize::new(0)),
+            code_mode_failed_calls_total: Arc::new(AtomicUsize::new(0)),
+            code_mode_probe_attempt_total: Arc::new(AtomicUsize::new(0)),
+            code_mode_circuit_open_total: Arc::new(AtomicUsize::new(0)),
+            code_mode_circuit_close_total: Arc::new(AtomicUsize::new(0)),
             max_recent_turns,
             max_semantic_memories,
             semantic_lookback_days,
@@ -146,6 +229,286 @@ impl MessageService {
         self.context_memory_budget_ratio = memory_budget_ratio;
         self.context_min_recent_messages = min_recent_messages;
         self
+    }
+
+    pub fn with_agent_code_mode(mut self, settings: AgentCodeModeSettings) -> Self {
+        self.agent_code_mode = settings;
+        self.code_mode_timeout_alert_streak
+            .store(0, Ordering::Relaxed);
+        self.code_mode_timeout_circuit_open
+            .store(false, Ordering::Relaxed);
+        self.code_mode_timeout_probe_counter
+            .store(0, Ordering::Relaxed);
+        self.code_mode_attempts_total.store(0, Ordering::Relaxed);
+        self.code_mode_used_total.store(0, Ordering::Relaxed);
+        self.code_mode_fallback_total.store(0, Ordering::Relaxed);
+        self.code_mode_timed_out_calls_total
+            .store(0, Ordering::Relaxed);
+        self.code_mode_failed_calls_total
+            .store(0, Ordering::Relaxed);
+        self.code_mode_probe_attempt_total
+            .store(0, Ordering::Relaxed);
+        self.code_mode_circuit_open_total
+            .store(0, Ordering::Relaxed);
+        self.code_mode_circuit_close_total
+            .store(0, Ordering::Relaxed);
+        self
+    }
+
+    pub fn with_code_mode_planner(mut self, planner: Arc<dyn CodeModePlanner>) -> Self {
+        self.code_mode_planner = planner;
+        self
+    }
+
+    pub fn code_mode_diagnostics(&self) -> CodeModeDiagnostics {
+        CodeModeDiagnostics {
+            policy: CodeModeDiagnosticsPolicy {
+                enabled: self.agent_code_mode.enabled,
+                shadow_mode: self.agent_code_mode.shadow_mode,
+                execution_mode: self.agent_code_mode.execution_mode.clone(),
+                timeout_warn_ratio: self.agent_code_mode.normalized_timeout_warn_ratio(),
+                timeout_auto_shadow_enabled: self.agent_code_mode.timeout_auto_shadow_enabled,
+                timeout_auto_shadow_streak: self.agent_code_mode.timeout_auto_shadow_streak.max(1),
+                timeout_auto_shadow_probe_every: self
+                    .agent_code_mode
+                    .timeout_auto_shadow_probe_every
+                    .max(1),
+            },
+            runtime: CodeModeDiagnosticsRuntime {
+                circuit_open: self.is_code_mode_timeout_circuit_open(),
+                timeout_alert_streak: self.code_mode_timeout_alert_streak.load(Ordering::Relaxed),
+                probe_counter: self.code_mode_timeout_probe_counter.load(Ordering::Relaxed),
+                counters: CodeModeDiagnosticsCounters {
+                    attempts_total: self.code_mode_attempts_total.load(Ordering::Relaxed),
+                    used_total: self.code_mode_used_total.load(Ordering::Relaxed),
+                    fallback_total: self.code_mode_fallback_total.load(Ordering::Relaxed),
+                    timed_out_calls_total: self
+                        .code_mode_timed_out_calls_total
+                        .load(Ordering::Relaxed),
+                    failed_calls_total: self.code_mode_failed_calls_total.load(Ordering::Relaxed),
+                    probe_attempt_total: self.code_mode_probe_attempt_total.load(Ordering::Relaxed),
+                    circuit_open_total: self.code_mode_circuit_open_total.load(Ordering::Relaxed),
+                    circuit_close_total: self.code_mode_circuit_close_total.load(Ordering::Relaxed),
+                },
+            },
+        }
+    }
+
+    pub fn code_mode_metrics_prometheus(&self) -> String {
+        let diag = self.code_mode_diagnostics();
+        let counters = &diag.runtime.counters;
+        let mut out = String::new();
+
+        let _ = writeln!(
+            out,
+            "# HELP xiaomaolv_code_mode_attempts_total Total code mode attempts."
+        );
+        let _ = writeln!(out, "# TYPE xiaomaolv_code_mode_attempts_total counter");
+        let _ = writeln!(
+            out,
+            "xiaomaolv_code_mode_attempts_total {}",
+            counters.attempts_total
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP xiaomaolv_code_mode_used_total Total code mode attempts that were used directly."
+        );
+        let _ = writeln!(out, "# TYPE xiaomaolv_code_mode_used_total counter");
+        let _ = writeln!(
+            out,
+            "xiaomaolv_code_mode_used_total {}",
+            counters.used_total
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP xiaomaolv_code_mode_fallback_total Total code mode attempts that fell back."
+        );
+        let _ = writeln!(out, "# TYPE xiaomaolv_code_mode_fallback_total counter");
+        let _ = writeln!(
+            out,
+            "xiaomaolv_code_mode_fallback_total {}",
+            counters.fallback_total
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP xiaomaolv_code_mode_timed_out_calls_total Total timed out tool calls in code mode."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE xiaomaolv_code_mode_timed_out_calls_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "xiaomaolv_code_mode_timed_out_calls_total {}",
+            counters.timed_out_calls_total
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP xiaomaolv_code_mode_failed_calls_total Total failed tool calls in code mode."
+        );
+        let _ = writeln!(out, "# TYPE xiaomaolv_code_mode_failed_calls_total counter");
+        let _ = writeln!(
+            out,
+            "xiaomaolv_code_mode_failed_calls_total {}",
+            counters.failed_calls_total
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP xiaomaolv_code_mode_probe_attempt_total Total probe attempts when timeout circuit is open."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE xiaomaolv_code_mode_probe_attempt_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "xiaomaolv_code_mode_probe_attempt_total {}",
+            counters.probe_attempt_total
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP xiaomaolv_code_mode_circuit_open_total Total times timeout circuit opened."
+        );
+        let _ = writeln!(out, "# TYPE xiaomaolv_code_mode_circuit_open_total counter");
+        let _ = writeln!(
+            out,
+            "xiaomaolv_code_mode_circuit_open_total {}",
+            counters.circuit_open_total
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP xiaomaolv_code_mode_circuit_close_total Total times timeout circuit closed."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE xiaomaolv_code_mode_circuit_close_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "xiaomaolv_code_mode_circuit_close_total {}",
+            counters.circuit_close_total
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP xiaomaolv_code_mode_circuit_open Current timeout circuit open state (1=open, 0=closed)."
+        );
+        let _ = writeln!(out, "# TYPE xiaomaolv_code_mode_circuit_open gauge");
+        let _ = writeln!(
+            out,
+            "xiaomaolv_code_mode_circuit_open {}",
+            if diag.runtime.circuit_open { 1 } else { 0 }
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP xiaomaolv_code_mode_timeout_alert_streak Current timeout alert streak."
+        );
+        let _ = writeln!(out, "# TYPE xiaomaolv_code_mode_timeout_alert_streak gauge");
+        let _ = writeln!(
+            out,
+            "xiaomaolv_code_mode_timeout_alert_streak {}",
+            diag.runtime.timeout_alert_streak
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP xiaomaolv_code_mode_probe_counter Current probe counter while circuit is open."
+        );
+        let _ = writeln!(out, "# TYPE xiaomaolv_code_mode_probe_counter gauge");
+        let _ = writeln!(
+            out,
+            "xiaomaolv_code_mode_probe_counter {}",
+            diag.runtime.probe_counter
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP xiaomaolv_code_mode_enabled Whether code mode is enabled (1=yes, 0=no)."
+        );
+        let _ = writeln!(out, "# TYPE xiaomaolv_code_mode_enabled gauge");
+        let _ = writeln!(
+            out,
+            "xiaomaolv_code_mode_enabled {}",
+            if diag.policy.enabled { 1 } else { 0 }
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP xiaomaolv_code_mode_shadow_mode Whether code mode shadow mode is enabled (1=yes, 0=no)."
+        );
+        let _ = writeln!(out, "# TYPE xiaomaolv_code_mode_shadow_mode gauge");
+        let _ = writeln!(
+            out,
+            "xiaomaolv_code_mode_shadow_mode {}",
+            if diag.policy.shadow_mode { 1 } else { 0 }
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP xiaomaolv_code_mode_timeout_warn_ratio Timeout warning ratio threshold."
+        );
+        let _ = writeln!(out, "# TYPE xiaomaolv_code_mode_timeout_warn_ratio gauge");
+        let _ = writeln!(
+            out,
+            "xiaomaolv_code_mode_timeout_warn_ratio {:.6}",
+            diag.policy.timeout_warn_ratio
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP xiaomaolv_code_mode_timeout_auto_shadow_enabled Whether timeout auto shadow is enabled (1=yes, 0=no)."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE xiaomaolv_code_mode_timeout_auto_shadow_enabled gauge"
+        );
+        let _ = writeln!(
+            out,
+            "xiaomaolv_code_mode_timeout_auto_shadow_enabled {}",
+            if diag.policy.timeout_auto_shadow_enabled {
+                1
+            } else {
+                0
+            }
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP xiaomaolv_code_mode_timeout_auto_shadow_streak Timeout auto shadow streak threshold."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE xiaomaolv_code_mode_timeout_auto_shadow_streak gauge"
+        );
+        let _ = writeln!(
+            out,
+            "xiaomaolv_code_mode_timeout_auto_shadow_streak {}",
+            diag.policy.timeout_auto_shadow_streak
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP xiaomaolv_code_mode_timeout_auto_shadow_probe_every Probe interval when timeout circuit is open."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE xiaomaolv_code_mode_timeout_auto_shadow_probe_every gauge"
+        );
+        let _ = writeln!(
+            out,
+            "xiaomaolv_code_mode_timeout_auto_shadow_probe_every {}",
+            diag.policy.timeout_auto_shadow_probe_every
+        );
+
+        out
     }
 
     pub async fn handle(&self, incoming: IncomingMessage) -> anyhow::Result<OutgoingMessage> {
@@ -594,7 +957,126 @@ impl MessageService {
                 .context("provider completion failed");
         }
 
+        if self.agent_code_mode.enabled
+            && let Some(attempt) = self.next_code_mode_attempt()
+        {
+            let force_shadow = matches!(attempt, CodeModeAttempt::Probe);
+            match self
+                .complete_with_code_mode(history.clone(), &tools, &runtime, force_shadow)
+                .await
+            {
+                Ok(Some(reply)) => return Ok(reply),
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(error = %err, "code mode path failed, fallback to mcp json loop");
+                }
+            }
+        }
+
         self.complete_with_mcp_loop(history, tools, runtime).await
+    }
+
+    async fn complete_with_code_mode(
+        &self,
+        history: Vec<StoredMessage>,
+        tools: &[McpToolInfo],
+        runtime: &McpRuntime,
+        force_shadow: bool,
+    ) -> anyhow::Result<Option<String>> {
+        let started_at = Instant::now();
+        let planner = self.code_mode_planner.clone();
+        let planner_name = planner.name();
+        let plan = planner.build_plan(&history, tools).await?;
+        let Some(plan) = plan else {
+            let audit = CodeModeAuditRecord::fallback(planner_name, "planner returned no plan");
+            emit_code_mode_audit(&audit, self.agent_code_mode.normalized_timeout_warn_ratio());
+            self.record_code_mode_counters(&audit, force_shadow, CodeModeCircuitChange::None);
+            return Ok(None);
+        };
+
+        let planned_calls = plan.calls.len();
+        let execution = match self.agent_code_mode.execution_mode {
+            CodeModeExecutionMode::Local => {
+                let executor = CodeModeExecutor::new(self.agent_code_mode.clone());
+                executor.execute(runtime, &plan, tools).await
+            }
+            CodeModeExecutionMode::Subprocess => {
+                execute_plan_via_subprocess(&plan, tools, &self.agent_code_mode).await
+            }
+        };
+        let execution = match execution {
+            Ok(report) => report,
+            Err(err) => {
+                let audit = CodeModeAuditRecord {
+                    planner: planner_name.to_string(),
+                    used: false,
+                    fallback: true,
+                    reason: Some(err.to_string()),
+                    planned_calls,
+                    executed_calls: 0,
+                    failed_calls: 0,
+                    timed_out_calls: 0,
+                    elapsed_ms: started_at.elapsed().as_millis(),
+                };
+                emit_code_mode_audit(&audit, self.agent_code_mode.normalized_timeout_warn_ratio());
+                self.record_code_mode_counters(&audit, force_shadow, CodeModeCircuitChange::None);
+                return Ok(None);
+            }
+        };
+
+        let mut audit = CodeModeAuditRecord {
+            planner: planner_name.to_string(),
+            used: !self.agent_code_mode.shadow_mode && !force_shadow,
+            fallback: self.agent_code_mode.shadow_mode || force_shadow,
+            reason: if self.agent_code_mode.shadow_mode {
+                Some("shadow_mode enabled".to_string())
+            } else if force_shadow {
+                Some("timeout circuit probe".to_string())
+            } else {
+                None
+            },
+            planned_calls,
+            executed_calls: execution.calls.len(),
+            failed_calls: execution.failed_calls,
+            timed_out_calls: execution.timed_out_calls,
+            elapsed_ms: started_at.elapsed().as_millis(),
+        };
+        let circuit_change = self.update_code_mode_timeout_circuit(&audit);
+        if matches!(circuit_change, CodeModeCircuitChange::Opened) {
+            audit.used = false;
+            audit.fallback = true;
+            audit.reason = Some("timeout auto shadow circuit opened".to_string());
+        } else if matches!(circuit_change, CodeModeCircuitChange::Closed) && force_shadow {
+            audit.reason = Some("timeout circuit probe succeeded; circuit closed".to_string());
+        }
+        emit_code_mode_audit(&audit, self.agent_code_mode.normalized_timeout_warn_ratio());
+        self.record_code_mode_counters(&audit, force_shadow, circuit_change);
+
+        if self.agent_code_mode.shadow_mode
+            || force_shadow
+            || matches!(circuit_change, CodeModeCircuitChange::Opened)
+        {
+            return Ok(None);
+        }
+
+        let mut next_history = history;
+        next_history.push(StoredMessage {
+            role: MessageRole::System,
+            content: format!(
+                "CODE_MODE_TOOL_RESULT_JSON:\n{}",
+                serde_json::to_string(&execution).unwrap_or_else(|_| {
+                    "{\"calls\":[],\"failed_calls\":0,\"timed_out_calls\":0}".to_string()
+                })
+            ),
+        });
+        let reply = self
+            .provider
+            .complete(CompletionRequest {
+                messages: next_history,
+            })
+            .await
+            .context("provider completion failed after code mode execution")?;
+        Ok(Some(reply))
     }
 
     async fn complete_with_mcp_loop(
@@ -603,6 +1085,7 @@ impl MessageService {
         tools: Vec<McpToolInfo>,
         runtime: McpRuntime,
     ) -> anyhow::Result<String> {
+        let mut telemetry = McpLoopTelemetry::new(tools.len());
         history.push(StoredMessage {
             role: MessageRole::System,
             content: build_mcp_system_prompt(&tools)?,
@@ -610,6 +1093,7 @@ impl MessageService {
 
         let max_iterations = self.agent_mcp.max_iterations.max(1);
         for _ in 0..max_iterations {
+            telemetry.observe_prompt_chars(&history);
             let reply = self
                 .provider
                 .complete(CompletionRequest {
@@ -617,8 +1101,10 @@ impl MessageService {
                 })
                 .await
                 .context("provider completion failed")?;
+            telemetry.iterations += 1;
 
             let Some(tool_call) = parse_mcp_tool_call(&reply) else {
+                telemetry.emit("final_answer");
                 return Ok(reply);
             };
 
@@ -632,6 +1118,8 @@ impl MessageService {
 
             let tool_message = match tool_result {
                 Ok(value) => {
+                    telemetry.tool_calls_total += 1;
+                    telemetry.tool_calls_ok += 1;
                     let result = truncate_json_value(&value, self.agent_mcp.max_tool_result_chars);
                     serde_json::json!({
                         "server": tool_call.server,
@@ -640,12 +1128,16 @@ impl MessageService {
                         "result": result
                     })
                 }
-                Err(err) => serde_json::json!({
-                    "server": tool_call.server,
-                    "tool": tool_call.tool,
-                    "ok": false,
-                    "error": err.to_string()
-                }),
+                Err(err) => {
+                    telemetry.tool_calls_total += 1;
+                    telemetry.tool_calls_err += 1;
+                    serde_json::json!({
+                        "server": tool_call.server,
+                        "tool": tool_call.tool,
+                        "ok": false,
+                        "error": err.to_string()
+                    })
+                }
             };
 
             history.push(StoredMessage {
@@ -667,10 +1159,13 @@ impl MessageService {
             content: "MCP tool loop reached max iterations. Give a final answer based on available context."
                 .to_string(),
         });
-        self.provider
+        let final_reply = self
+            .provider
             .complete(CompletionRequest { messages: history })
             .await
-            .context("provider completion failed")
+            .context("provider completion failed")?;
+        telemetry.emit("max_iterations");
+        Ok(final_reply)
     }
 
     fn is_mcp_agent_enabled(&self) -> bool {
@@ -683,6 +1178,118 @@ impl MessageService {
         }
         let runtime = self.mcp_runtime.as_ref()?;
         Some(runtime.read().await.clone())
+    }
+
+    fn is_code_mode_timeout_circuit_open(&self) -> bool {
+        self.code_mode_timeout_circuit_open.load(Ordering::Relaxed)
+    }
+
+    fn next_code_mode_attempt(&self) -> Option<CodeModeAttempt> {
+        if !self.is_code_mode_timeout_circuit_open() {
+            return Some(CodeModeAttempt::Normal);
+        }
+
+        let probe_count = self
+            .code_mode_timeout_probe_counter
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        if should_probe_code_mode_timeout_circuit(
+            probe_count,
+            self.agent_code_mode.timeout_auto_shadow_probe_every,
+        ) {
+            return Some(CodeModeAttempt::Probe);
+        }
+        None
+    }
+
+    fn update_code_mode_timeout_circuit(
+        &self,
+        record: &CodeModeAuditRecord,
+    ) -> CodeModeCircuitChange {
+        if !self.agent_code_mode.timeout_auto_shadow_enabled || self.agent_code_mode.shadow_mode {
+            return CodeModeCircuitChange::None;
+        }
+
+        let timeout_warn_ratio = self.agent_code_mode.normalized_timeout_warn_ratio();
+        let current = self.code_mode_timeout_alert_streak.load(Ordering::Relaxed);
+        let next = next_code_mode_timeout_streak(current, record, timeout_warn_ratio);
+        self.code_mode_timeout_alert_streak
+            .store(next, Ordering::Relaxed);
+
+        if should_open_code_mode_timeout_circuit(next, &self.agent_code_mode) {
+            let was_open = self
+                .code_mode_timeout_circuit_open
+                .swap(true, Ordering::SeqCst);
+            if !was_open {
+                warn!(
+                    streak = next,
+                    threshold = self.agent_code_mode.timeout_auto_shadow_streak.max(1),
+                    timeout_warn_ratio,
+                    "code mode timeout auto shadow circuit opened"
+                );
+                return CodeModeCircuitChange::Opened;
+            }
+            return CodeModeCircuitChange::None;
+        }
+
+        let is_timeout_alert = should_warn_code_mode_timeouts(record, timeout_warn_ratio);
+        if self.is_code_mode_timeout_circuit_open() && !is_timeout_alert {
+            let was_open = self
+                .code_mode_timeout_circuit_open
+                .swap(false, Ordering::SeqCst);
+            if was_open {
+                self.code_mode_timeout_alert_streak
+                    .store(0, Ordering::Relaxed);
+                self.code_mode_timeout_probe_counter
+                    .store(0, Ordering::Relaxed);
+                info!(
+                    timeout_warn_ratio,
+                    "code mode timeout auto shadow circuit closed"
+                );
+                return CodeModeCircuitChange::Closed;
+            }
+        }
+        CodeModeCircuitChange::None
+    }
+
+    fn record_code_mode_counters(
+        &self,
+        record: &CodeModeAuditRecord,
+        force_shadow: bool,
+        circuit_change: CodeModeCircuitChange,
+    ) {
+        self.code_mode_attempts_total
+            .fetch_add(1, Ordering::Relaxed);
+        if record.used {
+            self.code_mode_used_total.fetch_add(1, Ordering::Relaxed);
+        }
+        if record.fallback {
+            self.code_mode_fallback_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if record.timed_out_calls > 0 {
+            self.code_mode_timed_out_calls_total
+                .fetch_add(record.timed_out_calls, Ordering::Relaxed);
+        }
+        if record.failed_calls > 0 {
+            self.code_mode_failed_calls_total
+                .fetch_add(record.failed_calls, Ordering::Relaxed);
+        }
+        if force_shadow {
+            self.code_mode_probe_attempt_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        match circuit_change {
+            CodeModeCircuitChange::Opened => {
+                self.code_mode_circuit_open_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            CodeModeCircuitChange::Closed => {
+                self.code_mode_circuit_close_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            CodeModeCircuitChange::None => {}
+        }
     }
 
     pub async fn reload_mcp_runtime_from_registry(
@@ -754,6 +1361,123 @@ impl MessageService {
         }
         history
     }
+}
+
+#[derive(Debug, Clone)]
+struct McpLoopTelemetry {
+    started_at: Instant,
+    discovered_tools: usize,
+    iterations: usize,
+    prompt_chars_total: usize,
+    tool_calls_total: usize,
+    tool_calls_ok: usize,
+    tool_calls_err: usize,
+}
+
+impl McpLoopTelemetry {
+    fn new(discovered_tools: usize) -> Self {
+        Self {
+            started_at: Instant::now(),
+            discovered_tools,
+            iterations: 0,
+            prompt_chars_total: 0,
+            tool_calls_total: 0,
+            tool_calls_ok: 0,
+            tool_calls_err: 0,
+        }
+    }
+
+    fn observe_prompt_chars(&mut self, history: &[StoredMessage]) {
+        self.prompt_chars_total += history
+            .iter()
+            .map(|m| m.content.chars().count())
+            .sum::<usize>();
+    }
+
+    fn emit(&self, stop_reason: &str) {
+        info!(
+            stop_reason,
+            discovered_tools = self.discovered_tools,
+            iterations = self.iterations,
+            prompt_chars_total = self.prompt_chars_total,
+            tool_calls_total = self.tool_calls_total,
+            tool_calls_ok = self.tool_calls_ok,
+            tool_calls_err = self.tool_calls_err,
+            elapsed_ms = self.started_at.elapsed().as_millis(),
+            "mcp loop baseline"
+        );
+    }
+}
+
+fn emit_code_mode_audit(record: &CodeModeAuditRecord, timeout_warn_ratio: f64) {
+    info!(
+        planner = %record.planner,
+        used = record.used,
+        fallback = record.fallback,
+        reason = %record.reason.as_deref().unwrap_or(""),
+        planned_calls = record.planned_calls,
+        executed_calls = record.executed_calls,
+        failed_calls = record.failed_calls,
+        timed_out_calls = record.timed_out_calls,
+        elapsed_ms = record.elapsed_ms,
+        "code mode audit"
+    );
+
+    if should_warn_code_mode_timeouts(record, timeout_warn_ratio)
+        && let Some(timeout_ratio) = code_mode_timeout_ratio(record)
+    {
+        warn!(
+            planner = %record.planner,
+            used = record.used,
+            fallback = record.fallback,
+            executed_calls = record.executed_calls,
+            timed_out_calls = record.timed_out_calls,
+            timeout_ratio = timeout_ratio,
+            timeout_ratio_pct = timeout_ratio * 100.0,
+            threshold = timeout_warn_ratio,
+            "code mode timeout ratio is high"
+        );
+    }
+}
+
+fn code_mode_timeout_ratio(record: &CodeModeAuditRecord) -> Option<f64> {
+    if record.executed_calls == 0 {
+        return None;
+    }
+    Some(record.timed_out_calls as f64 / record.executed_calls as f64)
+}
+
+fn should_warn_code_mode_timeouts(record: &CodeModeAuditRecord, timeout_warn_ratio: f64) -> bool {
+    let Some(ratio) = code_mode_timeout_ratio(record) else {
+        return false;
+    };
+    record.timed_out_calls > 0 && ratio >= timeout_warn_ratio
+}
+
+fn next_code_mode_timeout_streak(
+    current: usize,
+    record: &CodeModeAuditRecord,
+    timeout_warn_ratio: f64,
+) -> usize {
+    if should_warn_code_mode_timeouts(record, timeout_warn_ratio) {
+        return current.saturating_add(1);
+    }
+    0
+}
+
+fn should_probe_code_mode_timeout_circuit(probe_count: usize, probe_every: usize) -> bool {
+    let interval = probe_every.max(1);
+    probe_count % interval == 0
+}
+
+fn should_open_code_mode_timeout_circuit(
+    timeout_streak: usize,
+    settings: &AgentCodeModeSettings,
+) -> bool {
+    if !settings.timeout_auto_shadow_enabled || settings.shadow_mode {
+        return false;
+    }
+    timeout_streak >= settings.timeout_auto_shadow_streak.max(1)
 }
 
 #[derive(Debug, Clone)]
@@ -1052,9 +1776,25 @@ fn truncate_json_value(value: &Value, max_chars: usize) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_context_budget, parse_mcp_tool_call, parse_scheduler_intent_json, truncate_json_value,
+        CodeModeCircuitChange, MessageService, apply_context_budget, code_mode_timeout_ratio,
+        next_code_mode_timeout_streak, parse_mcp_tool_call, parse_scheduler_intent_json,
+        should_open_code_mode_timeout_circuit, should_probe_code_mode_timeout_circuit,
+        should_warn_code_mode_timeouts, truncate_json_value,
     };
+    use crate::code_mode::{AgentCodeModeSettings, CodeModeAuditRecord};
     use crate::domain::{MessageRole, StoredMessage};
+    use crate::memory::SqliteMemoryStore;
+    use crate::provider::{ChatProvider, CompletionRequest};
+    use std::sync::Arc;
+
+    struct FakeProvider;
+
+    #[async_trait::async_trait]
+    impl ChatProvider for FakeProvider {
+        async fn complete(&self, _req: CompletionRequest) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+    }
 
     #[test]
     fn parse_tool_call_plain_json() {
@@ -1152,5 +1892,154 @@ mod tests {
                 .iter()
                 .any(|m| m.content.contains("score=0.120") && m.role == MessageRole::System)
         );
+    }
+
+    #[test]
+    fn code_mode_timeout_ratio_warning_threshold_works() {
+        let low = CodeModeAuditRecord {
+            planner: "p".to_string(),
+            used: true,
+            fallback: false,
+            reason: None,
+            planned_calls: 5,
+            executed_calls: 5,
+            failed_calls: 1,
+            timed_out_calls: 1,
+            elapsed_ms: 100,
+        };
+        assert_eq!(code_mode_timeout_ratio(&low), Some(0.2));
+        assert!(!should_warn_code_mode_timeouts(&low, 0.4));
+
+        let high = CodeModeAuditRecord {
+            timed_out_calls: 2,
+            ..low.clone()
+        };
+        assert_eq!(code_mode_timeout_ratio(&high), Some(0.4));
+        assert!(should_warn_code_mode_timeouts(&high, 0.4));
+
+        let no_exec = CodeModeAuditRecord {
+            executed_calls: 0,
+            failed_calls: 0,
+            timed_out_calls: 0,
+            ..low
+        };
+        assert_eq!(code_mode_timeout_ratio(&no_exec), None);
+        assert!(!should_warn_code_mode_timeouts(&no_exec, 0.4));
+    }
+
+    #[test]
+    fn code_mode_timeout_streak_and_circuit_rules_work() {
+        let settings = AgentCodeModeSettings {
+            shadow_mode: false,
+            timeout_auto_shadow_enabled: true,
+            timeout_auto_shadow_streak: 3,
+            ..AgentCodeModeSettings::default()
+        };
+        assert!(!should_open_code_mode_timeout_circuit(2, &settings));
+        assert!(should_open_code_mode_timeout_circuit(3, &settings));
+
+        let disabled = AgentCodeModeSettings {
+            timeout_auto_shadow_enabled: false,
+            timeout_auto_shadow_streak: 1,
+            ..AgentCodeModeSettings::default()
+        };
+        assert!(!should_open_code_mode_timeout_circuit(99, &disabled));
+
+        let forced_shadow = AgentCodeModeSettings {
+            shadow_mode: true,
+            timeout_auto_shadow_enabled: true,
+            timeout_auto_shadow_streak: 1,
+            ..AgentCodeModeSettings::default()
+        };
+        assert!(!should_open_code_mode_timeout_circuit(99, &forced_shadow));
+
+        let high = CodeModeAuditRecord {
+            planner: "p".to_string(),
+            used: true,
+            fallback: false,
+            reason: None,
+            planned_calls: 5,
+            executed_calls: 5,
+            failed_calls: 2,
+            timed_out_calls: 2,
+            elapsed_ms: 100,
+        };
+        let low = CodeModeAuditRecord {
+            timed_out_calls: 0,
+            ..high.clone()
+        };
+
+        assert_eq!(next_code_mode_timeout_streak(0, &high, 0.4), 1);
+        assert_eq!(next_code_mode_timeout_streak(2, &high, 0.4), 3);
+        assert_eq!(next_code_mode_timeout_streak(2, &low, 0.4), 0);
+    }
+
+    #[test]
+    fn code_mode_probe_schedule_works() {
+        assert!(!should_probe_code_mode_timeout_circuit(1, 5));
+        assert!(!should_probe_code_mode_timeout_circuit(4, 5));
+        assert!(should_probe_code_mode_timeout_circuit(5, 5));
+        assert!(should_probe_code_mode_timeout_circuit(10, 5));
+        assert!(should_probe_code_mode_timeout_circuit(1, 0));
+    }
+
+    #[tokio::test]
+    async fn code_mode_diagnostics_counters_accumulate() {
+        let store = SqliteMemoryStore::new("sqlite::memory:")
+            .await
+            .expect("store");
+        let service = MessageService::new(Arc::new(FakeProvider), store, 8);
+
+        let audit = CodeModeAuditRecord {
+            planner: "p".to_string(),
+            used: false,
+            fallback: true,
+            reason: Some("timeout circuit probe".to_string()),
+            planned_calls: 2,
+            executed_calls: 2,
+            failed_calls: 1,
+            timed_out_calls: 1,
+            elapsed_ms: 42,
+        };
+        service.record_code_mode_counters(&audit, true, CodeModeCircuitChange::Opened);
+
+        let diag = service.code_mode_diagnostics();
+        assert_eq!(diag.runtime.counters.attempts_total, 1);
+        assert_eq!(diag.runtime.counters.used_total, 0);
+        assert_eq!(diag.runtime.counters.fallback_total, 1);
+        assert_eq!(diag.runtime.counters.failed_calls_total, 1);
+        assert_eq!(diag.runtime.counters.timed_out_calls_total, 1);
+        assert_eq!(diag.runtime.counters.probe_attempt_total, 1);
+        assert_eq!(diag.runtime.counters.circuit_open_total, 1);
+        assert_eq!(diag.runtime.counters.circuit_close_total, 0);
+    }
+
+    #[tokio::test]
+    async fn code_mode_prometheus_metrics_render_counter_values() {
+        let store = SqliteMemoryStore::new("sqlite::memory:")
+            .await
+            .expect("store");
+        let service = MessageService::new(Arc::new(FakeProvider), store, 8);
+
+        let audit = CodeModeAuditRecord {
+            planner: "p".to_string(),
+            used: false,
+            fallback: true,
+            reason: Some("timeout circuit probe".to_string()),
+            planned_calls: 2,
+            executed_calls: 2,
+            failed_calls: 1,
+            timed_out_calls: 1,
+            elapsed_ms: 42,
+        };
+        service.record_code_mode_counters(&audit, true, CodeModeCircuitChange::Opened);
+
+        let body = service.code_mode_metrics_prometheus();
+        assert!(body.contains("xiaomaolv_code_mode_attempts_total 1"));
+        assert!(body.contains("xiaomaolv_code_mode_fallback_total 1"));
+        assert!(body.contains("xiaomaolv_code_mode_timed_out_calls_total 1"));
+        assert!(body.contains("xiaomaolv_code_mode_circuit_open_total 1"));
+        assert!(body.contains("xiaomaolv_code_mode_timeout_warn_ratio 0.400000"));
+        assert!(body.contains("xiaomaolv_code_mode_timeout_auto_shadow_probe_every 5"));
     }
 }

@@ -187,6 +187,23 @@ Key settings:
   - `skills_max_prompt_chars = 8000`
   - `skills_match_min_score = 0.45`
   - `skills_llm_rerank_enabled = false`
+- Agent Code Mode (safe-by-default scaffold):
+  - `code_mode.enabled = false`
+  - `code_mode.shadow_mode = true`
+  - `code_mode.max_calls = 6`
+  - `code_mode.max_parallel = 2`
+  - `code_mode.max_runtime_ms = 2500`
+  - `code_mode.max_call_timeout_ms = 1200`
+  - `code_mode.timeout_warn_ratio = 0.4`
+  - `code_mode.timeout_auto_shadow_enabled = false`
+  - `code_mode.timeout_auto_shadow_probe_every = 5`
+  - `code_mode.timeout_auto_shadow_streak = 3`
+  - `code_mode.max_result_chars = 12000`
+  - `code_mode.execution_mode = "local"` (`local|subprocess`)
+  - `code_mode.subprocess_timeout_secs = 8`
+  - `code_mode.allow_network = false`
+  - `code_mode.allow_filesystem = false`
+  - `code_mode.allow_env = false`
 
 <a id="hybrid-memory"></a>
 ## Optional: Hybrid Memory (SQLite + zvec sidecar)
@@ -218,6 +235,8 @@ Core endpoints:
 
 - `GET /health`
 - `POST /v1/messages`
+- `GET /v1/code-mode/diag` (requires `Authorization: Bearer <channels.http.diag_bearer_token>`)
+- `GET /v1/code-mode/metrics` (Prometheus format, same bearer token as diag)
 - `GET /v1/channels/{channel}/mode`
 - `GET /v1/channels/{channel}/diag`
 - `POST /v1/channels/{channel}/inbound`
@@ -229,7 +248,20 @@ Example:
 curl -X POST http://127.0.0.1:8080/v1/messages \
   -H 'content-type: application/json' \
   -d '{"session_id":"demo-1","user_id":"u1","text":"hello"}'
+
+curl http://127.0.0.1:8080/v1/code-mode/diag \
+  -H 'authorization: Bearer YOUR_HTTP_DIAG_BEARER_TOKEN'
+
+curl http://127.0.0.1:8080/v1/code-mode/metrics \
+  -H 'authorization: Bearer YOUR_HTTP_DIAG_BEARER_TOKEN'
 ```
+
+`/v1/code-mode/diag` includes both current breaker state and cumulative counters
+(`attempts_total`, `fallback_total`, `timed_out_calls_total`, `circuit_open_total`, etc.)
+for alerting and dashboards.
+Both endpoints are rate limited by `channels.http.diag_rate_limit_per_minute`.
+
+Prometheus scraping + alerting examples: `docs/code-mode-observability.md`.
 
 <a id="mcp-integration"></a>
 ## MCP Integration
@@ -357,6 +389,24 @@ skills_max_selected = 3
 skills_max_prompt_chars = 8000
 skills_match_min_score = 0.45
 skills_llm_rerank_enabled = false
+
+[agent.code_mode]
+enabled = false
+shadow_mode = true
+max_calls = 6
+max_parallel = 2
+max_runtime_ms = 2500
+max_call_timeout_ms = 1200
+timeout_warn_ratio = 0.4
+timeout_auto_shadow_enabled = false
+timeout_auto_shadow_probe_every = 5
+timeout_auto_shadow_streak = 3
+max_result_chars = 12000
+execution_mode = "local" # local | subprocess
+subprocess_timeout_secs = 8
+allow_network = false
+allow_filesystem = false
+allow_env = false
 ```
 
 <a id="plugin-system"></a>

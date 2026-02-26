@@ -109,7 +109,11 @@ async fn custom_channel_plugin_can_receive_messages_via_unified_endpoint() {
         ))
         .collect(),
         channels: ChannelsConfig {
-            http: HttpChannelConfig { enabled: true },
+            http: HttpChannelConfig {
+                enabled: true,
+                diag_bearer_token: None,
+                diag_rate_limit_per_minute: 120,
+            },
             telegram: None,
             plugins: std::iter::once((
                 "webhook1".to_string(),

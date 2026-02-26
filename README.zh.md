@@ -175,6 +175,22 @@ curl -sS http://127.0.0.1:8080/v1/channels/telegram/mode
   - `skills_max_prompt_chars = 8000`
   - `skills_match_min_score = 0.45`
   - `skills_llm_rerank_enabled = false`
+  - `code_mode.enabled = false`（默认关闭）
+  - `code_mode.shadow_mode = true`（灰度模式，仅审计不接管结果）
+  - `code_mode.max_calls = 6`
+  - `code_mode.max_parallel = 2`
+  - `code_mode.max_runtime_ms = 2500`
+  - `code_mode.max_call_timeout_ms = 1200`
+  - `code_mode.timeout_warn_ratio = 0.4`
+  - `code_mode.timeout_auto_shadow_enabled = false`
+  - `code_mode.timeout_auto_shadow_probe_every = 5`
+  - `code_mode.timeout_auto_shadow_streak = 3`
+  - `code_mode.max_result_chars = 12000`
+  - `code_mode.execution_mode = "local"`（`local|subprocess`）
+  - `code_mode.subprocess_timeout_secs = 8`
+  - `code_mode.allow_network = false`
+  - `code_mode.allow_filesystem = false`
+  - `code_mode.allow_env = false`
 
 <a id="hybrid-memory"></a>
 ## 可选：启用混合记忆（SQLite + zvec sidecar）
@@ -206,7 +222,10 @@ curl -sS http://127.0.0.1:8080/v1/channels/telegram/mode
 
 - `GET /health`
 - `POST /v1/messages`
+- `GET /v1/code-mode/diag`（需 `Authorization: Bearer <channels.http.diag_bearer_token>`）
+- `GET /v1/code-mode/metrics`（Prometheus 文本格式，鉴权同上）
 - `GET /v1/channels/{channel}/mode`
+- `GET /v1/channels/{channel}/diag`
 - `POST /v1/channels/{channel}/inbound`
 - `POST /v1/channels/{channel}/inbound/{secret}`
 
@@ -216,7 +235,20 @@ curl -sS http://127.0.0.1:8080/v1/channels/telegram/mode
 curl -X POST http://127.0.0.1:8080/v1/messages \
   -H 'content-type: application/json' \
   -d '{"session_id":"demo-1","user_id":"u1","text":"你好"}'
+
+curl http://127.0.0.1:8080/v1/code-mode/diag \
+  -H 'authorization: Bearer YOUR_HTTP_DIAG_BEARER_TOKEN'
+
+curl http://127.0.0.1:8080/v1/code-mode/metrics \
+  -H 'authorization: Bearer YOUR_HTTP_DIAG_BEARER_TOKEN'
 ```
+
+`/v1/code-mode/diag` 同时返回当前断路器状态与累计计数指标
+（如 `attempts_total`、`fallback_total`、`timed_out_calls_total`、`circuit_open_total`），
+可直接用于告警与看板。
+两个端点都受 `channels.http.diag_rate_limit_per_minute` 限流保护。
+
+Prometheus 抓取与告警示例见：`docs/code-mode-observability.md`。
 
 <a id="skills-integration"></a>
 ## Skills 集成

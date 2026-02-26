@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, bail};
@@ -9,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::{Duration, timeout};
 
 const ENV_USER_CONFIG_OVERRIDE: &str = "XIAOMAOLV_MCP_USER_CONFIG";
@@ -153,7 +155,7 @@ pub struct McpAddSpec {
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpToolInfo {
     pub server: String,
     pub name: String,
@@ -345,6 +347,27 @@ fn server_view(name: String, source: &str, cfg: McpServerConfig) -> McpServerVie
 pub struct McpRuntime {
     servers: HashMap<String, McpServerConfig>,
     http_client: reqwest::Client,
+    session_pool: Arc<McpSessionPool>,
+    tool_cache: Arc<RwLock<HashMap<String, Vec<McpToolInfo>>>>,
+}
+
+#[derive(Default)]
+struct McpSessionPool {
+    stdio: Mutex<HashMap<String, Arc<Mutex<StdioSession>>>>,
+    http: Mutex<HashMap<String, String>>,
+}
+
+struct StdioSession {
+    child: tokio::process::Child,
+    writer: tokio::process::ChildStdin,
+    reader: BufReader<tokio::process::ChildStdout>,
+    next_id: u64,
+}
+
+impl Drop for StdioSession {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+    }
 }
 
 impl Default for McpRuntime {
@@ -353,11 +376,146 @@ impl Default for McpRuntime {
     }
 }
 
+impl McpSessionPool {
+    async fn get_or_create_stdio(
+        &self,
+        server_name: &str,
+        cfg: &McpServerConfig,
+    ) -> anyhow::Result<Arc<Mutex<StdioSession>>> {
+        let mut sessions = self.stdio.lock().await;
+        if let Some(session) = sessions.get(server_name) {
+            return Ok(session.clone());
+        }
+        let created = Arc::new(Mutex::new(
+            StdioSession::connect(server_name, cfg)
+                .await
+                .with_context(|| {
+                    format!("failed to initialize stdio session for '{server_name}'")
+                })?,
+        ));
+        sessions.insert(server_name.to_string(), created.clone());
+        Ok(created)
+    }
+
+    async fn drop_stdio(&self, server_name: &str) {
+        let mut sessions = self.stdio.lock().await;
+        sessions.remove(server_name);
+    }
+
+    async fn get_http_session_id(&self, server_name: &str) -> Option<String> {
+        self.http.lock().await.get(server_name).cloned()
+    }
+
+    async fn set_http_session_id(&self, server_name: &str, session_id: Option<String>) {
+        let mut sessions = self.http.lock().await;
+        if let Some(session) = session_id {
+            sessions.insert(server_name.to_string(), session);
+        } else {
+            sessions.remove(server_name);
+        }
+    }
+}
+
+impl StdioSession {
+    async fn connect(server_name: &str, cfg: &McpServerConfig) -> anyhow::Result<Self> {
+        let command = cfg
+            .command
+            .as_deref()
+            .with_context(|| format!("mcp server '{server_name}' command missing"))?;
+
+        let mut cmd = Command::new(command);
+        cmd.args(&cfg.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        if let Some(cwd) = cfg.cwd.as_deref() {
+            cmd.current_dir(cwd);
+        }
+
+        for (k, v) in &cfg.env {
+            cmd.env(k, v);
+        }
+
+        let mut child = cmd.spawn().with_context(|| {
+            format!("failed to spawn stdio mcp server '{server_name}' using '{command}'")
+        })?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .with_context(|| format!("mcp server '{server_name}' missing stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .with_context(|| format!("mcp server '{server_name}' missing stdout"))?;
+        let mut session = Self {
+            child,
+            writer: stdin,
+            reader: BufReader::new(stdout),
+            next_id: 2,
+        };
+        session
+            .initialize(server_name, cfg.timeout_secs.max(1))
+            .await
+            .with_context(|| format!("mcp server '{server_name}' initialize failed"))?;
+        Ok(session)
+    }
+
+    async fn initialize(&mut self, server_name: &str, timeout_secs: u64) -> anyhow::Result<()> {
+        write_json_line(
+            &mut self.writer,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "xiaomaolv",
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                }
+            }),
+        )
+        .await?;
+
+        let init_response =
+            read_jsonrpc_message_with_id(&mut self.reader, Duration::from_secs(timeout_secs), 1)
+                .await
+                .with_context(|| format!("mcp server '{server_name}' initialize read failed"))?;
+        if init_response.get("error").is_some() {
+            bail!("mcp server '{server_name}' initialize returned error: {init_response}");
+        }
+
+        write_json_line(
+            &mut self.writer,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {}
+            }),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    fn allocate_request_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1).max(2);
+        id
+    }
+}
+
 impl McpRuntime {
     pub fn new(servers: HashMap<String, McpServerConfig>) -> Self {
         Self {
             servers,
             http_client: reqwest::Client::new(),
+            session_pool: Arc::new(McpSessionPool::default()),
+            tool_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -451,6 +609,10 @@ impl McpRuntime {
         server_name: &str,
         cfg: &McpServerConfig,
     ) -> anyhow::Result<Vec<McpToolInfo>> {
+        if let Some(cached) = self.tool_cache.read().await.get(server_name).cloned() {
+            return Ok(cached);
+        }
+
         let response = self
             .request_server(server_name, cfg, "tools/list", serde_json::json!({}))
             .await?;
@@ -462,7 +624,7 @@ impl McpRuntime {
             .cloned()
             .unwrap_or_default();
 
-        Ok(tools
+        let parsed = tools
             .into_iter()
             .filter_map(|tool| {
                 let name = tool.get("name")?.as_str()?.to_string();
@@ -478,7 +640,12 @@ impl McpRuntime {
                     input_schema,
                 })
             })
-            .collect())
+            .collect::<Vec<_>>();
+        self.tool_cache
+            .write()
+            .await
+            .insert(server_name.to_string(), parsed.clone());
+        Ok(parsed)
     }
 
     async fn request_server(
@@ -501,103 +668,51 @@ impl McpRuntime {
         method: &str,
         params: Value,
     ) -> anyhow::Result<Value> {
-        let command = cfg
-            .command
-            .as_deref()
-            .with_context(|| format!("mcp server '{server_name}' command missing"))?;
-
-        let mut cmd = Command::new(command);
-        cmd.args(&cfg.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-
-        if let Some(cwd) = cfg.cwd.as_deref() {
-            cmd.current_dir(cwd);
-        }
-
-        for (k, v) in &cfg.env {
-            cmd.env(k, v);
-        }
-
-        let mut child = cmd.spawn().with_context(|| {
-            format!("failed to spawn stdio mcp server '{server_name}' using '{command}'")
-        })?;
-
-        let stdin = child
-            .stdin
-            .take()
-            .with_context(|| format!("mcp server '{server_name}' missing stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .with_context(|| format!("mcp server '{server_name}' missing stdout"))?;
-        let mut writer = stdin;
-        let mut reader = BufReader::new(stdout);
         let timeout_secs = cfg.timeout_secs.max(1);
+        let send = || async {
+            let session = self
+                .session_pool
+                .get_or_create_stdio(server_name, cfg)
+                .await?;
+            let mut guard = session.lock().await;
+            let request_id = guard.allocate_request_id();
 
-        write_json_line(
-            &mut writer,
-            &serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": {},
-                    "clientInfo": {
-                        "name": "xiaomaolv",
-                        "version": env!("CARGO_PKG_VERSION")
-                    }
-                }
-            }),
-        )
-        .await?;
+            write_json_line(
+                &mut guard.writer,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": params.clone()
+                }),
+            )
+            .await?;
 
-        let init_response = read_jsonrpc_message(&mut reader, Duration::from_secs(timeout_secs))
+            read_jsonrpc_message_with_id(
+                &mut guard.reader,
+                Duration::from_secs(timeout_secs),
+                request_id,
+            )
             .await
-            .with_context(|| format!("mcp server '{server_name}' initialize read failed"))?;
-
-        if init_response.get("error").is_some() {
-            bail!("mcp server '{server_name}' initialize returned error: {init_response}");
-        }
-
-        write_json_line(
-            &mut writer,
-            &serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized",
-                "params": {}
-            }),
-        )
-        .await?;
-
-        write_json_line(
-            &mut writer,
-            &serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": method,
-                "params": params
-            }),
-        )
-        .await?;
-
-        let response = loop {
-            let msg = read_jsonrpc_message(&mut reader, Duration::from_secs(timeout_secs))
-                .await
-                .with_context(|| format!("mcp server '{server_name}' read failed"))?;
-            let id = msg.get("id");
-            if id.is_none() {
-                continue;
-            }
-            if id == Some(&serde_json::json!(2)) {
-                break msg;
-            }
+            .with_context(|| format!("mcp server '{server_name}' read failed"))
         };
 
-        let _ = child.kill().await;
-        Ok(response)
+        match send().await {
+            Ok(response) => Ok(response),
+            Err(first_err) => {
+                self.session_pool.drop_stdio(server_name).await;
+                if method == "tools/list" {
+                    return send().await.with_context(|| {
+                        format!("mcp server '{server_name}' retry after session reset failed")
+                    });
+                }
+                Err(first_err).with_context(|| {
+                    format!(
+                        "mcp server '{server_name}' request failed; session reset, no auto-retry for non-idempotent method '{method}'"
+                    )
+                })
+            }
+        }
     }
 
     async fn request_http(
@@ -612,8 +727,66 @@ impl McpRuntime {
             .as_deref()
             .with_context(|| format!("mcp server '{server_name}' url missing"))?;
         let timeout_secs = cfg.timeout_secs.max(1);
+        let mut session_id = self.session_pool.get_http_session_id(server_name).await;
+        if session_id.is_none() {
+            self.initialize_http_session(url, cfg, &mut session_id, timeout_secs)
+                .await
+                .with_context(|| format!("mcp server '{server_name}' initialize failed"))?;
+        }
 
-        let mut session_id: Option<String> = None;
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": method,
+            "params": params
+        });
+        let first = self
+            .http_jsonrpc(url, cfg, &request, &mut session_id, timeout_secs)
+            .await;
+
+        match first {
+            Ok(value) => {
+                self.session_pool
+                    .set_http_session_id(server_name, session_id)
+                    .await;
+                Ok(value)
+            }
+            Err(first_err) => {
+                session_id = None;
+                self.session_pool
+                    .set_http_session_id(server_name, None)
+                    .await;
+                self.initialize_http_session(url, cfg, &mut session_id, timeout_secs)
+                    .await
+                    .with_context(|| format!("mcp server '{server_name}' reinitialize failed"))?;
+                let retry = self
+                    .http_jsonrpc(url, cfg, &request, &mut session_id, timeout_secs)
+                    .await
+                    .with_context(|| {
+                        format!("mcp server '{server_name}' request failed after reinitialize")
+                    });
+                match retry {
+                    Ok(value) => {
+                        self.session_pool
+                            .set_http_session_id(server_name, session_id)
+                            .await;
+                        Ok(value)
+                    }
+                    Err(retry_err) => Err(anyhow::anyhow!(
+                        "mcp server '{server_name}' request failed before and after reinitialize; first error: {first_err}; retry error: {retry_err}"
+                    )),
+                }
+            }
+        }
+    }
+
+    async fn initialize_http_session(
+        &self,
+        url: &str,
+        cfg: &McpServerConfig,
+        session_id: &mut Option<String>,
+        timeout_secs: u64,
+    ) -> anyhow::Result<()> {
         let initialize = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -628,10 +801,10 @@ impl McpRuntime {
             }
         });
         let init = self
-            .http_jsonrpc(url, cfg, &initialize, &mut session_id, timeout_secs)
+            .http_jsonrpc(url, cfg, &initialize, session_id, timeout_secs)
             .await?;
         if init.get("error").is_some() {
-            bail!("mcp server '{server_name}' initialize returned error: {init}");
+            bail!("initialize returned error: {init}");
         }
 
         let initialized = serde_json::json!({
@@ -640,17 +813,9 @@ impl McpRuntime {
             "params": {}
         });
         let _ = self
-            .http_jsonrpc(url, cfg, &initialized, &mut session_id, timeout_secs)
+            .http_jsonrpc(url, cfg, &initialized, session_id, timeout_secs)
             .await?;
-
-        let request = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": method,
-            "params": params
-        });
-        self.http_jsonrpc(url, cfg, &request, &mut session_id, timeout_secs)
-            .await
+        Ok(())
     }
 
     async fn http_jsonrpc(
@@ -776,6 +941,23 @@ async fn read_jsonrpc_message(
     .context("mcp stdio read timeout")?
 }
 
+async fn read_jsonrpc_message_with_id(
+    reader: &mut BufReader<tokio::process::ChildStdout>,
+    dur: Duration,
+    request_id: u64,
+) -> anyhow::Result<Value> {
+    loop {
+        let msg = read_jsonrpc_message(reader, dur).await?;
+        let id = msg.get("id");
+        if id.is_none() {
+            continue;
+        }
+        if id == Some(&serde_json::json!(request_id)) {
+            return Ok(msg);
+        }
+    }
+}
+
 fn parse_content_length(line: &str) -> Option<usize> {
     let lower = line.to_ascii_lowercase();
     if !lower.starts_with("content-length:") {
@@ -844,7 +1026,110 @@ pub fn parse_header_kv(input: &str) -> anyhow::Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::extract::State;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use axum::{Json, Router};
     use tempfile::tempdir;
+
+    #[derive(Default)]
+    struct MockHttpMcpState {
+        initialize_calls: AtomicUsize,
+        tools_list_calls: AtomicUsize,
+        tools_call_calls: AtomicUsize,
+    }
+
+    async fn mock_http_mcp_handler(
+        State(state): State<Arc<MockHttpMcpState>>,
+        headers: HeaderMap,
+        Json(payload): Json<Value>,
+    ) -> impl IntoResponse {
+        let method = payload
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+
+        match method {
+            "initialize" => {
+                state.initialize_calls.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    [("mcp-session-id", "session-1")],
+                    Json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": payload.get("id").cloned().unwrap_or_else(|| serde_json::json!(1)),
+                        "result": {
+                            "protocolVersion": "2025-06-18",
+                            "serverInfo": { "name": "mock", "version": "1.0.0" }
+                        }
+                    })),
+                )
+                    .into_response()
+            }
+            "notifications/initialized" => (
+                StatusCode::OK,
+                Json(serde_json::json!({ "jsonrpc": "2.0", "result": {} })),
+            )
+                .into_response(),
+            "tools/list" => {
+                if headers.get("mcp-session-id").is_none() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": "missing mcp-session-id" })),
+                    )
+                        .into_response();
+                }
+                state.tools_list_calls.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": payload.get("id").cloned().unwrap_or_else(|| serde_json::json!(2)),
+                        "result": {
+                            "tools": [
+                                {
+                                    "name": "echo",
+                                    "description": "echo tool",
+                                    "inputSchema": { "type": "object" }
+                                }
+                            ]
+                        }
+                    })),
+                )
+                    .into_response()
+            }
+            "tools/call" => {
+                if headers.get("mcp-session-id").is_none() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": "missing mcp-session-id" })),
+                    )
+                        .into_response();
+                }
+                state.tools_call_calls.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": payload.get("id").cloned().unwrap_or_else(|| serde_json::json!(2)),
+                        "result": {
+                            "echoed": payload.get("params").cloned().unwrap_or_else(|| serde_json::json!({}))
+                        }
+                    })),
+                )
+                    .into_response()
+            }
+            _ => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("unsupported method: {method}") })),
+            )
+                .into_response(),
+        }
+    }
 
     #[tokio::test]
     async fn registry_merge_uses_project_precedence() {
@@ -951,5 +1236,62 @@ mod tests {
         let (h, v) = parse_header_kv("Authorization: Bearer token").expect("parse header");
         assert_eq!(h, "Authorization");
         assert_eq!(v, "Bearer token");
+    }
+
+    #[tokio::test]
+    async fn http_runtime_reuses_session_and_caches_tools() {
+        let state = Arc::new(MockHttpMcpState::default());
+        let app = Router::new()
+            .route("/mcp", post(mock_http_mcp_handler))
+            .with_state(state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let mut servers = HashMap::new();
+        servers.insert(
+            "demo".to_string(),
+            McpServerConfig {
+                enabled: true,
+                transport: McpTransport::Http,
+                command: None,
+                args: vec![],
+                cwd: None,
+                env: HashMap::new(),
+                url: Some(format!("http://{addr}/mcp")),
+                headers: HashMap::new(),
+                timeout_secs: 5,
+            },
+        );
+        let runtime = McpRuntime::new(servers);
+
+        let tools_first = runtime.list_tools(Some("demo")).await.expect("tools first");
+        let tools_second = runtime
+            .list_tools(Some("demo"))
+            .await
+            .expect("tools second");
+        assert_eq!(tools_first.len(), 1);
+        assert_eq!(tools_second.len(), 1);
+
+        let _ = runtime
+            .call_tool("demo", "echo", serde_json::json!({ "q": 1 }))
+            .await
+            .expect("call first");
+        let _ = runtime
+            .call_tool("demo", "echo", serde_json::json!({ "q": 2 }))
+            .await
+            .expect("call second");
+
+        assert_eq!(state.initialize_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.tools_list_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.tools_call_calls.load(Ordering::SeqCst), 2);
+
+        server.abort();
+        let _ = server.await;
     }
 }

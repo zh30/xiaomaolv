@@ -1,3 +1,4 @@
+use xiaomaolv::code_mode::CodeModeExecutionMode;
 use xiaomaolv::config::AppConfig;
 
 #[test]
@@ -20,6 +21,8 @@ enabled = true
     let cfg = AppConfig::from_toml(toml).expect("config should parse");
     assert_eq!(cfg.app.default_provider, "openai");
     assert!(cfg.channels.http.enabled);
+    assert!(cfg.channels.http.diag_bearer_token.is_none());
+    assert_eq!(cfg.channels.http.diag_rate_limit_per_minute, 120);
     assert!(cfg.agent.mcp_enabled);
     assert_eq!(cfg.agent.mcp_max_iterations, 4);
     assert!(cfg.agent.skills_enabled);
@@ -27,6 +30,52 @@ enabled = true
     assert_eq!(cfg.agent.skills_max_prompt_chars, 8000);
     assert_eq!(cfg.agent.skills_match_min_score, 0.45);
     assert!(!cfg.agent.skills_llm_rerank_enabled);
+    assert!(!cfg.agent.code_mode.enabled);
+    assert!(cfg.agent.code_mode.shadow_mode);
+    assert_eq!(cfg.agent.code_mode.max_calls, 6);
+    assert_eq!(cfg.agent.code_mode.max_parallel, 2);
+    assert_eq!(cfg.agent.code_mode.max_runtime_ms, 2500);
+    assert_eq!(cfg.agent.code_mode.max_call_timeout_ms, 1200);
+    assert_eq!(cfg.agent.code_mode.timeout_warn_ratio, 0.4);
+    assert!(!cfg.agent.code_mode.timeout_auto_shadow_enabled);
+    assert_eq!(cfg.agent.code_mode.timeout_auto_shadow_probe_every, 5);
+    assert_eq!(cfg.agent.code_mode.timeout_auto_shadow_streak, 3);
+    assert_eq!(cfg.agent.code_mode.max_result_chars, 12000);
+    assert_eq!(
+        cfg.agent.code_mode.execution_mode,
+        CodeModeExecutionMode::Local
+    );
+    assert_eq!(cfg.agent.code_mode.subprocess_timeout_secs, 8);
+    assert!(!cfg.agent.code_mode.allow_network);
+    assert!(!cfg.agent.code_mode.allow_filesystem);
+    assert!(!cfg.agent.code_mode.allow_env);
+}
+
+#[test]
+fn config_bootstrap_parses_http_diag_bearer_token() {
+    let toml = r#"
+[app]
+bind = "127.0.0.1:8080"
+default_provider = "openai"
+
+[providers.openai]
+kind = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+api_key = "test-key"
+model = "gpt-4o-mini"
+
+[channels.http]
+enabled = true
+diag_bearer_token = "${HTTP_DIAG_BEARER_TOKEN:-diag-secret}"
+diag_rate_limit_per_minute = 7
+"#;
+
+    let cfg = AppConfig::from_toml(toml).expect("config should parse");
+    assert_eq!(
+        cfg.channels.http.diag_bearer_token.as_deref(),
+        Some("diag-secret")
+    );
+    assert_eq!(cfg.channels.http.diag_rate_limit_per_minute, 7);
 }
 
 #[test]
@@ -320,6 +369,24 @@ skills_max_selected = 5
 skills_max_prompt_chars = 12000
 skills_match_min_score = 0.66
 skills_llm_rerank_enabled = true
+
+[agent.code_mode]
+enabled = true
+shadow_mode = false
+max_calls = 10
+max_parallel = 4
+max_runtime_ms = 4000
+max_call_timeout_ms = 900
+timeout_warn_ratio = 0.6
+timeout_auto_shadow_enabled = true
+timeout_auto_shadow_probe_every = 7
+timeout_auto_shadow_streak = 5
+max_result_chars = 20000
+execution_mode = "subprocess"
+subprocess_timeout_secs = 15
+allow_network = false
+allow_filesystem = false
+allow_env = false
 "#;
 
     let cfg = AppConfig::from_toml(toml).expect("config should parse");
@@ -331,4 +398,23 @@ skills_llm_rerank_enabled = true
     assert_eq!(cfg.agent.skills_max_prompt_chars, 12000);
     assert_eq!(cfg.agent.skills_match_min_score, 0.66);
     assert!(cfg.agent.skills_llm_rerank_enabled);
+    assert!(cfg.agent.code_mode.enabled);
+    assert!(!cfg.agent.code_mode.shadow_mode);
+    assert_eq!(cfg.agent.code_mode.max_calls, 10);
+    assert_eq!(cfg.agent.code_mode.max_parallel, 4);
+    assert_eq!(cfg.agent.code_mode.max_runtime_ms, 4000);
+    assert_eq!(cfg.agent.code_mode.max_call_timeout_ms, 900);
+    assert_eq!(cfg.agent.code_mode.timeout_warn_ratio, 0.6);
+    assert!(cfg.agent.code_mode.timeout_auto_shadow_enabled);
+    assert_eq!(cfg.agent.code_mode.timeout_auto_shadow_probe_every, 7);
+    assert_eq!(cfg.agent.code_mode.timeout_auto_shadow_streak, 5);
+    assert_eq!(cfg.agent.code_mode.max_result_chars, 20000);
+    assert_eq!(
+        cfg.agent.code_mode.execution_mode,
+        CodeModeExecutionMode::Subprocess
+    );
+    assert_eq!(cfg.agent.code_mode.subprocess_timeout_secs, 15);
+    assert!(!cfg.agent.code_mode.allow_network);
+    assert!(!cfg.agent.code_mode.allow_filesystem);
+    assert!(!cfg.agent.code_mode.allow_env);
 }

@@ -41,6 +41,8 @@ enum Commands {
         #[command(subcommand)]
         command: SkillsCommands,
     },
+    #[command(name = "__code-mode-exec", hide = true)]
+    CodeModeExec,
 }
 
 #[tokio::main]
@@ -60,6 +62,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Serve { config, database } => serve(config, &database).await,
         Commands::Mcp { command } => handle_mcp(command).await,
         Commands::Skills { command } => handle_skills(command).await,
+        Commands::CodeModeExec => handle_code_mode_exec().await,
     }
 }
 
@@ -125,6 +128,10 @@ async fn handle_skills(command: SkillsCommands) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn handle_code_mode_exec() -> anyhow::Result<()> {
+    xiaomaolv::code_mode::run_subprocess_exec_from_stdin().await
+}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -163,6 +170,9 @@ max_retries = 2
 
 [channels.http]
 enabled = true
+# Required for GET /v1/code-mode/diag (Bearer token)
+# diag_bearer_token = "${HTTP_DIAG_BEARER_TOKEN}"
+diag_rate_limit_per_minute = 120
 
 [channels.telegram]
 enabled = false
@@ -213,4 +223,22 @@ skills_max_selected = 3
 skills_max_prompt_chars = 8000
 skills_match_min_score = 0.45
 skills_llm_rerank_enabled = false
+
+[agent.code_mode]
+enabled = false
+shadow_mode = true
+max_calls = 6
+max_parallel = 2
+max_runtime_ms = 2500
+max_call_timeout_ms = 1200
+timeout_warn_ratio = 0.4
+timeout_auto_shadow_enabled = false
+timeout_auto_shadow_probe_every = 5
+timeout_auto_shadow_streak = 3
+max_result_chars = 12000
+execution_mode = "local" # local | subprocess
+subprocess_timeout_secs = 8
+allow_network = false
+allow_filesystem = false
+allow_env = false
 "#;

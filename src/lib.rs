@@ -1,4 +1,5 @@
 pub mod channel;
+pub mod code_mode;
 pub mod config;
 pub mod domain;
 pub mod http;

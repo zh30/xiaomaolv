@@ -1,9 +1,11 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -14,6 +16,7 @@ use crate::channel::{
     ChannelContext, ChannelInbound, ChannelPlugin, ChannelPluginConfig, ChannelPluginError,
     ChannelRegistry, ChannelRuntimeContext, ChannelWorker,
 };
+use crate::code_mode::LlmCodeModePlanner;
 use crate::config::AppConfig;
 use crate::domain::IncomingMessage;
 use crate::mcp::{McpConfigPaths, McpRegistry, McpRuntime};
@@ -22,8 +25,10 @@ use crate::memory::{
     SqliteMemoryStore, ZvecSidecarClient, ZvecSidecarConfig,
 };
 use crate::provider::{ChatProvider, ProviderRegistry};
-use crate::service::{AgentMcpSettings, AgentSkillsSettings, MessageService};
+use crate::service::{AgentMcpSettings, AgentSkillsSettings, CodeModeDiagnostics, MessageService};
 use crate::skills::{SkillConfigPaths, SkillRegistry, SkillRuntime};
+
+const CODE_MODE_DIAG_OVERFLOW_SOURCE_KEY: &str = "__overflow__";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -31,6 +36,78 @@ pub struct AppState {
     pub channel_plugins: Arc<HashMap<String, Arc<dyn ChannelPlugin>>>,
     pub mcp_runtime: Arc<RwLock<McpRuntime>>,
     pub semaphore: Arc<Semaphore>,
+    pub code_mode_diag_bearer_token: Option<String>,
+    code_mode_diag_rate_limiter: Arc<FixedWindowRateLimiter>,
+}
+
+#[derive(Debug)]
+struct FixedWindowSourceCounter {
+    window_start_secs: u64,
+    request_count: usize,
+}
+
+#[derive(Debug)]
+struct FixedWindowRateLimiter {
+    window_secs: u64,
+    max_requests: usize,
+    max_sources: usize,
+    by_source: Mutex<HashMap<String, FixedWindowSourceCounter>>,
+}
+
+impl FixedWindowRateLimiter {
+    fn new(window_secs: u64, max_requests: usize) -> Self {
+        Self {
+            window_secs: window_secs.max(1),
+            max_requests,
+            max_sources: 4096,
+            by_source: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn allow(&self, source_key: &str) -> bool {
+        self.allow_at_for_source(current_unix_time_secs(), source_key)
+    }
+
+    fn allow_at_for_source(&self, now_secs: u64, source_key: &str) -> bool {
+        if self.max_requests == 0 {
+            return true;
+        }
+
+        let source = normalize_source_key(source_key);
+        let current_window = active_window_start(now_secs, self.window_secs);
+        let mut guard = match self.by_source.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        compact_source_windows_if_needed(
+            &mut guard,
+            current_window,
+            self.window_secs,
+            self.max_sources,
+        );
+        let has_overflow = guard.contains_key(CODE_MODE_DIAG_OVERFLOW_SOURCE_KEY);
+        let tracked_regular_sources = guard.len().saturating_sub(usize::from(has_overflow));
+        let effective_source = if guard.contains_key(&source) {
+            source
+        } else if tracked_regular_sources >= self.max_sources {
+            CODE_MODE_DIAG_OVERFLOW_SOURCE_KEY.to_string()
+        } else {
+            source
+        };
+
+        let entry = guard
+            .entry(effective_source)
+            .or_insert(FixedWindowSourceCounter {
+                window_start_secs: current_window,
+                request_count: 0,
+            });
+        if entry.window_start_secs != current_window {
+            entry.window_start_secs = current_window;
+            entry.request_count = 0;
+        }
+        entry.request_count = entry.request_count.saturating_add(1);
+        entry.request_count <= self.max_requests
+    }
 }
 
 pub struct AppRuntime {
@@ -183,6 +260,7 @@ async fn build_state(
 
     let mcp_runtime = Arc::new(RwLock::new(load_mcp_runtime().await));
     let skills_runtime = Arc::new(RwLock::new(load_skill_runtime().await));
+    let code_mode_planner = Arc::new(LlmCodeModePlanner::new(provider.clone()));
     let service = Arc::new(
         MessageService::new_with_backend(
             provider,
@@ -203,6 +281,8 @@ async fn build_state(
             config.memory.context_memory_budget_ratio,
             config.memory.context_min_recent_messages,
         )
+        .with_agent_code_mode(config.agent.code_mode.clone())
+        .with_code_mode_planner(code_mode_planner)
         .with_agent_skills(
             Some(skills_runtime.clone()),
             AgentSkillsSettings {
@@ -217,12 +297,27 @@ async fn build_state(
 
     let channel_plugins = load_channel_plugins(&config, &channel_registry)?;
 
-    let state = AppState {
-        service,
-        channel_plugins: Arc::new(channel_plugins),
-        mcp_runtime,
-        semaphore: Arc::new(Semaphore::new(config.app.concurrency_limit.max(1))),
-    };
+    let state =
+        AppState {
+            service,
+            channel_plugins: Arc::new(channel_plugins),
+            mcp_runtime,
+            semaphore: Arc::new(Semaphore::new(config.app.concurrency_limit.max(1))),
+            code_mode_diag_bearer_token: config.channels.http.diag_bearer_token.clone().and_then(
+                |v| {
+                    let trimmed = v.trim().to_string();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed)
+                    }
+                },
+            ),
+            code_mode_diag_rate_limiter: Arc::new(FixedWindowRateLimiter::new(
+                60,
+                config.channels.http.diag_rate_limit_per_minute,
+            )),
+        };
 
     Ok((state, http_enabled))
 }
@@ -231,7 +326,10 @@ fn build_axum_router(state: AppState, http_enabled: bool) -> Router {
     let mut router = Router::new().route("/health", get(health));
 
     if http_enabled {
-        router = router.route("/v1/messages", post(post_message));
+        router = router
+            .route("/v1/messages", post(post_message))
+            .route("/v1/code-mode/diag", get(get_code_mode_diag))
+            .route("/v1/code-mode/metrics", get(get_code_mode_metrics));
     }
 
     router
@@ -529,6 +627,46 @@ async fn get_mcp_servers(
     }))
 }
 
+async fn get_code_mode_diag(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<CodeModeDiagnostics>, (StatusCode, String)> {
+    guard_code_mode_diag_access(&state, &headers)?;
+
+    let _permit = state.semaphore.acquire().await.map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("concurrency semaphore closed: {err}"),
+        )
+    })?;
+
+    Ok(Json(state.service.code_mode_diagnostics()))
+}
+
+async fn get_code_mode_metrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<(HeaderMap, String), (StatusCode, String)> {
+    guard_code_mode_diag_access(&state, &headers)?;
+
+    let _permit = state.semaphore.acquire().await.map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("concurrency semaphore closed: {err}"),
+        )
+    })?;
+
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+    Ok((
+        response_headers,
+        state.service.code_mode_metrics_prometheus(),
+    ))
+}
+
 async fn get_mcp_tools(
     State(state): State<AppState>,
     Query(query): Query<McpToolsQuery>,
@@ -726,5 +864,226 @@ fn internal_err(message: &'static str) -> impl Fn(anyhow::Error) -> (StatusCode,
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("{message}: {err}"),
         )
+    }
+}
+
+fn guard_code_mode_diag_access(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, String)> {
+    if !is_code_mode_diag_authorized(headers, state.code_mode_diag_bearer_token.as_deref()) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "code mode diagnostics unauthorized".to_string(),
+        ));
+    }
+
+    let source_key = code_mode_diag_source_key(headers);
+    if !state.code_mode_diag_rate_limiter.allow(&source_key) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "code mode diagnostics rate limited".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn is_code_mode_diag_authorized(headers: &HeaderMap, expected_token: Option<&str>) -> bool {
+    let Some(expected) = expected_token.map(str::trim).filter(|v| !v.is_empty()) else {
+        return false;
+    };
+
+    let Some(auth_header) = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let mut parts = auth_header.splitn(2, char::is_whitespace);
+    let Some(scheme) = parts.next() else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return false;
+    }
+    let Some(token) = parts.next().map(str::trim).filter(|v| !v.is_empty()) else {
+        return false;
+    };
+
+    constant_time_eq(token.as_bytes(), expected.as_bytes())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let max_len = left.len().max(right.len());
+    let mut diff = left.len() ^ right.len();
+    for i in 0..max_len {
+        let a = left.get(i).copied().unwrap_or(0);
+        let b = right.get(i).copied().unwrap_or(0);
+        diff |= (a ^ b) as usize;
+    }
+    diff == 0
+}
+
+fn code_mode_diag_source_key(headers: &HeaderMap) -> String {
+    if let Some(value) = header_value_trimmed(headers, "cf-connecting-ip") {
+        return normalize_source_key(&value);
+    }
+    if let Some(value) = header_value_trimmed(headers, "x-real-ip") {
+        return normalize_source_key(&value);
+    }
+    if let Some(value) = header_value_trimmed(headers, "x-forwarded-for") {
+        let first = value.split(',').next().map(str::trim).unwrap_or("");
+        return normalize_source_key(first);
+    }
+    "unknown".to_string()
+}
+
+fn header_value_trimmed(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn normalize_source_key(source_key: &str) -> String {
+    let trimmed = source_key.trim();
+    if trimmed.is_empty() {
+        return "unknown".to_string();
+    }
+
+    let mut normalized = String::with_capacity(trimmed.len().min(128));
+    for ch in trimmed.chars().take(128) {
+        normalized.push(ch.to_ascii_lowercase());
+    }
+    if normalized.is_empty() {
+        "unknown".to_string()
+    } else {
+        normalized
+    }
+}
+
+fn compact_source_windows_if_needed(
+    by_source: &mut HashMap<String, FixedWindowSourceCounter>,
+    current_window: u64,
+    window_secs: u64,
+    max_sources: usize,
+) {
+    if by_source.is_empty() {
+        return;
+    }
+
+    let min_window = current_window.saturating_sub(window_secs);
+    by_source.retain(|_, counter| counter.window_start_secs >= min_window);
+
+    let hard_cap = max_sources.saturating_add(1);
+    if by_source.len() <= hard_cap {
+        return;
+    }
+
+    by_source.retain(|_, counter| counter.window_start_secs == current_window);
+    if by_source.len() <= hard_cap {
+        return;
+    }
+
+    // Defensive trim to keep memory bounded if the map was previously overgrown.
+    let remove_count = by_source.len().saturating_sub(hard_cap);
+    if remove_count == 0 {
+        return;
+    }
+    let mut keys: Vec<String> = by_source.keys().cloned().collect();
+    keys.sort_unstable();
+    for key in keys.into_iter().take(remove_count) {
+        by_source.remove(&key);
+    }
+}
+
+fn active_window_start(now_secs: u64, window_secs: u64) -> u64 {
+    let width = window_secs.max(1);
+    now_secs - (now_secs % width)
+}
+
+fn current_unix_time_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        FixedWindowRateLimiter, code_mode_diag_source_key, constant_time_eq,
+        is_code_mode_diag_authorized,
+    };
+    use axum::http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
+
+    #[test]
+    fn constant_time_eq_matches_expected() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(!constant_time_eq(b"", b"x"));
+    }
+
+    #[test]
+    fn code_mode_diag_authorization_accepts_case_insensitive_bearer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("bearer diag-token"));
+        assert!(is_code_mode_diag_authorized(&headers, Some("diag-token")));
+    }
+
+    #[test]
+    fn code_mode_diag_authorization_rejects_invalid_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("basic abc"));
+        assert!(!is_code_mode_diag_authorized(&headers, Some("diag-token")));
+
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer wrong-token"),
+        );
+        assert!(!is_code_mode_diag_authorized(&headers, Some("diag-token")));
+        assert!(!is_code_mode_diag_authorized(&headers, None));
+    }
+
+    #[test]
+    fn fixed_window_rate_limiter_enforces_limit_and_resets_next_window() {
+        let limiter = FixedWindowRateLimiter::new(60, 2);
+        assert!(limiter.allow_at_for_source(120, "198.51.100.1"));
+        assert!(limiter.allow_at_for_source(121, "198.51.100.1"));
+        assert!(!limiter.allow_at_for_source(122, "198.51.100.1"));
+        assert!(limiter.allow_at_for_source(180, "198.51.100.1"));
+    }
+
+    #[test]
+    fn fixed_window_rate_limiter_allows_unlimited_when_limit_is_zero() {
+        let limiter = FixedWindowRateLimiter::new(60, 0);
+        for _ in 0..100 {
+            assert!(limiter.allow_at_for_source(120, "198.51.100.1"));
+        }
+    }
+
+    #[test]
+    fn fixed_window_rate_limiter_isolated_by_source() {
+        let limiter = FixedWindowRateLimiter::new(60, 1);
+        assert!(limiter.allow_at_for_source(120, "198.51.100.1"));
+        assert!(!limiter.allow_at_for_source(121, "198.51.100.1"));
+        assert!(limiter.allow_at_for_source(121, "203.0.113.7"));
+    }
+
+    #[test]
+    fn code_mode_diag_source_key_prefers_forwarded_first_ip() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("198.51.100.10, 198.51.100.20"),
+        );
+        assert_eq!(code_mode_diag_source_key(&headers), "198.51.100.10");
+    }
+
+    #[test]
+    fn code_mode_diag_source_key_defaults_to_unknown() {
+        let headers = HeaderMap::new();
+        assert_eq!(code_mode_diag_source_key(&headers), "unknown");
     }
 }
