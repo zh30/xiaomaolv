@@ -37,6 +37,7 @@ struct RuntimeHandles {
     service: Arc<MessageService>,
     channel_plugins: Arc<HashMap<String, Arc<dyn ChannelPlugin>>>,
     mcp_runtime: Arc<RwLock<McpRuntime>>,
+    locale: String,
 }
 
 #[derive(Clone)]
@@ -512,6 +513,11 @@ async fn build_runtime_handles(
         service,
         channel_plugins: Arc::new(channel_plugins),
         mcp_runtime,
+        locale: std::env::var("XIAOMAOLV_LOCALE")
+            .ok()
+            .and_then(|value| normalize_supported_locale(&value))
+            .or_else(|| normalize_supported_locale(&config.app.locale))
+            .unwrap_or_else(|| "en-US".to_string()),
     })
 }
 
@@ -852,9 +858,7 @@ struct McpCallResponse {
 #[derive(Debug, Clone, Copy)]
 struct ConfigUiFieldSpec {
     key: &'static str,
-    label: &'static str,
-    category: &'static str,
-    description: &'static str,
+    group_key: &'static str,
     required: bool,
     sensitive: bool,
     default_value: &'static str,
@@ -878,6 +882,21 @@ struct ConfigUiStateResponse {
     first_time: bool,
     required_keys: Vec<String>,
     fields: Vec<ConfigUiFieldView>,
+    ui_locale: String,
+    global_locale: String,
+    available_locales: Vec<ConfigUiLocaleOption>,
+    messages: HashMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ConfigUiLocaleOption {
+    code: String,
+    label: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigUiStateQuery {
+    locale: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -898,9 +917,7 @@ struct ConfigUiSaveResponse {
 const CONFIG_UI_FIELDS: &[ConfigUiFieldSpec] = &[
     ConfigUiFieldSpec {
         key: "MINIMAX_API_KEY",
-        label: "MiniMax API Key",
-        category: "1. 基础必填",
-        description: "MiniMax 的 API 密钥（必填）。",
+        group_key: "required",
         required: true,
         sensitive: true,
         default_value: "",
@@ -908,9 +925,7 @@ const CONFIG_UI_FIELDS: &[ConfigUiFieldSpec] = &[
     },
     ConfigUiFieldSpec {
         key: "TELEGRAM_BOT_TOKEN",
-        label: "Telegram Bot Token",
-        category: "1. 基础必填",
-        description: "Telegram BotFather 生成的 token（必填）。",
+        group_key: "required",
         required: true,
         sensitive: true,
         default_value: "",
@@ -918,9 +933,7 @@ const CONFIG_UI_FIELDS: &[ConfigUiFieldSpec] = &[
     },
     ConfigUiFieldSpec {
         key: "MINIMAX_MODEL",
-        label: "MiniMax Model",
-        category: "2. 模型与服务",
-        description: "模型名，默认 MiniMax-M2.5-highspeed。",
+        group_key: "model",
         required: false,
         sensitive: false,
         default_value: "MiniMax-M2.5-highspeed",
@@ -928,9 +941,7 @@ const CONFIG_UI_FIELDS: &[ConfigUiFieldSpec] = &[
     },
     ConfigUiFieldSpec {
         key: "TELEGRAM_BOT_USERNAME",
-        label: "Telegram Bot Username",
-        category: "3. Telegram 基础",
-        description: "机器人用户名（不带 @），用于群组触发判定。",
+        group_key: "telegram",
         required: false,
         sensitive: false,
         default_value: "",
@@ -938,9 +949,7 @@ const CONFIG_UI_FIELDS: &[ConfigUiFieldSpec] = &[
     },
     ConfigUiFieldSpec {
         key: "TELEGRAM_STARTUP_ONLINE_TEXT",
-        label: "Startup Online Text",
-        category: "3. Telegram 基础",
-        description: "启动后设置的在线状态文案。",
+        group_key: "telegram",
         required: false,
         sensitive: false,
         default_value: "online",
@@ -948,9 +957,7 @@ const CONFIG_UI_FIELDS: &[ConfigUiFieldSpec] = &[
     },
     ConfigUiFieldSpec {
         key: "TELEGRAM_GROUP_TRIGGER_MODE",
-        label: "Group Trigger Mode",
-        category: "4. 群组策略",
-        description: "群组触发模式：strict 或 smart。",
+        group_key: "group",
         required: false,
         sensitive: false,
         default_value: "smart",
@@ -958,9 +965,7 @@ const CONFIG_UI_FIELDS: &[ConfigUiFieldSpec] = &[
     },
     ConfigUiFieldSpec {
         key: "TELEGRAM_SCHEDULER_DEFAULT_TIMEZONE",
-        label: "Scheduler Timezone",
-        category: "5. 调度与权限",
-        description: "定时任务默认时区（IANA）。",
+        group_key: "scheduler",
         required: false,
         sensitive: false,
         default_value: "Asia/Shanghai",
@@ -968,19 +973,23 @@ const CONFIG_UI_FIELDS: &[ConfigUiFieldSpec] = &[
     },
     ConfigUiFieldSpec {
         key: "TELEGRAM_ADMIN_USER_IDS",
-        label: "Admin User IDs",
-        category: "5. 调度与权限",
-        description: "私聊管理员 ID（逗号分隔）。",
+        group_key: "scheduler",
         required: false,
         sensitive: false,
         default_value: "",
         placeholder: "123456789,987654321",
     },
     ConfigUiFieldSpec {
+        key: "XIAOMAOLV_LOCALE",
+        group_key: "system",
+        required: false,
+        sensitive: false,
+        default_value: "en-US",
+        placeholder: "en-US",
+    },
+    ConfigUiFieldSpec {
         key: "HTTP_DIAG_BEARER_TOKEN",
-        label: "HTTP Diag Bearer Token",
-        category: "6. 诊断与观测",
-        description: "保护 /v1/code-mode/diag 与 /v1/code-mode/metrics 的 Bearer token。",
+        group_key: "diagnostics",
         required: false,
         sensitive: true,
         default_value: "",
@@ -988,9 +997,7 @@ const CONFIG_UI_FIELDS: &[ConfigUiFieldSpec] = &[
     },
     ConfigUiFieldSpec {
         key: "ZVEC_SIDECAR_ENDPOINT",
-        label: "zvec Sidecar Endpoint",
-        category: "7. 混合记忆",
-        description: "hybrid memory 使用的 zvec sidecar 地址。",
+        group_key: "memory",
         required: false,
         sensitive: false,
         default_value: "http://127.0.0.1:3711",
@@ -998,9 +1005,7 @@ const CONFIG_UI_FIELDS: &[ConfigUiFieldSpec] = &[
     },
     ConfigUiFieldSpec {
         key: "ZVEC_SIDECAR_TOKEN",
-        label: "zvec Sidecar Token",
-        category: "7. 混合记忆",
-        description: "sidecar Bearer token（可选）。",
+        group_key: "memory",
         required: false,
         sensitive: true,
         default_value: "",
@@ -1010,6 +1015,341 @@ const CONFIG_UI_FIELDS: &[ConfigUiFieldSpec] = &[
 
 fn config_ui_field_spec(key: &str) -> Option<&'static ConfigUiFieldSpec> {
     CONFIG_UI_FIELDS.iter().find(|spec| spec.key == key)
+}
+
+const SUPPORTED_UI_LOCALES: &[&str] = &["en-US", "zh-CN", "hi-IN", "es-ES", "ar"];
+
+fn normalize_supported_locale(raw: &str) -> Option<String> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    let locale = match normalized.as_str() {
+        "en" | "en-us" => "en-US",
+        "zh" | "zh-cn" | "zh-hans" => "zh-CN",
+        "hi" | "hi-in" => "hi-IN",
+        "es" | "es-es" | "es-419" => "es-ES",
+        "ar" | "ar-sa" | "ar-eg" => "ar",
+        _ => return None,
+    };
+    Some(locale.to_string())
+}
+
+fn locale_family(locale: &str) -> &'static str {
+    let lower = locale.to_ascii_lowercase();
+    if lower.starts_with("zh") {
+        "zh"
+    } else if lower.starts_with("hi") {
+        "hi"
+    } else if lower.starts_with("es") {
+        "es"
+    } else if lower.starts_with("ar") {
+        "ar"
+    } else {
+        "en"
+    }
+}
+
+fn locale_label(locale: &str) -> &'static str {
+    match locale {
+        "zh-CN" => "中文",
+        "hi-IN" => "हिन्दी",
+        "es-ES" => "Español",
+        "ar" => "العربية",
+        _ => "English",
+    }
+}
+
+fn localized_group_name(group_key: &str, locale: &str) -> &'static str {
+    match (group_key, locale_family(locale)) {
+        ("required", "zh") => "1. 首次必填",
+        ("required", "hi") => "1. आवश्यक शुरुआत",
+        ("required", "es") => "1. Requerido al inicio",
+        ("required", "ar") => "1. متطلبات البداية",
+        ("required", _) => "1. Required First Step",
+        ("model", "zh") => "2. 模型与服务",
+        ("model", "hi") => "2. मॉडल और सेवा",
+        ("model", "es") => "2. Modelo y servicio",
+        ("model", "ar") => "2. النموذج والخدمة",
+        ("model", _) => "2. Model & Service",
+        ("telegram", "zh") => "3. Telegram 基础",
+        ("telegram", "hi") => "3. Telegram आधार",
+        ("telegram", "es") => "3. Base de Telegram",
+        ("telegram", "ar") => "3. أساسيات Telegram",
+        ("telegram", _) => "3. Telegram Basics",
+        ("group", "zh") => "4. 群组策略",
+        ("group", "hi") => "4. समूह रणनीति",
+        ("group", "es") => "4. Política de grupos",
+        ("group", "ar") => "4. سياسة المجموعات",
+        ("group", _) => "4. Group Policy",
+        ("scheduler", "zh") => "5. 调度与权限",
+        ("scheduler", "hi") => "5. शेड्यूल और अनुमति",
+        ("scheduler", "es") => "5. Programación y permisos",
+        ("scheduler", "ar") => "5. الجدولة والصلاحيات",
+        ("scheduler", _) => "5. Scheduler & Access",
+        ("system", "zh") => "6. 系统语言",
+        ("system", "hi") => "6. सिस्टम भाषा",
+        ("system", "es") => "6. Idioma del sistema",
+        ("system", "ar") => "6. لغة النظام",
+        ("system", _) => "6. System Language",
+        ("diagnostics", "zh") => "7. 诊断与观测",
+        ("diagnostics", "hi") => "7. डायग्नोस्टिक्स",
+        ("diagnostics", "es") => "7. Diagnóstico",
+        ("diagnostics", "ar") => "7. التشخيص",
+        ("diagnostics", _) => "7. Diagnostics",
+        ("memory", "zh") => "8. 混合记忆",
+        ("memory", "hi") => "8. हाइब्रिड मेमोरी",
+        ("memory", "es") => "8. Memoria híbrida",
+        ("memory", "ar") => "8. الذاكرة الهجينة",
+        ("memory", _) => "8. Hybrid Memory",
+        (_, _) => "Other",
+    }
+}
+
+fn localized_field_label(key: &str, locale: &str) -> &'static str {
+    match (key, locale_family(locale)) {
+        ("MINIMAX_API_KEY", "zh") => "MiniMax API 密钥",
+        ("MINIMAX_API_KEY", "hi") => "MiniMax API कुंजी",
+        ("MINIMAX_API_KEY", "es") => "Clave API de MiniMax",
+        ("MINIMAX_API_KEY", "ar") => "مفتاح MiniMax API",
+        ("MINIMAX_API_KEY", _) => "MiniMax API Key",
+        ("TELEGRAM_BOT_TOKEN", "zh") => "Telegram 机器人 Token",
+        ("TELEGRAM_BOT_TOKEN", "hi") => "Telegram Bot टोकन",
+        ("TELEGRAM_BOT_TOKEN", "es") => "Token del bot de Telegram",
+        ("TELEGRAM_BOT_TOKEN", "ar") => "رمز Telegram Bot",
+        ("TELEGRAM_BOT_TOKEN", _) => "Telegram Bot Token",
+        ("MINIMAX_MODEL", "zh") => "MiniMax 模型",
+        ("MINIMAX_MODEL", "hi") => "MiniMax मॉडल",
+        ("MINIMAX_MODEL", "es") => "Modelo MiniMax",
+        ("MINIMAX_MODEL", "ar") => "نموذج MiniMax",
+        ("MINIMAX_MODEL", _) => "MiniMax Model",
+        ("TELEGRAM_BOT_USERNAME", "zh") => "Telegram 用户名",
+        ("TELEGRAM_BOT_USERNAME", "hi") => "Telegram उपयोगकर्ता नाम",
+        ("TELEGRAM_BOT_USERNAME", "es") => "Nombre de usuario de Telegram",
+        ("TELEGRAM_BOT_USERNAME", "ar") => "اسم مستخدم Telegram",
+        ("TELEGRAM_BOT_USERNAME", _) => "Telegram Bot Username",
+        ("TELEGRAM_STARTUP_ONLINE_TEXT", "zh") => "启动在线文案",
+        ("TELEGRAM_STARTUP_ONLINE_TEXT", "hi") => "स्टार्टअप ऑनलाइन टेक्स्ट",
+        ("TELEGRAM_STARTUP_ONLINE_TEXT", "es") => "Texto de estado al iniciar",
+        ("TELEGRAM_STARTUP_ONLINE_TEXT", "ar") => "نص الحالة عند التشغيل",
+        ("TELEGRAM_STARTUP_ONLINE_TEXT", _) => "Startup Online Text",
+        ("TELEGRAM_GROUP_TRIGGER_MODE", "zh") => "群组触发模式",
+        ("TELEGRAM_GROUP_TRIGGER_MODE", "hi") => "ग्रुप ट्रिगर मोड",
+        ("TELEGRAM_GROUP_TRIGGER_MODE", "es") => "Modo de activación en grupo",
+        ("TELEGRAM_GROUP_TRIGGER_MODE", "ar") => "وضع تشغيل المجموعة",
+        ("TELEGRAM_GROUP_TRIGGER_MODE", _) => "Group Trigger Mode",
+        ("TELEGRAM_SCHEDULER_DEFAULT_TIMEZONE", "zh") => "调度默认时区",
+        ("TELEGRAM_SCHEDULER_DEFAULT_TIMEZONE", "hi") => "शेड्यूलर डिफ़ॉल्ट टाइमज़ोन",
+        ("TELEGRAM_SCHEDULER_DEFAULT_TIMEZONE", "es") => "Zona horaria del programador",
+        ("TELEGRAM_SCHEDULER_DEFAULT_TIMEZONE", "ar") => "المنطقة الزمنية للجدولة",
+        ("TELEGRAM_SCHEDULER_DEFAULT_TIMEZONE", _) => "Scheduler Timezone",
+        ("TELEGRAM_ADMIN_USER_IDS", "zh") => "管理员用户 ID",
+        ("TELEGRAM_ADMIN_USER_IDS", "hi") => "एडमिन यूज़र ID",
+        ("TELEGRAM_ADMIN_USER_IDS", "es") => "IDs de administradores",
+        ("TELEGRAM_ADMIN_USER_IDS", "ar") => "معرّفات المدراء",
+        ("TELEGRAM_ADMIN_USER_IDS", _) => "Admin User IDs",
+        ("XIAOMAOLV_LOCALE", "zh") => "系统默认语言",
+        ("XIAOMAOLV_LOCALE", "hi") => "सिस्टम डिफ़ॉल्ट भाषा",
+        ("XIAOMAOLV_LOCALE", "es") => "Idioma predeterminado del sistema",
+        ("XIAOMAOLV_LOCALE", "ar") => "اللغة الافتراضية للنظام",
+        ("XIAOMAOLV_LOCALE", _) => "System Default Language",
+        ("HTTP_DIAG_BEARER_TOKEN", "zh") => "HTTP 诊断令牌",
+        ("HTTP_DIAG_BEARER_TOKEN", "hi") => "HTTP डायग टोकन",
+        ("HTTP_DIAG_BEARER_TOKEN", "es") => "Token de diagnóstico HTTP",
+        ("HTTP_DIAG_BEARER_TOKEN", "ar") => "رمز تشخيص HTTP",
+        ("HTTP_DIAG_BEARER_TOKEN", _) => "HTTP Diag Bearer Token",
+        ("ZVEC_SIDECAR_ENDPOINT", "zh") => "zvec Sidecar 地址",
+        ("ZVEC_SIDECAR_ENDPOINT", "hi") => "zvec साइडकार एंडपॉइंट",
+        ("ZVEC_SIDECAR_ENDPOINT", "es") => "Endpoint de zvec sidecar",
+        ("ZVEC_SIDECAR_ENDPOINT", "ar") => "نقطة zvec الجانبية",
+        ("ZVEC_SIDECAR_ENDPOINT", _) => "zvec Sidecar Endpoint",
+        ("ZVEC_SIDECAR_TOKEN", "zh") => "zvec Sidecar Token",
+        ("ZVEC_SIDECAR_TOKEN", "hi") => "zvec साइडकार टोकन",
+        ("ZVEC_SIDECAR_TOKEN", "es") => "Token de zvec sidecar",
+        ("ZVEC_SIDECAR_TOKEN", "ar") => "رمز zvec الجانبي",
+        ("ZVEC_SIDECAR_TOKEN", _) => "zvec Sidecar Token",
+        _ => "Unknown",
+    }
+}
+
+fn localized_field_description(key: &str, locale: &str) -> &'static str {
+    match (key, locale_family(locale)) {
+        ("MINIMAX_API_KEY", "zh") => "MiniMax 接口密钥（必填）。",
+        ("MINIMAX_API_KEY", "hi") => "MiniMax API कुंजी (आवश्यक)।",
+        ("MINIMAX_API_KEY", "es") => "Clave de MiniMax (obligatoria).",
+        ("MINIMAX_API_KEY", "ar") => "مفتاح MiniMax (مطلوب).",
+        ("MINIMAX_API_KEY", _) => "MiniMax API credential (required).",
+        ("TELEGRAM_BOT_TOKEN", "zh") => "BotFather 生成的机器人 token（必填）。",
+        ("TELEGRAM_BOT_TOKEN", "hi") => "BotFather से मिला Telegram token (आवश्यक)।",
+        ("TELEGRAM_BOT_TOKEN", "es") => "Token del bot de BotFather (obligatorio).",
+        ("TELEGRAM_BOT_TOKEN", "ar") => "رمز Telegram BotFather (مطلوب).",
+        ("TELEGRAM_BOT_TOKEN", _) => "Telegram bot token from BotFather (required).",
+        ("MINIMAX_MODEL", "zh") => "模型名，默认 MiniMax-M2.5-highspeed。",
+        ("MINIMAX_MODEL", "hi") => "मॉडल नाम, डिफ़ॉल्ट MiniMax-M2.5-highspeed.",
+        ("MINIMAX_MODEL", "es") => "Nombre del modelo, por defecto MiniMax-M2.5-highspeed.",
+        ("MINIMAX_MODEL", "ar") => "اسم النموذج، الافتراضي MiniMax-M2.5-highspeed.",
+        ("MINIMAX_MODEL", _) => "Model name, default MiniMax-M2.5-highspeed.",
+        ("TELEGRAM_BOT_USERNAME", "zh") => "不带 @，提升群组触发判定准确度。",
+        ("TELEGRAM_BOT_USERNAME", "hi") => "@ के बिना, ग्रुप ट्रिगर के लिए उपयोगी।",
+        ("TELEGRAM_BOT_USERNAME", "es") => "Sin @, mejora la detección en grupos.",
+        ("TELEGRAM_BOT_USERNAME", "ar") => "بدون @، لتحسين التعرف في المجموعات.",
+        ("TELEGRAM_BOT_USERNAME", _) => "Without @, improves trigger detection in groups.",
+        ("TELEGRAM_STARTUP_ONLINE_TEXT", "zh") => "机器人启动后写入的状态文案。",
+        ("TELEGRAM_STARTUP_ONLINE_TEXT", "hi") => "स्टार्टअप के बाद दिखाई देने वाला स्टेटस टेक्स्ट।",
+        ("TELEGRAM_STARTUP_ONLINE_TEXT", "es") => "Texto de estado al iniciar el bot.",
+        ("TELEGRAM_STARTUP_ONLINE_TEXT", "ar") => "نص الحالة بعد تشغيل البوت.",
+        ("TELEGRAM_STARTUP_ONLINE_TEXT", _) => "Startup status text shown on Telegram profile.",
+        ("TELEGRAM_GROUP_TRIGGER_MODE", "zh") => "strict 或 smart。",
+        ("TELEGRAM_GROUP_TRIGGER_MODE", "hi") => "strict या smart चुनें।",
+        ("TELEGRAM_GROUP_TRIGGER_MODE", "es") => "Elige strict o smart.",
+        ("TELEGRAM_GROUP_TRIGGER_MODE", "ar") => "اختر strict أو smart.",
+        ("TELEGRAM_GROUP_TRIGGER_MODE", _) => "Choose strict or smart.",
+        ("TELEGRAM_SCHEDULER_DEFAULT_TIMEZONE", "zh") => "IANA 时区，例如 Asia/Shanghai。",
+        ("TELEGRAM_SCHEDULER_DEFAULT_TIMEZONE", "hi") => "IANA टाइमज़ोन, जैसे Asia/Shanghai.",
+        ("TELEGRAM_SCHEDULER_DEFAULT_TIMEZONE", "es") => {
+            "Zona horaria IANA, por ejemplo Asia/Shanghai."
+        }
+        ("TELEGRAM_SCHEDULER_DEFAULT_TIMEZONE", "ar") => "منطقة IANA مثل Asia/Shanghai.",
+        ("TELEGRAM_SCHEDULER_DEFAULT_TIMEZONE", _) => "IANA timezone, for example Asia/Shanghai.",
+        ("TELEGRAM_ADMIN_USER_IDS", "zh") => "私聊管理员白名单，逗号分隔。",
+        ("TELEGRAM_ADMIN_USER_IDS", "hi") => "एडमिन ID, कॉमा से अलग करें।",
+        ("TELEGRAM_ADMIN_USER_IDS", "es") => "IDs de admin separados por coma.",
+        ("TELEGRAM_ADMIN_USER_IDS", "ar") => "معرّفات المدراء مفصولة بفواصل.",
+        ("TELEGRAM_ADMIN_USER_IDS", _) => "Admin IDs in CSV form.",
+        ("XIAOMAOLV_LOCALE", "zh") => "系统默认语言（en-US/zh-CN/hi-IN/es-ES/ar）。",
+        ("XIAOMAOLV_LOCALE", "hi") => "सिस्टम डिफ़ॉल्ट भाषा (en-US/zh-CN/hi-IN/es-ES/ar).",
+        ("XIAOMAOLV_LOCALE", "es") => "Idioma global por defecto (en-US/zh-CN/hi-IN/es-ES/ar).",
+        ("XIAOMAOLV_LOCALE", "ar") => "اللغة الافتراضية للنظام (en-US/zh-CN/hi-IN/es-ES/ar).",
+        ("XIAOMAOLV_LOCALE", _) => "Global default locale (en-US/zh-CN/hi-IN/es-ES/ar).",
+        ("HTTP_DIAG_BEARER_TOKEN", "zh") => "用于保护诊断接口访问。",
+        ("HTTP_DIAG_BEARER_TOKEN", "hi") => "डायग API सुरक्षा हेतु टोकन।",
+        ("HTTP_DIAG_BEARER_TOKEN", "es") => "Token para proteger APIs de diagnóstico.",
+        ("HTTP_DIAG_BEARER_TOKEN", "ar") => "رمز لحماية واجهات التشخيص.",
+        ("HTTP_DIAG_BEARER_TOKEN", _) => "Token protecting diagnostics APIs.",
+        ("ZVEC_SIDECAR_ENDPOINT", "zh") => "混合记忆的 sidecar 地址。",
+        ("ZVEC_SIDECAR_ENDPOINT", "hi") => "हाइब्रिड मेमोरी sidecar का endpoint.",
+        ("ZVEC_SIDECAR_ENDPOINT", "es") => "Endpoint del sidecar de memoria híbrida.",
+        ("ZVEC_SIDECAR_ENDPOINT", "ar") => "عنوان sidecar للذاكرة الهجينة.",
+        ("ZVEC_SIDECAR_ENDPOINT", _) => "Sidecar endpoint for hybrid memory mode.",
+        ("ZVEC_SIDECAR_TOKEN", "zh") => "sidecar Bearer token（可选）。",
+        ("ZVEC_SIDECAR_TOKEN", "hi") => "sidecar Bearer token (वैकल्पिक)।",
+        ("ZVEC_SIDECAR_TOKEN", "es") => "Token Bearer del sidecar (opcional).",
+        ("ZVEC_SIDECAR_TOKEN", "ar") => "رمز Bearer للـ sidecar (اختياري).",
+        ("ZVEC_SIDECAR_TOKEN", _) => "Bearer token for sidecar (optional).",
+        _ => "",
+    }
+}
+
+fn localized_messages(locale: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let family = locale_family(locale);
+    let entries = match family {
+        "zh" => vec![
+            ("title", "配置中心"),
+            (
+                "subtitle",
+                "可先用 .env.realtest 作为初始值，也可直接在这里编辑；保存后立即热重载生效。",
+            ),
+            ("required_title", "首次配置（必填）"),
+            ("mobile_tag", "移动优先"),
+            ("all_title", "完整配置（分类）"),
+            ("save_required", "保存必填并生效"),
+            ("save_all", "保存全部并生效"),
+            ("reload", "刷新状态"),
+            ("notice_first", "当前是首次配置，请先填写必填项。"),
+            ("notice_ready", "当前配置已完成，可继续按分类调整。"),
+            ("saved", "配置已保存并即时生效"),
+            ("view_language", "页面语言"),
+        ],
+        "hi" => vec![
+            ("title", "कॉन्फ़िग केंद्र"),
+            (
+                "subtitle",
+                ".env.realtest को प्रारंभिक मान की तरह उपयोग करें या सीधे यहाँ संपादित करें। सेव करते ही लागू होगा।",
+            ),
+            ("required_title", "पहली सेटअप (आवश्यक)"),
+            ("mobile_tag", "मोबाइल-प्रथम"),
+            ("all_title", "पूर्ण कॉन्फ़िग (श्रेणीबद्ध)"),
+            ("save_required", "आवश्यक सेव करें"),
+            ("save_all", "सब सेव करें"),
+            ("reload", "स्थिति रीफ़्रेश करें"),
+            ("notice_first", "पहली बार सेटअप है, पहले आवश्यक फ़ील्ड भरें।"),
+            ("notice_ready", "कॉन्फ़िग तैयार है, आगे समायोजित कर सकते हैं।"),
+            ("saved", "कॉन्फ़िग सेव हुआ और तुरंत लागू हुआ"),
+            ("view_language", "पेज भाषा"),
+        ],
+        "es" => vec![
+            ("title", "Centro de Configuración"),
+            (
+                "subtitle",
+                "Puedes usar .env.realtest como valor inicial o editar aquí; al guardar se aplica al instante.",
+            ),
+            ("required_title", "Configuración inicial (obligatoria)"),
+            ("mobile_tag", "Mobile-first"),
+            ("all_title", "Configuración completa (por categorías)"),
+            ("save_required", "Guardar obligatorios"),
+            ("save_all", "Guardar todo"),
+            ("reload", "Actualizar estado"),
+            (
+                "notice_first",
+                "Primera configuración: completa primero los campos obligatorios.",
+            ),
+            (
+                "notice_ready",
+                "Configuración completa; puedes seguir ajustando por categorías.",
+            ),
+            ("saved", "Configuración guardada y aplicada al instante"),
+            ("view_language", "Idioma de la página"),
+        ],
+        "ar" => vec![
+            ("title", "مركز الإعدادات"),
+            (
+                "subtitle",
+                "يمكنك استخدام .env.realtest كقيمة أولية أو التعديل هنا مباشرة؛ يتم التطبيق فور الحفظ.",
+            ),
+            ("required_title", "الإعداد الأولي (إلزامي)"),
+            ("mobile_tag", "أولوية الجوال"),
+            ("all_title", "إعداد كامل (منظم)"),
+            ("save_required", "حفظ الإلزامي"),
+            ("save_all", "حفظ الكل"),
+            ("reload", "تحديث الحالة"),
+            (
+                "notice_first",
+                "هذه أول مرة إعداد، أكمل الحقول الإلزامية أولاً.",
+            ),
+            (
+                "notice_ready",
+                "الإعداد مكتمل، ويمكنك التعديل حسب التصنيفات.",
+            ),
+            ("saved", "تم حفظ الإعداد وتفعيله فوراً"),
+            ("view_language", "لغة الصفحة"),
+        ],
+        _ => vec![
+            ("title", "Configuration Center"),
+            (
+                "subtitle",
+                "Use values from .env.realtest as defaults, or edit here directly. Save applies immediately with hot reload.",
+            ),
+            ("required_title", "First-time Setup (Required)"),
+            ("mobile_tag", "Mobile-first"),
+            ("all_title", "Full Configuration (Categorized)"),
+            ("save_required", "Save Required Fields"),
+            ("save_all", "Save All"),
+            ("reload", "Refresh State"),
+            (
+                "notice_first",
+                "First-time setup detected. Fill required fields first.",
+            ),
+            (
+                "notice_ready",
+                "Configuration is ready. Continue with categorized adjustments.",
+            ),
+            ("saved", "Configuration saved and applied immediately"),
+            ("view_language", "View Language"),
+        ],
+    };
+
+    for (key, value) in entries {
+        map.insert(key.to_string(), value.to_string());
+    }
+    map
 }
 
 fn is_missing_required_value(value: &str) -> bool {
@@ -1099,14 +1439,17 @@ fn render_env_file(known: &BTreeMap<String, String>, extras: &BTreeMap<String, S
     out.push_str("# Managed by xiaomaolv setup UI.\n");
     out.push_str("# You can still edit this file manually.\n\n");
 
-    let mut current_category = "";
+    let mut current_group = "";
     for spec in CONFIG_UI_FIELDS {
-        if spec.category != current_category {
-            if !current_category.is_empty() {
+        if spec.group_key != current_group {
+            if !current_group.is_empty() {
                 out.push('\n');
             }
-            current_category = spec.category;
-            out.push_str(&format!("# {}\n", spec.category));
+            current_group = spec.group_key;
+            out.push_str(&format!(
+                "# {}\n",
+                localized_group_name(spec.group_key, "en-US")
+            ));
         }
         let value = known.get(spec.key).cloned().unwrap_or_default();
         out.push_str(&format!("{}={}\n", spec.key, format_env_value(&value)));
@@ -1122,7 +1465,11 @@ fn render_env_file(known: &BTreeMap<String, String>, extras: &BTreeMap<String, S
     out
 }
 
-async fn build_config_ui_state(manager: &ConfigUiManager) -> anyhow::Result<ConfigUiStateResponse> {
+async fn build_config_ui_state(
+    manager: &ConfigUiManager,
+    ui_locale: &str,
+    global_locale: &str,
+) -> anyhow::Result<ConfigUiStateResponse> {
     let env_file_values = read_env_file_values(&manager.env_file_path).await?;
     let mut fields = Vec::with_capacity(CONFIG_UI_FIELDS.len());
     let mut required_keys = Vec::new();
@@ -1139,9 +1486,9 @@ async fn build_config_ui_state(manager: &ConfigUiManager) -> anyhow::Result<Conf
 
         fields.push(ConfigUiFieldView {
             key: spec.key.to_string(),
-            label: spec.label.to_string(),
-            category: spec.category.to_string(),
-            description: spec.description.to_string(),
+            label: localized_field_label(spec.key, ui_locale).to_string(),
+            category: localized_group_name(spec.group_key, ui_locale).to_string(),
+            description: localized_field_description(spec.key, ui_locale).to_string(),
             required: spec.required,
             sensitive: spec.sensitive,
             value,
@@ -1149,10 +1496,22 @@ async fn build_config_ui_state(manager: &ConfigUiManager) -> anyhow::Result<Conf
         });
     }
 
+    let available_locales = SUPPORTED_UI_LOCALES
+        .iter()
+        .map(|code| ConfigUiLocaleOption {
+            code: (*code).to_string(),
+            label: locale_label(code).to_string(),
+        })
+        .collect();
+
     Ok(ConfigUiStateResponse {
         first_time,
         required_keys,
         fields,
+        ui_locale: ui_locale.to_string(),
+        global_locale: global_locale.to_string(),
+        available_locales,
+        messages: localized_messages(ui_locale),
     })
 }
 
@@ -1162,6 +1521,7 @@ async fn get_setup_page() -> Html<&'static str> {
 
 async fn get_config_ui_state(
     State(state): State<AppState>,
+    Query(query): Query<ConfigUiStateQuery>,
 ) -> Result<Json<ConfigUiStateResponse>, (StatusCode, String)> {
     let Some(manager) = state.config_ui.clone() else {
         return Err((
@@ -1170,7 +1530,17 @@ async fn get_config_ui_state(
         ));
     };
 
-    let snapshot = build_config_ui_state(&manager)
+    let global_locale = {
+        let runtime = state.runtime.read().await;
+        normalize_supported_locale(&runtime.locale).unwrap_or_else(|| "en-US".to_string())
+    };
+    let ui_locale = query
+        .locale
+        .as_deref()
+        .and_then(normalize_supported_locale)
+        .unwrap_or_else(|| global_locale.clone());
+
+    let snapshot = build_config_ui_state(&manager, &ui_locale, &global_locale)
         .await
         .map_err(internal_err("failed to load config ui state"))?;
     Ok(Json(snapshot))
@@ -1194,7 +1564,12 @@ async fn post_config_ui_save(
     let mut accepted_keys = 0usize;
     for (key, value) in req.values {
         if config_ui_field_spec(&key).is_some() {
-            env_values.insert(key, value.trim().to_string());
+            let normalized_value = if key == "XIAOMAOLV_LOCALE" {
+                normalize_supported_locale(value.trim()).unwrap_or_else(|| "en-US".to_string())
+            } else {
+                value.trim().to_string()
+            };
+            env_values.insert(key, normalized_value);
             accepted_keys += 1;
         }
     }
@@ -1267,25 +1642,34 @@ async fn post_config_ui_save(
         .await
         .map_err(internal_err("failed to reload runtime after saving config"))?;
 
-    let snapshot = build_config_ui_state(&manager)
+    let global_locale = {
+        let runtime = state.runtime.read().await;
+        normalize_supported_locale(&runtime.locale).unwrap_or_else(|| "en-US".to_string())
+    };
+    let snapshot = build_config_ui_state(&manager, &global_locale, &global_locale)
         .await
         .map_err(internal_err("failed to refresh config ui state"))?;
+    let message = snapshot
+        .messages
+        .get("saved")
+        .cloned()
+        .unwrap_or_else(|| "Configuration saved and applied immediately".to_string());
 
     Ok(Json(ConfigUiSaveResponse {
         saved: true,
         runtime_reloaded: true,
         first_time: snapshot.first_time,
         applied_at_unix: current_unix_time_secs(),
-        message: "配置已保存并即时生效".to_string(),
+        message,
     }))
 }
 
 const SETUP_PAGE_HTML: &str = r#"<!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>xiaomaolv 配置中心</title>
+  <title>xiaomaolv setup</title>
   <style>
     :root {
       --bg: #f4f5f7;
@@ -1299,7 +1683,6 @@ const SETUP_PAGE_HTML: &str = r#"<!doctype html>
       --radius: 16px;
       --shadow: 0 12px 28px rgba(0, 0, 0, 0.08);
     }
-
     * { box-sizing: border-box; }
     body {
       margin: 0;
@@ -1310,11 +1693,7 @@ const SETUP_PAGE_HTML: &str = r#"<!doctype html>
       color: var(--ink);
       font: 15px/1.45 "IBM Plex Sans", "PingFang SC", "Noto Sans CJK SC", sans-serif;
     }
-    .wrap {
-      max-width: 980px;
-      margin: 0 auto;
-      padding: 14px;
-    }
+    .wrap { max-width: 980px; margin: 0 auto; padding: 14px; }
     .hero {
       background: var(--paper);
       border: 1px solid var(--line);
@@ -1322,11 +1701,14 @@ const SETUP_PAGE_HTML: &str = r#"<!doctype html>
       padding: 18px;
       box-shadow: var(--shadow);
     }
-    h1 {
-      margin: 0 0 8px 0;
-      font: 700 24px/1.2 "Source Han Sans SC", "PingFang SC", sans-serif;
-      letter-spacing: .2px;
+    .hero-head {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
     }
+    h1 { margin: 0 0 8px 0; font: 700 24px/1.2 "Source Han Sans SC", "PingFang SC", sans-serif; }
     .muted { color: var(--muted); }
     .notice {
       margin-top: 12px;
@@ -1336,16 +1718,8 @@ const SETUP_PAGE_HTML: &str = r#"<!doctype html>
       color: #0f4b48;
       display: none;
     }
-    .notice.error {
-      background: #fdebf0;
-      color: var(--danger);
-    }
-    .grid {
-      margin-top: 14px;
-      display: grid;
-      gap: 12px;
-      grid-template-columns: 1fr;
-    }
+    .notice.error { background: #fdebf0; color: var(--danger); }
+    .grid { margin-top: 14px; display: grid; gap: 12px; grid-template-columns: 1fr; }
     .panel {
       background: var(--paper);
       border: 1px solid var(--line);
@@ -1353,28 +1727,12 @@ const SETUP_PAGE_HTML: &str = r#"<!doctype html>
       box-shadow: var(--shadow);
       padding: 14px;
     }
-    .panel h2 {
-      margin: 0 0 10px 0;
-      font: 700 17px/1.3 "Source Han Sans SC", "PingFang SC", sans-serif;
-    }
-    .field {
-      margin-bottom: 10px;
-    }
-    .field label {
-      display: block;
-      font-weight: 600;
-      margin-bottom: 4px;
-    }
-    .req {
-      color: var(--danger);
-      margin-left: 4px;
-    }
-    .desc {
-      margin: 3px 0 6px 0;
-      color: var(--muted);
-      font-size: 13px;
-    }
-    input {
+    .panel h2 { margin: 0 0 10px 0; font: 700 17px/1.3 "Source Han Sans SC", "PingFang SC", sans-serif; }
+    .field { margin-bottom: 10px; }
+    .field label { display: block; font-weight: 600; margin-bottom: 4px; }
+    .req { color: var(--danger); margin-left: 4px; }
+    .desc { margin: 3px 0 6px 0; color: var(--muted); font-size: 13px; }
+    input, select {
       width: 100%;
       border: 1px solid var(--line);
       border-radius: 12px;
@@ -1382,17 +1740,8 @@ const SETUP_PAGE_HTML: &str = r#"<!doctype html>
       font: inherit;
       background: #fff;
     }
-    input:focus {
-      outline: none;
-      border-color: var(--accent);
-      box-shadow: 0 0 0 3px rgba(11, 122, 117, 0.17);
-    }
-    .actions {
-      margin-top: 12px;
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-    }
+    input:focus, select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(11, 122, 117, 0.17); }
+    .actions { margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap; }
     button {
       border: none;
       border-radius: 12px;
@@ -1402,44 +1751,43 @@ const SETUP_PAGE_HTML: &str = r#"<!doctype html>
     }
     .btn-main { background: var(--accent); color: white; }
     .btn-light { background: #eef2f7; color: #24313d; }
-    .tag {
-      display: inline-block;
-      margin-left: 6px;
-      padding: 2px 8px;
-      border-radius: 999px;
-      background: #f0f4fa;
-      color: #465364;
-      font-size: 12px;
-    }
+    .tag { display: inline-block; margin-left: 6px; padding: 2px 8px; border-radius: 999px; background: #f0f4fa; color: #465364; font-size: 12px; }
+    .locale-box { min-width: 200px; }
     @media (min-width: 920px) {
       .wrap { padding: 22px; }
-      .grid {
-        grid-template-columns: 1fr 1fr;
-      }
+      .grid { grid-template-columns: 1fr 1fr; }
     }
   </style>
 </head>
 <body>
   <div class="wrap">
     <section class="hero">
-      <h1>配置中心</h1>
-      <div class="muted">可先用 <code>.env.realtest</code> 做初始值，也可直接在这里编辑并保存；保存后自动热重载立即生效。</div>
+      <div class="hero-head">
+        <div>
+          <h1 id="ui-title">Configuration Center</h1>
+          <div class="muted" id="ui-subtitle">Save applies immediately.</div>
+        </div>
+        <div class="locale-box">
+          <label for="view-language" id="ui-view-language" class="muted">View Language</label>
+          <select id="view-language"></select>
+        </div>
+      </div>
       <div id="notice" class="notice"></div>
     </section>
     <section class="grid">
       <article class="panel" id="required-panel">
-        <h2>首次配置（必填）<span class="tag">移动优先</span></h2>
+        <h2><span id="ui-required-title">First-time Setup</span><span class="tag" id="ui-mobile-tag">Mobile-first</span></h2>
         <div id="required-fields"></div>
         <div class="actions">
-          <button class="btn-main" id="save-required">保存必填并生效</button>
-          <button class="btn-light" id="reload-state">刷新状态</button>
+          <button class="btn-main" id="save-required">Save Required Fields</button>
+          <button class="btn-light" id="reload-state">Refresh State</button>
         </div>
       </article>
       <article class="panel">
-        <h2>完整配置（分类）</h2>
+        <h2 id="ui-all-title">Full Configuration</h2>
         <div id="all-fields"></div>
         <div class="actions">
-          <button class="btn-main" id="save-all">保存全部并生效</button>
+          <button class="btn-main" id="save-all">Save All</button>
         </div>
       </article>
     </section>
@@ -1447,6 +1795,19 @@ const SETUP_PAGE_HTML: &str = r#"<!doctype html>
 
   <script>
     let latest = null;
+
+    function escapeHtml(text) {
+      return String(text || "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;");
+    }
+
+    function m(key, fallback = "") {
+      if (!latest || !latest.messages) return fallback;
+      return latest.messages[key] || fallback;
+    }
 
     function notice(message, isError = false) {
       const el = document.getElementById("notice");
@@ -1469,16 +1830,39 @@ const SETUP_PAGE_HTML: &str = r#"<!doctype html>
       const type = field.sensitive ? "password" : "text";
       const requiredMark = field.required ? '<span class="req">*</span>' : "";
       return `
-        <div class="field" data-key="${field.key}">
-          <label>${field.label}${requiredMark}</label>
-          <div class="desc">${field.description}</div>
-          <input type="${type}" id="f-${field.key}" value="${(field.value || "").replace(/"/g, '&quot;')}" placeholder="${(field.placeholder || "").replace(/"/g, '&quot;')}" />
+        <div class="field" data-key="${escapeHtml(field.key)}">
+          <label>${escapeHtml(field.label)}${requiredMark}</label>
+          <div class="desc">${escapeHtml(field.description)}</div>
+          <input type="${type}" id="f-${escapeHtml(field.key)}" value="${escapeHtml(field.value || "")}" placeholder="${escapeHtml(field.placeholder || "")}" />
         </div>
       `;
     }
 
+    function renderLocaleSelector() {
+      const select = document.getElementById("view-language");
+      const current = latest.ui_locale;
+      select.innerHTML = (latest.available_locales || [])
+        .map(item => `<option value="${escapeHtml(item.code)}"${item.code === current ? " selected" : ""}>${escapeHtml(item.label)}</option>`)
+        .join("");
+    }
+
+    function renderStaticTexts() {
+      document.getElementById("ui-title").textContent = m("title", "Configuration Center");
+      document.getElementById("ui-subtitle").textContent = m("subtitle", "Save applies immediately.");
+      document.getElementById("ui-required-title").textContent = m("required_title", "First-time Setup");
+      document.getElementById("ui-mobile-tag").textContent = m("mobile_tag", "Mobile-first");
+      document.getElementById("ui-all-title").textContent = m("all_title", "Full Configuration");
+      document.getElementById("save-required").textContent = m("save_required", "Save Required Fields");
+      document.getElementById("save-all").textContent = m("save_all", "Save All");
+      document.getElementById("reload-state").textContent = m("reload", "Refresh State");
+      document.getElementById("ui-view-language").textContent = m("view_language", "View Language");
+    }
+
     function render(state) {
       latest = state;
+      renderStaticTexts();
+      renderLocaleSelector();
+
       const requiredEl = document.getElementById("required-fields");
       const allEl = document.getElementById("all-fields");
       const requiredOnly = state.fields.filter(f => f.required);
@@ -1487,16 +1871,13 @@ const SETUP_PAGE_HTML: &str = r#"<!doctype html>
       const grouped = groupedFields(state.fields);
       let html = "";
       for (const [category, fields] of grouped.entries()) {
-        html += `<h3>${category}</h3>`;
+        html += `<h3>${escapeHtml(category)}</h3>`;
         html += fields.map(renderField).join("");
       }
       allEl.innerHTML = html;
 
-      if (state.first_time) {
-        notice("当前是首次配置，请先填写必填项。");
-      } else {
-        notice("当前配置已完成，可按分类继续调整。");
-      }
+      if (state.first_time) notice(m("notice_first", "First-time setup detected."));
+      else notice(m("notice_ready", "Configuration is ready."));
     }
 
     function collectValues() {
@@ -1509,8 +1890,9 @@ const SETUP_PAGE_HTML: &str = r#"<!doctype html>
       return payload;
     }
 
-    async function loadState() {
-      const res = await fetch("/v1/config/ui/state");
+    async function loadState(locale) {
+      const query = locale ? `?locale=${encodeURIComponent(locale)}` : "";
+      const res = await fetch(`/v1/config/ui/state${query}`);
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
       render(data);
@@ -1518,6 +1900,7 @@ const SETUP_PAGE_HTML: &str = r#"<!doctype html>
 
     async function save(mode) {
       try {
+        const selectedLocale = document.getElementById("view-language").value || "";
         const res = await fetch("/v1/config/ui/save", {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -1525,18 +1908,32 @@ const SETUP_PAGE_HTML: &str = r#"<!doctype html>
         });
         const body = await res.json();
         if (!res.ok) throw new Error(body.message || JSON.stringify(body));
-        notice(body.message || "保存成功");
-        await loadState();
+        notice(body.message || m("saved", "Saved."));
+        await loadState(selectedLocale);
       } catch (err) {
         notice(String(err.message || err), true);
       }
     }
 
+    async function init() {
+      const preferred = localStorage.getItem("setup_ui_locale") || "";
+      await loadState(preferred);
+      const selector = document.getElementById("view-language");
+      selector.addEventListener("change", async () => {
+        const locale = selector.value || "";
+        localStorage.setItem("setup_ui_locale", locale);
+        await loadState(locale);
+      });
+    }
+
     document.getElementById("save-required").addEventListener("click", () => save("required"));
     document.getElementById("save-all").addEventListener("click", () => save("full"));
-    document.getElementById("reload-state").addEventListener("click", () => loadState());
+    document.getElementById("reload-state").addEventListener("click", async () => {
+      const locale = document.getElementById("view-language").value || "";
+      await loadState(locale);
+    });
 
-    loadState().catch(err => notice(String(err.message || err), true));
+    init().catch(err => notice(String(err.message || err), true));
   </script>
 </body>
 </html>

@@ -125,6 +125,7 @@ curl -sS http://127.0.0.1:8080/v1/channels/telegram/mode
 
 - Provider：`[providers.<name>]`
 - 默认 Provider：`[app].default_provider`
+- 系统语言：`[app].locale = "${XIAOMAOLV_LOCALE:-en-US}"`（支持 `en-US | zh-CN | hi-IN | es-ES | ar`）
 - MiniMax 模型（MVP 模板）：`model = "${MINIMAX_MODEL:-MiniMax-M2.5-highspeed}"`
 - Telegram 流式：
   - `streaming_enabled = true`

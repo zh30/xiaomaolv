@@ -165,6 +165,7 @@ async fn shutdown_signal() {
 const DEFAULT_CONFIG: &str = r#"[app]
 bind = "0.0.0.0:8080"
 default_provider = "openai"
+locale = "${XIAOMAOLV_LOCALE:-en-US}"
 max_history = 16
 concurrency_limit = 128
 

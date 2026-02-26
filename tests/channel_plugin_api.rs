@@ -92,6 +92,7 @@ async fn custom_channel_plugin_can_receive_messages_via_unified_endpoint() {
         app: AppSettings {
             bind: "127.0.0.1:0".to_string(),
             default_provider: "openai".to_string(),
+            locale: "en-US".to_string(),
             max_history: 16,
             concurrency_limit: 32,
         },

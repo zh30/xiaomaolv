@@ -33,6 +33,8 @@ impl AppConfig {
     }
 
     fn resolve_env_placeholders(&mut self) {
+        self.app.locale = resolve_env_placeholder(&self.app.locale);
+
         if let Some(token) = self.channels.http.diag_bearer_token.as_mut() {
             *token = resolve_env_placeholder(token);
         }
@@ -80,6 +82,8 @@ impl AppConfig {
 pub struct AppSettings {
     pub bind: String,
     pub default_provider: String,
+    #[serde(default = "default_app_locale")]
+    pub locale: String,
     #[serde(default = "default_max_history")]
     pub max_history: usize,
     #[serde(default = "default_concurrency")]
@@ -338,6 +342,10 @@ impl Default for ZvecSidecarMemoryConfig {
 
 fn default_max_history() -> usize {
     16
+}
+
+fn default_app_locale() -> String {
+    "en-US".to_string()
 }
 
 fn default_concurrency() -> usize {

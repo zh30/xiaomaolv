@@ -135,6 +135,7 @@ Key settings:
 
 - Provider config: `[providers.<name>]`
 - Default provider: `[app].default_provider`
+- System locale: `[app].locale = "${XIAOMAOLV_LOCALE:-en-US}"` (`en-US | zh-CN | hi-IN | es-ES | ar`)
 - MiniMax model (MVP template): `model = "${MINIMAX_MODEL:-MiniMax-M2.5-highspeed}"`
 - Telegram streaming:
   - `streaming_enabled = true`

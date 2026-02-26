@@ -20,6 +20,7 @@ enabled = true
 
     let cfg = AppConfig::from_toml(toml).expect("config should parse");
     assert_eq!(cfg.app.default_provider, "openai");
+    assert_eq!(cfg.app.locale, "en-US");
     assert!(cfg.channels.http.enabled);
     assert!(cfg.channels.http.diag_bearer_token.is_none());
     assert_eq!(cfg.channels.http.diag_rate_limit_per_minute, 120);
@@ -49,6 +50,28 @@ enabled = true
     assert!(!cfg.agent.code_mode.allow_network);
     assert!(!cfg.agent.code_mode.allow_filesystem);
     assert!(!cfg.agent.code_mode.allow_env);
+}
+
+#[test]
+fn config_bootstrap_resolves_app_locale_from_env_fallback() {
+    let toml = r#"
+[app]
+bind = "127.0.0.1:8080"
+default_provider = "openai"
+locale = "${XIAOMAOLV_LOCALE:-zh-CN}"
+
+[providers.openai]
+kind = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+api_key = "test-key"
+model = "gpt-4o-mini"
+
+[channels.http]
+enabled = true
+"#;
+
+    let cfg = AppConfig::from_toml(toml).expect("config should parse");
+    assert_eq!(cfg.app.locale, "zh-CN");
 }
 
 #[test]
