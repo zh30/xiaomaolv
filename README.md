@@ -71,6 +71,8 @@ Optional model override:
 - `TELEGRAM_BOT_USERNAME` (without `@`, recommended for group mention matching)
 - `TELEGRAM_ADMIN_USER_IDS` (comma-separated Telegram user IDs for private chat access and `/mcp` + `/skills`, e.g. `123456789,987654321`)
 
+You can also skip this step first and configure from the visual setup page after boot: `http://127.0.0.1:8080/setup`.
+
 ### 3) Start MVP in one command
 
 ```bash
@@ -234,6 +236,9 @@ Details: `docs/zvec-sidecar.md`
 Core endpoints:
 
 - `GET /health`
+- `GET /setup` (visual setup page)
+- `GET /v1/config/ui/state` (read setup page state)
+- `POST /v1/config/ui/save` (save and hot-reload config)
 - `POST /v1/messages`
 - `GET /v1/code-mode/diag` (requires `Authorization: Bearer <channels.http.diag_bearer_token>`)
 - `GET /v1/code-mode/metrics` (Prometheus format, same bearer token as diag)

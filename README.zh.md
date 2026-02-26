@@ -63,6 +63,8 @@ cp .env.realtest.example .env.realtest
 - `TELEGRAM_BOT_USERNAME`（不带 `@`，建议填写，用于群组@匹配）
 - `TELEGRAM_ADMIN_USER_IDS`（私聊访问 + `/mcp` + `/skills` 管理员用户 ID，逗号分隔，如 `123456789,987654321`）
 
+也可以先不填，直接启动后打开可视化配置页：`http://127.0.0.1:8080/setup`。
+
 ### 3) 一键启动 MVP
 
 ```bash
@@ -221,6 +223,9 @@ curl -sS http://127.0.0.1:8080/v1/channels/telegram/mode
 核心接口：
 
 - `GET /health`
+- `GET /setup`（可视化配置页）
+- `GET /v1/config/ui/state`（读取配置页状态）
+- `POST /v1/config/ui/save`（保存配置并热重载生效）
 - `POST /v1/messages`
 - `GET /v1/code-mode/diag`（需 `Authorization: Bearer <channels.http.diag_bearer_token>`）
 - `GET /v1/code-mode/metrics`（Prometheus 文本格式，鉴权同上）

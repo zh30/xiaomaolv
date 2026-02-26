@@ -43,8 +43,7 @@ done
 ENV_FILE="${ROOT_DIR}/.env.realtest"
 if [[ ! -f "${ENV_FILE}" ]]; then
   cp "${ROOT_DIR}/.env.realtest.example" "${ENV_FILE}"
-  echo "created ${ENV_FILE}; fill MINIMAX_API_KEY and TELEGRAM_BOT_TOKEN first" >&2
-  exit 1
+  echo "created ${ENV_FILE}; you can fill it now or continue and configure via http://127.0.0.1:8080/setup" >&2
 fi
 
 set -a
@@ -52,13 +51,11 @@ source "${ENV_FILE}"
 set +a
 
 if [[ -z "${MINIMAX_API_KEY:-}" || "${MINIMAX_API_KEY}" == replace_with_* ]]; then
-  echo "MINIMAX_API_KEY is missing in ${ENV_FILE}" >&2
-  exit 1
+  echo "[mvp] MINIMAX_API_KEY is missing; start anyway and configure in /setup" >&2
 fi
 export MINIMAX_MODEL="${MINIMAX_MODEL:-MiniMax-M2.5-highspeed}"
 if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || "${TELEGRAM_BOT_TOKEN}" == replace_with_* ]]; then
-  echo "TELEGRAM_BOT_TOKEN is missing in ${ENV_FILE}" >&2
-  exit 1
+  echo "[mvp] TELEGRAM_BOT_TOKEN is missing; Telegram channel may stay inactive until /setup save" >&2
 fi
 
 BASE_CONFIG="${ROOT_DIR}/config/xiaomaolv.minimax-telegram.toml"
@@ -90,6 +87,7 @@ echo "[mvp] mode=${MODE}"
 echo "[mvp] config=${RUNTIME_CONFIG}"
 echo "[mvp] database=sqlite://xiaomaolv.db"
 echo "[mvp] minimax_model=${MINIMAX_MODEL}"
+echo "[mvp] setup ui: http://127.0.0.1:8080/setup"
 echo "[mvp] telegram mode check after boot: curl -sS http://127.0.0.1:8080/v1/channels/telegram/mode"
 
 if lsof -nP -iTCP:8080 -sTCP:LISTEN >/dev/null 2>&1; then

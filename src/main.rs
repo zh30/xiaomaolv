@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use xiaomaolv::config::AppConfig;
-use xiaomaolv::http::build_app_runtime;
+use xiaomaolv::http::build_app_runtime_with_config_paths;
 use xiaomaolv::mcp_commands::{McpCommands, discover_mcp_registry, execute_mcp_command};
 use xiaomaolv::skills_commands::{SkillsCommands, discover_skill_registry, execute_skills_command};
 
@@ -84,11 +84,13 @@ async fn init_config(path: PathBuf) -> anyhow::Result<()> {
 async fn serve(config_path: PathBuf, database_url: &str) -> anyhow::Result<()> {
     let config = AppConfig::from_path(&config_path).await?;
     let bind = config.app.bind.clone();
+    let env_file_path = resolve_env_file_path()?;
 
-    let runtime = build_app_runtime(config, database_url, None)
-        .await
-        .context("failed to build app runtime")?;
-    let (router, shutdown_tx, workers) = runtime.into_parts();
+    let runtime =
+        build_app_runtime_with_config_paths(&config_path, &env_file_path, database_url, None)
+            .await
+            .context("failed to build app runtime")?;
+    let (router, runtime_handle) = runtime.into_parts();
 
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
@@ -101,13 +103,19 @@ async fn serve(config_path: PathBuf, database_url: &str) -> anyhow::Result<()> {
         .await
         .context("server exited with error")?;
 
-    let _ = shutdown_tx.send(true);
-    for worker in workers {
-        worker.task.abort();
-        let _ = worker.task.await;
-    }
+    runtime_handle.shutdown().await;
 
     Ok(())
+}
+
+fn resolve_env_file_path() -> anyhow::Result<PathBuf> {
+    if let Ok(value) = std::env::var("XIAOMAOLV_ENV_FILE")
+        && !value.trim().is_empty()
+    {
+        return Ok(PathBuf::from(value));
+    }
+    let cwd = std::env::current_dir().context("failed to resolve current directory")?;
+    Ok(cwd.join(".env.realtest"))
 }
 
 async fn handle_mcp(command: McpCommands) -> anyhow::Result<()> {
