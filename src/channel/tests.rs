@@ -10,9 +10,10 @@ use super::{
     extract_realtime_name_correction, extract_scheduler_job_id, extract_vocative_alias_candidate,
     is_reply_to_bot_message, looks_like_scheduler_list_text, message_mentions_bot,
     parse_admin_user_ids, parse_telegram_slash_command, render_telegram_text_parts,
-    short_description_payload, telegram_help_text, telegram_registered_commands,
+    scheduler_confirm_inline_keyboard, short_description_payload, telegram_help_text,
+    telegram_registered_commands,
     telegram_scheduler_requires_confirm, telegram_session_id, text_implies_latest_target,
-    truncate_chars, typing_action_payload,
+    truncate_chars, try_build_relative_reminder_draft_from_text, typing_action_payload,
 };
 
 fn test_scheduler_settings() -> TelegramSchedulerSettings {
@@ -107,6 +108,55 @@ fn typing_payload_includes_thread_id_when_present() {
 fn short_description_payload_has_expected_shape() {
     let payload = short_description_payload("online");
     assert_eq!(payload["short_description"], "online");
+}
+
+#[test]
+fn scheduler_confirm_inline_keyboard_has_confirm_and_cancel_buttons() {
+    let keyboard = scheduler_confirm_inline_keyboard();
+    assert_eq!(keyboard.len(), 1);
+    assert_eq!(keyboard[0].len(), 2);
+    assert_eq!(keyboard[0][0].text, "确认创建");
+    assert_eq!(keyboard[0][0].callback_data, "scheduler:confirm");
+    assert_eq!(keyboard[0][1].text, "取消");
+    assert_eq!(keyboard[0][1].callback_data, "scheduler:cancel");
+}
+
+#[test]
+fn telegram_update_deserializes_callback_query_payload() {
+    let update: super::TelegramUpdate = serde_json::from_value(serde_json::json!({
+        "update_id": 1,
+        "callback_query": {
+            "id": "cq-1",
+            "from": {
+                "id": 6028409442_i64,
+                "is_bot": false,
+                "username": "hege"
+            },
+            "message": {
+                "message_id": 100,
+                "chat": {
+                    "id": 6028409442_i64,
+                    "type": "private"
+                },
+                "from": {
+                    "id": 8779778283_i64,
+                    "is_bot": true,
+                    "username": "myxiaomaolvbot"
+                },
+                "text": "识别到定时任务草案",
+                "message_thread_id": null,
+                "reply_to_message": null,
+                "entities": null
+            },
+            "data": "scheduler:confirm"
+        }
+    }))
+    .expect("deserialize");
+    assert!(update.message.is_none());
+    let callback = update.callback_query.expect("callback query");
+    assert_eq!(callback.id, "cq-1");
+    assert_eq!(callback.from.id, 6028409442);
+    assert_eq!(callback.data.as_deref(), Some("scheduler:confirm"));
 }
 
 #[test]
@@ -480,6 +530,33 @@ fn parse_scheduler_once_time_supports_default_timezone_local_format() {
     let unix =
         super::parse_scheduler_once_time("2026-03-01 09:00", "Asia/Shanghai").expect("parse time");
     assert!(unix > 0);
+}
+
+#[test]
+fn relative_reminder_draft_parses_common_sentence() {
+    let now_unix = 1_772_097_600;
+    let draft = try_build_relative_reminder_draft_from_text(
+        "1分钟后提醒我水好了",
+        "Asia/Shanghai",
+        now_unix,
+    )
+    .expect("draft");
+    assert_eq!(draft.payload, "水好了");
+    assert_eq!(draft.timezone, "Asia/Shanghai");
+    assert_eq!(draft.run_at_unix, Some(now_unix + 60));
+}
+
+#[test]
+fn relative_reminder_draft_supports_group_style_sentence() {
+    let now_unix = 1_772_097_600;
+    let draft = try_build_relative_reminder_draft_from_text(
+        "驴哥5分钟后提醒我去出恭",
+        "Asia/Shanghai",
+        now_unix,
+    )
+    .expect("draft");
+    assert_eq!(draft.payload, "去出恭");
+    assert_eq!(draft.run_at_unix, Some(now_unix + 300));
 }
 
 #[test]

@@ -92,6 +92,13 @@ pub(super) async fn process_telegram_update(
         diag_state,
     } = runtime;
 
+    if let Some(callback) = update.callback_query.as_ref() {
+        log_inbound_callback_query(callback);
+        if maybe_handle_telegram_callback_query(&ctx, sender, callback, &command_settings).await? {
+            return Ok(());
+        }
+    }
+
     let Some(message) = update.message else {
         return Ok(());
     };
@@ -164,6 +171,15 @@ pub(super) async fn process_telegram_update(
         return Ok(());
     }
 
+    if should_send_early_group_typing_hint(
+        text,
+        &meta,
+        group_mention_bot_username.as_deref(),
+        group_trigger_settings.mode,
+    ) {
+        send_initial_typing_hint(sender, &meta, "group_pretrigger");
+    }
+
     let model_input_text = if meta.is_group {
         match process_group_message(GroupProcessContext {
             ctx: &ctx,
@@ -189,7 +205,9 @@ pub(super) async fn process_telegram_update(
         text.to_string()
     };
 
-    if meta.is_group && should_send_initial_typing_before_scheduler_nl(&meta, &command_settings.scheduler) {
+    if meta.is_group
+        && should_send_initial_typing_before_scheduler_nl(&meta, &command_settings.scheduler)
+    {
         send_initial_typing_hint(sender, &meta, "group_scheduler_nl");
     }
 
@@ -253,6 +271,25 @@ fn log_inbound_message(text: &str, meta: &TelegramInboundMeta, bot_user_id: Opti
     );
 }
 
+fn log_inbound_callback_query(callback: &TelegramCallbackQuery) {
+    let data_preview = callback
+        .data
+        .as_deref()
+        .map(|v| truncate_chars(v.trim(), 120).replace('\n', " "))
+        .unwrap_or_default();
+    let chat_id = callback.message.as_ref().map(|m| m.chat.id);
+    let message_id = callback.message.as_ref().map(|m| m.message_id);
+    info!(
+        callback_query_id = %callback.id,
+        from_id = callback.from.id,
+        chat_id = ?chat_id,
+        message_id = ?message_id,
+        data_len = callback.data.as_ref().map(|v| v.chars().count()).unwrap_or(0),
+        data_preview = %data_preview,
+        "telegram inbound callback_query"
+    );
+}
+
 fn should_send_initial_typing_before_scheduler_nl(
     meta: &TelegramInboundMeta,
     scheduler_settings: &TelegramSchedulerSettings,
@@ -260,6 +297,31 @@ fn should_send_initial_typing_before_scheduler_nl(
     scheduler_settings.enabled
         && scheduler_settings.nl_enabled
         && (meta.is_group || meta.is_private_chat)
+}
+
+fn should_send_early_group_typing_hint(
+    text: &str,
+    meta: &TelegramInboundMeta,
+    group_mention_bot_username: Option<&str>,
+    group_trigger_mode: TelegramGroupTriggerMode,
+) -> bool {
+    if !meta.is_group {
+        return false;
+    }
+    if meta.replied_to_bot {
+        return true;
+    }
+
+    let Some(bot_username) = group_mention_bot_username else {
+        return false;
+    };
+    if message_mentions_bot(text, bot_username) {
+        return true;
+    }
+
+    matches!(group_trigger_mode, TelegramGroupTriggerMode::Smart)
+        && message_has_question_marker(text)
+        && extract_vocative_alias_candidate(text, bot_username).is_some()
 }
 
 fn send_initial_typing_hint(
@@ -271,6 +333,13 @@ fn send_initial_typing_hint(
     let chat_id = meta.chat_id;
     let message_id = meta.message_id;
     let message_thread_id = meta.message_thread_id;
+    debug!(
+        chat_id,
+        message_id,
+        message_thread_id = ?message_thread_id,
+        stage,
+        "telegram initial typing hint scheduled"
+    );
     tokio::spawn(async move {
         if let Err(err) = sender
             .send_chat_action_typing(chat_id, message_thread_id)
@@ -495,5 +564,56 @@ mod tests {
         assert!(should_send_initial_typing_before_scheduler_nl(
             &meta, &settings
         ));
+    }
+
+    #[test]
+    fn early_group_pretyping_triggers_on_reply_to_bot() {
+        let meta = inbound_meta(true, false);
+        let result = should_send_early_group_typing_hint(
+            "随便说一句",
+            &TelegramInboundMeta {
+                replied_to_bot: true,
+                ..meta
+            },
+            Some("myxiaomaolvbot"),
+            TelegramGroupTriggerMode::Strict,
+        );
+        assert!(result);
+    }
+
+    #[test]
+    fn early_group_pretyping_triggers_on_explicit_mention() {
+        let meta = inbound_meta(true, false);
+        let result = should_send_early_group_typing_hint(
+            "@myxiaomaolvbot 你在吗",
+            &meta,
+            Some("myxiaomaolvbot"),
+            TelegramGroupTriggerMode::Strict,
+        );
+        assert!(result);
+    }
+
+    #[test]
+    fn early_group_pretyping_triggers_on_smart_vocative_question() {
+        let meta = inbound_meta(true, false);
+        let result = should_send_early_group_typing_hint(
+            "驴哥你在吗？",
+            &meta,
+            Some("myxiaomaolvbot"),
+            TelegramGroupTriggerMode::Smart,
+        );
+        assert!(result);
+    }
+
+    #[test]
+    fn early_group_pretyping_does_not_trigger_for_strict_vocative_question() {
+        let meta = inbound_meta(true, false);
+        let result = should_send_early_group_typing_hint(
+            "驴哥你在吗？",
+            &meta,
+            Some("myxiaomaolvbot"),
+            TelegramGroupTriggerMode::Strict,
+        );
+        assert!(!result);
     }
 }

@@ -26,6 +26,9 @@ pub(super) enum PrivateChatAccess {
     Unauthorized,
 }
 
+const TELEGRAM_SCHEDULER_CB_CONFIRM: &str = "scheduler:confirm";
+const TELEGRAM_SCHEDULER_CB_CANCEL: &str = "scheduler:cancel";
+
 pub(super) async fn maybe_handle_telegram_command(
     ctx: &ChannelContext,
     sender: &TelegramSender,
@@ -284,6 +287,85 @@ pub(super) async fn maybe_handle_telegram_command(
             }
         }
     }
+}
+
+pub(super) async fn maybe_handle_telegram_callback_query(
+    ctx: &ChannelContext,
+    sender: &TelegramSender,
+    callback: &TelegramCallbackQuery,
+    command_settings: &TelegramCommandSettings,
+) -> anyhow::Result<bool> {
+    let action_text = match callback.data.as_deref().map(str::trim) {
+        Some(TELEGRAM_SCHEDULER_CB_CONFIRM) => Some(("确认", "已确认，正在创建任务")),
+        Some(TELEGRAM_SCHEDULER_CB_CANCEL) => Some(("取消", "已取消")),
+        _ => None,
+    };
+    let Some((user_text, callback_hint)) = action_text else {
+        return Ok(false);
+    };
+
+    if let Err(err) = sender
+        .answer_callback_query(&callback.id, Some(callback_hint))
+        .await
+    {
+        warn!(
+            callback_query_id = %callback.id,
+            error = %format!("{err:#}"),
+            "failed to answer telegram callback query"
+        );
+    }
+
+    let Some(callback_message) = callback.message.as_ref() else {
+        return Ok(true);
+    };
+    let mut message = callback_message.clone();
+    message.from = Some(callback.from.clone());
+
+    if is_private_chat_type(message.chat.kind.as_deref()) {
+        match evaluate_private_chat_access(
+            message.from.as_ref().map(|u| u.id),
+            &command_settings.admin_user_ids,
+        ) {
+            PrivateChatAccess::Allowed => {}
+            PrivateChatAccess::MissingAdminAllowlist => {
+                send_telegram_command_reply(
+                    sender,
+                    &message,
+                    &format!(
+                        "管理员白名单未配置，私聊功能未启用。\n{}\n\n请在 .env.realtest 中配置 TELEGRAM_ADMIN_USER_IDS，然后重启服务。",
+                        telegram_whoami_hint(&message)
+                    ),
+                )
+                .await?;
+                return Ok(true);
+            }
+            PrivateChatAccess::Unauthorized => {
+                send_telegram_command_reply(
+                    sender,
+                    &message,
+                    &format!(
+                        "无权限使用私聊功能。\n{}\n\n请将你的 ID 加到 TELEGRAM_ADMIN_USER_IDS。",
+                        telegram_whoami_hint(&message)
+                    ),
+                )
+                .await?;
+                return Ok(true);
+            }
+        }
+    }
+
+    let handled = maybe_handle_telegram_scheduler_natural_language(
+        ctx,
+        sender,
+        &message,
+        user_text,
+        &command_settings.scheduler,
+    )
+    .await?;
+    if !handled {
+        send_telegram_command_reply(sender, &message, "当前没有待确认的任务草案。").await?;
+    }
+    Ok(true)
 }
 
 pub(super) async fn handle_telegram_task_command(
@@ -615,6 +697,61 @@ pub(super) async fn maybe_handle_telegram_scheduler_natural_language(
             return Ok(true);
         }
 
+        if let Some(updated_draft) = try_build_relative_reminder_draft_from_text(
+            text,
+            scheduler_settings.default_timezone.as_str(),
+            now_unix,
+        ) {
+            if require_confirm {
+                upsert_scheduler_pending_intent(
+                    ctx,
+                    chat_id,
+                    owner_user_id,
+                    &updated_draft,
+                    now_unix + TELEGRAM_SCHEDULER_PENDING_TTL_SECS,
+                )
+                .await?;
+                send_scheduler_pending_confirmation_reply(
+                    sender,
+                    message,
+                    &format!(
+                        "已更新任务草案:\n{}\n\n回复“确认”创建任务，回复“取消”放弃草案。",
+                        describe_scheduler_draft(&updated_draft)
+                    ),
+                )
+                .await?;
+            } else {
+                let (job_id, next_run_at_unix) = create_scheduler_job_from_draft(
+                    ctx,
+                    chat_id,
+                    message.message_thread_id,
+                    owner_user_id,
+                    scheduler_settings,
+                    &updated_draft,
+                )
+                .await?;
+                let _ = ctx
+                    .service
+                    .delete_telegram_scheduler_pending_intent(
+                        channel_name.clone(),
+                        chat_id,
+                        owner_user_id,
+                    )
+                    .await;
+                send_telegram_command_reply(
+                    sender,
+                    message,
+                    &format!(
+                        "已创建任务。\nID: {job_id}\n下次执行: {}\n内容: {}",
+                        format_scheduler_time(Some(next_run_at_unix), &updated_draft.timezone),
+                        updated_draft.payload
+                    ),
+                )
+                .await?;
+            }
+            return Ok(true);
+        }
+
         if let Some(intent) = ctx
             .service
             .detect_telegram_scheduler_intent(
@@ -642,7 +779,7 @@ pub(super) async fn maybe_handle_telegram_scheduler_natural_language(
                     now_unix + TELEGRAM_SCHEDULER_PENDING_TTL_SECS,
                 )
                 .await?;
-                send_telegram_command_reply(
+                send_scheduler_pending_confirmation_reply(
                     sender,
                     message,
                     &format!(
@@ -695,6 +832,53 @@ pub(super) async fn maybe_handle_telegram_scheduler_natural_language(
     )
     .await?
     {
+        return Ok(true);
+    }
+
+    if let Some(draft) = try_build_relative_reminder_draft_from_text(
+        text,
+        scheduler_settings.default_timezone.as_str(),
+        now_unix,
+    ) {
+        if require_confirm {
+            upsert_scheduler_pending_intent(
+                ctx,
+                chat_id,
+                owner_user_id,
+                &draft,
+                now_unix + TELEGRAM_SCHEDULER_PENDING_TTL_SECS,
+            )
+            .await?;
+            send_scheduler_pending_confirmation_reply(
+                sender,
+                message,
+                &format!(
+                    "识别到定时任务草案:\n{}\n\n回复“确认”创建任务，回复“取消”放弃草案。",
+                    describe_scheduler_draft(&draft)
+                ),
+            )
+            .await?;
+        } else {
+            let (job_id, next_run_at_unix) = create_scheduler_job_from_draft(
+                ctx,
+                chat_id,
+                message.message_thread_id,
+                owner_user_id,
+                scheduler_settings,
+                &draft,
+            )
+            .await?;
+            send_telegram_command_reply(
+                sender,
+                message,
+                &format!(
+                    "已创建任务。\nID: {job_id}\n下次执行: {}\n内容: {}",
+                    format_scheduler_time(Some(next_run_at_unix), &draft.timezone),
+                    draft.payload
+                ),
+            )
+            .await?;
+        }
         return Ok(true);
     }
 
@@ -781,7 +965,7 @@ pub(super) async fn maybe_handle_telegram_scheduler_natural_language(
                     now_unix + TELEGRAM_SCHEDULER_PENDING_TTL_SECS,
                 )
                 .await?;
-                send_telegram_command_reply(
+                send_scheduler_pending_confirmation_reply(
                     sender,
                     message,
                     &format!(
@@ -1219,6 +1403,39 @@ pub(super) fn telegram_scheduler_requires_confirm(
     chat_kind: Option<&str>,
 ) -> bool {
     scheduler_settings.require_confirm && !is_group_chat_type(chat_kind)
+}
+
+pub(super) fn scheduler_confirm_inline_keyboard() -> Vec<Vec<TelegramInlineKeyboardButton>> {
+    vec![vec![
+        TelegramInlineKeyboardButton {
+            text: "确认创建".to_string(),
+            callback_data: TELEGRAM_SCHEDULER_CB_CONFIRM.to_string(),
+        },
+        TelegramInlineKeyboardButton {
+            text: "取消".to_string(),
+            callback_data: TELEGRAM_SCHEDULER_CB_CANCEL.to_string(),
+        },
+    ]]
+}
+
+pub(super) async fn send_scheduler_pending_confirmation_reply(
+    sender: &TelegramSender,
+    message: &TelegramMessage,
+    text: &str,
+) -> anyhow::Result<()> {
+    if is_private_chat_type(message.chat.kind.as_deref()) {
+        sender
+            .send_message_with_inline_keyboard(
+                message.chat.id,
+                message.message_thread_id,
+                Some(message.message_id),
+                text,
+                scheduler_confirm_inline_keyboard(),
+            )
+            .await?;
+        return Ok(());
+    }
+    send_telegram_command_reply(sender, message, text).await
 }
 
 pub(super) async fn send_telegram_command_reply(

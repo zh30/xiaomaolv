@@ -54,9 +54,10 @@ pub use crate::config::ChannelPluginConfig;
 #[derive(Debug, Deserialize)]
 pub struct TelegramUpdate {
     pub message: Option<TelegramMessage>,
+    pub callback_query: Option<TelegramCallbackQuery>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TelegramMessage {
     pub message_id: i64,
     pub chat: TelegramChat,
@@ -67,14 +68,14 @@ pub struct TelegramMessage {
     pub entities: Option<Vec<TelegramMessageEntity>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TelegramChat {
     pub id: i64,
     #[serde(rename = "type")]
     pub kind: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TelegramUser {
     pub id: i64,
     pub is_bot: Option<bool>,
@@ -83,7 +84,7 @@ pub struct TelegramUser {
     pub last_name: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TelegramReplyMessage {
     pub message_id: i64,
     pub from: Option<TelegramUser>,
@@ -91,7 +92,7 @@ pub struct TelegramReplyMessage {
     pub caption: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TelegramMessageEntity {
     #[serde(rename = "type")]
     pub kind: String,
@@ -99,10 +100,19 @@ pub struct TelegramMessageEntity {
     pub length: i64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct TelegramCallbackQuery {
+    pub id: String,
+    pub from: TelegramUser,
+    pub message: Option<TelegramMessage>,
+    pub data: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct TelegramPollUpdate {
     update_id: i64,
     message: Option<TelegramMessage>,
+    callback_query: Option<TelegramCallbackQuery>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -250,6 +260,12 @@ struct TelegramRenderedText {
     parse_mode: Option<&'static str>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct TelegramInlineKeyboardButton {
+    pub text: String,
+    pub callback_data: String,
+}
+
 const TELEGRAM_MAX_TEXT_CHARS: usize = 4096;
 
 #[derive(Clone)]
@@ -280,7 +296,13 @@ impl TelegramSender {
         for (idx, part) in parts.iter().enumerate() {
             let part_reply_to = if idx == 0 { reply_to_message_id } else { None };
             let _ = self
-                .send_rendered_message_with_id(chat_id, message_thread_id, part_reply_to, part)
+                .send_rendered_message_with_id(
+                    chat_id,
+                    message_thread_id,
+                    part_reply_to,
+                    part,
+                    None,
+                )
                 .await?;
         }
         Ok(())
@@ -295,8 +317,35 @@ impl TelegramSender {
     ) -> anyhow::Result<i64> {
         let parts = render_telegram_text_parts(text, TELEGRAM_MAX_TEXT_CHARS);
         let first = parts.first().context("empty telegram message text")?;
-        self.send_rendered_message_with_id(chat_id, message_thread_id, reply_to_message_id, first)
-            .await
+        self.send_rendered_message_with_id(
+            chat_id,
+            message_thread_id,
+            reply_to_message_id,
+            first,
+            None,
+        )
+        .await
+    }
+
+    pub(super) async fn send_message_with_inline_keyboard(
+        &self,
+        chat_id: i64,
+        message_thread_id: Option<i64>,
+        reply_to_message_id: Option<i64>,
+        text: &str,
+        inline_keyboard: Vec<Vec<TelegramInlineKeyboardButton>>,
+    ) -> anyhow::Result<i64> {
+        let parts = render_telegram_text_parts(text, TELEGRAM_MAX_TEXT_CHARS);
+        let first = parts.first().context("empty telegram message text")?;
+        let reply_markup = serde_json::json!({ "inline_keyboard": inline_keyboard });
+        self.send_rendered_message_with_id(
+            chat_id,
+            message_thread_id,
+            reply_to_message_id,
+            first,
+            Some(&reply_markup),
+        )
+        .await
     }
 
     async fn send_rendered_message_with_id(
@@ -305,6 +354,7 @@ impl TelegramSender {
         message_thread_id: Option<i64>,
         reply_to_message_id: Option<i64>,
         rendered: &TelegramRenderedText,
+        reply_markup: Option<&Value>,
     ) -> anyhow::Result<i64> {
         let url = format!("https://api.telegram.org/bot{}/sendMessage", self.bot_token);
         let mut payload = serde_json::json!({ "chat_id": chat_id, "text": rendered.text });
@@ -319,6 +369,9 @@ impl TelegramSender {
         }
         if let Some(mode) = rendered.parse_mode {
             payload["parse_mode"] = serde_json::json!(mode);
+        }
+        if let Some(markup) = reply_markup {
+            payload["reply_markup"] = markup.clone();
         }
 
         let response = self
@@ -442,6 +495,48 @@ impl TelegramSender {
             );
         }
 
+        Ok(())
+    }
+
+    pub async fn answer_callback_query(
+        &self,
+        callback_query_id: &str,
+        text: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let url = format!(
+            "https://api.telegram.org/bot{}/answerCallbackQuery",
+            self.bot_token
+        );
+        let mut payload = serde_json::json!({
+            "callback_query_id": callback_query_id,
+        });
+        if let Some(t) = text
+            && !t.trim().is_empty()
+        {
+            payload["text"] = serde_json::json!(t.trim());
+        }
+        let response = self
+            .client
+            .post(url)
+            .json(&payload)
+            .send()
+            .await
+            .context("failed to call telegram answerCallbackQuery")?
+            .error_for_status()
+            .context("telegram answerCallbackQuery returned error")?;
+
+        let body: TelegramApiResponse<bool> = response
+            .json()
+            .await
+            .context("failed to decode telegram answerCallbackQuery payload")?;
+
+        if !body.ok || !body.result {
+            bail!(
+                "telegram answerCallbackQuery returned ok=false: {}",
+                body.description
+                    .unwrap_or_else(|| "unknown error".to_string())
+            );
+        }
         Ok(())
     }
 
@@ -1431,6 +1526,7 @@ impl ChannelPlugin for TelegramChannelPlugin {
 
                             let payload = TelegramUpdate {
                                 message: update.message,
+                                callback_query: update.callback_query,
                             };
                             let group_mention_bot_username =
                                 resolve_group_mention_bot_username_with_cache(

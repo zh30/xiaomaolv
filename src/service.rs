@@ -525,6 +525,16 @@ impl MessageService {
             .await
             .context("failed to persist user message")?;
 
+        if let Some(text) = self.try_answer_time_query_fast_path(&incoming.text).await {
+            self.persist_assistant_reply(&incoming, &text).await?;
+            return Ok(OutgoingMessage {
+                channel: incoming.channel,
+                session_id: incoming.session_id,
+                text,
+                reply_target: incoming.reply_target,
+            });
+        }
+
         let history = self
             .memory
             .load_context(MemoryContextRequest {
@@ -552,18 +562,7 @@ impl MessageService {
 
         let text = self.complete_with_optional_mcp(history).await?;
 
-        self.memory
-            .append(MemoryWriteRequest {
-                session_id: incoming.session_id.clone(),
-                user_id: incoming.user_id.clone(),
-                channel: incoming.channel.clone(),
-                message: StoredMessage {
-                    role: MessageRole::Assistant,
-                    content: text.clone(),
-                },
-            })
-            .await
-            .context("failed to persist assistant message")?;
+        self.persist_assistant_reply(&incoming, &text).await?;
 
         Ok(OutgoingMessage {
             channel: incoming.channel,
@@ -590,6 +589,19 @@ impl MessageService {
             })
             .await
             .context("failed to persist user message")?;
+
+        if let Some(text) = self.try_answer_time_query_fast_path(&incoming.text).await {
+            if !text.is_empty() {
+                sink.on_delta(&text).await?;
+            }
+            self.persist_assistant_reply(&incoming, &text).await?;
+            return Ok(OutgoingMessage {
+                channel: incoming.channel,
+                session_id: incoming.session_id,
+                text,
+                reply_target: incoming.reply_target,
+            });
+        }
 
         let history = self
             .memory
@@ -621,18 +633,7 @@ impl MessageService {
             .await
             .context("failed to process streaming completion with optional mcp")?;
 
-        self.memory
-            .append(MemoryWriteRequest {
-                session_id: incoming.session_id.clone(),
-                user_id: incoming.user_id.clone(),
-                channel: incoming.channel.clone(),
-                message: StoredMessage {
-                    role: MessageRole::Assistant,
-                    content: text.clone(),
-                },
-            })
-            .await
-            .context("failed to persist assistant message")?;
+        self.persist_assistant_reply(&incoming, &text).await?;
 
         Ok(OutgoingMessage {
             channel: incoming.channel,
@@ -1545,18 +1546,19 @@ impl MessageService {
         mut history: Vec<StoredMessage>,
         query_text: &str,
     ) -> Vec<StoredMessage> {
-        if !looks_like_time_query(query_text) {
+        let user_text = extract_primary_user_text(query_text);
+        if !looks_like_time_query(user_text) {
             return history;
         }
-        let Some(runtime) = self.mcp_runtime.as_ref().map(|runtime| runtime.read()) else {
+        let Some(runtime) = self.snapshot_mcp_runtime().await else {
             return history;
         };
-        let runtime = runtime.await.clone();
+        let timezone_hint = infer_timezone_from_time_query(user_text);
         match runtime
             .call_tool(
                 BUILTIN_MCP_SERVER_NAME,
                 BUILTIN_MCP_TOOL_CURRENT_TIME,
-                serde_json::json!({}),
+                build_builtin_time_tool_arguments(timezone_hint),
             )
             .await
         {
@@ -1575,6 +1577,11 @@ impl MessageService {
                             .unwrap_or_else(|_| "{\"ok\":false}".to_string())
                     ),
                 });
+                info!(
+                    timezone = ?timezone_hint.map(|hint| hint.timezone),
+                    timezone_source = ?timezone_hint.map(|hint| hint.source),
+                    "prefetched builtin mcp time context"
+                );
             }
             Err(err) => {
                 warn!(
@@ -1584,6 +1591,59 @@ impl MessageService {
             }
         }
         history
+    }
+
+    async fn persist_assistant_reply(
+        &self,
+        incoming: &IncomingMessage,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        self.memory
+            .append(MemoryWriteRequest {
+                session_id: incoming.session_id.clone(),
+                user_id: incoming.user_id.clone(),
+                channel: incoming.channel.clone(),
+                message: StoredMessage {
+                    role: MessageRole::Assistant,
+                    content: text.to_string(),
+                },
+            })
+            .await
+            .context("failed to persist assistant message")
+    }
+
+    async fn try_answer_time_query_fast_path(&self, query_text: &str) -> Option<String> {
+        let user_text = extract_primary_user_text(query_text);
+        if !is_explicit_current_time_query(user_text) {
+            return None;
+        }
+        let runtime = self.snapshot_mcp_runtime().await?;
+        let timezone_hint = infer_timezone_from_time_query(user_text);
+        match runtime
+            .call_tool(
+                BUILTIN_MCP_SERVER_NAME,
+                BUILTIN_MCP_TOOL_CURRENT_TIME,
+                build_builtin_time_tool_arguments(timezone_hint),
+            )
+            .await
+        {
+            Ok(value) => {
+                let answer = render_fast_time_answer(user_text, &value, timezone_hint);
+                info!(
+                    timezone = ?timezone_hint.map(|hint| hint.timezone),
+                    timezone_source = ?timezone_hint.map(|hint| hint.source),
+                    "time query served by builtin mcp fast path"
+                );
+                Some(answer)
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "builtin mcp fast path failed for time query, fallback to model pipeline"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -1769,8 +1829,29 @@ fn build_mcp_system_prompt(tools: &[McpToolInfo]) -> anyhow::Result<String> {
     ))
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TimezoneHint {
+    timezone: &'static str,
+    display: &'static str,
+    source: &'static str,
+    note: Option<&'static str>,
+}
+
+fn extract_primary_user_text(text: &str) -> &str {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(raw) = trimmed.strip_prefix("原始消息:") {
+            let raw = raw.trim();
+            if !raw.is_empty() {
+                return raw;
+            }
+        }
+    }
+    text.trim()
+}
+
 fn looks_like_time_query(text: &str) -> bool {
-    let trimmed = text.trim();
+    let trimmed = extract_primary_user_text(text).trim();
     if trimmed.is_empty() {
         return false;
     }
@@ -1798,6 +1879,278 @@ fn looks_like_time_query(text: &str) -> bool {
     ]
     .iter()
     .any(|kw| trimmed.contains(kw))
+}
+
+fn is_explicit_current_time_query(text: &str) -> bool {
+    let trimmed = extract_primary_user_text(text).trim();
+    if trimmed.is_empty() || !looks_like_time_query(trimmed) {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if [
+        "提醒",
+        "分钟后",
+        "小时后",
+        "之后",
+        "定时",
+        "闹钟",
+        "every ",
+        "cron",
+        "remind",
+        "schedule",
+    ]
+    .iter()
+    .any(|kw| trimmed.contains(kw) || lower.contains(kw))
+    {
+        return false;
+    }
+
+    let explicit_cn = [
+        "几点",
+        "星期几",
+        "周几",
+        "几号",
+        "日期",
+        "哪年",
+        "今年",
+        "生肖",
+    ];
+    let explicit_en = [
+        "what time",
+        "time is it",
+        "current time",
+        "what date",
+        "what day",
+        "weekday",
+        "what year",
+        "zodiac",
+    ];
+    if explicit_cn.iter().any(|kw| trimmed.contains(kw))
+        || explicit_en.iter().any(|kw| lower.contains(kw))
+    {
+        return true;
+    }
+
+    (trimmed.contains("现在") || lower.contains("now"))
+        && (trimmed.contains("时间") || lower.contains("time"))
+        && (trimmed.contains('？') || trimmed.contains('?') || trimmed.ends_with('吗'))
+}
+
+fn infer_timezone_from_time_query(text: &str) -> Option<TimezoneHint> {
+    let trimmed = extract_primary_user_text(text).trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+
+    if ["美西", "洛杉矶", "pacific", "los angeles", "pst", "pdt"]
+        .iter()
+        .any(|kw| trimmed.contains(kw) || lower.contains(kw))
+    {
+        return Some(TimezoneHint {
+            timezone: "America/Los_Angeles",
+            display: "美国西部时间",
+            source: "us_west",
+            note: None,
+        });
+    }
+    if ["美东", "纽约", "eastern", "new york", "est", "edt"]
+        .iter()
+        .any(|kw| trimmed.contains(kw) || lower.contains(kw))
+    {
+        return Some(TimezoneHint {
+            timezone: "America/New_York",
+            display: "美国东部时间",
+            source: "us_east",
+            note: None,
+        });
+    }
+    if [
+        "美国",
+        "美利坚",
+        "america",
+        "usa",
+        "us time",
+        "united states",
+    ]
+    .iter()
+    .any(|kw| trimmed.contains(kw) || lower.contains(kw))
+    {
+        return Some(TimezoneHint {
+            timezone: "America/New_York",
+            display: "美国东部时间",
+            source: "us_default",
+            note: Some("美国有多个时区，当前默认按美国东部时间。"),
+        });
+    }
+    if ["中国", "国内", "北京时间", "北京", "china", "beijing"]
+        .iter()
+        .any(|kw| trimmed.contains(kw) || lower.contains(kw))
+    {
+        return Some(TimezoneHint {
+            timezone: "Asia/Shanghai",
+            display: "北京时间",
+            source: "china",
+            note: None,
+        });
+    }
+    if ["日本", "东京", "japan", "tokyo", "jst"]
+        .iter()
+        .any(|kw| trimmed.contains(kw) || lower.contains(kw))
+    {
+        return Some(TimezoneHint {
+            timezone: "Asia/Tokyo",
+            display: "日本时间",
+            source: "japan",
+            note: None,
+        });
+    }
+    if ["韩国", "首尔", "korea", "seoul", "kst"]
+        .iter()
+        .any(|kw| trimmed.contains(kw) || lower.contains(kw))
+    {
+        return Some(TimezoneHint {
+            timezone: "Asia/Seoul",
+            display: "韩国时间",
+            source: "korea",
+            note: None,
+        });
+    }
+    if ["英国", "伦敦", "uk", "britain", "london"]
+        .iter()
+        .any(|kw| trimmed.contains(kw) || lower.contains(kw))
+    {
+        return Some(TimezoneHint {
+            timezone: "Europe/London",
+            display: "英国时间",
+            source: "uk",
+            note: None,
+        });
+    }
+    if ["utc", "gmt"].iter().any(|kw| lower.contains(kw)) {
+        return Some(TimezoneHint {
+            timezone: "UTC",
+            display: "UTC",
+            source: "utc",
+            note: None,
+        });
+    }
+
+    None
+}
+
+fn build_builtin_time_tool_arguments(timezone_hint: Option<TimezoneHint>) -> Value {
+    match timezone_hint {
+        Some(hint) => serde_json::json!({ "timezone": hint.timezone }),
+        None => serde_json::json!({}),
+    }
+}
+
+fn render_fast_time_answer(
+    query_text: &str,
+    tool_result: &Value,
+    timezone_hint: Option<TimezoneHint>,
+) -> String {
+    let query = extract_primary_user_text(query_text).trim();
+    let lower = query.to_ascii_lowercase();
+    let local_time = tool_result
+        .get("local_time")
+        .and_then(|v| v.as_str())
+        .unwrap_or("--:--:--");
+    let local_date = tool_result
+        .get("local_date")
+        .and_then(|v| v.as_str())
+        .unwrap_or("----/--/--");
+    let local_weekday = tool_result
+        .get("local_weekday")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Unknown");
+    let weekday_zh = weekday_to_chinese(local_weekday);
+    let local_year = tool_result
+        .get("local_year")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let zodiac = zodiac_for_year(local_year as i32);
+    let timezone = tool_result
+        .get("timezone")
+        .and_then(|v| v.as_str())
+        .or_else(|| timezone_hint.map(|hint| hint.timezone))
+        .unwrap_or("local");
+    let timezone_display = timezone_hint.map(|hint| hint.display).unwrap_or("本地时间");
+
+    let wants_time = ["几点", "时间", "what time", "time now", "current time"]
+        .iter()
+        .any(|kw| query.contains(kw) || lower.contains(kw));
+    let wants_date = ["几号", "日期", "today", "date"]
+        .iter()
+        .any(|kw| query.contains(kw) || lower.contains(kw));
+    let wants_weekday = ["星期", "周几", "weekday", "what day"]
+        .iter()
+        .any(|kw| query.contains(kw) || lower.contains(kw));
+    let wants_year = ["今年", "年份", "哪年", "year"]
+        .iter()
+        .any(|kw| query.contains(kw) || lower.contains(kw));
+    let wants_zodiac = [
+        "生肖", "zodiac", "蛇年", "龙年", "马年", "羊年", "猴年", "鸡年", "狗年", "猪年", "鼠年",
+        "牛年", "虎年", "兔年",
+    ]
+    .iter()
+    .any(|kw| query.contains(kw) || lower.contains(kw));
+
+    let mut parts = Vec::new();
+    if wants_time || (!wants_date && !wants_weekday && !wants_year && !wants_zodiac) {
+        parts.push(format!(
+            "当前{}（{}）是 {}",
+            timezone_display, timezone, local_time
+        ));
+    }
+    if wants_date {
+        parts.push(format!("当前日期是 {}", local_date));
+    }
+    if wants_weekday {
+        parts.push(format!("今天是星期{}", weekday_zh));
+    }
+    if wants_year || wants_zodiac {
+        parts.push(format!("当前年份是 {} 年（{}）", local_year, zodiac));
+    }
+    if parts.is_empty() {
+        parts.push(format!(
+            "当前{}（{}）是 {} {}，星期{}",
+            timezone_display, timezone, local_date, local_time, weekday_zh
+        ));
+    }
+
+    let mut answer = parts.join("；");
+    if let Some(note) = timezone_hint.and_then(|hint| hint.note) {
+        answer.push('。');
+        answer.push_str(note);
+    }
+    answer
+}
+
+fn weekday_to_chinese(weekday_en: &str) -> &'static str {
+    match weekday_en {
+        "Monday" => "一",
+        "Tuesday" => "二",
+        "Wednesday" => "三",
+        "Thursday" => "四",
+        "Friday" => "五",
+        "Saturday" => "六",
+        "Sunday" => "日",
+        _ => "?",
+    }
+}
+
+fn zodiac_for_year(year: i32) -> &'static str {
+    const SIGNS: [&str; 12] = [
+        "鼠年", "牛年", "虎年", "兔年", "龙年", "蛇年", "马年", "羊年", "猴年", "鸡年", "狗年",
+        "猪年",
+    ];
+    if year <= 0 {
+        return "未知生肖";
+    }
+    let idx = (year - 4).rem_euclid(12) as usize;
+    SIGNS[idx]
 }
 
 fn parse_mcp_tool_call(reply: &str) -> Option<ParsedMcpToolCall> {
@@ -1847,13 +2200,76 @@ fn parse_scheduler_intent_json(reply: &str) -> Option<TelegramSchedulerIntent> {
 }
 
 fn extract_json_payload(text: &str) -> Option<String> {
-    if text.starts_with("```") {
-        let stripped = text.trim_start_matches("```");
-        let stripped = stripped.strip_prefix("json").unwrap_or(stripped).trim();
-        let stripped = stripped.strip_suffix("```").unwrap_or(stripped).trim();
-        return Some(stripped.to_string());
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
     }
-    Some(text.to_string())
+    if serde_json::from_str::<Value>(trimmed).is_ok() {
+        return Some(trimmed.to_string());
+    }
+    extract_first_json_value_segment(trimmed)
+}
+
+fn extract_first_json_value_segment(text: &str) -> Option<String> {
+    for (start, ch) in text.char_indices() {
+        if !matches!(ch, '{' | '[') {
+            continue;
+        }
+        let suffix = &text[start..];
+        let Some(end_offset) = find_json_segment_end(suffix) else {
+            continue;
+        };
+        let candidate = suffix[..end_offset].trim();
+        if serde_json::from_str::<Value>(candidate).is_ok() {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+fn find_json_segment_end(input: &str) -> Option<usize> {
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (offset, ch) in input.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' | '[' => stack.push(ch),
+            '}' => {
+                if stack.pop() != Some('{') {
+                    return None;
+                }
+                if stack.is_empty() {
+                    return Some(offset + ch.len_utf8());
+                }
+            }
+            ']' => {
+                if stack.pop() != Some('[') {
+                    return None;
+                }
+                if stack.is_empty() {
+                    return Some(offset + ch.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 fn parse_mcp_tool_call_value(value: &Value) -> Option<ParsedMcpToolCall> {
@@ -2072,10 +2488,11 @@ mod tests {
     use super::{
         AgentMcpSettings, BUILTIN_MCP_SERVER_NAME, BUILTIN_MCP_TOOL_CURRENT_TIME,
         CodeModeCircuitChange, MessageService, apply_context_budget, build_mcp_system_prompt,
-        code_mode_timeout_ratio, looks_like_time_query, next_code_mode_timeout_streak,
-        parse_mcp_tool_call, parse_scheduler_intent_json, should_open_code_mode_timeout_circuit,
-        should_probe_code_mode_timeout_circuit, should_warn_code_mode_timeouts,
-        truncate_json_value,
+        code_mode_timeout_ratio, extract_primary_user_text, infer_timezone_from_time_query,
+        is_explicit_current_time_query, looks_like_time_query, next_code_mode_timeout_streak,
+        parse_mcp_tool_call, parse_scheduler_intent_json, render_fast_time_answer,
+        should_open_code_mode_timeout_circuit, should_probe_code_mode_timeout_circuit,
+        should_warn_code_mode_timeouts, truncate_json_value, weekday_to_chinese, zodiac_for_year,
     };
     use crate::code_mode::{AgentCodeModeSettings, CodeModeAuditRecord};
     use crate::domain::{MessageRole, StoredMessage};
@@ -2091,6 +2508,23 @@ mod tests {
     impl ChatProvider for FakeProvider {
         async fn complete(&self, _req: CompletionRequest) -> anyhow::Result<String> {
             Ok("ok".to_string())
+        }
+    }
+
+    struct NeverProvider;
+
+    #[async_trait::async_trait]
+    impl ChatProvider for NeverProvider {
+        async fn complete(&self, _req: CompletionRequest) -> anyhow::Result<String> {
+            anyhow::bail!("provider should not be called in time fast path")
+        }
+
+        async fn complete_stream(
+            &self,
+            _req: CompletionRequest,
+            _sink: &mut dyn StreamSink,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("provider stream should not be called in time fast path")
         }
     }
 
@@ -2121,11 +2555,42 @@ mod tests {
             sink: &mut dyn StreamSink,
         ) -> anyhow::Result<String> {
             let reply = self.next_reply();
-            for chunk in reply.as_bytes().chunks(6) {
-                let delta = std::str::from_utf8(chunk).expect("utf8");
-                sink.on_delta(delta).await?;
+            let chars = reply.chars().collect::<Vec<_>>();
+            for chunk in chars.chunks(6) {
+                let delta = chunk.iter().collect::<String>();
+                sink.on_delta(&delta).await?;
             }
             Ok(reply)
+        }
+    }
+
+    struct SequenceNoDeltaStreamProvider {
+        replies: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl SequenceNoDeltaStreamProvider {
+        fn next_reply(&self) -> String {
+            let mut guard = self.replies.lock().expect("reply lock");
+            if guard.is_empty() {
+                String::new()
+            } else {
+                guard.remove(0)
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChatProvider for SequenceNoDeltaStreamProvider {
+        async fn complete(&self, _req: CompletionRequest) -> anyhow::Result<String> {
+            Ok(self.next_reply())
+        }
+
+        async fn complete_stream(
+            &self,
+            _req: CompletionRequest,
+            _sink: &mut dyn StreamSink,
+        ) -> anyhow::Result<String> {
+            Ok(self.next_reply())
         }
     }
 
@@ -2192,6 +2657,51 @@ mod tests {
     }
 
     #[test]
+    fn extract_primary_user_text_reads_group_wrapped_message() {
+        let wrapped = "[群成员身份映射]\n当前发言账号: uid=1\n原始消息: 现在美国时间是几点？\n[/群成员身份映射]";
+        assert_eq!(extract_primary_user_text(wrapped), "现在美国时间是几点？");
+    }
+
+    #[test]
+    fn time_query_timezone_inference_defaults_us_to_eastern() {
+        let inferred = infer_timezone_from_time_query("现在美国时间是几点？").expect("tz");
+        assert_eq!(inferred.timezone, "America/New_York");
+        assert_eq!(inferred.source, "us_default");
+    }
+
+    #[test]
+    fn explicit_time_query_filter_ignores_scheduler_sentence() {
+        assert!(!is_explicit_current_time_query("2分钟后提醒我看看时间"));
+        assert!(is_explicit_current_time_query("今天是星期几？"));
+    }
+
+    #[test]
+    fn render_fast_time_answer_formats_weekday_and_year() {
+        let answer = render_fast_time_answer(
+            "今天是星期几，今年什么生肖？",
+            &serde_json::json!({
+                "local_date": "2026-02-26",
+                "local_time": "09:32:00",
+                "local_weekday": "Thursday",
+                "local_year": 2026,
+                "timezone": "Asia/Shanghai"
+            }),
+            None,
+        );
+        assert!(answer.contains("星期四"));
+        assert!(answer.contains("2026"));
+        assert!(answer.contains("马年"));
+    }
+
+    #[test]
+    fn weekday_and_zodiac_helpers_return_expected_values() {
+        assert_eq!(weekday_to_chinese("Monday"), "一");
+        assert_eq!(weekday_to_chinese("Thursday"), "四");
+        assert_eq!(zodiac_for_year(2025), "蛇年");
+        assert_eq!(zodiac_for_year(2026), "马年");
+    }
+
+    #[test]
     fn truncate_json_value_caps_size() {
         let value = serde_json::json!({ "long": "abcdefghijklmnopqrstuvwxyz" });
         let truncated = truncate_json_value(&value, 12);
@@ -2214,6 +2724,27 @@ mod tests {
         assert_eq!(parsed.timezone.as_deref(), Some("Asia/Shanghai"));
         assert!(parsed.job_id.is_none());
         assert_eq!(parsed.job_operation.as_deref(), Some("delete"));
+    }
+
+    #[test]
+    fn parse_scheduler_intent_json_extracts_object_from_wrapped_text() {
+        let parsed = parse_scheduler_intent_json(
+            "好的，已解析如下：\n```json\n{\"action\":\"create\",\"confidence\":0.92,\"task_kind\":\"reminder\",\"payload\":\"喝水\",\"schedule_kind\":\"once\",\"run_at\":\"1772067600\",\"cron_expr\":null,\"timezone\":\"Asia/Shanghai\",\"job_id\":null,\"job_operation\":null}\n```\n请确认",
+        )
+        .expect("parsed");
+        assert_eq!(parsed.action, "create");
+        assert_eq!(parsed.payload.as_deref(), Some("喝水"));
+    }
+
+    #[test]
+    fn parse_mcp_tool_call_extracts_object_from_wrapped_text() {
+        let parsed = parse_mcp_tool_call(
+            "我准备调用工具：\n{\"server\":\"builtin\",\"tool\":\"current_time\",\"arguments\":{\"timezone\":\"Asia/Shanghai\"}}\n然后返回结果",
+        )
+        .expect("parsed");
+        assert_eq!(parsed.server, "builtin");
+        assert_eq!(parsed.tool, "current_time");
+        assert_eq!(parsed.arguments["timezone"], "Asia/Shanghai");
     }
 
     #[test]
@@ -2442,7 +2973,7 @@ mod tests {
                     channel: "telegram".to_string(),
                     session_id: "tg:test:stream".to_string(),
                     user_id: "u1".to_string(),
-                    text: "现在几点".to_string(),
+                    text: "请调用工具并给我最终结论".to_string(),
                     reply_target: None,
                 },
                 &mut sink,
@@ -2453,5 +2984,248 @@ mod tests {
         assert_eq!(out.text, "现在是正确的当前时间。");
         assert_eq!(sink.text, "现在是正确的当前时间。");
         assert!(!sink.text.contains("\"server\""));
+    }
+
+    #[tokio::test]
+    async fn handle_stream_supports_multi_iteration_mcp_tool_loop() {
+        let provider = Arc::new(SequenceStreamProvider {
+            replies: Arc::new(Mutex::new(vec![
+                format!(
+                    r#"{{"server":"{BUILTIN_MCP_SERVER_NAME}","tool":"{BUILTIN_MCP_TOOL_CURRENT_TIME}","arguments":{{"timezone":"Asia/Shanghai"}}}}"#
+                ),
+                format!(
+                    r#"{{"server":"{BUILTIN_MCP_SERVER_NAME}","tool":"{BUILTIN_MCP_TOOL_CURRENT_TIME}","arguments":{{"timezone":"America/New_York"}}}}"#
+                ),
+                "这是多轮工具调用后的最终回答。".to_string(),
+            ])),
+        });
+        let store = SqliteMemoryStore::new("sqlite::memory:")
+            .await
+            .expect("store");
+        let memory: Arc<dyn MemoryBackend> = Arc::new(SqliteMemoryBackend::new(store));
+        let service = MessageService::new_with_backend(
+            provider,
+            memory,
+            Some(Arc::new(RwLock::new(McpRuntime::default()))),
+            AgentMcpSettings::default(),
+            8,
+            0,
+            0,
+        );
+
+        let mut sink = CaptureSink::default();
+        let out = service
+            .handle_stream(
+                crate::domain::IncomingMessage {
+                    channel: "telegram".to_string(),
+                    session_id: "tg:test:stream-multi-loop".to_string(),
+                    user_id: "u1".to_string(),
+                    text: "请连续调用两次工具后再回答".to_string(),
+                    reply_target: None,
+                },
+                &mut sink,
+            )
+            .await
+            .expect("handle stream with multi mcp loop");
+
+        assert_eq!(out.text, "这是多轮工具调用后的最终回答。");
+        assert_eq!(sink.text, "这是多轮工具调用后的最终回答。");
+        assert!(!sink.text.contains("\"server\""));
+    }
+
+    #[tokio::test]
+    async fn handle_stream_supports_fenced_json_tool_call() {
+        let provider = Arc::new(SequenceStreamProvider {
+            replies: Arc::new(Mutex::new(vec![
+                format!(
+                    "```json\n{{\"tool_call\":{{\"server\":\"{BUILTIN_MCP_SERVER_NAME}\",\"tool\":\"{BUILTIN_MCP_TOOL_CURRENT_TIME}\",\"arguments\":{{\"timezone\":\"Asia/Shanghai\"}}}}}}\n```"
+                ),
+                "fenced json tool call 已成功执行。".to_string(),
+            ])),
+        });
+        let store = SqliteMemoryStore::new("sqlite::memory:")
+            .await
+            .expect("store");
+        let memory: Arc<dyn MemoryBackend> = Arc::new(SqliteMemoryBackend::new(store));
+        let service = MessageService::new_with_backend(
+            provider,
+            memory,
+            Some(Arc::new(RwLock::new(McpRuntime::default()))),
+            AgentMcpSettings::default(),
+            8,
+            0,
+            0,
+        );
+
+        let mut sink = CaptureSink::default();
+        let out = service
+            .handle_stream(
+                crate::domain::IncomingMessage {
+                    channel: "telegram".to_string(),
+                    session_id: "tg:test:stream-fenced".to_string(),
+                    user_id: "u1".to_string(),
+                    text: "请用 fenced json 发起工具调用".to_string(),
+                    reply_target: None,
+                },
+                &mut sink,
+            )
+            .await
+            .expect("handle stream with fenced json tool call");
+
+        assert_eq!(out.text, "fenced json tool call 已成功执行。");
+        assert_eq!(sink.text, "fenced json tool call 已成功执行。");
+        assert!(!sink.text.contains("\"tool_call\""));
+    }
+
+    #[tokio::test]
+    async fn handle_stream_continues_after_mcp_tool_error() {
+        let provider = Arc::new(SequenceStreamProvider {
+            replies: Arc::new(Mutex::new(vec![
+                format!(
+                    r#"{{"server":"{BUILTIN_MCP_SERVER_NAME}","tool":"no_such_tool","arguments":{{}}}}"#
+                ),
+                "我捕获到了工具调用失败，并继续给出最终回答。".to_string(),
+            ])),
+        });
+        let store = SqliteMemoryStore::new("sqlite::memory:")
+            .await
+            .expect("store");
+        let memory: Arc<dyn MemoryBackend> = Arc::new(SqliteMemoryBackend::new(store));
+        let service = MessageService::new_with_backend(
+            provider,
+            memory,
+            Some(Arc::new(RwLock::new(McpRuntime::default()))),
+            AgentMcpSettings::default(),
+            8,
+            0,
+            0,
+        );
+
+        let mut sink = CaptureSink::default();
+        let out = service
+            .handle_stream(
+                crate::domain::IncomingMessage {
+                    channel: "telegram".to_string(),
+                    session_id: "tg:test:stream-tool-error".to_string(),
+                    user_id: "u1".to_string(),
+                    text: "请调用一个不存在的工具后继续回答".to_string(),
+                    reply_target: None,
+                },
+                &mut sink,
+            )
+            .await
+            .expect("handle stream should continue after tool error");
+
+        assert_eq!(out.text, "我捕获到了工具调用失败，并继续给出最终回答。");
+        assert_eq!(sink.text, "我捕获到了工具调用失败，并继续给出最终回答。");
+    }
+
+    #[tokio::test]
+    async fn handle_stream_parses_tool_call_even_when_provider_emits_no_deltas() {
+        let provider = Arc::new(SequenceNoDeltaStreamProvider {
+            replies: Arc::new(Mutex::new(vec![
+                format!(
+                    r#"{{"server":"{BUILTIN_MCP_SERVER_NAME}","tool":"{BUILTIN_MCP_TOOL_CURRENT_TIME}","arguments":{{"timezone":"Asia/Shanghai"}}}}"#
+                ),
+                "无delta流式也能完成工具链路。".to_string(),
+            ])),
+        });
+        let store = SqliteMemoryStore::new("sqlite::memory:")
+            .await
+            .expect("store");
+        let memory: Arc<dyn MemoryBackend> = Arc::new(SqliteMemoryBackend::new(store));
+        let service = MessageService::new_with_backend(
+            provider,
+            memory,
+            Some(Arc::new(RwLock::new(McpRuntime::default()))),
+            AgentMcpSettings::default(),
+            8,
+            0,
+            0,
+        );
+
+        let mut sink = CaptureSink::default();
+        let out = service
+            .handle_stream(
+                crate::domain::IncomingMessage {
+                    channel: "telegram".to_string(),
+                    session_id: "tg:test:stream-no-delta".to_string(),
+                    user_id: "u1".to_string(),
+                    text: "即使没有delta也要完成工具调用".to_string(),
+                    reply_target: None,
+                },
+                &mut sink,
+            )
+            .await
+            .expect("handle stream should parse tool call from fallback reply text");
+
+        assert_eq!(out.text, "无delta流式也能完成工具链路。");
+        assert_eq!(sink.text, "无delta流式也能完成工具链路。");
+    }
+
+    #[tokio::test]
+    async fn handle_uses_builtin_time_fast_path_without_provider_call() {
+        let store = SqliteMemoryStore::new("sqlite::memory:")
+            .await
+            .expect("store");
+        let memory: Arc<dyn MemoryBackend> = Arc::new(SqliteMemoryBackend::new(store));
+        let service = MessageService::new_with_backend(
+            Arc::new(NeverProvider),
+            memory,
+            Some(Arc::new(RwLock::new(McpRuntime::default()))),
+            AgentMcpSettings::default(),
+            8,
+            0,
+            0,
+        );
+
+        let out = service
+            .handle(crate::domain::IncomingMessage {
+                channel: "telegram".to_string(),
+                session_id: "tg:test:fast-time".to_string(),
+                user_id: "u1".to_string(),
+                text: "现在美国时间是几点？".to_string(),
+                reply_target: None,
+            })
+            .await
+            .expect("fast time query should bypass provider");
+
+        assert!(out.text.contains("美国东部时间"));
+        assert!(out.text.contains("America/New_York"));
+    }
+
+    #[tokio::test]
+    async fn handle_stream_uses_builtin_time_fast_path_without_provider_call() {
+        let store = SqliteMemoryStore::new("sqlite::memory:")
+            .await
+            .expect("store");
+        let memory: Arc<dyn MemoryBackend> = Arc::new(SqliteMemoryBackend::new(store));
+        let service = MessageService::new_with_backend(
+            Arc::new(NeverProvider),
+            memory,
+            Some(Arc::new(RwLock::new(McpRuntime::default()))),
+            AgentMcpSettings::default(),
+            8,
+            0,
+            0,
+        );
+
+        let mut sink = CaptureSink::default();
+        let out = service
+            .handle_stream(
+                crate::domain::IncomingMessage {
+                    channel: "telegram".to_string(),
+                    session_id: "tg:test:fast-time-stream".to_string(),
+                    user_id: "u1".to_string(),
+                    text: "今天星期几？".to_string(),
+                    reply_target: None,
+                },
+                &mut sink,
+            )
+            .await
+            .expect("stream time query should bypass provider");
+
+        assert_eq!(sink.text, out.text);
+        assert!(out.text.contains("星期"));
     }
 }

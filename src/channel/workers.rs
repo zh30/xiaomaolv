@@ -360,7 +360,7 @@ pub(super) async fn fetch_telegram_updates(
         .json(&serde_json::json!({
             "offset": offset,
             "timeout": timeout_secs,
-            "allowed_updates": ["message"]
+            "allowed_updates": ["message", "callback_query"]
         }))
         .send()
         .await

@@ -467,6 +467,136 @@ pub(super) async fn enforce_scheduler_job_quota(
     Ok(())
 }
 
+pub(super) fn try_build_relative_reminder_draft_from_text(
+    text: &str,
+    default_timezone: &str,
+    now_unix: i64,
+) -> Option<TelegramSchedulerIntentDraft> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let delay_secs = parse_relative_delay_secs(trimmed)?;
+    let payload = extract_relative_reminder_payload(trimmed)?;
+    let run_at_unix = now_unix.saturating_add(delay_secs);
+
+    Some(TelegramSchedulerIntentDraft {
+        task_kind: TelegramSchedulerTaskKind::Reminder,
+        schedule_kind: TelegramSchedulerScheduleKind::Once,
+        payload,
+        timezone: default_timezone.to_string(),
+        run_at_unix: Some(run_at_unix),
+        cron_expr: None,
+        source_text: trimmed.to_string(),
+    })
+}
+
+fn parse_relative_delay_secs(text: &str) -> Option<i64> {
+    let mut cursor = 0usize;
+    while cursor < text.len() {
+        let mut digit_start = None;
+        for (off, ch) in text[cursor..].char_indices() {
+            if ch.is_ascii_digit() {
+                digit_start = Some(cursor + off);
+                break;
+            }
+        }
+        let Some(start) = digit_start else {
+            return None;
+        };
+        let mut end = start;
+        for (off, ch) in text[start..].char_indices() {
+            if ch.is_ascii_digit() {
+                end = start + off + ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let value = text[start..end].parse::<i64>().ok()?;
+        if value <= 0 {
+            cursor = end;
+            continue;
+        }
+
+        let rest = text[end..].trim_start();
+        let Some((unit_secs, consumed)) = parse_duration_unit(rest) else {
+            cursor = end;
+            continue;
+        };
+        let after_unit = rest[consumed..].trim_start();
+        let has_relative_suffix = after_unit.starts_with('后')
+            || after_unit.starts_with("之后")
+            || after_unit.starts_with("以后")
+            || after_unit.starts_with("later")
+            || after_unit.starts_with("from now")
+            || after_unit.starts_with("提醒")
+            || after_unit.starts_with("叫")
+            || after_unit.starts_with("喊");
+        if !has_relative_suffix {
+            cursor = end;
+            continue;
+        }
+
+        return Some(value.saturating_mul(unit_secs));
+    }
+    None
+}
+
+fn parse_duration_unit(text: &str) -> Option<(i64, usize)> {
+    let unit = [
+        ("minutes", 60),
+        ("minute", 60),
+        ("mins", 60),
+        ("min", 60),
+        ("hours", 3600),
+        ("hour", 3600),
+        ("days", 86400),
+        ("day", 86400),
+        ("分钟", 60),
+        ("分", 60),
+        ("小时", 3600),
+        ("秒钟", 1),
+        ("秒", 1),
+        ("天", 86400),
+    ];
+    for (token, secs) in unit {
+        if text.starts_with(token) {
+            return Some((secs, token.len()));
+        }
+    }
+    None
+}
+
+fn extract_relative_reminder_payload(text: &str) -> Option<String> {
+    for marker in [
+        "提醒一下我",
+        "提醒下我",
+        "提醒我",
+        "提醒一下",
+        "提醒下",
+        "提醒",
+        "叫一下我",
+        "叫我",
+        "叫一下",
+        "叫",
+        "喊我",
+        "喊",
+    ] {
+        let Some(start) = text.find(marker) else {
+            continue;
+        };
+        let tail = text[start + marker.len()..].trim_matches(|c: char| {
+            c.is_whitespace() || matches!(c, ',' | '，' | '.' | '。' | '!' | '！' | '?' | '？' | ':' | '：' | ';' | '；')
+        });
+        if !tail.is_empty() {
+            return Some(tail.to_string());
+        }
+        return Some("你设置的提醒".to_string());
+    }
+    None
+}
+
 pub(super) fn parse_task_schedule_and_payload(raw: &str) -> anyhow::Result<(String, String)> {
     let (left, right) = raw
         .split_once('|')

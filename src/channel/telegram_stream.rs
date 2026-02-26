@@ -154,6 +154,7 @@ impl<'a> TelegramStreamSink<'a> {
                     self.message_thread_id,
                     self.reply_to_message_id,
                     &parts[0],
+                    None,
                 )
                 .await
                 .context("failed to send telegram stream message")?;
@@ -177,6 +178,7 @@ impl<'a> TelegramStreamSink<'a> {
                         self.message_thread_id,
                         None,
                         rendered_tail,
+                        None,
                     )
                     .await
                     .context("failed to send telegram stream tail message")?;
