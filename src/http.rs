@@ -22,7 +22,8 @@ use crate::memory::{
     SqliteMemoryStore, ZvecSidecarClient, ZvecSidecarConfig,
 };
 use crate::provider::{ChatProvider, ProviderRegistry};
-use crate::service::{AgentMcpSettings, MessageService};
+use crate::service::{AgentMcpSettings, AgentSkillsSettings, MessageService};
+use crate::skills::{SkillConfigPaths, SkillRegistry, SkillRuntime};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -181,6 +182,7 @@ async fn build_state(
     };
 
     let mcp_runtime = Arc::new(RwLock::new(load_mcp_runtime().await));
+    let skills_runtime = Arc::new(RwLock::new(load_skill_runtime().await));
     let service = Arc::new(
         MessageService::new_with_backend(
             provider,
@@ -200,6 +202,16 @@ async fn build_state(
             config.memory.context_reserved_tokens,
             config.memory.context_memory_budget_ratio,
             config.memory.context_min_recent_messages,
+        )
+        .with_agent_skills(
+            Some(skills_runtime.clone()),
+            AgentSkillsSettings {
+                enabled: config.agent.skills_enabled,
+                max_selected: config.agent.skills_max_selected,
+                max_prompt_chars: config.agent.skills_max_prompt_chars,
+                match_min_score: config.agent.skills_match_min_score,
+                llm_rerank_enabled: config.agent.skills_llm_rerank_enabled,
+            },
         ),
     );
 
@@ -429,6 +441,40 @@ async fn load_mcp_runtime() -> McpRuntime {
         Err(err) => {
             warn!(error = %err, "failed to load mcp runtime, using empty runtime");
             McpRuntime::default()
+        }
+    }
+}
+
+async fn load_skill_runtime() -> SkillRuntime {
+    let cwd = match std::env::current_dir() {
+        Ok(path) => path,
+        Err(err) => {
+            warn!(error = %err, "failed to resolve current dir while loading skill registry, using empty runtime");
+            return SkillRuntime::default();
+        }
+    };
+
+    let paths = match SkillConfigPaths::discover(&cwd) {
+        Ok(paths) => paths,
+        Err(err) => {
+            warn!(error = %err, "failed to resolve skill config paths, using empty runtime");
+            return SkillRuntime::default();
+        }
+    };
+
+    let registry = match SkillRegistry::new(paths) {
+        Ok(registry) => registry,
+        Err(err) => {
+            warn!(error = %err, "failed to initialize skill registry, using empty runtime");
+            return SkillRuntime::default();
+        }
+    };
+
+    match SkillRuntime::from_registry(&registry).await {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            warn!(error = %err, "failed to load skill runtime, using empty runtime");
+            SkillRuntime::default()
         }
     }
 }

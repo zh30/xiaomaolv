@@ -331,11 +331,24 @@ fn parse_slash_command_supports_task() {
 }
 
 #[test]
-fn telegram_help_and_registered_commands_include_task() {
+fn parse_slash_command_supports_skill_alias() {
+    let parsed = parse_telegram_slash_command("/skill ls --scope merged", Some("xiaomaolv_bot"));
+    assert_eq!(
+        parsed,
+        Some(TelegramSlashCommand::Skills {
+            tail: "ls --scope merged".to_string()
+        })
+    );
+}
+
+#[test]
+fn telegram_help_and_registered_commands_include_task_and_skills() {
     let help = telegram_help_text();
     assert!(help.contains("/task"));
+    assert!(help.contains("/skills"));
     let commands = telegram_registered_commands();
     assert!(commands.iter().any(|(name, _)| *name == "task"));
+    assert!(commands.iter().any(|(name, _)| *name == "skills"));
 }
 
 #[test]

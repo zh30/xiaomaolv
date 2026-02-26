@@ -266,6 +266,16 @@ pub struct AgentConfig {
     pub mcp_max_iterations: usize,
     #[serde(default = "default_agent_mcp_max_tool_result_chars")]
     pub mcp_max_tool_result_chars: usize,
+    #[serde(default = "default_agent_skills_enabled")]
+    pub skills_enabled: bool,
+    #[serde(default = "default_agent_skills_max_selected")]
+    pub skills_max_selected: usize,
+    #[serde(default = "default_agent_skills_max_prompt_chars")]
+    pub skills_max_prompt_chars: usize,
+    #[serde(default = "default_agent_skills_match_min_score")]
+    pub skills_match_min_score: f32,
+    #[serde(default = "default_agent_skills_llm_rerank_enabled")]
+    pub skills_llm_rerank_enabled: bool,
 }
 
 impl Default for AgentConfig {
@@ -274,6 +284,11 @@ impl Default for AgentConfig {
             mcp_enabled: default_agent_mcp_enabled(),
             mcp_max_iterations: default_agent_mcp_max_iterations(),
             mcp_max_tool_result_chars: default_agent_mcp_max_tool_result_chars(),
+            skills_enabled: default_agent_skills_enabled(),
+            skills_max_selected: default_agent_skills_max_selected(),
+            skills_max_prompt_chars: default_agent_skills_max_prompt_chars(),
+            skills_match_min_score: default_agent_skills_match_min_score(),
+            skills_llm_rerank_enabled: default_agent_skills_llm_rerank_enabled(),
         }
     }
 }
@@ -507,6 +522,26 @@ fn default_agent_mcp_max_iterations() -> usize {
 
 fn default_agent_mcp_max_tool_result_chars() -> usize {
     4000
+}
+
+fn default_agent_skills_enabled() -> bool {
+    true
+}
+
+fn default_agent_skills_max_selected() -> usize {
+    3
+}
+
+fn default_agent_skills_max_prompt_chars() -> usize {
+    8000
+}
+
+fn default_agent_skills_match_min_score() -> f32 {
+    0.45
+}
+
+fn default_agent_skills_llm_rerank_enabled() -> bool {
+    false
 }
 
 fn resolve_env_placeholder(value: &str) -> String {

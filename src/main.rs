@@ -7,6 +7,7 @@ use tracing_subscriber::EnvFilter;
 use xiaomaolv::config::AppConfig;
 use xiaomaolv::http::build_app_runtime;
 use xiaomaolv::mcp_commands::{McpCommands, discover_mcp_registry, execute_mcp_command};
+use xiaomaolv::skills_commands::{SkillsCommands, discover_skill_registry, execute_skills_command};
 
 #[derive(Debug, Parser)]
 #[command(name = "xiaomaolv")]
@@ -35,6 +36,11 @@ enum Commands {
         #[command(subcommand)]
         command: McpCommands,
     },
+    /// Manage agent skills (install/search/use/update/remove)
+    Skills {
+        #[command(subcommand)]
+        command: SkillsCommands,
+    },
 }
 
 #[tokio::main]
@@ -53,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Init { output } => init_config(output).await,
         Commands::Serve { config, database } => serve(config, &database).await,
         Commands::Mcp { command } => handle_mcp(command).await,
+        Commands::Skills { command } => handle_skills(command).await,
     }
 }
 
@@ -103,6 +110,15 @@ async fn serve(config_path: PathBuf, database_url: &str) -> anyhow::Result<()> {
 async fn handle_mcp(command: McpCommands) -> anyhow::Result<()> {
     let registry = discover_mcp_registry()?;
     let output = execute_mcp_command(&registry, command).await?;
+    if !output.text.is_empty() {
+        println!("{}", output.text);
+    }
+    Ok(())
+}
+
+async fn handle_skills(command: SkillsCommands) -> anyhow::Result<()> {
+    let registry = discover_skill_registry()?;
+    let output = execute_skills_command(&registry, command).await?;
     if !output.text.is_empty() {
         println!("{}", output.text);
     }
@@ -192,4 +208,9 @@ query_path = "/v1/memory/query"
 mcp_enabled = true
 mcp_max_iterations = 4
 mcp_max_tool_result_chars = 4000
+skills_enabled = true
+skills_max_selected = 3
+skills_max_prompt_chars = 8000
+skills_match_min_score = 0.45
+skills_llm_rerank_enabled = false
 "#;

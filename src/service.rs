@@ -20,12 +20,22 @@ use crate::memory::{
     UpsertTelegramSchedulerPendingIntentRequest,
 };
 use crate::provider::{ChatProvider, CompletionRequest, StreamSink};
+use crate::skills::{SkillRegistry, SkillRuntime, SkillRuntimeSelectionSettings};
 
 #[derive(Debug, Clone)]
 pub struct AgentMcpSettings {
     pub enabled: bool,
     pub max_iterations: usize,
     pub max_tool_result_chars: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentSkillsSettings {
+    pub enabled: bool,
+    pub max_selected: usize,
+    pub max_prompt_chars: usize,
+    pub match_min_score: f32,
+    pub llm_rerank_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -52,12 +62,26 @@ impl Default for AgentMcpSettings {
     }
 }
 
+impl Default for AgentSkillsSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_selected: 3,
+            max_prompt_chars: 8000,
+            match_min_score: 0.45,
+            llm_rerank_enabled: false,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct MessageService {
     provider: Arc<dyn ChatProvider>,
     memory: Arc<dyn MemoryBackend>,
     mcp_runtime: Option<Arc<RwLock<McpRuntime>>>,
+    skills_runtime: Option<Arc<RwLock<SkillRuntime>>>,
     agent_mcp: AgentMcpSettings,
+    agent_skills: AgentSkillsSettings,
     max_recent_turns: usize,
     max_semantic_memories: usize,
     semantic_lookback_days: u32,
@@ -97,7 +121,9 @@ impl MessageService {
             provider,
             memory,
             mcp_runtime,
+            skills_runtime: None,
             agent_mcp,
+            agent_skills: AgentSkillsSettings::default(),
             max_recent_turns,
             max_semantic_memories,
             semantic_lookback_days,
@@ -156,6 +182,7 @@ impl MessageService {
             self.context_memory_budget_ratio,
             self.context_min_recent_messages,
         );
+        let history = self.apply_skills_prompt(history, &incoming.text).await;
 
         let text = self.complete_with_optional_mcp(history).await?;
 
@@ -218,6 +245,7 @@ impl MessageService {
             self.context_memory_budget_ratio,
             self.context_min_recent_messages,
         );
+        let history = self.apply_skills_prompt(history, &incoming.text).await;
 
         // Keep true streaming semantics on channel streaming path.
         // MCP tool loop currently runs on non-stream path only.
@@ -668,6 +696,63 @@ impl MessageService {
         let mut guard = runtime.write().await;
         *guard = next;
         Ok(())
+    }
+
+    pub async fn reload_skill_runtime_from_registry(
+        &self,
+        registry: &SkillRegistry,
+    ) -> anyhow::Result<()> {
+        let Some(runtime) = &self.skills_runtime else {
+            return Ok(());
+        };
+        let next = SkillRuntime::from_registry(registry).await?;
+        let mut guard = runtime.write().await;
+        *guard = next;
+        Ok(())
+    }
+
+    pub fn with_agent_skills(
+        mut self,
+        skills_runtime: Option<Arc<RwLock<SkillRuntime>>>,
+        settings: AgentSkillsSettings,
+    ) -> Self {
+        self.skills_runtime = skills_runtime;
+        self.agent_skills = settings;
+        self
+    }
+
+    fn is_skills_agent_enabled(&self) -> bool {
+        self.agent_skills.enabled && self.skills_runtime.is_some()
+    }
+
+    async fn snapshot_skill_runtime(&self) -> Option<SkillRuntime> {
+        if !self.is_skills_agent_enabled() {
+            return None;
+        }
+        let runtime = self.skills_runtime.as_ref()?;
+        Some(runtime.read().await.clone())
+    }
+
+    async fn apply_skills_prompt(
+        &self,
+        mut history: Vec<StoredMessage>,
+        query_text: &str,
+    ) -> Vec<StoredMessage> {
+        let Some(runtime) = self.snapshot_skill_runtime().await else {
+            return history;
+        };
+        let settings = SkillRuntimeSelectionSettings {
+            max_selected: self.agent_skills.max_selected,
+            max_prompt_chars: self.agent_skills.max_prompt_chars,
+            match_min_score: self.agent_skills.match_min_score,
+        };
+        if let Some(prompt) = runtime.build_system_prompt(query_text, &settings) {
+            history.push(StoredMessage {
+                role: MessageRole::System,
+                content: prompt,
+            });
+        }
+        history
     }
 }
 

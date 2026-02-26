@@ -6,6 +6,7 @@ pub(super) enum TelegramSlashCommand {
     Help,
     WhoAmI,
     Mcp { tail: String },
+    Skills { tail: String },
     Task { tail: String },
     Unknown { name: String },
 }
@@ -142,6 +143,109 @@ pub(super) async fn maybe_handle_telegram_command(
                             }
                             Err(err) => {
                                 out.push_str(&format!("\n\nMCP runtime 热重载失败: {err}"));
+                            }
+                        }
+                    }
+                    send_telegram_command_reply(sender, message, &out).await?;
+                }
+                Err(err) => {
+                    send_telegram_command_reply(sender, message, &format!("命令执行失败: {err}"))
+                        .await?;
+                }
+            }
+            Ok(true)
+        }
+        TelegramSlashCommand::Skills { tail } => {
+            if !command_settings.enabled {
+                send_telegram_command_reply(sender, message, "命令功能未启用。").await?;
+                return Ok(true);
+            }
+            match evaluate_mcp_command_access(
+                is_private_chat,
+                message.from.as_ref().map(|u| u.id),
+                command_settings,
+            ) {
+                McpCommandAccess::Allowed => {}
+                McpCommandAccess::RequirePrivateChat => {
+                    send_telegram_command_reply(sender, message, "请私聊使用 /skills 管理命令。")
+                        .await?;
+                    return Ok(true);
+                }
+                McpCommandAccess::MissingAdminAllowlist => {
+                    send_telegram_command_reply(
+                        sender,
+                        message,
+                        &format!(
+                            "管理员白名单未配置，命令不可用。\n{}\n\n请在 .env.realtest 中配置 TELEGRAM_ADMIN_USER_IDS，然后重启服务。",
+                            telegram_whoami_hint(message)
+                        ),
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+                McpCommandAccess::Unauthorized => {
+                    send_telegram_command_reply(
+                        sender,
+                        message,
+                        &format!(
+                            "无权限执行该命令。\n{}\n\n请将你的 ID 加到 TELEGRAM_ADMIN_USER_IDS。",
+                            telegram_whoami_hint(message)
+                        ),
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+            }
+
+            if tail.trim().is_empty() {
+                send_telegram_command_reply(sender, message, &skills_help_text()).await?;
+                return Ok(true);
+            }
+
+            let parsed = match parse_telegram_skills_command(&tail) {
+                Ok(command) => command,
+                Err(err) => {
+                    send_telegram_command_reply(
+                        sender,
+                        message,
+                        &format!("命令参数错误: {err}\n\n{}", skills_help_text()),
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+            };
+
+            let registry = match discover_skill_registry() {
+                Ok(registry) => registry,
+                Err(err) => {
+                    send_telegram_command_reply(
+                        sender,
+                        message,
+                        &format!("无法加载 skills 配置路径: {err}"),
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+            };
+
+            match execute_skills_command(&registry, parsed).await {
+                Ok(output) => {
+                    let mut out = if output.text.trim().is_empty() {
+                        "命令执行完成。".to_string()
+                    } else {
+                        output.text
+                    };
+                    if output.reload_runtime {
+                        match ctx
+                            .service
+                            .reload_skill_runtime_from_registry(&registry)
+                            .await
+                        {
+                            Ok(()) => {
+                                out.push_str("\n\nSkills runtime 已热重载。");
+                            }
+                            Err(err) => {
+                                out.push_str(&format!("\n\nSkills runtime 热重载失败: {err}"));
                             }
                         }
                     }
@@ -1001,6 +1105,7 @@ pub(super) fn parse_telegram_slash_command(
         "help" => Some(TelegramSlashCommand::Help),
         "whoami" => Some(TelegramSlashCommand::WhoAmI),
         "mcp" => Some(TelegramSlashCommand::Mcp { tail }),
+        "skills" | "skill" => Some(TelegramSlashCommand::Skills { tail }),
         "task" => Some(TelegramSlashCommand::Task { tail }),
         _ => Some(TelegramSlashCommand::Unknown { name: command }),
     }
@@ -1021,6 +1126,7 @@ pub(super) fn telegram_help_text() -> String {
         "/help - 查看帮助",
         "/whoami - 查看你的 Telegram 用户 ID",
         "/mcp - 管理 MCP 服务器（仅私聊管理员）",
+        "/skills - 管理 Skills（仅私聊管理员）",
         "/task - 管理定时任务（仅私聊管理员）",
     ]
     .join("\n")
@@ -1071,6 +1177,7 @@ pub(super) fn telegram_registered_commands() -> Vec<(&'static str, &'static str)
         ("help", "查看帮助"),
         ("whoami", "查看当前用户ID"),
         ("mcp", "管理 MCP 服务器"),
+        ("skills", "管理 Skills"),
         ("task", "管理定时任务"),
     ]
 }

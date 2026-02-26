@@ -11,6 +11,7 @@
 - [配置速览](#config-overview)
 - [可选：启用混合记忆（SQLite + zvec sidecar）](#hybrid-memory)
 - [HTTP API](#http-api)
+- [Skills 集成](#skills-integration)
 - [插件扩展（Provider / Channel）](#plugin-system)
 - [本地开发](#local-dev)
 - [工程质量门禁](#engineering-quality)
@@ -26,7 +27,7 @@
 - Telegram 流式回复（通过 `editMessageText` 增量更新）
 - Telegram 回复统一使用 `MarkdownV2` 渲染（支持加粗/斜体/代码/链接/列表/引用）
 - Telegram 启动在线状态（通过 `setMyShortDescription`，可配置）
-- Telegram `/` 命令：`/start`、`/help`、`/whoami`、`/mcp ...`（私聊管理员控制）
+- Telegram `/` 命令：`/start`、`/help`、`/whoami`、`/mcp ...`、`/skills ...`（私聊管理员控制）
 - Telegram 群组支持：
   - `strict` 模式：仅在 `@bot_username` 或 reply-to-bot 时回复
   - `smart` 模式：基于上下文规则的 `Respond/ObserveOnly/Ignore` 决策
@@ -60,7 +61,7 @@ cp .env.realtest.example .env.realtest
 
 - `MINIMAX_MODEL`（默认：`MiniMax-M2.5-highspeed`）
 - `TELEGRAM_BOT_USERNAME`（不带 `@`，建议填写，用于群组@匹配）
-- `TELEGRAM_ADMIN_USER_IDS`（私聊访问 + `/mcp` 管理员用户 ID，逗号分隔，如 `123456789,987654321`）
+- `TELEGRAM_ADMIN_USER_IDS`（私聊访问 + `/mcp` + `/skills` 管理员用户 ID，逗号分隔，如 `123456789,987654321`）
 
 ### 3) 一键启动 MVP
 
@@ -151,8 +152,8 @@ curl -sS http://127.0.0.1:8080/v1/channels/telegram/mode
   - `startup_online_text = "online"`（调用 Telegram `setMyShortDescription`）
   - `commands_enabled = true|false`（是否启用 `/` 命令处理）
   - `commands_auto_register = true|false`（启动时是否自动注册 Telegram 命令菜单）
-  - `commands_private_only = true|false`（为 true 时 `/mcp` 仅允许私聊）
-  - `admin_user_ids = "${TELEGRAM_ADMIN_USER_IDS:-}"`（私聊访问 + `/mcp` 白名单，推荐在 `.env.realtest` 配置）
+  - `commands_private_only = true|false`（为 true 时 `/mcp` 与 `/skills` 仅允许私聊）
+  - `admin_user_ids = "${TELEGRAM_ADMIN_USER_IDS:-}"`（私聊访问 + `/mcp` + `/skills` 白名单，推荐在 `.env.realtest` 配置）
 - 记忆模式：
   - `backend = "sqlite-only"`（默认）
   - `backend = "hybrid-sqlite-zvec"`（可选）
@@ -165,6 +166,15 @@ curl -sS http://127.0.0.1:8080/v1/channels/telegram/mode
   - `hybrid_min_score = 0.18`（注入记忆的最小相关度阈值）
   - `context_memory_budget_ratio = 35`（记忆片段最多占输入预算的百分比）
   - `context_min_recent_messages = 8`（始终保留近期轮次，保证对话连贯）
+- Agent：
+  - `mcp_enabled = true`
+  - `mcp_max_iterations = 4`
+  - `mcp_max_tool_result_chars = 4000`
+  - `skills_enabled = true`
+  - `skills_max_selected = 3`
+  - `skills_max_prompt_chars = 8000`
+  - `skills_match_min_score = 0.45`
+  - `skills_llm_rerank_enabled = false`
 
 <a id="hybrid-memory"></a>
 ## 可选：启用混合记忆（SQLite + zvec sidecar）
@@ -207,6 +217,36 @@ curl -X POST http://127.0.0.1:8080/v1/messages \
   -H 'content-type: application/json' \
   -d '{"session_id":"demo-1","user_id":"u1","text":"你好"}'
 ```
+
+<a id="skills-integration"></a>
+## Skills 集成
+
+支持本地与目录索引技能管理（user/project scope），并在消息推理前自动注入匹配到的 skill 指令。
+
+CLI 示例：
+
+```bash
+xiaomaolv skills ls --scope merged
+xiaomaolv skills search "browser automation" --top 5 --index all
+xiaomaolv skills install /path/to/my-skill --scope user --mode semantic
+xiaomaolv skills install agent-browser --scope user --mode semantic --yes
+xiaomaolv skills use agent-browser --scope all --mode always
+xiaomaolv skills update agent-browser --scope all --latest
+xiaomaolv skills rm agent-browser --scope all
+```
+
+团队目录可通过 `XIAOMAOLV_SKILLS_TEAM_INDEX_URL` 配置（JSON 索引 URL）。
+
+Telegram `/skills`：
+
+- `/skills ls [--scope merged|user|project]`
+- `/skills search <query> [--top 5] [--index official|team|all]`
+- `/skills install <path|id|query> [--scope user|project] [--mode semantic|always|off] [--yes]`
+- `/skills use <id> --mode semantic|always|off [--scope all|user|project]`
+- `/skills update <id> [--scope all|user|project] [--latest|--to-version <v>]`
+- `/skills rm <id> [--scope all|user|project]`
+
+与 `/mcp` 一致，`/skills` 默认仅私聊管理员可用；安装/更新/卸载后会自动热重载 skills runtime。
 
 <a id="plugin-system"></a>
 ## 插件扩展（Provider / Channel）

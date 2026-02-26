@@ -8,3 +8,5 @@ pub mod memory;
 pub mod provider;
 pub mod scheduler;
 pub mod service;
+pub mod skills;
+pub mod skills_commands;

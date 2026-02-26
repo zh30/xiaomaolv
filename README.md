@@ -14,6 +14,7 @@ Chinese version: `README.zh.md`
 - [Optional: Hybrid Memory (SQLite + zvec sidecar)](#hybrid-memory)
 - [HTTP API](#http-api)
 - [MCP Integration](#mcp-integration)
+- [Skills Integration](#skills-integration)
 - [Plugin Extensions (Provider / Channel)](#plugin-system)
 - [Local Development](#local-dev)
 - [Engineering Quality Gates](#engineering-quality)
@@ -31,7 +32,7 @@ Chinese version: `README.zh.md`
 - Telegram streaming prefers `sendMessageDraft` when supported, with automatic fallback
 - Telegram typing heartbeat: immediate `sendChatAction("typing")`, then every 5 seconds until completion
 - Telegram startup online status (via `setMyShortDescription`, configurable)
-- Telegram slash commands: `/start`, `/help`, `/whoami`, `/mcp ...` (admin/private-chat control)
+- Telegram slash commands: `/start`, `/help`, `/whoami`, `/mcp ...`, `/skills ...` (admin/private-chat control)
 - Telegram group support:
   - `strict` mode: only replies on `@bot_username` or reply-to-bot
   - `smart` mode: contextual trigger with `Respond/ObserveOnly/Ignore`
@@ -42,6 +43,7 @@ Chinese version: `README.zh.md`
 - Memory backends: `sqlite-only` (default) and `hybrid-sqlite-zvec` (optional)
 - Plugin-style extension API for Provider/Channel/Memory
 - Agent MCP auto tool loop (configurable max iterations/result size)
+- Agent Skills runtime injection (configurable selection budget/match threshold)
 
 <a id="quick-start"></a>
 ## Quick Start (Recommended: MiniMax + Telegram)
@@ -67,7 +69,7 @@ Optional model override:
 
 - `MINIMAX_MODEL` (default: `MiniMax-M2.5-highspeed`)
 - `TELEGRAM_BOT_USERNAME` (without `@`, recommended for group mention matching)
-- `TELEGRAM_ADMIN_USER_IDS` (comma-separated Telegram user IDs for private chat access and `/mcp`, e.g. `123456789,987654321`)
+- `TELEGRAM_ADMIN_USER_IDS` (comma-separated Telegram user IDs for private chat access and `/mcp` + `/skills`, e.g. `123456789,987654321`)
 
 ### 3) Start MVP in one command
 
@@ -161,8 +163,8 @@ Key settings:
   - `startup_online_text = "online"` (uses Telegram `setMyShortDescription`)
   - `commands_enabled = true|false` (enable slash command handling)
   - `commands_auto_register = true|false` (startup calls Telegram `setMyCommands`)
-  - `commands_private_only = true|false` (`/mcp` only in private chat when true)
-  - `admin_user_ids = "${TELEGRAM_ADMIN_USER_IDS:-}"` (private chat allowlist + `/mcp` allowlist; recommended in `.env.realtest`)
+  - `commands_private_only = true|false` (`/mcp` + `/skills` only in private chat when true)
+  - `admin_user_ids = "${TELEGRAM_ADMIN_USER_IDS:-}"` (private chat allowlist + `/mcp` + `/skills` allowlist; recommended in `.env.realtest`)
 - Memory mode:
   - `backend = "sqlite-only"` (default)
   - `backend = "hybrid-sqlite-zvec"` (optional)
@@ -179,6 +181,12 @@ Key settings:
   - `mcp_enabled = true`
   - `mcp_max_iterations = 4`
   - `mcp_max_tool_result_chars = 4000`
+- Agent Skills:
+  - `skills_enabled = true`
+  - `skills_max_selected = 3`
+  - `skills_max_prompt_chars = 8000`
+  - `skills_match_min_score = 0.45`
+  - `skills_llm_rerank_enabled = false`
 
 <a id="hybrid-memory"></a>
 ## Optional: Hybrid Memory (SQLite + zvec sidecar)
@@ -298,6 +306,36 @@ Private chat is restricted to allowed admin users (`TELEGRAM_ADMIN_USER_IDS`).
 `/whoami` returns the current Telegram user ID and a ready-to-copy env config snippet.
 After successful `/mcp add` or `/mcp rm`, MCP runtime is hot reloaded immediately.
 
+## Skills Integration
+
+xiaomaolv supports installing and managing local/catalog skills with user/project scopes.
+
+### CLI skills commands
+
+```bash
+xiaomaolv skills ls --scope merged
+xiaomaolv skills search "browser automation" --top 5 --index all
+xiaomaolv skills install /path/to/my-skill --scope user --mode semantic
+xiaomaolv skills install agent-browser --scope user --mode semantic --yes
+xiaomaolv skills use agent-browser --scope all --mode always
+xiaomaolv skills update agent-browser --scope all --latest
+xiaomaolv skills rm agent-browser --scope all
+```
+
+Team catalog can be configured via `XIAOMAOLV_SKILLS_TEAM_INDEX_URL` (JSON index URL).
+
+### Telegram `/skills` commands
+
+- `/skills ls [--scope merged|user|project]`
+- `/skills search <query> [--top 5] [--index official|team|all]`
+- `/skills install <path|id|query> [--scope user|project] [--mode semantic|always|off] [--yes]`
+- `/skills use <id> --mode semantic|always|off [--scope all|user|project]`
+- `/skills update <id> [--scope all|user|project] [--latest|--to-version <v>]`
+- `/skills rm <id> [--scope all|user|project]`
+
+Private chat is restricted to allowed admin users (`TELEGRAM_ADMIN_USER_IDS`), same as `/mcp`.
+After successful `/skills install|use|update|rm`, skills runtime is hot reloaded immediately.
+
 ### Agent auto tool loop
 
 When `agent.mcp_enabled = true`, message handling will:
@@ -312,6 +350,13 @@ You can disable this globally:
 ```toml
 [agent]
 mcp_enabled = false
+mcp_max_iterations = 4
+mcp_max_tool_result_chars = 4000
+skills_enabled = true
+skills_max_selected = 3
+skills_max_prompt_chars = 8000
+skills_match_min_score = 0.45
+skills_llm_rerank_enabled = false
 ```
 
 <a id="plugin-system"></a>

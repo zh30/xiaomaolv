@@ -27,6 +27,10 @@ use crate::scheduler::{
     scheduler_policy_json_schema,
 };
 use crate::service::{MessageService, TelegramSchedulerIntent};
+use crate::skills_commands::{
+    discover_skill_registry, execute_skills_command, parse_telegram_skills_command,
+    skills_help_text,
+};
 
 mod group_pipeline;
 mod scheduler_helpers;

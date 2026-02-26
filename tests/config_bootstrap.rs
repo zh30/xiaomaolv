@@ -22,6 +22,11 @@ enabled = true
     assert!(cfg.channels.http.enabled);
     assert!(cfg.agent.mcp_enabled);
     assert_eq!(cfg.agent.mcp_max_iterations, 4);
+    assert!(cfg.agent.skills_enabled);
+    assert_eq!(cfg.agent.skills_max_selected, 3);
+    assert_eq!(cfg.agent.skills_max_prompt_chars, 8000);
+    assert_eq!(cfg.agent.skills_match_min_score, 0.45);
+    assert!(!cfg.agent.skills_llm_rerank_enabled);
 }
 
 #[test]
@@ -288,4 +293,42 @@ context_min_recent_messages = 10
     assert_eq!(cfg.memory.hybrid_min_score, 0.22);
     assert_eq!(cfg.memory.context_memory_budget_ratio, 42);
     assert_eq!(cfg.memory.context_min_recent_messages, 10);
+}
+
+#[test]
+fn config_bootstrap_parses_agent_skills_fields() {
+    let toml = r#"
+[app]
+bind = "127.0.0.1:8080"
+default_provider = "openai"
+
+[providers.openai]
+kind = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+api_key = "test-key"
+model = "gpt-4o-mini"
+
+[channels.http]
+enabled = true
+
+[agent]
+mcp_enabled = false
+mcp_max_iterations = 2
+mcp_max_tool_result_chars = 1000
+skills_enabled = false
+skills_max_selected = 5
+skills_max_prompt_chars = 12000
+skills_match_min_score = 0.66
+skills_llm_rerank_enabled = true
+"#;
+
+    let cfg = AppConfig::from_toml(toml).expect("config should parse");
+    assert!(!cfg.agent.mcp_enabled);
+    assert_eq!(cfg.agent.mcp_max_iterations, 2);
+    assert_eq!(cfg.agent.mcp_max_tool_result_chars, 1000);
+    assert!(!cfg.agent.skills_enabled);
+    assert_eq!(cfg.agent.skills_max_selected, 5);
+    assert_eq!(cfg.agent.skills_max_prompt_chars, 12000);
+    assert_eq!(cfg.agent.skills_match_min_score, 0.66);
+    assert!(cfg.agent.skills_llm_rerank_enabled);
 }
