@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -60,6 +61,10 @@ pub struct MessageService {
     max_recent_turns: usize,
     max_semantic_memories: usize,
     semantic_lookback_days: u32,
+    context_window_tokens: usize,
+    context_reserved_tokens: usize,
+    context_memory_budget_ratio: u8,
+    context_min_recent_messages: usize,
 }
 
 impl MessageService {
@@ -96,7 +101,25 @@ impl MessageService {
             max_recent_turns,
             max_semantic_memories,
             semantic_lookback_days,
+            context_window_tokens: 200_000,
+            context_reserved_tokens: 8_192,
+            context_memory_budget_ratio: 35,
+            context_min_recent_messages: 8,
         }
+    }
+
+    pub fn with_context_budget(
+        mut self,
+        window_tokens: usize,
+        reserved_tokens: usize,
+        memory_budget_ratio: u8,
+        min_recent_messages: usize,
+    ) -> Self {
+        self.context_window_tokens = window_tokens;
+        self.context_reserved_tokens = reserved_tokens;
+        self.context_memory_budget_ratio = memory_budget_ratio;
+        self.context_min_recent_messages = min_recent_messages;
+        self
     }
 
     pub async fn handle(&self, incoming: IncomingMessage) -> anyhow::Result<OutgoingMessage> {
@@ -126,6 +149,13 @@ impl MessageService {
             })
             .await
             .context("failed to load history")?;
+        let history = apply_context_budget(
+            history,
+            self.context_window_tokens,
+            self.context_reserved_tokens,
+            self.context_memory_budget_ratio,
+            self.context_min_recent_messages,
+        );
 
         let text = self.complete_with_optional_mcp(history).await?;
 
@@ -181,6 +211,13 @@ impl MessageService {
             })
             .await
             .context("failed to load history")?;
+        let history = apply_context_budget(
+            history,
+            self.context_window_tokens,
+            self.context_reserved_tokens,
+            self.context_memory_budget_ratio,
+            self.context_min_recent_messages,
+        );
 
         // Keep true streaming semantics on channel streaming path.
         // MCP tool loop currently runs on non-stream path only.
@@ -755,6 +792,168 @@ fn parse_mcp_tool_call_value(value: &Value) -> Option<ParsedMcpToolCall> {
     None
 }
 
+fn apply_context_budget(
+    messages: Vec<StoredMessage>,
+    context_window_tokens: usize,
+    context_reserved_tokens: usize,
+    memory_budget_ratio: u8,
+    min_recent_messages: usize,
+) -> Vec<StoredMessage> {
+    if messages.is_empty() || context_window_tokens == 0 {
+        return messages;
+    }
+
+    let input_budget = context_window_tokens.saturating_sub(context_reserved_tokens);
+    if input_budget == 0 {
+        return messages
+            .into_iter()
+            .last()
+            .map(|m| vec![m])
+            .unwrap_or_default();
+    }
+
+    let total_tokens = messages.iter().map(estimate_message_tokens).sum::<usize>();
+    if total_tokens <= input_budget {
+        return messages;
+    }
+
+    let mut selected = vec![false; messages.len()];
+    let mut replacements: HashMap<usize, StoredMessage> = HashMap::new();
+    let mut used = 0usize;
+    let capped_ratio = memory_budget_ratio.clamp(0, 80) as usize;
+    let memory_budget = input_budget.saturating_mul(capped_ratio) / 100;
+
+    let mut memory_candidates = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, msg)| {
+            if msg.role != MessageRole::System {
+                return None;
+            }
+            let score = parse_memory_score(&msg.content)?;
+            Some((idx, score, estimate_message_tokens(msg)))
+        })
+        .collect::<Vec<_>>();
+    memory_candidates.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.0.cmp(&a.0))
+    });
+
+    for (idx, _score, tokens) in memory_candidates {
+        if used + tokens > memory_budget {
+            continue;
+        }
+        selected[idx] = true;
+        used += tokens;
+    }
+
+    let mut recent_kept = 0usize;
+    for idx in (0..messages.len()).rev() {
+        if selected[idx] {
+            continue;
+        }
+        let tokens = estimate_message_tokens(&messages[idx]);
+        if used + tokens > input_budget {
+            if recent_kept < min_recent_messages {
+                let remain = input_budget.saturating_sub(used);
+                if remain > 12 {
+                    let truncated = truncate_message_to_token_budget(&messages[idx], remain);
+                    let truncated_tokens = estimate_message_tokens(&truncated);
+                    if truncated_tokens > 0 {
+                        selected[idx] = true;
+                        used = used.saturating_add(truncated_tokens).min(input_budget);
+                        replacements.insert(idx, truncated);
+                    }
+                    recent_kept += 1;
+                }
+            }
+            continue;
+        }
+        selected[idx] = true;
+        used += tokens;
+        recent_kept += 1;
+        if used >= input_budget {
+            break;
+        }
+    }
+
+    for idx in (0..messages.len()).rev() {
+        if used >= input_budget {
+            break;
+        }
+        if selected[idx] {
+            continue;
+        }
+        let tokens = estimate_message_tokens(&messages[idx]);
+        if used + tokens > input_budget {
+            continue;
+        }
+        selected[idx] = true;
+        used += tokens;
+    }
+
+    if !selected.iter().any(|v| *v)
+        && let Some(last_idx) = messages.len().checked_sub(1)
+    {
+        selected[last_idx] = true;
+    }
+
+    messages
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, msg)| {
+            if !selected[idx] {
+                return None;
+            }
+            Some(replacements.remove(&idx).unwrap_or(msg))
+        })
+        .collect()
+}
+
+fn estimate_message_tokens(msg: &StoredMessage) -> usize {
+    estimate_text_tokens(&msg.content).saturating_add(4)
+}
+
+fn estimate_text_tokens(text: &str) -> usize {
+    let chars = text.chars().count();
+    (chars.saturating_add(3) / 4).max(1)
+}
+
+fn parse_memory_score(content: &str) -> Option<f32> {
+    let marker = "[memory score=";
+    let start = content.find(marker)? + marker.len();
+    let tail = &content[start..];
+    let end = tail.find([' ', ']'])?;
+    tail[..end].trim().parse::<f32>().ok()
+}
+
+fn truncate_message_to_token_budget(msg: &StoredMessage, max_tokens: usize) -> StoredMessage {
+    if max_tokens == 0 {
+        return StoredMessage {
+            role: msg.role.clone(),
+            content: String::new(),
+        };
+    }
+    if estimate_message_tokens(msg) <= max_tokens {
+        return msg.clone();
+    }
+
+    let max_chars = max_tokens.saturating_mul(4).saturating_sub(12);
+    let mut content = msg
+        .content
+        .chars()
+        .take(max_chars.max(8))
+        .collect::<String>();
+    if !content.is_empty() {
+        content.push_str(" ...(truncated)");
+    }
+    StoredMessage {
+        role: msg.role.clone(),
+        content,
+    }
+}
+
 fn truncate_json_value(value: &Value, max_chars: usize) -> Value {
     let encoded = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
     if encoded.chars().count() <= max_chars {
@@ -767,7 +966,10 @@ fn truncate_json_value(value: &Value, max_chars: usize) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_mcp_tool_call, parse_scheduler_intent_json, truncate_json_value};
+    use super::{
+        apply_context_budget, parse_mcp_tool_call, parse_scheduler_intent_json, truncate_json_value,
+    };
+    use crate::domain::{MessageRole, StoredMessage};
 
     #[test]
     fn parse_tool_call_plain_json() {
@@ -819,5 +1021,51 @@ mod tests {
         assert_eq!(parsed.timezone.as_deref(), Some("Asia/Shanghai"));
         assert!(parsed.job_id.is_none());
         assert_eq!(parsed.job_operation.as_deref(), Some("delete"));
+    }
+
+    #[test]
+    fn context_budget_prefers_high_score_memory_and_latest_turns() {
+        let messages = vec![
+            StoredMessage {
+                role: MessageRole::System,
+                content: "[memory score=0.950 src=vec] Rust trait object supports dynamic dispatch"
+                    .to_string(),
+            },
+            StoredMessage {
+                role: MessageRole::System,
+                content: "[memory score=0.120 src=vec]".to_string()
+                    + &"irrelevant old memory".repeat(80),
+            },
+            StoredMessage {
+                role: MessageRole::User,
+                content: "first question about rust".repeat(20),
+            },
+            StoredMessage {
+                role: MessageRole::Assistant,
+                content: "first answer".repeat(20),
+            },
+            StoredMessage {
+                role: MessageRole::User,
+                content: "latest question: explain trait object".to_string(),
+            },
+        ];
+
+        let trimmed = apply_context_budget(messages, 180, 40, 35, 2);
+
+        assert!(
+            trimmed
+                .iter()
+                .any(|m| m.content.contains("score=0.950") && m.role == MessageRole::System)
+        );
+        assert!(
+            trimmed
+                .iter()
+                .any(|m| m.content.contains("latest question") && m.role == MessageRole::User)
+        );
+        assert!(
+            !trimmed
+                .iter()
+                .any(|m| m.content.contains("score=0.120") && m.role == MessageRole::System)
+        );
     }
 }

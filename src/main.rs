@@ -169,6 +169,15 @@ backend = "sqlite-only" # sqlite-only | hybrid-sqlite-zvec
 max_recent_turns = 0 # 0 means fallback to app.max_history
 max_semantic_memories = 8
 semantic_lookback_days = 90
+context_window_tokens = 200000 # MiniMax 200k context window
+context_reserved_tokens = 8192 # reserve for model output and system overhead
+hybrid_keyword_enabled = true
+hybrid_keyword_topk = 8
+hybrid_keyword_candidate_limit = 256
+hybrid_memory_snippet_max_chars = 420
+hybrid_min_score = 0.18
+context_memory_budget_ratio = 35
+context_min_recent_messages = 8
 
 [memory.zvec]
 endpoint = "${ZVEC_SIDECAR_ENDPOINT}"

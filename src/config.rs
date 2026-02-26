@@ -215,6 +215,24 @@ pub struct MemoryConfig {
     pub max_semantic_memories: usize,
     #[serde(default = "default_semantic_lookback_days")]
     pub semantic_lookback_days: u32,
+    #[serde(default = "default_context_window_tokens")]
+    pub context_window_tokens: usize,
+    #[serde(default = "default_context_reserved_tokens")]
+    pub context_reserved_tokens: usize,
+    #[serde(default = "default_hybrid_keyword_enabled")]
+    pub hybrid_keyword_enabled: bool,
+    #[serde(default = "default_hybrid_keyword_topk")]
+    pub hybrid_keyword_topk: usize,
+    #[serde(default = "default_hybrid_keyword_candidate_limit")]
+    pub hybrid_keyword_candidate_limit: usize,
+    #[serde(default = "default_hybrid_memory_snippet_max_chars")]
+    pub hybrid_memory_snippet_max_chars: usize,
+    #[serde(default = "default_hybrid_min_score")]
+    pub hybrid_min_score: f32,
+    #[serde(default = "default_context_memory_budget_ratio")]
+    pub context_memory_budget_ratio: u8,
+    #[serde(default = "default_context_min_recent_messages")]
+    pub context_min_recent_messages: usize,
     #[serde(default)]
     pub zvec: ZvecSidecarMemoryConfig,
 }
@@ -226,6 +244,15 @@ impl Default for MemoryConfig {
             max_recent_turns: 0,
             max_semantic_memories: default_max_semantic_memories(),
             semantic_lookback_days: default_semantic_lookback_days(),
+            context_window_tokens: default_context_window_tokens(),
+            context_reserved_tokens: default_context_reserved_tokens(),
+            hybrid_keyword_enabled: default_hybrid_keyword_enabled(),
+            hybrid_keyword_topk: default_hybrid_keyword_topk(),
+            hybrid_keyword_candidate_limit: default_hybrid_keyword_candidate_limit(),
+            hybrid_memory_snippet_max_chars: default_hybrid_memory_snippet_max_chars(),
+            hybrid_min_score: default_hybrid_min_score(),
+            context_memory_budget_ratio: default_context_memory_budget_ratio(),
+            context_min_recent_messages: default_context_min_recent_messages(),
             zvec: ZvecSidecarMemoryConfig::default(),
         }
     }
@@ -408,6 +435,42 @@ fn default_max_semantic_memories() -> usize {
 
 fn default_semantic_lookback_days() -> u32 {
     90
+}
+
+fn default_context_window_tokens() -> usize {
+    200_000
+}
+
+fn default_context_reserved_tokens() -> usize {
+    8_192
+}
+
+fn default_hybrid_keyword_enabled() -> bool {
+    true
+}
+
+fn default_hybrid_keyword_topk() -> usize {
+    8
+}
+
+fn default_hybrid_keyword_candidate_limit() -> usize {
+    256
+}
+
+fn default_hybrid_memory_snippet_max_chars() -> usize {
+    420
+}
+
+fn default_hybrid_min_score() -> f32 {
+    0.18
+}
+
+fn default_context_memory_budget_ratio() -> u8 {
+    35
+}
+
+fn default_context_min_recent_messages() -> usize {
+    8
 }
 
 fn default_sidecar_endpoint() -> String {

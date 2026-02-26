@@ -1,4 +1,4 @@
-use std::collections::{HashSet, hash_map::DefaultHasher};
+use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -79,6 +79,14 @@ impl SqliteMemoryStore {
         .execute(&pool)
         .await
         .context("failed to initialize memory_chunks session index")?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_memory_chunks_scope_created
+             ON memory_chunks(user_id, channel, created_at DESC);",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize memory_chunks scope index")?;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS telegram_group_aliases (
@@ -264,6 +272,43 @@ impl SqliteMemoryStore {
         .await
         .context("failed to upsert memory chunk")?;
         Ok(())
+    }
+
+    pub async fn load_chunk_candidates(
+        &self,
+        user_id: &str,
+        channel: &str,
+        min_created_at: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryChunkCandidateRecord>> {
+        let rows = sqlx::query(
+            "SELECT role, text, created_at
+             FROM memory_chunks
+             WHERE user_id = ?1
+               AND channel = ?2
+               AND created_at >= ?3
+             ORDER BY created_at DESC
+             LIMIT ?4",
+        )
+        .bind(user_id)
+        .bind(channel)
+        .bind(min_created_at.max(0))
+        .bind(limit.max(1) as i64)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to load memory chunk candidates")?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let role: String = row.get("role");
+                MemoryChunkCandidateRecord {
+                    role: MessageRole::from_db(&role),
+                    text: row.get("text"),
+                    created_at: row.get("created_at"),
+                }
+            })
+            .collect())
     }
 
     pub async fn upsert_group_aliases(
@@ -869,6 +914,13 @@ pub struct MemoryChunkRecord {
 }
 
 #[derive(Debug, Clone)]
+pub struct MemoryChunkCandidateRecord {
+    pub role: MessageRole,
+    pub text: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone)]
 pub struct MemoryWriteRequest {
     pub session_id: String,
     pub user_id: String,
@@ -1275,13 +1327,60 @@ impl SqliteMemoryBackend {
 #[async_trait]
 impl MemoryBackend for SqliteMemoryBackend {
     async fn append(&self, req: MemoryWriteRequest) -> anyhow::Result<()> {
-        self.store.append(&req.session_id, req.message).await
+        self.store
+            .append(&req.session_id, req.message.clone())
+            .await
+            .context("failed to append message in sqlite backend")?;
+
+        if req.message.content.trim().is_empty() {
+            return Ok(());
+        }
+
+        let created_at = unix_ts();
+        let chunk_id = stable_chunk_id(&req, created_at);
+        self.store
+            .append_chunk(MemoryChunkRecord {
+                chunk_id,
+                session_id: req.session_id,
+                user_id: req.user_id,
+                channel: req.channel,
+                role: req.message.role,
+                text: req.message.content,
+                created_at,
+            })
+            .await
+            .context("failed to append memory chunk in sqlite backend")
     }
 
     async fn load_context(&self, req: MemoryContextRequest) -> anyhow::Result<Vec<StoredMessage>> {
-        self.store
+        let recent = self
+            .store
             .load_recent(&req.session_id, req.max_recent_turns)
             .await
+            .context("failed to load recent messages in sqlite backend")?;
+        if req.max_semantic_memories == 0 || req.query_text.trim().is_empty() {
+            return Ok(recent);
+        }
+
+        let keyword_limit = req.max_semantic_memories.max(1);
+        let keyword_candidates = collect_local_keyword_candidates(
+            &self.store,
+            &req,
+            keyword_limit,
+            keyword_limit.saturating_mul(24).clamp(64, 512),
+            0.18,
+        )
+        .await
+        .context("failed to collect local keyword candidates in sqlite backend")?;
+
+        Ok(merge_memory_candidates_into_context(
+            recent,
+            Vec::new(),
+            keyword_candidates,
+            req.max_semantic_memories,
+            420,
+            0.18,
+        ))
     }
 
     async fn upsert_group_aliases(&self, req: GroupAliasUpsertRequest) -> anyhow::Result<()> {
@@ -1448,6 +1547,27 @@ pub struct ZvecSidecarConfig {
     pub auth_bearer_token: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct HybridRetrievalOptions {
+    pub keyword_enabled: bool,
+    pub keyword_topk: usize,
+    pub keyword_candidate_limit: usize,
+    pub memory_snippet_max_chars: usize,
+    pub min_score: f32,
+}
+
+impl Default for HybridRetrievalOptions {
+    fn default() -> Self {
+        Self {
+            keyword_enabled: true,
+            keyword_topk: 8,
+            keyword_candidate_limit: 256,
+            memory_snippet_max_chars: 420,
+            min_score: 0.18,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ZvecSidecarClient {
     client: Client,
@@ -1546,11 +1666,24 @@ impl ZvecSidecarClient {
 pub struct HybridSqliteZvecMemoryBackend {
     store: SqliteMemoryStore,
     sidecar: ZvecSidecarClient,
+    options: HybridRetrievalOptions,
 }
 
 impl HybridSqliteZvecMemoryBackend {
     pub fn new(store: SqliteMemoryStore, sidecar: ZvecSidecarClient) -> Self {
-        Self { store, sidecar }
+        Self::with_options(store, sidecar, HybridRetrievalOptions::default())
+    }
+
+    pub fn with_options(
+        store: SqliteMemoryStore,
+        sidecar: ZvecSidecarClient,
+        options: HybridRetrievalOptions,
+    ) -> Self {
+        Self {
+            store,
+            sidecar,
+            options,
+        }
     }
 }
 
@@ -1614,36 +1747,60 @@ impl MemoryBackend for HybridSqliteZvecMemoryBackend {
             return Ok(recent);
         }
 
-        let hits = match self.sidecar.query(&req).await {
-            Ok(hits) => hits,
+        let semantic_candidates = match self.sidecar.query(&req).await {
+            Ok(hits) => hits
+                .into_iter()
+                .filter_map(|hit| {
+                    let text = hit.resolved_text()?.trim().to_string();
+                    if text.is_empty() {
+                        return None;
+                    }
+                    let score = normalize_memory_score(hit.score);
+                    if score < self.options.min_score {
+                        return None;
+                    }
+                    Some(RankedMemoryCandidate {
+                        text,
+                        score,
+                        source: "vec".to_string(),
+                        created_at: unix_ts(),
+                    })
+                })
+                .collect::<Vec<_>>(),
             Err(err) => {
-                warn!(error = %err, "zvec sidecar query failed, fallback to recent context");
-                return Ok(recent);
+                warn!(
+                    error = %err,
+                    "zvec sidecar query failed, fallback to local keyword retrieval"
+                );
+                Vec::new()
             }
         };
 
-        let mut seen = HashSet::new();
-        for msg in &recent {
-            seen.insert(msg.content.clone());
-        }
+        let keyword_candidates = if self.options.keyword_enabled {
+            collect_local_keyword_candidates(
+                &self.store,
+                &req,
+                self.options.keyword_topk.max(req.max_semantic_memories),
+                self.options.keyword_candidate_limit,
+                self.options.min_score,
+            )
+            .await
+            .unwrap_or_else(|err| {
+                warn!(error = %err, "local keyword retrieval failed");
+                Vec::new()
+            })
+        } else {
+            Vec::new()
+        };
 
-        let mut merged = Vec::new();
-        for hit in hits.into_iter().take(req.max_semantic_memories) {
-            let Some(text) = hit.resolved_text() else {
-                continue;
-            };
-            let text = text.trim();
-            if text.is_empty() || seen.contains(text) {
-                continue;
-            }
-            seen.insert(text.to_string());
-            merged.push(StoredMessage {
-                role: MessageRole::System,
-                content: format!("[memory score={:.3}] {}", hit.score, text),
-            });
-        }
-        merged.extend(recent);
-        Ok(merged)
+        Ok(merge_memory_candidates_into_context(
+            recent,
+            semantic_candidates,
+            keyword_candidates,
+            req.max_semantic_memories,
+            self.options.memory_snippet_max_chars,
+            self.options.min_score,
+        ))
     }
 
     async fn upsert_group_aliases(&self, req: GroupAliasUpsertRequest) -> anyhow::Result<()> {
@@ -1797,6 +1954,342 @@ impl MemoryBackend for HybridSqliteZvecMemoryBackend {
             .delete_telegram_scheduler_pending_intent(&channel, chat_id, owner_user_id)
             .await
     }
+}
+
+#[derive(Debug, Clone)]
+struct RankedMemoryCandidate {
+    text: String,
+    score: f32,
+    source: String,
+    created_at: i64,
+}
+
+async fn collect_local_keyword_candidates(
+    store: &SqliteMemoryStore,
+    req: &MemoryContextRequest,
+    topk: usize,
+    candidate_limit: usize,
+    min_score: f32,
+) -> anyhow::Result<Vec<RankedMemoryCandidate>> {
+    if topk == 0 || req.query_text.trim().is_empty() {
+        return Ok(vec![]);
+    }
+
+    let lookback_secs = (req.semantic_lookback_days.max(1) as i64).saturating_mul(86_400);
+    let min_created_at = unix_ts().saturating_sub(lookback_secs);
+
+    let rows = store
+        .load_chunk_candidates(
+            &req.user_id,
+            &req.channel,
+            min_created_at,
+            candidate_limit.max(topk),
+        )
+        .await?;
+
+    Ok(rank_local_keyword_candidates(
+        &req.query_text,
+        rows,
+        topk,
+        min_score,
+    ))
+}
+
+fn rank_local_keyword_candidates(
+    query_text: &str,
+    rows: Vec<MemoryChunkCandidateRecord>,
+    topk: usize,
+    min_score: f32,
+) -> Vec<RankedMemoryCandidate> {
+    let terms = keyword_terms(query_text);
+    if terms.is_empty() {
+        return vec![];
+    }
+
+    let now = unix_ts();
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+
+    for row in rows {
+        let text = row.text.trim();
+        if text.is_empty() || !seen.insert(text.to_string()) {
+            continue;
+        }
+
+        let lexical = keyword_overlap_score(text, &terms);
+        if lexical <= 0.0 {
+            continue;
+        }
+
+        let role_weight = match row.role {
+            MessageRole::User => 1.0,
+            MessageRole::Assistant => 0.9,
+            MessageRole::System => 0.7,
+        };
+        let age_secs = now.saturating_sub(row.created_at.max(0)) as f32;
+        let age_days = age_secs / 86_400.0;
+        let recency = 1.0 / (1.0 + age_days / 7.0);
+        let score = normalize_memory_score((lexical * 0.82 + recency * 0.18) * role_weight);
+        if score < min_score {
+            continue;
+        }
+
+        out.push(RankedMemoryCandidate {
+            text: text.to_string(),
+            score,
+            source: "kw".to_string(),
+            created_at: row.created_at,
+        });
+    }
+
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.created_at.cmp(&a.created_at))
+    });
+    out.truncate(topk);
+    out
+}
+
+fn keyword_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut ascii_buf = String::new();
+    let mut cjk_buf = String::new();
+
+    for ch in query.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            if !cjk_buf.is_empty() {
+                push_cjk_terms(&mut terms, &cjk_buf);
+                cjk_buf.clear();
+            }
+            ascii_buf.push(ch.to_ascii_lowercase());
+            continue;
+        }
+
+        if is_cjk_char(ch) {
+            if !ascii_buf.is_empty() {
+                if ascii_buf.chars().count() >= 2 {
+                    terms.push(ascii_buf.clone());
+                }
+                ascii_buf.clear();
+            }
+            cjk_buf.push(ch);
+            continue;
+        }
+
+        if !ascii_buf.is_empty() {
+            if ascii_buf.chars().count() >= 2 {
+                terms.push(ascii_buf.clone());
+            }
+            ascii_buf.clear();
+        }
+        if !cjk_buf.is_empty() {
+            push_cjk_terms(&mut terms, &cjk_buf);
+            cjk_buf.clear();
+        }
+    }
+
+    if !ascii_buf.is_empty() && ascii_buf.chars().count() >= 2 {
+        terms.push(ascii_buf);
+    }
+    if !cjk_buf.is_empty() {
+        push_cjk_terms(&mut terms, &cjk_buf);
+    }
+
+    let mut dedup = Vec::new();
+    let mut seen = HashSet::new();
+    for term in terms {
+        if seen.insert(term.clone()) {
+            dedup.push(term);
+        }
+        if dedup.len() >= 40 {
+            break;
+        }
+    }
+    dedup
+}
+
+fn push_cjk_terms(out: &mut Vec<String>, text: &str) {
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.is_empty() {
+        return;
+    }
+    if chars.len() == 1 {
+        out.push(chars[0].to_string());
+        return;
+    }
+    for window in chars.windows(2) {
+        let mut s = String::new();
+        s.push(window[0]);
+        s.push(window[1]);
+        out.push(s);
+    }
+}
+
+fn is_cjk_char(ch: char) -> bool {
+    ('\u{4E00}'..='\u{9FFF}').contains(&ch)
+        || ('\u{3400}'..='\u{4DBF}').contains(&ch)
+        || ('\u{20000}'..='\u{2A6DF}').contains(&ch)
+}
+
+fn keyword_overlap_score(text: &str, terms: &[String]) -> f32 {
+    if terms.is_empty() {
+        return 0.0;
+    }
+    let hay = text.to_lowercase();
+    let mut hit = 0.0f32;
+    let mut total = 0.0f32;
+    for term in terms {
+        let len = term.chars().count();
+        let weight = if len >= 6 {
+            2.0
+        } else if len >= 4 {
+            1.4
+        } else if len >= 2 {
+            1.0
+        } else {
+            0.6
+        };
+        total += weight;
+        if hay.contains(term) {
+            hit += weight;
+        }
+    }
+    if total <= 0.0 {
+        0.0
+    } else {
+        (hit / total).clamp(0.0, 1.0)
+    }
+}
+
+fn merge_memory_candidates_into_context(
+    recent: Vec<StoredMessage>,
+    semantic_candidates: Vec<RankedMemoryCandidate>,
+    keyword_candidates: Vec<RankedMemoryCandidate>,
+    max_semantic_memories: usize,
+    memory_snippet_max_chars: usize,
+    min_score: f32,
+) -> Vec<StoredMessage> {
+    if max_semantic_memories == 0 {
+        return recent;
+    }
+
+    let mut recent_seen = HashSet::new();
+    for msg in &recent {
+        let key = normalize_memory_text_key(&msg.content);
+        if !key.is_empty() {
+            recent_seen.insert(key);
+        }
+    }
+
+    let mut merged_by_text: HashMap<String, RankedMemoryCandidate> = HashMap::new();
+    for candidate in semantic_candidates
+        .into_iter()
+        .chain(keyword_candidates.into_iter())
+    {
+        if candidate.score < min_score {
+            continue;
+        }
+        let key = normalize_memory_text_key(&candidate.text);
+        if key.is_empty() || recent_seen.contains(&key) {
+            continue;
+        }
+
+        match merged_by_text.get_mut(&key) {
+            Some(existing) => {
+                if candidate.score > existing.score {
+                    existing.score = candidate.score;
+                }
+                if candidate.created_at > existing.created_at {
+                    existing.created_at = candidate.created_at;
+                }
+                existing.source = merge_source_tag(&existing.source, &candidate.source);
+                if candidate.text.chars().count() > existing.text.chars().count() {
+                    existing.text = candidate.text;
+                }
+            }
+            None => {
+                merged_by_text.insert(key, candidate);
+            }
+        }
+    }
+
+    let mut merged = merged_by_text.into_values().collect::<Vec<_>>();
+    merged.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.created_at.cmp(&a.created_at))
+    });
+    merged.truncate(max_semantic_memories);
+
+    let mut out = Vec::with_capacity(merged.len() + recent.len());
+    for candidate in merged {
+        let snippet = truncate_chars(&candidate.text, memory_snippet_max_chars.max(120));
+        out.push(StoredMessage {
+            role: MessageRole::System,
+            content: format!(
+                "[memory score={:.3} src={}] {}",
+                normalize_memory_score(candidate.score),
+                candidate.source,
+                snippet
+            ),
+        });
+    }
+    out.extend(recent);
+    out
+}
+
+fn normalize_memory_score(score: f32) -> f32 {
+    if score.is_finite() {
+        score.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn normalize_memory_text_key(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_lowercase()
+}
+
+fn merge_source_tag(current: &str, next: &str) -> String {
+    if current == next {
+        return current.to_string();
+    }
+    if current.contains(next) {
+        return current.to_string();
+    }
+    if next.contains(current) {
+        return next.to_string();
+    }
+    let mut tags = current
+        .split('+')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+    if !tags.iter().any(|v| v == next) {
+        tags.push(next.to_string());
+    }
+    tags.join("+")
+}
+
+fn truncate_chars(input: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    for (idx, ch) in input.chars().enumerate() {
+        if idx >= max_chars {
+            break;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 #[derive(Debug, Clone, Serialize)]

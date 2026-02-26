@@ -4,15 +4,17 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing::warn;
 
 use crate::config::ProviderConfig;
-use crate::domain::StoredMessage;
+use crate::domain::{MessageRole, StoredMessage};
 
 const RETRY_BACKOFF_BASE_MS: u64 = 100;
 const ERROR_BODY_MAX_CHARS: usize = 512;
+const COMPAT_MESSAGE_LIMIT: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct CompletionRequest {
@@ -204,9 +206,10 @@ impl ChatProvider for OpenAiCompatibleProvider {
 impl OpenAiCompatibleProvider {
     async fn complete_with_retry(&self, req: CompletionRequest) -> anyhow::Result<String> {
         let url = format!("{}/chat/completions", self.base_url);
+        let normalized_messages = normalize_messages(req.messages);
         let payload = OpenAiRequest {
             model: self.model.clone(),
-            messages: req.messages,
+            messages: normalized_messages.clone(),
         };
 
         let attempts = retry_attempts(self.max_retries);
@@ -227,6 +230,21 @@ impl OpenAiCompatibleProvider {
                     let status = resp.status();
                     if !status.is_success() {
                         let body = resp.text().await.unwrap_or_default();
+                        if let Some(text) = self
+                            .try_compat_nonstream_recovery(
+                                &url,
+                                &normalized_messages,
+                                status,
+                                &body,
+                            )
+                            .await
+                            .unwrap_or_else(|err| {
+                                warn!(error = %err, "compat non-stream recovery failed");
+                                None
+                            })
+                        {
+                            return Ok(text);
+                        }
                         last_error = Some(anyhow::anyhow!(
                             "provider returned status {}{}",
                             status,
@@ -264,7 +282,7 @@ impl OpenAiCompatibleProvider {
         sink: &mut dyn StreamSink,
     ) -> anyhow::Result<String> {
         let url = format!("{}/chat/completions", self.base_url);
-        let messages = req.messages;
+        let messages = normalize_messages(req.messages);
         let attempts = retry_attempts(self.max_retries);
         let mut last_error = None;
 
@@ -361,6 +379,58 @@ impl OpenAiCompatibleProvider {
             Err(fallback_err) => Err(last_error.unwrap_or(fallback_err)),
         }
     }
+
+    async fn try_compat_nonstream_recovery(
+        &self,
+        url: &str,
+        messages: &[StoredMessage],
+        status: StatusCode,
+        body: &str,
+    ) -> anyhow::Result<Option<String>> {
+        if !is_message_shape_error(status, body) {
+            return Ok(None);
+        }
+
+        let compat_messages = build_compat_messages(messages);
+        if compat_messages.is_empty() || compat_messages == messages {
+            return Ok(None);
+        }
+
+        warn!(
+            status = %status,
+            original_messages = messages.len(),
+            compat_messages = compat_messages.len(),
+            "provider request rejected by message shape, retry with compatibility message set"
+        );
+
+        let payload = OpenAiRequest {
+            model: self.model.clone(),
+            messages: compat_messages,
+        };
+        let resp = self
+            .client
+            .post(url)
+            .timeout(Duration::from_secs(self.timeout_secs))
+            .bearer_auth(&self.api_key)
+            .json(&payload)
+            .send()
+            .await
+            .context("compat recovery request failed")?;
+
+        if !resp.status().is_success() {
+            return Ok(None);
+        }
+
+        let parsed: OpenAiResponse = resp
+            .json()
+            .await
+            .context("failed to deserialize compat recovery response")?;
+        Ok(parsed
+            .choices
+            .into_iter()
+            .next()
+            .map(|choice| choice.message.content))
+    }
 }
 
 fn retry_attempts(max_retries: usize) -> usize {
@@ -369,6 +439,60 @@ fn retry_attempts(max_retries: usize) -> usize {
 
 fn retry_backoff_delay(attempt: usize) -> Duration {
     Duration::from_millis(RETRY_BACKOFF_BASE_MS * (attempt as u64 + 1))
+}
+
+fn normalize_messages(messages: Vec<StoredMessage>) -> Vec<StoredMessage> {
+    let mut normalized: Vec<StoredMessage> = Vec::with_capacity(messages.len());
+    for msg in messages {
+        if msg.content.trim().is_empty() {
+            continue;
+        }
+        if let Some(last) = normalized.last_mut()
+            && last.role == msg.role
+        {
+            last.content.push_str("\n\n");
+            last.content.push_str(&msg.content);
+            continue;
+        }
+        normalized.push(msg);
+    }
+    normalized
+}
+
+fn build_compat_messages(messages: &[StoredMessage]) -> Vec<StoredMessage> {
+    let mut filtered = normalize_messages(
+        messages
+            .iter()
+            .filter(|msg| msg.role != MessageRole::System)
+            .cloned()
+            .collect(),
+    );
+
+    if filtered.len() > COMPAT_MESSAGE_LIMIT {
+        filtered = filtered.split_off(filtered.len().saturating_sub(COMPAT_MESSAGE_LIMIT));
+    }
+
+    if filtered.is_empty()
+        && let Some(last_user) = messages
+            .iter()
+            .rev()
+            .find(|msg| msg.role == MessageRole::User && !msg.content.trim().is_empty())
+    {
+        filtered.push(last_user.clone());
+    }
+
+    filtered
+}
+
+fn is_message_shape_error(status: StatusCode, body: &str) -> bool {
+    if status != StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let lower = body.to_lowercase();
+    lower.contains("invalid chat setting")
+        || lower.contains("expr_path=messages")
+        || lower.contains("missing required parameter")
+        || lower.contains("invalid params")
 }
 
 fn format_error_body_suffix(body: &str) -> String {
@@ -457,7 +581,12 @@ fn extract_content_from_event(event: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_stream_delta, retry_attempts, truncate_chars};
+    use super::{
+        build_compat_messages, extract_stream_delta, is_message_shape_error, normalize_messages,
+        retry_attempts, truncate_chars,
+    };
+    use crate::domain::{MessageRole, StoredMessage};
+    use reqwest::StatusCode;
 
     #[test]
     fn retry_attempts_include_initial_request() {
@@ -476,5 +605,70 @@ mod tests {
         let line = r#"data: {"choices":[{"delta":{"content":"hello"}}]}"#;
         let delta = extract_stream_delta(line).expect("extract delta");
         assert_eq!(delta.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn normalize_messages_merges_adjacent_roles_and_drops_empty() {
+        let messages = vec![
+            StoredMessage {
+                role: MessageRole::User,
+                content: "hello".to_string(),
+            },
+            StoredMessage {
+                role: MessageRole::User,
+                content: "  world  ".to_string(),
+            },
+            StoredMessage {
+                role: MessageRole::Assistant,
+                content: "ok".to_string(),
+            },
+            StoredMessage {
+                role: MessageRole::Assistant,
+                content: "   ".to_string(),
+            },
+        ];
+
+        let out = normalize_messages(messages);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].role, MessageRole::User);
+        assert!(out[0].content.contains("hello"));
+        assert!(out[0].content.contains("world"));
+        assert_eq!(out[1].role, MessageRole::Assistant);
+    }
+
+    #[test]
+    fn build_compat_messages_drops_system_and_limits_tail() {
+        let mut messages = Vec::new();
+        messages.push(StoredMessage {
+            role: MessageRole::System,
+            content: "system memo".to_string(),
+        });
+        for idx in 0..24 {
+            messages.push(StoredMessage {
+                role: if idx % 2 == 0 {
+                    MessageRole::User
+                } else {
+                    MessageRole::Assistant
+                },
+                content: format!("m{idx}"),
+            });
+        }
+
+        let out = build_compat_messages(&messages);
+        assert!(out.len() <= 16);
+        assert!(out.iter().all(|m| m.role != MessageRole::System));
+        assert!(out.iter().any(|m| m.content == "m23"));
+    }
+
+    #[test]
+    fn is_message_shape_error_detects_minimax_style_400() {
+        assert!(is_message_shape_error(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"invalid params, invalid chat setting (2013)"}}"#,
+        ));
+        assert!(!is_message_shape_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "invalid chat setting",
+        ));
     }
 }

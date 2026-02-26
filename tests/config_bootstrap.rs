@@ -241,3 +241,51 @@ scheduler_max_jobs_per_owner = 120
     assert!(!tg.scheduler_require_confirm);
     assert_eq!(tg.scheduler_max_jobs_per_owner, 120);
 }
+
+#[test]
+fn config_bootstrap_parses_memory_budget_and_hybrid_keyword_fields() {
+    let toml = r#"
+[app]
+bind = "127.0.0.1:8080"
+default_provider = "openai"
+
+[providers.openai]
+kind = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+api_key = "test-key"
+model = "gpt-4o-mini"
+
+[channels.http]
+enabled = true
+
+[memory]
+backend = "hybrid-sqlite-zvec"
+max_recent_turns = 18
+max_semantic_memories = 6
+semantic_lookback_days = 45
+context_window_tokens = 120000
+context_reserved_tokens = 6000
+hybrid_keyword_enabled = true
+hybrid_keyword_topk = 12
+hybrid_keyword_candidate_limit = 300
+hybrid_memory_snippet_max_chars = 360
+hybrid_min_score = 0.22
+context_memory_budget_ratio = 42
+context_min_recent_messages = 10
+"#;
+
+    let cfg = AppConfig::from_toml(toml).expect("config should parse");
+    assert_eq!(cfg.memory.backend, "hybrid-sqlite-zvec");
+    assert_eq!(cfg.memory.max_recent_turns, 18);
+    assert_eq!(cfg.memory.max_semantic_memories, 6);
+    assert_eq!(cfg.memory.semantic_lookback_days, 45);
+    assert_eq!(cfg.memory.context_window_tokens, 120000);
+    assert_eq!(cfg.memory.context_reserved_tokens, 6000);
+    assert!(cfg.memory.hybrid_keyword_enabled);
+    assert_eq!(cfg.memory.hybrid_keyword_topk, 12);
+    assert_eq!(cfg.memory.hybrid_keyword_candidate_limit, 300);
+    assert_eq!(cfg.memory.hybrid_memory_snippet_max_chars, 360);
+    assert_eq!(cfg.memory.hybrid_min_score, 0.22);
+    assert_eq!(cfg.memory.context_memory_budget_ratio, 42);
+    assert_eq!(cfg.memory.context_min_recent_messages, 10);
+}

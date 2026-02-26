@@ -18,8 +18,8 @@ use crate::config::AppConfig;
 use crate::domain::IncomingMessage;
 use crate::mcp::{McpConfigPaths, McpRegistry, McpRuntime};
 use crate::memory::{
-    HybridSqliteZvecMemoryBackend, MemoryBackend, SqliteMemoryBackend, SqliteMemoryStore,
-    ZvecSidecarClient, ZvecSidecarConfig,
+    HybridRetrievalOptions, HybridSqliteZvecMemoryBackend, MemoryBackend, SqliteMemoryBackend,
+    SqliteMemoryStore, ZvecSidecarClient, ZvecSidecarConfig,
 };
 use crate::provider::{ChatProvider, ProviderRegistry};
 use crate::service::{AgentMcpSettings, MessageService};
@@ -162,9 +162,16 @@ async fn build_state(
                 query_path: config.memory.zvec.query_path.clone(),
                 auth_bearer_token: config.memory.zvec.auth_bearer_token.clone(),
             });
-            Arc::new(HybridSqliteZvecMemoryBackend::new(
+            Arc::new(HybridSqliteZvecMemoryBackend::with_options(
                 memory_store.clone(),
                 sidecar,
+                HybridRetrievalOptions {
+                    keyword_enabled: config.memory.hybrid_keyword_enabled,
+                    keyword_topk: config.memory.hybrid_keyword_topk,
+                    keyword_candidate_limit: config.memory.hybrid_keyword_candidate_limit,
+                    memory_snippet_max_chars: config.memory.hybrid_memory_snippet_max_chars,
+                    min_score: config.memory.hybrid_min_score,
+                },
             ))
         }
         other => bail!(
@@ -174,19 +181,27 @@ async fn build_state(
     };
 
     let mcp_runtime = Arc::new(RwLock::new(load_mcp_runtime().await));
-    let service = Arc::new(MessageService::new_with_backend(
-        provider,
-        memory_backend,
-        Some(mcp_runtime.clone()),
-        AgentMcpSettings {
-            enabled: config.agent.mcp_enabled,
-            max_iterations: config.agent.mcp_max_iterations,
-            max_tool_result_chars: config.agent.mcp_max_tool_result_chars,
-        },
-        max_recent_turns,
-        config.memory.max_semantic_memories,
-        config.memory.semantic_lookback_days,
-    ));
+    let service = Arc::new(
+        MessageService::new_with_backend(
+            provider,
+            memory_backend,
+            Some(mcp_runtime.clone()),
+            AgentMcpSettings {
+                enabled: config.agent.mcp_enabled,
+                max_iterations: config.agent.mcp_max_iterations,
+                max_tool_result_chars: config.agent.mcp_max_tool_result_chars,
+            },
+            max_recent_turns,
+            config.memory.max_semantic_memories,
+            config.memory.semantic_lookback_days,
+        )
+        .with_context_budget(
+            config.memory.context_window_tokens,
+            config.memory.context_reserved_tokens,
+            config.memory.context_memory_budget_ratio,
+            config.memory.context_min_recent_messages,
+        ),
+    );
 
     let channel_plugins = load_channel_plugins(&config, &channel_registry)?;
 

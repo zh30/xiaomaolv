@@ -35,6 +35,20 @@ impl ChatProvider for CountProvider {
     }
 }
 
+struct DumpProvider;
+
+#[async_trait::async_trait]
+impl ChatProvider for DumpProvider {
+    async fn complete(&self, req: CompletionRequest) -> anyhow::Result<String> {
+        Ok(req
+            .messages
+            .iter()
+            .map(|m| format!("{}:{}", m.role.as_str(), m.content))
+            .collect::<Vec<_>>()
+            .join("\n---\n"))
+    }
+}
+
 #[tokio::test]
 async fn hybrid_backend_merges_sidecar_memories_into_context() {
     let app = Router::new()
@@ -239,6 +253,61 @@ async fn hybrid_backend_falls_back_to_recent_context_when_sidecar_unavailable() 
         .expect("service handle");
 
     assert_eq!(out.text, "ctx:1");
+}
+
+#[tokio::test]
+async fn hybrid_backend_falls_back_to_local_keyword_memory_when_sidecar_unavailable() {
+    let store = SqliteMemoryStore::new("sqlite::memory:")
+        .await
+        .expect("store");
+    let sidecar = ZvecSidecarClient::new(ZvecSidecarConfig {
+        endpoint: "http://127.0.0.1:1".to_string(),
+        collection: "agent_memory_v1".to_string(),
+        query_topk: 20,
+        request_timeout_secs: 1,
+        upsert_path: "/v1/memory/upsert".to_string(),
+        query_path: "/v1/memory/query".to_string(),
+        auth_bearer_token: None,
+    });
+
+    let backend = Arc::new(HybridSqliteZvecMemoryBackend::new(store, sidecar));
+    let service = MessageService::new_with_backend(
+        Arc::new(DumpProvider),
+        backend,
+        None,
+        AgentMcpSettings::default(),
+        1,
+        4,
+        90,
+    );
+
+    service
+        .handle(IncomingMessage {
+            channel: "telegram".to_string(),
+            session_id: "s-local".to_string(),
+            user_id: "u-local".to_string(),
+            text: "Rust trait object 支持动态分发".to_string(),
+            reply_target: None,
+        })
+        .await
+        .expect("seed first turn");
+
+    let out = service
+        .handle(IncomingMessage {
+            channel: "telegram".to_string(),
+            session_id: "s-local".to_string(),
+            user_id: "u-local".to_string(),
+            text: "trait object 是什么".to_string(),
+            reply_target: None,
+        })
+        .await
+        .expect("second turn");
+
+    assert!(
+        out.text.contains("[memory score=") && out.text.contains("trait object"),
+        "expected local keyword memory fallback to inject relevant context, got: {}",
+        out.text
+    );
 }
 
 async fn mock_upsert(Json(_payload): Json<serde_json::Value>) -> Json<serde_json::Value> {

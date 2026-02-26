@@ -156,6 +156,15 @@ curl -sS http://127.0.0.1:8080/v1/channels/telegram/mode
 - 记忆模式：
   - `backend = "sqlite-only"`（默认）
   - `backend = "hybrid-sqlite-zvec"`（可选）
+  - `context_window_tokens = 200000` 与 `context_reserved_tokens = 8192`
+    - 上下文预算保护：优先保留高价值上下文，并预留输出空间
+  - `hybrid_keyword_enabled = true`
+  - `hybrid_keyword_topk = 8`
+  - `hybrid_keyword_candidate_limit = 256`
+  - `hybrid_memory_snippet_max_chars = 420`
+  - `hybrid_min_score = 0.18`（注入记忆的最小相关度阈值）
+  - `context_memory_budget_ratio = 35`（记忆片段最多占输入预算的百分比）
+  - `context_min_recent_messages = 8`（始终保留近期轮次，保证对话连贯）
 
 <a id="hybrid-memory"></a>
 ## 可选：启用混合记忆（SQLite + zvec sidecar）
