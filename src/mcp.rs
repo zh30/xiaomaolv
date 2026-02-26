@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, bail};
+use chrono::{Datelike, Local, Utc};
+use chrono_tz::Tz;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -16,6 +18,8 @@ use tokio::time::{Duration, timeout};
 const ENV_USER_CONFIG_OVERRIDE: &str = "XIAOMAOLV_MCP_USER_CONFIG";
 const ENV_PROJECT_CONFIG_OVERRIDE: &str = "XIAOMAOLV_MCP_PROJECT_CONFIG";
 const DEFAULT_TIMEOUT_SECS: u64 = 20;
+pub const BUILTIN_MCP_SERVER_NAME: &str = "xiaomaolv_builtin";
+pub const BUILTIN_MCP_TOOL_CURRENT_TIME: &str = "get_current_time";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -535,6 +539,9 @@ impl McpRuntime {
         server_filter: Option<&str>,
     ) -> anyhow::Result<Vec<McpToolInfo>> {
         let mut out = Vec::new();
+        if server_filter.is_none() || server_filter == Some(BUILTIN_MCP_SERVER_NAME) {
+            out.extend(builtin_mcp_tools());
+        }
 
         for (name, cfg) in &self.servers {
             if !cfg.enabled {
@@ -558,6 +565,10 @@ impl McpRuntime {
         tool_name: &str,
         args: Value,
     ) -> anyhow::Result<Value> {
+        if server_name == BUILTIN_MCP_SERVER_NAME {
+            return call_builtin_tool(tool_name, args);
+        }
+
         let cfg = self
             .servers
             .get(server_name)
@@ -877,6 +888,77 @@ impl McpRuntime {
 
         bail!("unsupported mcp http content type: {content_type}");
     }
+}
+
+fn builtin_mcp_tools() -> Vec<McpToolInfo> {
+    vec![McpToolInfo {
+        server: BUILTIN_MCP_SERVER_NAME.to_string(),
+        name: BUILTIN_MCP_TOOL_CURRENT_TIME.to_string(),
+        description: Some(
+            "Get current trusted runtime time. Optional args: {\"timezone\":\"Asia/Shanghai\"}"
+                .to_string(),
+        ),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "timezone": {
+                    "type": "string",
+                    "description": "Optional IANA timezone, for example Asia/Shanghai."
+                }
+            },
+            "additionalProperties": false
+        }),
+    }]
+}
+
+fn call_builtin_tool(tool_name: &str, args: Value) -> anyhow::Result<Value> {
+    match tool_name {
+        BUILTIN_MCP_TOOL_CURRENT_TIME => call_builtin_current_time(args),
+        _ => bail!(
+            "builtin mcp tool '{}' is not supported on server '{}'",
+            tool_name,
+            BUILTIN_MCP_SERVER_NAME
+        ),
+    }
+}
+
+fn call_builtin_current_time(args: Value) -> anyhow::Result<Value> {
+    let timezone_arg = args
+        .as_object()
+        .and_then(|obj| obj.get("timezone"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let now_utc = Utc::now();
+
+    if let Some(timezone) = timezone_arg {
+        let tz: Tz = timezone
+            .parse()
+            .with_context(|| format!("invalid timezone '{timezone}'"))?;
+        let local = now_utc.with_timezone(&tz);
+        return Ok(serde_json::json!({
+            "now_unix": now_utc.timestamp(),
+            "utc_rfc3339": now_utc.to_rfc3339(),
+            "local_rfc3339": local.to_rfc3339(),
+            "timezone": timezone,
+            "local_date": local.format("%Y-%m-%d").to_string(),
+            "local_time": local.format("%H:%M:%S").to_string(),
+            "local_year": local.year(),
+            "local_weekday": local.format("%A").to_string()
+        }));
+    }
+
+    let local = now_utc.with_timezone(&Local).fixed_offset();
+    Ok(serde_json::json!({
+        "now_unix": now_utc.timestamp(),
+        "utc_rfc3339": now_utc.to_rfc3339(),
+        "local_rfc3339": local.to_rfc3339(),
+        "timezone": local.offset().to_string(),
+        "local_date": local.format("%Y-%m-%d").to_string(),
+        "local_time": local.format("%H:%M:%S").to_string(),
+        "local_year": local.year(),
+        "local_weekday": local.format("%A").to_string()
+    }))
 }
 
 fn default_timeout_secs() -> u64 {
@@ -1293,5 +1375,43 @@ mod tests {
 
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn runtime_exposes_builtin_current_time_tool_without_external_servers() {
+        let runtime = McpRuntime::default();
+        let tools = runtime.list_tools(None).await.expect("list tools");
+        assert!(tools.iter().any(|tool| {
+            tool.server == BUILTIN_MCP_SERVER_NAME && tool.name == BUILTIN_MCP_TOOL_CURRENT_TIME
+        }));
+
+        let only_builtin = runtime
+            .list_tools(Some(BUILTIN_MCP_SERVER_NAME))
+            .await
+            .expect("list builtin tools");
+        assert_eq!(only_builtin.len(), 1);
+        assert_eq!(only_builtin[0].server, BUILTIN_MCP_SERVER_NAME);
+        assert_eq!(only_builtin[0].name, BUILTIN_MCP_TOOL_CURRENT_TIME);
+    }
+
+    #[tokio::test]
+    async fn runtime_builtin_current_time_tool_accepts_timezone() {
+        let runtime = McpRuntime::default();
+        let result = runtime
+            .call_tool(
+                BUILTIN_MCP_SERVER_NAME,
+                BUILTIN_MCP_TOOL_CURRENT_TIME,
+                serde_json::json!({ "timezone": "Asia/Shanghai" }),
+            )
+            .await
+            .expect("call builtin time tool");
+
+        assert_eq!(
+            result.get("timezone").and_then(|v| v.as_str()),
+            Some("Asia/Shanghai")
+        );
+        assert!(result.get("utc_rfc3339").is_some());
+        assert!(result.get("local_rfc3339").is_some());
+        assert!(result.get("local_year").and_then(|v| v.as_i64()).is_some());
     }
 }

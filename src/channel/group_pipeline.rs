@@ -61,6 +61,7 @@ pub(super) async fn process_group_message(
     } else {
         message_mentions_bot(text, bot_username)
     };
+    let has_question_marker = message_has_question_marker(text);
 
     if (mentioned || replied_to_bot) && !bot_username.is_empty() {
         learn_group_aliases(ctx, text, chat_id, bot_username, group_runtime_state).await;
@@ -70,7 +71,7 @@ pub(super) async fn process_group_message(
         recent_bot_participation,
         cooldown_active,
         seconds_since_last_bot_response,
-        learned_aliases,
+        mut learned_aliases,
     ) = load_group_runtime_signals(
         chat_id,
         prep.now,
@@ -79,14 +80,36 @@ pub(super) async fn process_group_message(
     )
     .await;
 
-    let alias_hit = message_contains_any_alias(text, &learned_aliases);
-    let has_question_marker = message_has_question_marker(text);
     let points_to_other_bot = if bot_username.is_empty() {
         false
     } else {
         message_mentions_other_handle(text, bot_username)
     };
     let low_signal_noise = is_low_signal_group_noise(text);
+    let vocative_alias_candidate = if bot_username.is_empty() {
+        None
+    } else {
+        detect_vocative_learned_alias_prefix(text, &learned_aliases)
+            .or_else(|| extract_vocative_alias_candidate(text, bot_username))
+    };
+    let vocative_alias_known = vocative_alias_candidate
+        .as_ref()
+        .map(|candidate| learned_aliases.iter().any(|v| v == candidate))
+        .unwrap_or(false);
+    let vocative_alias_hit = matches!(group_trigger_settings.mode, TelegramGroupTriggerMode::Smart)
+        && !points_to_other_bot
+        && vocative_alias_candidate.is_some()
+        && (vocative_alias_known || has_question_marker);
+
+    if vocative_alias_hit
+        && let Some(candidate) = vocative_alias_candidate.as_ref()
+        && !vocative_alias_known
+    {
+        learn_group_alias_tokens(ctx, chat_id, vec![candidate.clone()], group_runtime_state).await;
+        learned_aliases.push(candidate.clone());
+    }
+
+    let alias_hit = message_contains_any_alias(text, &learned_aliases);
 
     let decision = evaluate_group_decision(
         group_trigger_settings.mode,
@@ -95,6 +118,7 @@ pub(super) async fn process_group_message(
             replied_to_bot,
             recent_bot_participation,
             alias_hit,
+            vocative_alias_hit,
             has_question_marker,
             points_to_other_bot,
             low_signal_noise,
@@ -112,6 +136,8 @@ pub(super) async fn process_group_message(
         mentioned,
         replied_to_bot,
         alias_hit,
+        vocative_alias_hit,
+        vocative_alias_candidate = ?vocative_alias_candidate,
         aliases_count = learned_aliases.len(),
         has_question_marker,
         recent_bot_participation,
@@ -133,6 +159,8 @@ pub(super) async fn process_group_message(
         mentioned,
         replied_to_bot,
         alias_hit,
+        vocative_alias_hit,
+        vocative_alias_candidate = ?vocative_alias_candidate,
         aliases_count = learned_aliases.len(),
         has_question_marker,
         recent_bot_participation,
@@ -380,6 +408,7 @@ async fn build_group_identity_context(
 
     let model_input_text = build_group_member_identity_context(
         text,
+        message.reply_to_message.as_ref(),
         sender_user_id,
         &sender_profile,
         &roster_entries,
@@ -406,10 +435,22 @@ async fn learn_group_aliases(
         return;
     }
 
+    learn_group_alias_tokens(ctx, chat_id, learned, group_runtime_state).await;
+}
+
+async fn learn_group_alias_tokens(
+    ctx: &ChannelContext,
+    chat_id: i64,
+    aliases: Vec<String>,
+    group_runtime_state: &Arc<tokio::sync::Mutex<TelegramGroupRuntimeState>>,
+) {
+    if aliases.is_empty() {
+        return;
+    }
     let mut newly_added = Vec::new();
     let mut state = group_runtime_state.lock().await;
     let chat_aliases = state.learned_aliases_by_chat.entry(chat_id).or_default();
-    for alias in learned {
+    for alias in aliases {
         if chat_aliases.len() >= 24 {
             break;
         }

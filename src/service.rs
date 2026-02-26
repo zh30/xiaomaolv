@@ -15,7 +15,7 @@ use crate::code_mode::{
     CodeModePlanner, DisabledCodeModePlanner, execute_plan_via_subprocess,
 };
 use crate::domain::{IncomingMessage, MessageRole, OutgoingMessage, StoredMessage};
-use crate::mcp::{McpRuntime, McpToolInfo};
+use crate::mcp::{BUILTIN_MCP_SERVER_NAME, BUILTIN_MCP_TOOL_CURRENT_TIME, McpRuntime, McpToolInfo};
 use crate::memory::{
     ClaimDueTelegramSchedulerJobsRequest, CompleteTelegramSchedulerJobRunRequest,
     CreateTelegramSchedulerJobRequest, FailTelegramSchedulerJobRunRequest, GroupAliasLoadRequest,
@@ -546,6 +546,9 @@ impl MessageService {
             self.context_min_recent_messages,
         );
         let history = self.apply_skills_prompt(history, &incoming.text).await;
+        let history = self
+            .append_builtin_time_context_if_needed(history, &incoming.text)
+            .await;
 
         let text = self.complete_with_optional_mcp(history).await?;
 
@@ -609,14 +612,14 @@ impl MessageService {
             self.context_min_recent_messages,
         );
         let history = self.apply_skills_prompt(history, &incoming.text).await;
+        let history = self
+            .append_builtin_time_context_if_needed(history, &incoming.text)
+            .await;
 
-        // Keep true streaming semantics on channel streaming path.
-        // MCP tool loop currently runs on non-stream path only.
         let text = self
-            .provider
-            .complete_stream(CompletionRequest { messages: history }, sink)
+            .complete_with_optional_mcp_stream(history, sink)
             .await
-            .context("provider stream completion failed")?;
+            .context("failed to process streaming completion with optional mcp")?;
 
         self.memory
             .append(MemoryWriteRequest {
@@ -976,6 +979,66 @@ impl MessageService {
         self.complete_with_mcp_loop(history, tools, runtime).await
     }
 
+    async fn complete_with_optional_mcp_stream(
+        &self,
+        history: Vec<StoredMessage>,
+        sink: &mut dyn StreamSink,
+    ) -> anyhow::Result<String> {
+        let Some(runtime) = self.snapshot_mcp_runtime().await else {
+            return self
+                .provider
+                .complete_stream(CompletionRequest { messages: history }, sink)
+                .await
+                .context("provider stream completion failed");
+        };
+        let tools = match runtime.list_tools(None).await {
+            Ok(tools) => tools,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "failed to list mcp tools, fallback to plain stream completion"
+                );
+                return self
+                    .provider
+                    .complete_stream(CompletionRequest { messages: history }, sink)
+                    .await
+                    .context("provider stream completion failed");
+            }
+        };
+
+        if tools.is_empty() {
+            return self
+                .provider
+                .complete_stream(CompletionRequest { messages: history }, sink)
+                .await
+                .context("provider stream completion failed");
+        }
+
+        if self.agent_code_mode.enabled
+            && let Some(attempt) = self.next_code_mode_attempt()
+        {
+            let force_shadow = matches!(attempt, CodeModeAttempt::Probe);
+            match self
+                .complete_with_code_mode(history.clone(), &tools, &runtime, force_shadow)
+                .await
+            {
+                Ok(Some(reply)) => {
+                    if !reply.is_empty() {
+                        sink.on_delta(&reply).await?;
+                    }
+                    return Ok(reply);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(error = %err, "code mode path failed, fallback to mcp json loop");
+                }
+            }
+        }
+
+        self.complete_with_mcp_loop_stream(history, tools, runtime, sink)
+            .await
+    }
+
     async fn complete_with_code_mode(
         &self,
         history: Vec<StoredMessage>,
@@ -1166,6 +1229,121 @@ impl MessageService {
             .context("provider completion failed")?;
         telemetry.emit("max_iterations");
         Ok(final_reply)
+    }
+
+    async fn complete_with_mcp_loop_stream(
+        &self,
+        mut history: Vec<StoredMessage>,
+        tools: Vec<McpToolInfo>,
+        runtime: McpRuntime,
+        sink: &mut dyn StreamSink,
+    ) -> anyhow::Result<String> {
+        let mut telemetry = McpLoopTelemetry::new(tools.len());
+        history.push(StoredMessage {
+            role: MessageRole::System,
+            content: build_mcp_system_prompt(&tools)?,
+        });
+
+        let max_iterations = self.agent_mcp.max_iterations.max(1);
+        for _ in 0..max_iterations {
+            telemetry.observe_prompt_chars(&history);
+            let mut buffered_sink = BufferedStreamSink::default();
+            let reply = self
+                .provider
+                .complete_stream(
+                    CompletionRequest {
+                        messages: history.clone(),
+                    },
+                    &mut buffered_sink,
+                )
+                .await
+                .context("provider stream completion failed")?;
+            telemetry.iterations += 1;
+
+            let streamed_reply = buffered_sink.rendered_text();
+            let resolved_reply = if streamed_reply.trim().is_empty() {
+                reply
+            } else {
+                streamed_reply.clone()
+            };
+
+            let Some(tool_call) = parse_mcp_tool_call(&resolved_reply) else {
+                buffered_sink
+                    .replay_or_fallback(&resolved_reply, sink)
+                    .await?;
+                telemetry.emit("final_answer");
+                return Ok(resolved_reply);
+            };
+
+            let tool_result = runtime
+                .call_tool(
+                    &tool_call.server,
+                    &tool_call.tool,
+                    tool_call.arguments.clone(),
+                )
+                .await;
+
+            let tool_message = match tool_result {
+                Ok(value) => {
+                    telemetry.tool_calls_total += 1;
+                    telemetry.tool_calls_ok += 1;
+                    let result = truncate_json_value(&value, self.agent_mcp.max_tool_result_chars);
+                    serde_json::json!({
+                        "server": tool_call.server,
+                        "tool": tool_call.tool,
+                        "ok": true,
+                        "result": result
+                    })
+                }
+                Err(err) => {
+                    telemetry.tool_calls_total += 1;
+                    telemetry.tool_calls_err += 1;
+                    serde_json::json!({
+                        "server": tool_call.server,
+                        "tool": tool_call.tool,
+                        "ok": false,
+                        "error": err.to_string()
+                    })
+                }
+            };
+
+            history.push(StoredMessage {
+                role: MessageRole::Assistant,
+                content: resolved_reply,
+            });
+            history.push(StoredMessage {
+                role: MessageRole::System,
+                content: format!(
+                    "MCP_TOOL_RESULT_JSON:\n{}",
+                    serde_json::to_string(&tool_message)
+                        .unwrap_or_else(|_| "{\"ok\":false}".to_string())
+                ),
+            });
+        }
+
+        history.push(StoredMessage {
+            role: MessageRole::System,
+            content:
+                "MCP tool loop reached max iterations. Give a final answer based on available context."
+                    .to_string(),
+        });
+        let mut buffered_sink = BufferedStreamSink::default();
+        let final_reply = self
+            .provider
+            .complete_stream(CompletionRequest { messages: history }, &mut buffered_sink)
+            .await
+            .context("provider stream completion failed")?;
+        let streamed_reply = buffered_sink.rendered_text();
+        let resolved_reply = if streamed_reply.trim().is_empty() {
+            final_reply
+        } else {
+            streamed_reply
+        };
+        buffered_sink
+            .replay_or_fallback(&resolved_reply, sink)
+            .await?;
+        telemetry.emit("max_iterations");
+        Ok(resolved_reply)
     }
 
     fn is_mcp_agent_enabled(&self) -> bool {
@@ -1361,6 +1539,52 @@ impl MessageService {
         }
         history
     }
+
+    async fn append_builtin_time_context_if_needed(
+        &self,
+        mut history: Vec<StoredMessage>,
+        query_text: &str,
+    ) -> Vec<StoredMessage> {
+        if !looks_like_time_query(query_text) {
+            return history;
+        }
+        let Some(runtime) = self.mcp_runtime.as_ref().map(|runtime| runtime.read()) else {
+            return history;
+        };
+        let runtime = runtime.await.clone();
+        match runtime
+            .call_tool(
+                BUILTIN_MCP_SERVER_NAME,
+                BUILTIN_MCP_TOOL_CURRENT_TIME,
+                serde_json::json!({}),
+            )
+            .await
+        {
+            Ok(value) => {
+                let tool_message = serde_json::json!({
+                    "server": BUILTIN_MCP_SERVER_NAME,
+                    "tool": BUILTIN_MCP_TOOL_CURRENT_TIME,
+                    "ok": true,
+                    "result": value
+                });
+                history.push(StoredMessage {
+                    role: MessageRole::System,
+                    content: format!(
+                        "MCP_TOOL_RESULT_JSON:\n{}",
+                        serde_json::to_string(&tool_message)
+                            .unwrap_or_else(|_| "{\"ok\":false}".to_string())
+                    ),
+                });
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "failed to call builtin mcp time tool for time-related query"
+                );
+            }
+        }
+        history
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1372,6 +1596,45 @@ struct McpLoopTelemetry {
     tool_calls_total: usize,
     tool_calls_ok: usize,
     tool_calls_err: usize,
+}
+
+#[derive(Default)]
+struct BufferedStreamSink {
+    deltas: Vec<String>,
+}
+
+#[async_trait::async_trait]
+impl StreamSink for BufferedStreamSink {
+    async fn on_delta(&mut self, delta: &str) -> anyhow::Result<()> {
+        if !delta.is_empty() {
+            self.deltas.push(delta.to_string());
+        }
+        Ok(())
+    }
+}
+
+impl BufferedStreamSink {
+    fn rendered_text(&self) -> String {
+        self.deltas.concat()
+    }
+
+    async fn replay_or_fallback(
+        &self,
+        fallback_text: &str,
+        sink: &mut dyn StreamSink,
+    ) -> anyhow::Result<()> {
+        if self.deltas.is_empty() {
+            if !fallback_text.is_empty() {
+                sink.on_delta(fallback_text).await?;
+            }
+            return Ok(());
+        }
+
+        for delta in &self.deltas {
+            sink.on_delta(delta).await?;
+        }
+        Ok(())
+    }
 }
 
 impl McpLoopTelemetry {
@@ -1502,8 +1765,39 @@ fn build_mcp_system_prompt(tools: &[McpToolInfo]) -> anyhow::Result<String> {
         .collect::<Vec<_>>();
     let serialized = serde_json::to_string(&tool_defs).context("failed to encode mcp tool list")?;
     Ok(format!(
-        "You can use MCP tools.\nWhen a tool call is needed, reply with ONLY JSON (no markdown, no extra text): {{\"server\":\"<server>\",\"tool\":\"<tool>\",\"arguments\":{{...}}}}.\nAvailable tools: {serialized}\nIf no tool is needed, reply with the final answer directly."
+        "You can use MCP tools.\nWhen a tool call is needed, reply with ONLY JSON (no markdown, no extra text): {{\"server\":\"<server>\",\"tool\":\"<tool>\",\"arguments\":{{...}}}}.\nTime rule: when user asks about current time/date/year/today/now/weekday/zodiac, ALWAYS call {{\"server\":\"{BUILTIN_MCP_SERVER_NAME}\",\"tool\":\"{BUILTIN_MCP_TOOL_CURRENT_TIME}\",\"arguments\":{{}}}} first (or pass timezone).\nAvailable tools: {serialized}\nIf no tool is needed, reply with the final answer directly."
     ))
+}
+
+fn looks_like_time_query(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if [
+        "what time",
+        "current time",
+        "time now",
+        "today",
+        "date",
+        "year",
+        "weekday",
+        "zodiac",
+        "now",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw))
+    {
+        return true;
+    }
+    [
+        "几点", "时间", "现在", "今天", "日期", "几号", "今年", "年份", "星期", "周几", "生肖",
+        "蛇年", "龙年", "马年", "羊年", "猴年", "鸡年", "狗年", "猪年", "鼠年", "牛年", "虎年",
+        "兔年",
+    ]
+    .iter()
+    .any(|kw| trimmed.contains(kw))
 }
 
 fn parse_mcp_tool_call(reply: &str) -> Option<ParsedMcpToolCall> {
@@ -1776,16 +2070,20 @@ fn truncate_json_value(value: &Value, max_chars: usize) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        CodeModeCircuitChange, MessageService, apply_context_budget, code_mode_timeout_ratio,
-        next_code_mode_timeout_streak, parse_mcp_tool_call, parse_scheduler_intent_json,
-        should_open_code_mode_timeout_circuit, should_probe_code_mode_timeout_circuit,
-        should_warn_code_mode_timeouts, truncate_json_value,
+        AgentMcpSettings, BUILTIN_MCP_SERVER_NAME, BUILTIN_MCP_TOOL_CURRENT_TIME,
+        CodeModeCircuitChange, MessageService, apply_context_budget, build_mcp_system_prompt,
+        code_mode_timeout_ratio, looks_like_time_query, next_code_mode_timeout_streak,
+        parse_mcp_tool_call, parse_scheduler_intent_json, should_open_code_mode_timeout_circuit,
+        should_probe_code_mode_timeout_circuit, should_warn_code_mode_timeouts,
+        truncate_json_value,
     };
     use crate::code_mode::{AgentCodeModeSettings, CodeModeAuditRecord};
     use crate::domain::{MessageRole, StoredMessage};
-    use crate::memory::SqliteMemoryStore;
-    use crate::provider::{ChatProvider, CompletionRequest};
-    use std::sync::Arc;
+    use crate::mcp::McpRuntime;
+    use crate::memory::{MemoryBackend, SqliteMemoryBackend, SqliteMemoryStore};
+    use crate::provider::{ChatProvider, CompletionRequest, StreamSink};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::RwLock;
 
     struct FakeProvider;
 
@@ -1793,6 +2091,54 @@ mod tests {
     impl ChatProvider for FakeProvider {
         async fn complete(&self, _req: CompletionRequest) -> anyhow::Result<String> {
             Ok("ok".to_string())
+        }
+    }
+
+    struct SequenceStreamProvider {
+        replies: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl SequenceStreamProvider {
+        fn next_reply(&self) -> String {
+            let mut guard = self.replies.lock().expect("reply lock");
+            if guard.is_empty() {
+                String::new()
+            } else {
+                guard.remove(0)
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChatProvider for SequenceStreamProvider {
+        async fn complete(&self, _req: CompletionRequest) -> anyhow::Result<String> {
+            Ok(self.next_reply())
+        }
+
+        async fn complete_stream(
+            &self,
+            _req: CompletionRequest,
+            sink: &mut dyn StreamSink,
+        ) -> anyhow::Result<String> {
+            let reply = self.next_reply();
+            for chunk in reply.as_bytes().chunks(6) {
+                let delta = std::str::from_utf8(chunk).expect("utf8");
+                sink.on_delta(delta).await?;
+            }
+            Ok(reply)
+        }
+    }
+
+    #[derive(Default)]
+    struct CaptureSink {
+        text: String,
+    }
+
+    #[async_trait::async_trait]
+    impl StreamSink for CaptureSink {
+        async fn on_delta(&mut self, delta: &str) -> anyhow::Result<()> {
+            self.text.push_str(delta);
+            Ok(())
         }
     }
 
@@ -1821,6 +2167,28 @@ mod tests {
             parse_mcp_tool_call(r#"{"name":"s2::t2","arguments":{"x":1}}"#).expect("parsed");
         assert_eq!(parsed.server, "s2");
         assert_eq!(parsed.tool, "t2");
+    }
+
+    #[test]
+    fn mcp_system_prompt_includes_builtin_time_rule() {
+        let prompt = build_mcp_system_prompt(&[]).expect("prompt");
+        assert!(prompt.contains(BUILTIN_MCP_SERVER_NAME));
+        assert!(prompt.contains(BUILTIN_MCP_TOOL_CURRENT_TIME));
+        assert!(prompt.contains("Time rule"));
+    }
+
+    #[test]
+    fn looks_like_time_query_detects_cn_and_en_intents() {
+        assert!(looks_like_time_query("现在几点了？"));
+        assert!(looks_like_time_query("今天几号"));
+        assert!(looks_like_time_query("今年是什么生肖"));
+        assert!(looks_like_time_query("what time is it now"));
+    }
+
+    #[test]
+    fn looks_like_time_query_ignores_regular_reminder_text() {
+        assert!(!looks_like_time_query("5分钟后提醒我喝水"));
+        assert!(!looks_like_time_query("驴哥，帮我总结一下上面的讨论"));
     }
 
     #[test]
@@ -2041,5 +2409,49 @@ mod tests {
         assert!(body.contains("xiaomaolv_code_mode_circuit_open_total 1"));
         assert!(body.contains("xiaomaolv_code_mode_timeout_warn_ratio 0.400000"));
         assert!(body.contains("xiaomaolv_code_mode_timeout_auto_shadow_probe_every 5"));
+    }
+
+    #[tokio::test]
+    async fn handle_stream_supports_mcp_tool_loop() {
+        let provider = Arc::new(SequenceStreamProvider {
+            replies: Arc::new(Mutex::new(vec![
+                format!(
+                    r#"{{"server":"{BUILTIN_MCP_SERVER_NAME}","tool":"{BUILTIN_MCP_TOOL_CURRENT_TIME}","arguments":{{"timezone":"Asia/Shanghai"}}}}"#
+                ),
+                "现在是正确的当前时间。".to_string(),
+            ])),
+        });
+        let store = SqliteMemoryStore::new("sqlite::memory:")
+            .await
+            .expect("store");
+        let memory: Arc<dyn MemoryBackend> = Arc::new(SqliteMemoryBackend::new(store));
+        let service = MessageService::new_with_backend(
+            provider,
+            memory,
+            Some(Arc::new(RwLock::new(McpRuntime::default()))),
+            AgentMcpSettings::default(),
+            8,
+            0,
+            0,
+        );
+
+        let mut sink = CaptureSink::default();
+        let out = service
+            .handle_stream(
+                crate::domain::IncomingMessage {
+                    channel: "telegram".to_string(),
+                    session_id: "tg:test:stream".to_string(),
+                    user_id: "u1".to_string(),
+                    text: "现在几点".to_string(),
+                    reply_target: None,
+                },
+                &mut sink,
+            )
+            .await
+            .expect("handle stream with mcp loop");
+
+        assert_eq!(out.text, "现在是正确的当前时间。");
+        assert_eq!(sink.text, "现在是正确的当前时间。");
+        assert!(!sink.text.contains("\"server\""));
     }
 }

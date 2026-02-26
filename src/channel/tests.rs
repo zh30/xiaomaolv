@@ -3,13 +3,16 @@ use super::{
     TELEGRAM_MAX_TEXT_CHARS, TelegramCommandSettings, TelegramGroupTriggerMode,
     TelegramGroupUserProfile, TelegramReplyMessage, TelegramSchedulerSettings,
     TelegramSlashCommand, TelegramUser, build_draft_message_id,
-    build_group_member_identity_context, detect_scheduler_job_operation_keyword,
-    evaluate_group_decision, evaluate_mcp_command_access, evaluate_private_chat_access,
-    extract_dynamic_alias_candidates, extract_realtime_name_correction, extract_scheduler_job_id,
+    build_group_member_identity_context, build_scheduler_owner_mention,
+    build_scheduler_reminder_outbound_text, detect_scheduler_job_operation_keyword,
+    detect_vocative_learned_alias_prefix, evaluate_group_decision, evaluate_mcp_command_access,
+    evaluate_private_chat_access, extract_dynamic_alias_candidates,
+    extract_realtime_name_correction, extract_scheduler_job_id, extract_vocative_alias_candidate,
     is_reply_to_bot_message, looks_like_scheduler_list_text, message_mentions_bot,
     parse_admin_user_ids, parse_telegram_slash_command, render_telegram_text_parts,
     short_description_payload, telegram_help_text, telegram_registered_commands,
-    telegram_session_id, text_implies_latest_target, truncate_chars, typing_action_payload,
+    telegram_scheduler_requires_confirm, telegram_session_id, text_implies_latest_target,
+    truncate_chars, typing_action_payload,
 };
 
 fn test_scheduler_settings() -> TelegramSchedulerSettings {
@@ -140,6 +143,8 @@ fn reply_to_bot_detection_uses_reply_from_is_bot() {
             first_name: None,
             last_name: None,
         }),
+        text: None,
+        caption: None,
     };
     let reply_from_user = TelegramReplyMessage {
         message_id: 2,
@@ -150,10 +155,14 @@ fn reply_to_bot_detection_uses_reply_from_is_bot() {
             first_name: None,
             last_name: None,
         }),
+        text: None,
+        caption: None,
     };
     let reply_without_from = TelegramReplyMessage {
         message_id: 3,
         from: None,
+        text: None,
+        caption: None,
     };
 
     assert!(is_reply_to_bot_message(Some(&reply_from_bot), None));
@@ -173,6 +182,8 @@ fn reply_to_bot_detection_falls_back_to_bot_user_id_when_is_bot_missing() {
             first_name: None,
             last_name: None,
         }),
+        text: None,
+        caption: None,
     };
     assert!(is_reply_to_bot_message(
         Some(&reply_without_flag),
@@ -189,6 +200,67 @@ fn extract_dynamic_alias_candidates_learns_prefix_name() {
     let aliases =
         extract_dynamic_alias_candidates("小绿，@myxiaomaolvbot 你看看这个", "myxiaomaolvbot");
     assert!(aliases.iter().any(|v| v == "小绿"));
+}
+
+#[test]
+fn extract_dynamic_alias_candidates_learns_suffix_name_after_mention() {
+    let aliases = extract_dynamic_alias_candidates("@myxiaomaolvbot 驴哥 你在吗", "myxiaomaolvbot");
+    assert!(aliases.iter().any(|v| v == "驴哥"));
+}
+
+#[test]
+fn extract_dynamic_alias_candidates_extracts_name_from_phrase_after_mention() {
+    let aliases =
+        extract_dynamic_alias_candidates("@myxiaomaolvbot 你叫驴哥，你知道吧", "myxiaomaolvbot");
+    assert!(aliases.iter().any(|v| v == "驴哥"));
+}
+
+#[test]
+fn extract_vocative_alias_candidate_detects_direct_group_summon() {
+    let alias = extract_vocative_alias_candidate("驴哥，你能知道我在召唤你吗？", "myxiaomaolvbot");
+    assert_eq!(alias, Some("驴哥".to_string()));
+}
+
+#[test]
+fn extract_vocative_alias_candidate_detects_no_punctuation_summon() {
+    let alias = extract_vocative_alias_candidate("驴哥你在吗", "myxiaomaolvbot");
+    assert_eq!(alias, Some("驴哥".to_string()));
+}
+
+#[test]
+fn extract_vocative_alias_candidate_detects_digit_following_summon() {
+    let alias = extract_vocative_alias_candidate("驴哥5分钟后提醒我喝水", "myxiaomaolvbot");
+    assert_eq!(alias, Some("驴哥".to_string()));
+}
+
+#[test]
+fn extract_vocative_alias_candidate_ignores_generic_collective_address() {
+    let alias = extract_vocative_alias_candidate("大家，你们先聊，我晚点看。", "myxiaomaolvbot");
+    assert_eq!(alias, None);
+}
+
+#[test]
+fn extract_vocative_alias_candidate_ignores_interjection_phrase() {
+    let alias = extract_vocative_alias_candidate("我擦，你终于好了", "myxiaomaolvbot");
+    assert_eq!(alias, None);
+}
+
+#[test]
+fn detect_vocative_learned_alias_prefix_supports_no_punctuation() {
+    let alias = detect_vocative_learned_alias_prefix(
+        "驴哥你话太密了",
+        &["驴哥".to_string(), "小绿".to_string()],
+    );
+    assert_eq!(alias, Some("驴哥".to_string()));
+}
+
+#[test]
+fn detect_vocative_learned_alias_prefix_supports_digit_following() {
+    let alias = detect_vocative_learned_alias_prefix(
+        "驴哥5分钟后提醒我喝水",
+        &["驴哥".to_string(), "小绿".to_string()],
+    );
+    assert_eq!(alias, Some("驴哥".to_string()));
 }
 
 #[test]
@@ -237,6 +309,7 @@ fn group_member_identity_context_includes_sender_and_roster_mapping() {
 
     let context = build_group_member_identity_context(
         "我们今天要评审需求",
+        None,
         1001,
         &sender_profile,
         &roster,
@@ -248,6 +321,49 @@ fn group_member_identity_context_includes_sender_and_roster_mapping() {
     assert!(context.contains("uid=1001 -> 阿青"));
     assert!(context.contains("uid=1002 -> 小米"));
     assert!(context.contains("原始消息: 我们今天要评审需求"));
+}
+
+#[test]
+fn group_member_identity_context_includes_replied_message_context() {
+    let sender_profile = TelegramGroupUserProfile {
+        preferred_name: "赫哥".to_string(),
+        username: Some("hege".to_string()),
+        updated_at: 1700000000,
+    };
+    let roster = vec![(
+        2001_i64,
+        TelegramGroupUserProfile {
+            preferred_name: "赫哥".to_string(),
+            username: Some("hege".to_string()),
+            updated_at: 1700000000,
+        },
+    )];
+    let reply = TelegramReplyMessage {
+        message_id: 556,
+        from: Some(TelegramUser {
+            id: 6084818790,
+            is_bot: Some(false),
+            username: Some("shawn".to_string()),
+            first_name: Some("Shawn".to_string()),
+            last_name: None,
+        }),
+        text: Some("感觉和一个老年痴呆驴在聊天".to_string()),
+        caption: None,
+    };
+
+    let context = build_group_member_identity_context(
+        "我也觉得 @myxiaomaolvbot",
+        Some(&reply),
+        2001,
+        &sender_profile,
+        &roster,
+        6,
+    );
+
+    assert!(context.contains("[被回复消息]"));
+    assert!(context.contains("被回复消息ID: 556"));
+    assert!(context.contains("被回复消息发送者: Shawn"));
+    assert!(context.contains("被回复消息内容: 感觉和一个老年痴呆驴在聊天"));
 }
 
 #[test]
@@ -444,6 +560,7 @@ fn group_decision_strict_only_allows_mention_or_reply() {
             replied_to_bot: false,
             recent_bot_participation: true,
             alias_hit: true,
+            vocative_alias_hit: false,
             has_question_marker: true,
             points_to_other_bot: false,
             low_signal_noise: false,
@@ -463,6 +580,7 @@ fn group_decision_strict_allows_explicit_mention() {
             replied_to_bot: false,
             recent_bot_participation: false,
             alias_hit: false,
+            vocative_alias_hit: false,
             has_question_marker: false,
             points_to_other_bot: false,
             low_signal_noise: false,
@@ -482,6 +600,7 @@ fn group_decision_strict_allows_reply_to_bot() {
             replied_to_bot: true,
             recent_bot_participation: false,
             alias_hit: false,
+            vocative_alias_hit: false,
             has_question_marker: false,
             points_to_other_bot: false,
             low_signal_noise: false,
@@ -501,6 +620,7 @@ fn group_decision_smart_promotes_contextual_question_to_observe_or_respond() {
             replied_to_bot: false,
             recent_bot_participation: true,
             alias_hit: true,
+            vocative_alias_hit: false,
             has_question_marker: true,
             points_to_other_bot: false,
             low_signal_noise: false,
@@ -520,6 +640,7 @@ fn group_decision_smart_suppresses_other_bot_target() {
             replied_to_bot: false,
             recent_bot_participation: false,
             alias_hit: false,
+            vocative_alias_hit: false,
             has_question_marker: true,
             points_to_other_bot: true,
             low_signal_noise: false,
@@ -528,4 +649,98 @@ fn group_decision_smart_suppresses_other_bot_target() {
         70,
     );
     assert_eq!(decision.kind, GroupDecisionKind::Ignore);
+}
+
+#[test]
+fn group_decision_smart_responds_to_vocative_alias_summon() {
+    let decision = evaluate_group_decision(
+        TelegramGroupTriggerMode::Smart,
+        &GroupSignalInput {
+            mentioned: false,
+            replied_to_bot: false,
+            recent_bot_participation: false,
+            alias_hit: false,
+            vocative_alias_hit: true,
+            has_question_marker: false,
+            points_to_other_bot: false,
+            low_signal_noise: false,
+            cooldown_active: false,
+        },
+        70,
+    );
+    assert_eq!(decision.kind, GroupDecisionKind::Respond);
+}
+
+#[test]
+fn group_decision_smart_vocative_alias_bypasses_cooldown() {
+    let decision = evaluate_group_decision(
+        TelegramGroupTriggerMode::Smart,
+        &GroupSignalInput {
+            mentioned: false,
+            replied_to_bot: false,
+            recent_bot_participation: true,
+            alias_hit: false,
+            vocative_alias_hit: true,
+            has_question_marker: false,
+            points_to_other_bot: false,
+            low_signal_noise: false,
+            cooldown_active: true,
+        },
+        70,
+    );
+    assert_eq!(decision.kind, GroupDecisionKind::Respond);
+}
+
+#[test]
+fn scheduler_confirm_required_in_private_chat_when_enabled() {
+    let settings = test_scheduler_settings();
+    assert!(telegram_scheduler_requires_confirm(
+        &settings,
+        Some("private")
+    ));
+}
+
+#[test]
+fn scheduler_confirm_is_not_required_in_group_chat() {
+    let settings = test_scheduler_settings();
+    assert!(!telegram_scheduler_requires_confirm(
+        &settings,
+        Some("group")
+    ));
+}
+
+#[test]
+fn scheduler_owner_mention_prefers_username() {
+    let mention = build_scheduler_owner_mention(6028409442, Some("he_ge"), Some("赫哥"));
+    assert_eq!(mention, "@he_ge");
+}
+
+#[test]
+fn scheduler_owner_mention_falls_back_to_tg_link_when_username_missing() {
+    let mention = build_scheduler_owner_mention(6028409442, None, Some("赫哥"));
+    assert_eq!(mention, "[赫哥](tg://user?id=6028409442)");
+}
+
+#[test]
+fn scheduler_reminder_text_in_group_mentions_owner() {
+    let text = build_scheduler_reminder_outbound_text(
+        -5107319852,
+        6028409442,
+        Some("he_ge"),
+        Some("赫哥"),
+        "2分钟后喝水",
+    );
+    assert_eq!(text, "@he_ge 你的定时提醒到了：2分钟后喝水");
+}
+
+#[test]
+fn scheduler_reminder_text_in_private_chat_keeps_payload() {
+    let text = build_scheduler_reminder_outbound_text(
+        6028409442,
+        6028409442,
+        Some("he_ge"),
+        Some("赫哥"),
+        "2分钟后喝水",
+    );
+    assert_eq!(text, "2分钟后喝水");
 }

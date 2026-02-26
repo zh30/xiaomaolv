@@ -508,6 +508,8 @@ pub(super) async fn maybe_handle_telegram_scheduler_natural_language(
     let chat_id = message.chat.id;
     let now_unix = current_unix_timestamp_i64();
     let channel_name = ctx.channel_name.clone();
+    let require_confirm =
+        telegram_scheduler_requires_confirm(scheduler_settings, message.chat.kind.as_deref());
 
     let pending = ctx
         .service
@@ -631,23 +633,53 @@ pub(super) async fn maybe_handle_telegram_scheduler_natural_language(
                 now_unix,
             )?
         {
-            upsert_scheduler_pending_intent(
-                ctx,
-                chat_id,
-                owner_user_id,
-                &updated_draft,
-                now_unix + TELEGRAM_SCHEDULER_PENDING_TTL_SECS,
-            )
-            .await?;
-            send_telegram_command_reply(
-                sender,
-                message,
-                &format!(
-                    "已更新任务草案:\n{}\n\n回复“确认”创建任务，回复“取消”放弃草案。",
-                    describe_scheduler_draft(&updated_draft)
-                ),
-            )
-            .await?;
+            if require_confirm {
+                upsert_scheduler_pending_intent(
+                    ctx,
+                    chat_id,
+                    owner_user_id,
+                    &updated_draft,
+                    now_unix + TELEGRAM_SCHEDULER_PENDING_TTL_SECS,
+                )
+                .await?;
+                send_telegram_command_reply(
+                    sender,
+                    message,
+                    &format!(
+                        "已更新任务草案:\n{}\n\n回复“确认”创建任务，回复“取消”放弃草案。",
+                        describe_scheduler_draft(&updated_draft)
+                    ),
+                )
+                .await?;
+            } else {
+                let (job_id, next_run_at_unix) = create_scheduler_job_from_draft(
+                    ctx,
+                    chat_id,
+                    message.message_thread_id,
+                    owner_user_id,
+                    scheduler_settings,
+                    &updated_draft,
+                )
+                .await?;
+                let _ = ctx
+                    .service
+                    .delete_telegram_scheduler_pending_intent(
+                        channel_name.clone(),
+                        chat_id,
+                        owner_user_id,
+                    )
+                    .await;
+                send_telegram_command_reply(
+                    sender,
+                    message,
+                    &format!(
+                        "已创建任务。\nID: {job_id}\n下次执行: {}\n内容: {}",
+                        format_scheduler_time(Some(next_run_at_unix), &updated_draft.timezone),
+                        updated_draft.payload
+                    ),
+                )
+                .await?;
+            }
             return Ok(true);
         }
     }
@@ -740,7 +772,7 @@ pub(super) async fn maybe_handle_telegram_scheduler_natural_language(
                 return Ok(false);
             };
 
-            if scheduler_settings.require_confirm {
+            if require_confirm {
                 upsert_scheduler_pending_intent(
                     ctx,
                     chat_id,
@@ -1180,6 +1212,13 @@ pub(super) fn telegram_registered_commands() -> Vec<(&'static str, &'static str)
         ("skills", "管理 Skills"),
         ("task", "管理定时任务"),
     ]
+}
+
+pub(super) fn telegram_scheduler_requires_confirm(
+    scheduler_settings: &TelegramSchedulerSettings,
+    chat_kind: Option<&str>,
+) -> bool {
+    scheduler_settings.require_confirm && !is_group_chat_type(chat_kind)
 }
 
 pub(super) async fn send_telegram_command_reply(

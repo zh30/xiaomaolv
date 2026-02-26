@@ -3,6 +3,46 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::*;
 
+pub(super) fn build_scheduler_owner_mention(
+    owner_user_id: i64,
+    owner_username: Option<&str>,
+    owner_preferred_name: Option<&str>,
+) -> String {
+    let normalized_username = owner_username
+        .map(|v| v.trim().trim_start_matches('@'))
+        .filter(|v| !v.is_empty());
+    if let Some(username) = normalized_username {
+        return format!("@{username}");
+    }
+
+    let preferred_name = owner_preferred_name
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("这位同学");
+    format!("[{preferred_name}](tg://user?id={owner_user_id})")
+}
+
+pub(super) fn build_scheduler_reminder_outbound_text(
+    chat_id: i64,
+    owner_user_id: i64,
+    owner_username: Option<&str>,
+    owner_preferred_name: Option<&str>,
+    payload: &str,
+) -> String {
+    if chat_id >= 0 {
+        return payload.to_string();
+    }
+
+    let mention =
+        build_scheduler_owner_mention(owner_user_id, owner_username, owner_preferred_name);
+    let reminder_body = payload.trim();
+    if reminder_body.is_empty() {
+        format!("{mention} 你的定时提醒到了。")
+    } else {
+        format!("{mention} 你的定时提醒到了：{reminder_body}")
+    }
+}
+
 pub(super) async fn run_telegram_scheduler_loop(
     channel_name: String,
     service: Arc<MessageService>,
@@ -116,7 +156,41 @@ pub(super) async fn run_telegram_scheduler_loop(
                 let policy =
                     resolve_scheduler_policy_for_job(&job, &scheduler_settings.default_timezone)?;
                 let outbound_text = match job.task_kind {
-                    TelegramSchedulerTaskKind::Reminder => job.payload.clone(),
+                    TelegramSchedulerTaskKind::Reminder => {
+                        let mut owner_preferred_name: Option<String> = None;
+                        let mut owner_username: Option<String> = None;
+                        if job.chat_id < 0 {
+                            match service
+                                .load_group_user_profiles(channel_name.clone(), job.chat_id, 256)
+                                .await
+                            {
+                                Ok(profiles) => {
+                                    if let Some(profile) =
+                                        profiles.into_iter().find(|p| p.user_id == job.owner_user_id)
+                                    {
+                                        owner_preferred_name = Some(profile.preferred_name);
+                                        owner_username = profile.username;
+                                    }
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        channel = %channel_name,
+                                        chat_id = job.chat_id,
+                                        owner_user_id = job.owner_user_id,
+                                        error = %format!("{err:#}"),
+                                        "failed to load group profiles for scheduler reminder mention"
+                                    );
+                                }
+                            }
+                        }
+                        build_scheduler_reminder_outbound_text(
+                            job.chat_id,
+                            job.owner_user_id,
+                            owner_username.as_deref(),
+                            owner_preferred_name.as_deref(),
+                            &job.payload,
+                        )
+                    }
                     TelegramSchedulerTaskKind::Agent => {
                         let session_id = format!("tg:{}:scheduler:{}", job.chat_id, job.job_id);
                         let user_id = format!("scheduler:{}", job.owner_user_id);

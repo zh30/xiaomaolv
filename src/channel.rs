@@ -87,6 +87,8 @@ pub struct TelegramUser {
 pub struct TelegramReplyMessage {
     pub message_id: i64,
     pub from: Option<TelegramUser>,
+    pub text: Option<String>,
+    pub caption: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -923,6 +925,7 @@ struct GroupSignalInput {
     replied_to_bot: bool,
     recent_bot_participation: bool,
     alias_hit: bool,
+    vocative_alias_hit: bool,
     has_question_marker: bool,
     points_to_other_bot: bool,
     low_signal_noise: bool,

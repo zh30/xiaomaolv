@@ -145,8 +145,13 @@ pub(super) async fn process_telegram_update(
     }
 
     if meta.is_private_chat
-        && command_settings.scheduler.enabled
-        && command_settings.scheduler.nl_enabled
+        && should_send_initial_typing_before_scheduler_nl(&meta, &command_settings.scheduler)
+    {
+        send_initial_typing_hint(sender, &meta, "private_scheduler_nl");
+    }
+
+    if meta.is_private_chat
+        && should_send_initial_typing_before_scheduler_nl(&meta, &command_settings.scheduler)
         && maybe_handle_telegram_scheduler_natural_language(
             &ctx,
             sender,
@@ -183,6 +188,28 @@ pub(super) async fn process_telegram_update(
     } else {
         text.to_string()
     };
+
+    if meta.is_group && should_send_initial_typing_before_scheduler_nl(&meta, &command_settings.scheduler) {
+        send_initial_typing_hint(sender, &meta, "group_scheduler_nl");
+    }
+
+    if meta.is_group
+        && should_send_initial_typing_before_scheduler_nl(&meta, &command_settings.scheduler)
+        && maybe_handle_telegram_scheduler_natural_language(
+            &ctx,
+            sender,
+            &message,
+            text.trim(),
+            &command_settings.scheduler,
+        )
+        .await?
+    {
+        let mut state = group_runtime_state.lock().await;
+        state
+            .last_bot_response_unix_by_chat
+            .insert(meta.chat_id, current_unix_timestamp());
+        return Ok(());
+    }
 
     dispatch_telegram_reply(ReplyDispatchConfig {
         ctx: &ctx,
@@ -224,6 +251,40 @@ fn log_inbound_message(text: &str, meta: &TelegramInboundMeta, bot_user_id: Opti
         text_preview = %text_preview,
         "telegram inbound message"
     );
+}
+
+fn should_send_initial_typing_before_scheduler_nl(
+    meta: &TelegramInboundMeta,
+    scheduler_settings: &TelegramSchedulerSettings,
+) -> bool {
+    scheduler_settings.enabled
+        && scheduler_settings.nl_enabled
+        && (meta.is_group || meta.is_private_chat)
+}
+
+fn send_initial_typing_hint(
+    sender: &TelegramSender,
+    meta: &TelegramInboundMeta,
+    stage: &'static str,
+) {
+    let sender = sender.clone();
+    let chat_id = meta.chat_id;
+    let message_id = meta.message_id;
+    let message_thread_id = meta.message_thread_id;
+    tokio::spawn(async move {
+        if let Err(err) = sender
+            .send_chat_action_typing(chat_id, message_thread_id)
+            .await
+        {
+            warn!(
+                error = %err,
+                chat_id,
+                message_id,
+                stage,
+                "telegram initial typing hint failed"
+            );
+        }
+    });
 }
 
 async fn enforce_private_chat_access(
@@ -373,4 +434,66 @@ async fn dispatch_telegram_reply(config: ReplyDispatchConfig<'_>) -> anyhow::Res
     typing_task.abort();
     let _ = typing_task.await;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scheduler_settings(enabled: bool, nl_enabled: bool) -> TelegramSchedulerSettings {
+        TelegramSchedulerSettings {
+            enabled,
+            tick_secs: 2,
+            batch_size: 8,
+            lease_secs: 30,
+            default_timezone: "Asia/Shanghai".to_string(),
+            nl_enabled,
+            nl_min_confidence: 0.78,
+            require_confirm: true,
+            max_jobs_per_owner: 64,
+        }
+    }
+
+    fn inbound_meta(is_group: bool, is_private_chat: bool) -> TelegramInboundMeta {
+        TelegramInboundMeta {
+            chat_id: -100,
+            message_id: 1,
+            chat_kind: "group".to_string(),
+            message_thread_id: None,
+            reply_to_message_id: None,
+            replied_to_bot: false,
+            is_group,
+            is_private_chat,
+            from_id: Some(42),
+            from_is_bot: false,
+            mention_entity_count: 0,
+        }
+    }
+
+    #[test]
+    fn pretyping_is_enabled_for_group_scheduler_nl_flow() {
+        let meta = inbound_meta(true, false);
+        let settings = scheduler_settings(true, true);
+        assert!(should_send_initial_typing_before_scheduler_nl(
+            &meta, &settings
+        ));
+    }
+
+    #[test]
+    fn pretyping_is_disabled_when_scheduler_nl_is_off() {
+        let meta = inbound_meta(true, false);
+        let settings = scheduler_settings(true, false);
+        assert!(!should_send_initial_typing_before_scheduler_nl(
+            &meta, &settings
+        ));
+    }
+
+    #[test]
+    fn pretyping_is_enabled_for_private_scheduler_nl_flow() {
+        let meta = inbound_meta(false, true);
+        let settings = scheduler_settings(true, true);
+        assert!(should_send_initial_typing_before_scheduler_nl(
+            &meta, &settings
+        ));
+    }
 }

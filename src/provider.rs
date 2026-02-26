@@ -460,6 +460,14 @@ fn normalize_messages(messages: Vec<StoredMessage>) -> Vec<StoredMessage> {
 }
 
 fn build_compat_messages(messages: &[StoredMessage]) -> Vec<StoredMessage> {
+    let system_guidance = messages
+        .iter()
+        .filter(|msg| msg.role == MessageRole::System)
+        .map(|msg| msg.content.trim())
+        .filter(|content| !content.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
     let mut filtered = normalize_messages(
         messages
             .iter()
@@ -479,6 +487,24 @@ fn build_compat_messages(messages: &[StoredMessage]) -> Vec<StoredMessage> {
             .find(|msg| msg.role == MessageRole::User && !msg.content.trim().is_empty())
     {
         filtered.push(last_user.clone());
+    }
+
+    if !system_guidance.is_empty() {
+        let folded = format!("系统提示（兼容模式）:\n{system_guidance}");
+        if let Some(first_user) = filtered
+            .iter_mut()
+            .find(|msg| msg.role == MessageRole::User)
+        {
+            first_user.content = format!("{folded}\n\n{}", first_user.content);
+        } else {
+            filtered.insert(
+                0,
+                StoredMessage {
+                    role: MessageRole::User,
+                    content: folded,
+                },
+            );
+        }
     }
 
     filtered
@@ -658,6 +684,26 @@ mod tests {
         assert!(out.len() <= 16);
         assert!(out.iter().all(|m| m.role != MessageRole::System));
         assert!(out.iter().any(|m| m.content == "m23"));
+    }
+
+    #[test]
+    fn build_compat_messages_preserves_system_guidance_via_user_message() {
+        let messages = vec![
+            StoredMessage {
+                role: MessageRole::System,
+                content: "运行时当前时间: 2026-02-26".to_string(),
+            },
+            StoredMessage {
+                role: MessageRole::User,
+                content: "现在是哪一年？".to_string(),
+            },
+        ];
+
+        let out = build_compat_messages(&messages);
+        assert!(out.iter().all(|m| m.role != MessageRole::System));
+        assert!(out.iter().any(|m| {
+            m.role == MessageRole::User && m.content.contains("运行时当前时间: 2026-02-26")
+        }));
     }
 
     #[test]

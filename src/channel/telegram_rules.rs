@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use super::{
     GroupDecision, GroupDecisionKind, GroupSignalInput, TelegramGroupTriggerMode,
-    TelegramGroupUserProfile, TelegramReplyMessage, TelegramUser,
+    TelegramGroupUserProfile, TelegramReplyMessage, TelegramUser, truncate_chars,
 };
 
 pub(super) fn message_contains_any_alias(text: &str, aliases: &[String]) -> bool {
@@ -22,7 +22,13 @@ pub(super) fn message_contains_any_alias(text: &str, aliases: &[String]) -> bool
 }
 
 pub(super) fn message_has_question_marker(text: &str) -> bool {
-    text.contains('?') || text.contains('？')
+    if text.contains('?') || text.contains('？') {
+        return true;
+    }
+    let tail = text
+        .trim()
+        .trim_end_matches(|ch: char| "，,。.!！？?;；:：)）]】}>》\"'`~|/\\ ".contains(ch));
+    tail.ends_with('吗') || tail.ends_with('么')
 }
 
 pub(super) fn message_mentions_other_handle(text: &str, bot_username: &str) -> bool {
@@ -85,6 +91,10 @@ pub(super) fn evaluate_group_decision(
         score += 25;
         reasons.push("alias_hit");
     }
+    if input.vocative_alias_hit {
+        score += 75;
+        reasons.push("vocative_alias_hit");
+    }
     if input.has_question_marker {
         score += 20;
         reasons.push("question_marker");
@@ -107,7 +117,10 @@ pub(super) fn evaluate_group_decision(
     } else {
         GroupDecisionKind::Ignore
     };
-    if input.cooldown_active && matches!(kind, GroupDecisionKind::Respond) {
+    if input.cooldown_active
+        && matches!(kind, GroupDecisionKind::Respond)
+        && !input.vocative_alias_hit
+    {
         kind = GroupDecisionKind::ObserveOnly;
         reasons.push("cooldown_active");
     }
@@ -283,6 +296,7 @@ pub(super) fn extract_realtime_name_correction(text: &str) -> Option<String> {
 
 pub(super) fn build_group_member_identity_context(
     raw_text: &str,
+    reply_to_message: Option<&TelegramReplyMessage>,
     sender_user_id: i64,
     sender_profile: &TelegramGroupUserProfile,
     roster: &[(i64, TelegramGroupUserProfile)],
@@ -310,6 +324,30 @@ pub(super) fn build_group_member_identity_context(
     lines.push(
         "规则: 回复点名时，称呼必须和 uid 对应；若用户纠正称呼，立即使用最新称呼。".to_string(),
     );
+    if let Some(reply) = reply_to_message {
+        lines.push("[被回复消息]".to_string());
+        lines.push(format!("被回复消息ID: {}", reply.message_id));
+        if let Some(from) = reply.from.as_ref() {
+            if let Some(name) = derive_telegram_user_display_name(Some(from)) {
+                lines.push(format!("被回复消息发送者: {}", name));
+            } else {
+                lines.push(format!("被回复消息发送者uid: {}", from.id));
+            }
+        }
+        let quoted = reply
+            .text
+            .as_deref()
+            .or(reply.caption.as_deref())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|v| truncate_chars(v, 220));
+        if let Some(quoted) = quoted {
+            lines.push(format!("被回复消息内容: {}", quoted));
+        } else {
+            lines.push("被回复消息内容: <不可用>".to_string());
+        }
+        lines.push("[/被回复消息]".to_string());
+    }
     lines.push(format!("原始消息: {}", raw_text.trim()));
     lines.push("[/群成员身份映射]".to_string());
     lines.join("\n")
@@ -326,7 +364,6 @@ pub(super) fn extract_dynamic_alias_candidates(text: &str, bot_username: &str) -
     if own.is_empty() {
         return vec![];
     }
-    let own_handle = format!("@{own}");
     let tokens = text
         .split(|ch: char| ch.is_whitespace() || ",，:：;；.!?！？()[]{}<>\"'".contains(ch))
         .map(normalize_alias_token)
@@ -338,30 +375,170 @@ pub(super) fn extract_dynamic_alias_candidates(text: &str, bot_username: &str) -
 
     let mut out = Vec::new();
     for (idx, token) in tokens.iter().enumerate() {
-        if token != &own_handle {
+        if token != &own {
             continue;
         }
         if idx > 0 {
             let candidate = &tokens[idx - 1];
-            if is_dynamic_alias_candidate(candidate, &own) && !out.contains(candidate) {
-                out.push(candidate.clone());
+            if let Some(normalized) = normalize_dynamic_alias_candidate(candidate, &own)
+                && !out.contains(&normalized)
+            {
+                out.push(normalized);
             }
         }
         if idx + 1 < tokens.len() {
             let candidate = &tokens[idx + 1];
-            if is_dynamic_alias_candidate(candidate, &own) && !out.contains(candidate) {
-                out.push(candidate.clone());
+            if let Some(normalized) = normalize_dynamic_alias_candidate(candidate, &own)
+                && !out.contains(&normalized)
+            {
+                out.push(normalized);
             }
         }
     }
 
     if out.is_empty() {
         let first = &tokens[0];
-        if is_dynamic_alias_candidate(first, &own) {
-            out.push(first.clone());
+        if let Some(normalized) = normalize_dynamic_alias_candidate(first, &own) {
+            out.push(normalized);
         }
     }
     out
+}
+
+fn normalize_dynamic_alias_candidate(candidate: &str, bot_username: &str) -> Option<String> {
+    let normalized = normalize_alias_token(candidate);
+    if normalized.is_empty() {
+        return None;
+    }
+
+    if let Some(idx) = normalized.rfind("叫")
+        && idx + "叫".len() < normalized.len()
+    {
+        let tail = &normalized[idx + "叫".len()..];
+        if let Some(name) = extract_name_candidate_from_tail(tail)
+            && is_dynamic_alias_candidate(&name, bot_username)
+        {
+            return Some(name);
+        }
+    }
+
+    if is_dynamic_alias_candidate(&normalized, bot_username) {
+        return Some(normalized);
+    }
+    None
+}
+
+pub(super) fn extract_vocative_alias_candidate(text: &str, bot_username: &str) -> Option<String> {
+    let own = bot_username.trim().trim_start_matches('@').to_lowercase();
+    if own.is_empty() {
+        return None;
+    }
+    let compact = text.trim_start();
+    if compact.is_empty() {
+        return None;
+    }
+
+    let mut split: Option<(usize, char)> = None;
+    for (idx, ch) in compact.char_indices() {
+        if ch.is_whitespace()
+            || "，,。.!！？?;；:：()[]{}<>\"'`~|/\\-=".contains(ch)
+            || (idx > 0 && is_vocative_follow_char(ch))
+        {
+            split = Some((idx, ch));
+            break;
+        }
+    }
+    let (idx, sep) = split?;
+    if idx == 0 {
+        return None;
+    }
+    if !matches!(sep, '，' | ',' | '：' | ':' | '！' | '!' | '？' | '?')
+        && !is_vocative_follow_char(sep)
+    {
+        return None;
+    }
+
+    let candidate = normalize_alias_token(&compact[..idx]);
+    if candidate.is_empty() {
+        return None;
+    }
+    if normalize_display_name(&candidate).is_none() {
+        return None;
+    }
+    if !is_dynamic_alias_candidate(&candidate, &own) {
+        return None;
+    }
+    Some(candidate)
+}
+
+pub(super) fn detect_vocative_learned_alias_prefix(
+    text: &str,
+    aliases: &[String],
+) -> Option<String> {
+    if aliases.is_empty() {
+        return None;
+    }
+    let compact = text.trim_start();
+    if compact.is_empty() {
+        return None;
+    }
+    let compact_lowered = compact.to_lowercase();
+
+    let mut candidates = aliases
+        .iter()
+        .map(|v| v.trim().to_lowercase())
+        .filter(|v| !v.is_empty())
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|v| std::cmp::Reverse(v.chars().count()));
+
+    for alias in candidates {
+        if !compact_lowered.starts_with(&alias) {
+            continue;
+        }
+        let next = compact.chars().nth(alias.chars().count());
+        if next.is_none_or(|ch| {
+            ch.is_whitespace()
+                || "，,。.!！？?;；:：()[]{}<>\"'`~|/\\-=".contains(ch)
+                || is_vocative_follow_char(ch)
+        }) {
+            return Some(alias);
+        }
+    }
+    None
+}
+
+fn is_vocative_follow_char(ch: char) -> bool {
+    if ch.is_ascii_digit() {
+        return true;
+    }
+    matches!(
+        ch,
+        '你' | '您'
+            | '在'
+            | '来'
+            | '给'
+            | '帮'
+            | '说'
+            | '讲'
+            | '聊'
+            | '能'
+            | '可'
+            | '会'
+            | '要'
+            | '别'
+            | '快'
+            | '咋'
+            | '怎'
+            | '么'
+            | '吗'
+            | '呢'
+            | '呀'
+            | '啊'
+            | '哈'
+            | '吧'
+            | '啦'
+            | '喽'
+    )
 }
 
 pub(super) fn is_dynamic_alias_candidate(candidate: &str, bot_username: &str) -> bool {
@@ -380,7 +557,20 @@ pub(super) fn is_dynamic_alias_candidate(candidate: &str, bot_username: &str) ->
     }
     !matches!(
         candidate,
-        "hi" | "hello" | "hey" | "你好" | "您好" | "请问" | "请教" | "bot" | "机器人" | "助手"
+        "hi" | "hello"
+            | "hey"
+            | "你好"
+            | "您好"
+            | "请问"
+            | "请教"
+            | "bot"
+            | "机器人"
+            | "助手"
+            | "我擦"
+            | "卧槽"
+            | "我去"
+            | "wc"
+            | "woc"
     )
 }
 
