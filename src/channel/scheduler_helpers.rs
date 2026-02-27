@@ -587,7 +587,11 @@ fn extract_relative_reminder_payload(text: &str) -> Option<String> {
             continue;
         };
         let tail = text[start + marker.len()..].trim_matches(|c: char| {
-            c.is_whitespace() || matches!(c, ',' | '，' | '.' | '。' | '!' | '！' | '?' | '？' | ':' | '：' | ';' | '；')
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    ',' | '，' | '.' | '。' | '!' | '！' | '?' | '？' | ':' | '：' | ';' | '；'
+                )
         });
         if !tail.is_empty() {
             return Some(tail.to_string());

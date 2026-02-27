@@ -31,6 +31,15 @@ enabled = true
     assert_eq!(cfg.agent.skills_max_prompt_chars, 8000);
     assert_eq!(cfg.agent.skills_match_min_score, 0.45);
     assert!(!cfg.agent.skills_llm_rerank_enabled);
+    assert!(cfg.agent.swarm.enabled);
+    assert!(cfg.agent.swarm.auto_detect);
+    assert_eq!(cfg.agent.swarm.max_depth, 3);
+    assert_eq!(cfg.agent.swarm.max_agents, 16);
+    assert_eq!(cfg.agent.swarm.max_parallel, 4);
+    assert_eq!(cfg.agent.swarm.max_node_timeout_ms, 20_000);
+    assert_eq!(cfg.agent.swarm.max_run_timeout_ms, 90_000);
+    assert!(cfg.agent.swarm.reply_summary_enabled);
+    assert_eq!(cfg.agent.swarm.audit_retention_days, 30);
     assert!(!cfg.agent.code_mode.enabled);
     assert!(cfg.agent.code_mode.shadow_mode);
     assert_eq!(cfg.agent.code_mode.max_calls, 6);
@@ -393,6 +402,17 @@ skills_max_prompt_chars = 12000
 skills_match_min_score = 0.66
 skills_llm_rerank_enabled = true
 
+[agent.swarm]
+enabled = false
+auto_detect = false
+max_depth = 5
+max_agents = 32
+max_parallel = 8
+max_node_timeout_ms = 30000
+max_run_timeout_ms = 180000
+reply_summary_enabled = false
+audit_retention_days = 7
+
 [agent.code_mode]
 enabled = true
 shadow_mode = false
@@ -421,6 +441,15 @@ allow_env = false
     assert_eq!(cfg.agent.skills_max_prompt_chars, 12000);
     assert_eq!(cfg.agent.skills_match_min_score, 0.66);
     assert!(cfg.agent.skills_llm_rerank_enabled);
+    assert!(!cfg.agent.swarm.enabled);
+    assert!(!cfg.agent.swarm.auto_detect);
+    assert_eq!(cfg.agent.swarm.max_depth, 5);
+    assert_eq!(cfg.agent.swarm.max_agents, 32);
+    assert_eq!(cfg.agent.swarm.max_parallel, 8);
+    assert_eq!(cfg.agent.swarm.max_node_timeout_ms, 30_000);
+    assert_eq!(cfg.agent.swarm.max_run_timeout_ms, 180_000);
+    assert!(!cfg.agent.swarm.reply_summary_enabled);
+    assert_eq!(cfg.agent.swarm.audit_retention_days, 7);
     assert!(cfg.agent.code_mode.enabled);
     assert!(!cfg.agent.code_mode.shadow_mode);
     assert_eq!(cfg.agent.code_mode.max_calls, 10);

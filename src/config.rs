@@ -290,7 +290,47 @@ pub struct AgentConfig {
     #[serde(default = "default_agent_skills_llm_rerank_enabled")]
     pub skills_llm_rerank_enabled: bool,
     #[serde(default)]
+    pub swarm: AgentSwarmConfig,
+    #[serde(default)]
     pub code_mode: AgentCodeModeSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSwarmConfig {
+    #[serde(default = "default_agent_swarm_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_agent_swarm_auto_detect")]
+    pub auto_detect: bool,
+    #[serde(default = "default_agent_swarm_max_depth")]
+    pub max_depth: usize,
+    #[serde(default = "default_agent_swarm_max_agents")]
+    pub max_agents: usize,
+    #[serde(default = "default_agent_swarm_max_parallel")]
+    pub max_parallel: usize,
+    #[serde(default = "default_agent_swarm_max_node_timeout_ms")]
+    pub max_node_timeout_ms: u64,
+    #[serde(default = "default_agent_swarm_max_run_timeout_ms")]
+    pub max_run_timeout_ms: u64,
+    #[serde(default = "default_agent_swarm_reply_summary_enabled")]
+    pub reply_summary_enabled: bool,
+    #[serde(default = "default_agent_swarm_audit_retention_days")]
+    pub audit_retention_days: u32,
+}
+
+impl Default for AgentSwarmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_agent_swarm_enabled(),
+            auto_detect: default_agent_swarm_auto_detect(),
+            max_depth: default_agent_swarm_max_depth(),
+            max_agents: default_agent_swarm_max_agents(),
+            max_parallel: default_agent_swarm_max_parallel(),
+            max_node_timeout_ms: default_agent_swarm_max_node_timeout_ms(),
+            max_run_timeout_ms: default_agent_swarm_max_run_timeout_ms(),
+            reply_summary_enabled: default_agent_swarm_reply_summary_enabled(),
+            audit_retention_days: default_agent_swarm_audit_retention_days(),
+        }
+    }
 }
 
 impl Default for AgentConfig {
@@ -304,6 +344,7 @@ impl Default for AgentConfig {
             skills_max_prompt_chars: default_agent_skills_max_prompt_chars(),
             skills_match_min_score: default_agent_skills_match_min_score(),
             skills_llm_rerank_enabled: default_agent_skills_llm_rerank_enabled(),
+            swarm: AgentSwarmConfig::default(),
             code_mode: AgentCodeModeSettings::default(),
         }
     }
@@ -566,6 +607,42 @@ fn default_agent_skills_match_min_score() -> f32 {
 
 fn default_agent_skills_llm_rerank_enabled() -> bool {
     false
+}
+
+fn default_agent_swarm_enabled() -> bool {
+    true
+}
+
+fn default_agent_swarm_auto_detect() -> bool {
+    true
+}
+
+fn default_agent_swarm_max_depth() -> usize {
+    3
+}
+
+fn default_agent_swarm_max_agents() -> usize {
+    16
+}
+
+fn default_agent_swarm_max_parallel() -> usize {
+    4
+}
+
+fn default_agent_swarm_max_node_timeout_ms() -> u64 {
+    20_000
+}
+
+fn default_agent_swarm_max_run_timeout_ms() -> u64 {
+    90_000
+}
+
+fn default_agent_swarm_reply_summary_enabled() -> bool {
+    true
+}
+
+fn default_agent_swarm_audit_retention_days() -> u32 {
+    30
 }
 
 fn resolve_env_placeholder(value: &str) -> String {

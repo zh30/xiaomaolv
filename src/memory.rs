@@ -210,6 +210,82 @@ impl SqliteMemoryStore {
         .await
         .context("failed to initialize telegram_scheduler_pending_intents owner index")?;
 
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS agent_swarm_runs (
+                run_id TEXT PRIMARY KEY,
+                channel TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                root_task TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at_unix INTEGER NOT NULL,
+                finished_at_unix INTEGER,
+                error TEXT,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize agent_swarm_runs table")?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_agent_swarm_runs_channel_user_started
+             ON agent_swarm_runs(channel, user_id, started_at_unix DESC);",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize agent_swarm_runs user index")?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_agent_swarm_runs_channel_started
+             ON agent_swarm_runs(channel, started_at_unix DESC);",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize agent_swarm_runs started index")?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS agent_swarm_nodes (
+                agent_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                parent_agent_id TEXT,
+                depth INTEGER NOT NULL,
+                nickname TEXT NOT NULL,
+                role_name TEXT NOT NULL,
+                role_definition TEXT NOT NULL,
+                task TEXT NOT NULL,
+                state TEXT NOT NULL,
+                exit_status TEXT,
+                summary TEXT,
+                error TEXT,
+                started_at_unix INTEGER NOT NULL,
+                finished_at_unix INTEGER,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize agent_swarm_nodes table")?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_agent_swarm_nodes_channel_run
+             ON agent_swarm_nodes(channel, run_id, depth, started_at_unix);",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize agent_swarm_nodes run index")?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_agent_swarm_nodes_channel_started
+             ON agent_swarm_nodes(channel, started_at_unix);",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize agent_swarm_nodes started index")?;
+
         Ok(Self { pool })
     }
 
@@ -878,6 +954,210 @@ impl SqliteMemoryStore {
 
         Ok(deleted.rows_affected() > 0)
     }
+
+    pub async fn create_agent_swarm_run(
+        &self,
+        req: CreateAgentSwarmRunRequest,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO agent_swarm_runs
+             (run_id, channel, session_id, user_id, root_task, status, started_at_unix, finished_at_unix, error, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, unixepoch(), unixepoch())",
+        )
+        .bind(req.run_id)
+        .bind(req.channel)
+        .bind(req.session_id)
+        .bind(req.user_id)
+        .bind(req.root_task)
+        .bind(req.status.as_str())
+        .bind(req.started_at_unix)
+        .execute(&self.pool)
+        .await
+        .context("failed to create agent swarm run")?;
+        Ok(())
+    }
+
+    pub async fn finish_agent_swarm_run(
+        &self,
+        req: FinishAgentSwarmRunRequest,
+    ) -> anyhow::Result<bool> {
+        let updated = sqlx::query(
+            "UPDATE agent_swarm_runs
+             SET status = ?1,
+                 finished_at_unix = ?2,
+                 error = ?3,
+                 updated_at = unixepoch()
+             WHERE channel = ?4 AND run_id = ?5",
+        )
+        .bind(req.status.as_str())
+        .bind(req.finished_at_unix)
+        .bind(req.error)
+        .bind(req.channel)
+        .bind(req.run_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to finish agent swarm run")?;
+        Ok(updated.rows_affected() > 0)
+    }
+
+    pub async fn upsert_agent_swarm_node(
+        &self,
+        req: UpsertAgentSwarmNodeRequest,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO agent_swarm_nodes
+             (agent_id, run_id, channel, parent_agent_id, depth, nickname, role_name, role_definition,
+              task, state, exit_status, summary, error, started_at_unix, finished_at_unix, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, unixepoch(), unixepoch())
+             ON CONFLICT(agent_id) DO UPDATE SET
+               run_id=excluded.run_id,
+               channel=excluded.channel,
+               parent_agent_id=excluded.parent_agent_id,
+               depth=excluded.depth,
+               nickname=excluded.nickname,
+               role_name=excluded.role_name,
+               role_definition=excluded.role_definition,
+               task=excluded.task,
+               state=excluded.state,
+               exit_status=excluded.exit_status,
+               summary=excluded.summary,
+               error=excluded.error,
+               started_at_unix=excluded.started_at_unix,
+               finished_at_unix=excluded.finished_at_unix,
+               updated_at=unixepoch()",
+        )
+        .bind(req.agent_id)
+        .bind(req.run_id)
+        .bind(req.channel)
+        .bind(req.parent_agent_id)
+        .bind(req.depth as i64)
+        .bind(req.nickname)
+        .bind(req.role_name)
+        .bind(req.role_definition)
+        .bind(req.task)
+        .bind(req.state.as_str())
+        .bind(req.exit_status.map(|v| v.as_str().to_string()))
+        .bind(req.summary)
+        .bind(req.error)
+        .bind(req.started_at_unix)
+        .bind(req.finished_at_unix)
+        .execute(&self.pool)
+        .await
+        .context("failed to upsert agent swarm node")?;
+        Ok(())
+    }
+
+    pub async fn list_agent_swarm_runs(
+        &self,
+        channel: &str,
+        user_id: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<AgentSwarmRunRecord>> {
+        let rows = sqlx::query(
+            "SELECT r.run_id, r.channel, r.session_id, r.user_id, r.root_task, r.status,
+                    r.started_at_unix, r.finished_at_unix, r.error, r.created_at, r.updated_at,
+                    (SELECT COUNT(*)
+                       FROM agent_swarm_nodes n
+                      WHERE n.channel = r.channel AND n.run_id = r.run_id) AS agent_count
+             FROM agent_swarm_runs r
+             WHERE r.channel = ?1
+               AND (?2 IS NULL OR r.user_id = ?2)
+             ORDER BY r.started_at_unix DESC
+             LIMIT ?3",
+        )
+        .bind(channel)
+        .bind(user_id)
+        .bind(limit.max(1) as i64)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list agent swarm runs")?;
+
+        rows.into_iter().map(agent_swarm_run_from_row).collect()
+    }
+
+    pub async fn load_agent_swarm_nodes_by_run(
+        &self,
+        channel: &str,
+        run_id: &str,
+    ) -> anyhow::Result<Vec<AgentSwarmNodeRecord>> {
+        let rows = sqlx::query(
+            "SELECT agent_id, run_id, channel, parent_agent_id, depth, nickname, role_name, role_definition,
+                    task, state, exit_status, summary, error, started_at_unix, finished_at_unix, created_at, updated_at
+             FROM agent_swarm_nodes
+             WHERE channel = ?1 AND run_id = ?2
+             ORDER BY depth ASC, started_at_unix ASC, agent_id ASC",
+        )
+        .bind(channel)
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to load agent swarm nodes by run")?;
+
+        rows.into_iter().map(agent_swarm_node_from_row).collect()
+    }
+
+    pub async fn load_agent_swarm_node(
+        &self,
+        channel: &str,
+        agent_id: &str,
+    ) -> anyhow::Result<Option<AgentSwarmNodeRecord>> {
+        let row = sqlx::query(
+            "SELECT agent_id, run_id, channel, parent_agent_id, depth, nickname, role_name, role_definition,
+                    task, state, exit_status, summary, error, started_at_unix, finished_at_unix, created_at, updated_at
+             FROM agent_swarm_nodes
+             WHERE channel = ?1 AND agent_id = ?2
+             LIMIT 1",
+        )
+        .bind(channel)
+        .bind(agent_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load agent swarm node")?;
+
+        row.map(agent_swarm_node_from_row).transpose()
+    }
+
+    pub async fn cleanup_agent_swarm_audit(
+        &self,
+        channel: &str,
+        before_unix: i64,
+    ) -> anyhow::Result<i64> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to begin agent swarm cleanup tx")?;
+
+        sqlx::query(
+            "DELETE FROM agent_swarm_nodes
+             WHERE channel = ?1
+               AND run_id IN (
+                   SELECT run_id
+                   FROM agent_swarm_runs
+                   WHERE channel = ?1 AND started_at_unix < ?2
+               )",
+        )
+        .bind(channel)
+        .bind(before_unix)
+        .execute(&mut *tx)
+        .await
+        .context("failed to delete agent swarm nodes in cleanup")?;
+
+        let deleted = sqlx::query(
+            "DELETE FROM agent_swarm_runs
+             WHERE channel = ?1 AND started_at_unix < ?2",
+        )
+        .bind(channel)
+        .bind(before_unix)
+        .execute(&mut *tx)
+        .await
+        .context("failed to delete agent swarm runs in cleanup")?;
+
+        tx.commit()
+            .await
+            .context("failed to commit agent swarm cleanup tx")?;
+        Ok(deleted.rows_affected() as i64)
+    }
 }
 
 async fn maybe_add_scheduler_jobs_column(
@@ -1184,6 +1464,188 @@ pub struct UpsertTelegramSchedulerPendingIntentRequest {
     pub expires_at_unix: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentSwarmRunStatus {
+    Running,
+    Completed,
+    Partial,
+    Failed,
+}
+
+impl AgentSwarmRunStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Partial => "partial",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn from_db(value: &str) -> Self {
+        match value {
+            "completed" => Self::Completed,
+            "partial" => Self::Partial,
+            "failed" => Self::Failed,
+            _ => Self::Running,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentSwarmNodeState {
+    Running,
+    Exited,
+}
+
+impl AgentSwarmNodeState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Exited => "exited",
+        }
+    }
+
+    fn from_db(value: &str) -> Self {
+        match value {
+            "exited" => Self::Exited,
+            _ => Self::Running,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentSwarmNodeExitStatus {
+    Success,
+    Failed,
+    Timeout,
+    Partial,
+    Skipped,
+}
+
+impl AgentSwarmNodeExitStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failed => "failed",
+            Self::Timeout => "timeout",
+            Self::Partial => "partial",
+            Self::Skipped => "skipped",
+        }
+    }
+
+    fn from_db(value: &str) -> Self {
+        match value {
+            "failed" => Self::Failed,
+            "timeout" => Self::Timeout,
+            "partial" => Self::Partial,
+            "skipped" => Self::Skipped,
+            _ => Self::Success,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSwarmRunRecord {
+    pub run_id: String,
+    pub channel: String,
+    pub session_id: String,
+    pub user_id: String,
+    pub root_task: String,
+    pub status: AgentSwarmRunStatus,
+    pub started_at_unix: i64,
+    pub finished_at_unix: Option<i64>,
+    pub error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub agent_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSwarmNodeRecord {
+    pub agent_id: String,
+    pub run_id: String,
+    pub channel: String,
+    pub parent_agent_id: Option<String>,
+    pub depth: usize,
+    pub nickname: String,
+    pub role_name: String,
+    pub role_definition: String,
+    pub task: String,
+    pub state: AgentSwarmNodeState,
+    pub exit_status: Option<AgentSwarmNodeExitStatus>,
+    pub summary: Option<String>,
+    pub error: Option<String>,
+    pub started_at_unix: i64,
+    pub finished_at_unix: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateAgentSwarmRunRequest {
+    pub run_id: String,
+    pub channel: String,
+    pub session_id: String,
+    pub user_id: String,
+    pub root_task: String,
+    pub status: AgentSwarmRunStatus,
+    pub started_at_unix: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct FinishAgentSwarmRunRequest {
+    pub channel: String,
+    pub run_id: String,
+    pub status: AgentSwarmRunStatus,
+    pub finished_at_unix: i64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertAgentSwarmNodeRequest {
+    pub agent_id: String,
+    pub run_id: String,
+    pub channel: String,
+    pub parent_agent_id: Option<String>,
+    pub depth: usize,
+    pub nickname: String,
+    pub role_name: String,
+    pub role_definition: String,
+    pub task: String,
+    pub state: AgentSwarmNodeState,
+    pub exit_status: Option<AgentSwarmNodeExitStatus>,
+    pub summary: Option<String>,
+    pub error: Option<String>,
+    pub started_at_unix: i64,
+    pub finished_at_unix: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentSwarmRunListRequest {
+    pub channel: String,
+    pub user_id: Option<String>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentSwarmTreeRequest {
+    pub channel: String,
+    pub run_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentSwarmNodeLoadRequest {
+    pub channel: String,
+    pub agent_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentSwarmCleanupRequest {
+    pub channel: String,
+    pub before_unix: i64,
+}
+
 fn telegram_scheduler_job_from_row(
     row: sqlx::sqlite::SqliteRow,
 ) -> anyhow::Result<TelegramSchedulerJobRecord> {
@@ -1212,6 +1674,50 @@ fn telegram_scheduler_job_from_row(
         max_runs: row.get("max_runs"),
         lease_token: row.get("lease_token"),
         lease_until_unix: row.get("lease_until_unix"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn agent_swarm_run_from_row(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<AgentSwarmRunRecord> {
+    let status: String = row.get("status");
+    Ok(AgentSwarmRunRecord {
+        run_id: row.get("run_id"),
+        channel: row.get("channel"),
+        session_id: row.get("session_id"),
+        user_id: row.get("user_id"),
+        root_task: row.get("root_task"),
+        status: AgentSwarmRunStatus::from_db(&status),
+        started_at_unix: row.get("started_at_unix"),
+        finished_at_unix: row.get("finished_at_unix"),
+        error: row.get("error"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+        agent_count: row.get::<Option<i64>, _>("agent_count").unwrap_or(0),
+    })
+}
+
+fn agent_swarm_node_from_row(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<AgentSwarmNodeRecord> {
+    let state: String = row.get("state");
+    let exit_status = row
+        .get::<Option<String>, _>("exit_status")
+        .map(|v| AgentSwarmNodeExitStatus::from_db(&v));
+    Ok(AgentSwarmNodeRecord {
+        agent_id: row.get("agent_id"),
+        run_id: row.get("run_id"),
+        channel: row.get("channel"),
+        parent_agent_id: row.get("parent_agent_id"),
+        depth: (row.get::<i64, _>("depth")).max(0) as usize,
+        nickname: row.get("nickname"),
+        role_name: row.get("role_name"),
+        role_definition: row.get("role_definition"),
+        task: row.get("task"),
+        state: AgentSwarmNodeState::from_db(&state),
+        exit_status,
+        summary: row.get("summary"),
+        error: row.get("error"),
+        started_at_unix: row.get("started_at_unix"),
+        finished_at_unix: row.get("finished_at_unix"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     })
@@ -1310,6 +1816,45 @@ pub trait MemoryBackend: Send + Sync {
         _owner_user_id: i64,
     ) -> anyhow::Result<bool> {
         Ok(false)
+    }
+    async fn create_agent_swarm_run(&self, _req: CreateAgentSwarmRunRequest) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn finish_agent_swarm_run(
+        &self,
+        _req: FinishAgentSwarmRunRequest,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+    async fn upsert_agent_swarm_node(
+        &self,
+        _req: UpsertAgentSwarmNodeRequest,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn list_agent_swarm_runs(
+        &self,
+        _req: AgentSwarmRunListRequest,
+    ) -> anyhow::Result<Vec<AgentSwarmRunRecord>> {
+        Ok(vec![])
+    }
+    async fn load_agent_swarm_tree(
+        &self,
+        _req: AgentSwarmTreeRequest,
+    ) -> anyhow::Result<Vec<AgentSwarmNodeRecord>> {
+        Ok(vec![])
+    }
+    async fn load_agent_swarm_node(
+        &self,
+        _req: AgentSwarmNodeLoadRequest,
+    ) -> anyhow::Result<Option<AgentSwarmNodeRecord>> {
+        Ok(None)
+    }
+    async fn cleanup_agent_swarm_audit(
+        &self,
+        _req: AgentSwarmCleanupRequest,
+    ) -> anyhow::Result<i64> {
+        Ok(0)
     }
 }
 
@@ -1532,6 +2077,60 @@ impl MemoryBackend for SqliteMemoryBackend {
     ) -> anyhow::Result<bool> {
         self.store
             .delete_telegram_scheduler_pending_intent(&channel, chat_id, owner_user_id)
+            .await
+    }
+
+    async fn create_agent_swarm_run(&self, req: CreateAgentSwarmRunRequest) -> anyhow::Result<()> {
+        self.store.create_agent_swarm_run(req).await
+    }
+
+    async fn finish_agent_swarm_run(
+        &self,
+        req: FinishAgentSwarmRunRequest,
+    ) -> anyhow::Result<bool> {
+        self.store.finish_agent_swarm_run(req).await
+    }
+
+    async fn upsert_agent_swarm_node(
+        &self,
+        req: UpsertAgentSwarmNodeRequest,
+    ) -> anyhow::Result<()> {
+        self.store.upsert_agent_swarm_node(req).await
+    }
+
+    async fn list_agent_swarm_runs(
+        &self,
+        req: AgentSwarmRunListRequest,
+    ) -> anyhow::Result<Vec<AgentSwarmRunRecord>> {
+        self.store
+            .list_agent_swarm_runs(&req.channel, req.user_id.as_deref(), req.limit)
+            .await
+    }
+
+    async fn load_agent_swarm_tree(
+        &self,
+        req: AgentSwarmTreeRequest,
+    ) -> anyhow::Result<Vec<AgentSwarmNodeRecord>> {
+        self.store
+            .load_agent_swarm_nodes_by_run(&req.channel, &req.run_id)
+            .await
+    }
+
+    async fn load_agent_swarm_node(
+        &self,
+        req: AgentSwarmNodeLoadRequest,
+    ) -> anyhow::Result<Option<AgentSwarmNodeRecord>> {
+        self.store
+            .load_agent_swarm_node(&req.channel, &req.agent_id)
+            .await
+    }
+
+    async fn cleanup_agent_swarm_audit(
+        &self,
+        req: AgentSwarmCleanupRequest,
+    ) -> anyhow::Result<i64> {
+        self.store
+            .cleanup_agent_swarm_audit(&req.channel, req.before_unix)
             .await
     }
 }
@@ -1952,6 +2551,60 @@ impl MemoryBackend for HybridSqliteZvecMemoryBackend {
     ) -> anyhow::Result<bool> {
         self.store
             .delete_telegram_scheduler_pending_intent(&channel, chat_id, owner_user_id)
+            .await
+    }
+
+    async fn create_agent_swarm_run(&self, req: CreateAgentSwarmRunRequest) -> anyhow::Result<()> {
+        self.store.create_agent_swarm_run(req).await
+    }
+
+    async fn finish_agent_swarm_run(
+        &self,
+        req: FinishAgentSwarmRunRequest,
+    ) -> anyhow::Result<bool> {
+        self.store.finish_agent_swarm_run(req).await
+    }
+
+    async fn upsert_agent_swarm_node(
+        &self,
+        req: UpsertAgentSwarmNodeRequest,
+    ) -> anyhow::Result<()> {
+        self.store.upsert_agent_swarm_node(req).await
+    }
+
+    async fn list_agent_swarm_runs(
+        &self,
+        req: AgentSwarmRunListRequest,
+    ) -> anyhow::Result<Vec<AgentSwarmRunRecord>> {
+        self.store
+            .list_agent_swarm_runs(&req.channel, req.user_id.as_deref(), req.limit)
+            .await
+    }
+
+    async fn load_agent_swarm_tree(
+        &self,
+        req: AgentSwarmTreeRequest,
+    ) -> anyhow::Result<Vec<AgentSwarmNodeRecord>> {
+        self.store
+            .load_agent_swarm_nodes_by_run(&req.channel, &req.run_id)
+            .await
+    }
+
+    async fn load_agent_swarm_node(
+        &self,
+        req: AgentSwarmNodeLoadRequest,
+    ) -> anyhow::Result<Option<AgentSwarmNodeRecord>> {
+        self.store
+            .load_agent_swarm_node(&req.channel, &req.agent_id)
+            .await
+    }
+
+    async fn cleanup_agent_swarm_audit(
+        &self,
+        req: AgentSwarmCleanupRequest,
+    ) -> anyhow::Result<i64> {
+        self.store
+            .cleanup_agent_swarm_audit(&req.channel, req.before_unix)
             .await
     }
 }

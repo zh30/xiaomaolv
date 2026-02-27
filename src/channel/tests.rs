@@ -8,10 +8,10 @@ use super::{
     detect_vocative_learned_alias_prefix, evaluate_group_decision, evaluate_mcp_command_access,
     evaluate_private_chat_access, extract_dynamic_alias_candidates,
     extract_realtime_name_correction, extract_scheduler_job_id, extract_vocative_alias_candidate,
-    is_reply_to_bot_message, looks_like_scheduler_list_text, message_mentions_bot,
-    parse_admin_user_ids, parse_telegram_slash_command, render_telegram_text_parts,
-    scheduler_confirm_inline_keyboard, short_description_payload, telegram_help_text,
-    telegram_registered_commands,
+    format_agent_swarm_node_detail_text, format_agent_swarm_tree_text, is_reply_to_bot_message,
+    looks_like_scheduler_list_text, message_mentions_bot, parse_admin_user_ids,
+    parse_telegram_slash_command, render_telegram_text_parts, scheduler_confirm_inline_keyboard,
+    short_description_payload, telegram_help_text, telegram_registered_commands,
     telegram_scheduler_requires_confirm, telegram_session_id, text_implies_latest_target,
     truncate_chars, try_build_relative_reminder_draft_from_text, typing_action_payload,
 };
@@ -508,13 +508,109 @@ fn parse_slash_command_supports_skill_alias() {
 }
 
 #[test]
-fn telegram_help_and_registered_commands_include_task_and_skills() {
+fn parse_slash_command_supports_agents_alias() {
+    let parsed = parse_telegram_slash_command("/agent ls --limit 5", Some("xiaomaolv_bot"));
+    assert_eq!(
+        parsed,
+        Some(TelegramSlashCommand::Agents {
+            tail: "ls --limit 5".to_string()
+        })
+    );
+}
+
+#[test]
+fn telegram_help_and_registered_commands_include_task_skills_agents() {
     let help = telegram_help_text();
     assert!(help.contains("/task"));
     assert!(help.contains("/skills"));
+    assert!(help.contains("/agents"));
     let commands = telegram_registered_commands();
     assert!(commands.iter().any(|(name, _)| *name == "task"));
     assert!(commands.iter().any(|(name, _)| *name == "skills"));
+    assert!(commands.iter().any(|(name, _)| *name == "agents"));
+}
+
+#[test]
+fn agents_tree_formatter_includes_exited_subagents() {
+    use crate::memory::{AgentSwarmNodeExitStatus, AgentSwarmNodeRecord, AgentSwarmNodeState};
+
+    let nodes = vec![
+        AgentSwarmNodeRecord {
+            agent_id: "run-1:1".to_string(),
+            run_id: "run-1".to_string(),
+            channel: "telegram".to_string(),
+            parent_agent_id: None,
+            depth: 0,
+            nickname: "Orchestrator".to_string(),
+            role_name: "orchestrator".to_string(),
+            role_definition: "负责分解和汇总".to_string(),
+            task: "主任务".to_string(),
+            state: AgentSwarmNodeState::Exited,
+            exit_status: Some(AgentSwarmNodeExitStatus::Success),
+            summary: Some("完成".to_string()),
+            error: None,
+            started_at_unix: 1,
+            finished_at_unix: Some(2),
+            created_at: 1,
+            updated_at: 2,
+        },
+        AgentSwarmNodeRecord {
+            agent_id: "run-1:2".to_string(),
+            run_id: "run-1".to_string(),
+            channel: "telegram".to_string(),
+            parent_agent_id: Some("run-1:1".to_string()),
+            depth: 1,
+            nickname: "FE-2".to_string(),
+            role_name: "frontend".to_string(),
+            role_definition: "前端实现".to_string(),
+            task: "实现页面".to_string(),
+            state: AgentSwarmNodeState::Exited,
+            exit_status: Some(AgentSwarmNodeExitStatus::Skipped),
+            summary: Some("跳过".to_string()),
+            error: None,
+            started_at_unix: 1,
+            finished_at_unix: Some(1),
+            created_at: 1,
+            updated_at: 1,
+        },
+    ];
+
+    let text = format_agent_swarm_tree_text("run-1", &nodes);
+    assert!(text.contains("Agent 树: run-1"));
+    assert!(text.contains("Orchestrator (orchestrator) state=exited exit=success"));
+    assert!(text.contains("FE-2 (frontend) state=exited exit=skipped"));
+}
+
+#[test]
+fn agents_show_formatter_includes_role_nickname_exit_and_error() {
+    use crate::memory::{AgentSwarmNodeExitStatus, AgentSwarmNodeRecord, AgentSwarmNodeState};
+
+    let node = AgentSwarmNodeRecord {
+        agent_id: "run-2:3".to_string(),
+        run_id: "run-2".to_string(),
+        channel: "telegram".to_string(),
+        parent_agent_id: Some("run-2:1".to_string()),
+        depth: 2,
+        nickname: "BE-3".to_string(),
+        role_name: "backend".to_string(),
+        role_definition: "后端实现".to_string(),
+        task: "实现接口".to_string(),
+        state: AgentSwarmNodeState::Exited,
+        exit_status: Some(AgentSwarmNodeExitStatus::Failed),
+        summary: Some("接口测试失败".to_string()),
+        error: Some("DB timeout".to_string()),
+        started_at_unix: 10,
+        finished_at_unix: Some(12),
+        created_at: 10,
+        updated_at: 12,
+    };
+
+    let text = format_agent_swarm_node_detail_text(&node);
+    assert!(text.contains("agent_id: run-2:3"));
+    assert!(text.contains("nickname: BE-3"));
+    assert!(text.contains("role: backend (后端实现)"));
+    assert!(text.contains("exit: failed"));
+    assert!(text.contains("error: DB timeout"));
 }
 
 #[test]

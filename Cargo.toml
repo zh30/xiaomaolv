@@ -1,6 +1,6 @@
 [package]
 name = "xiaomaolv"
-version = "0.2.2"
+version = "0.3.1"
 edition = "2024"
 
 [lib]
@@ -20,6 +20,7 @@ chrono-tz = "0.10"
 clap = { version = "4.5", features = ["derive"] }
 cron = "0.15"
 dirs = "6"
+futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = [
   "json",
   "rustls-tls",

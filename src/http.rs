@@ -27,7 +27,9 @@ use crate::memory::{
     SqliteMemoryStore, ZvecSidecarClient, ZvecSidecarConfig,
 };
 use crate::provider::{ChatProvider, ProviderRegistry};
-use crate::service::{AgentMcpSettings, AgentSkillsSettings, CodeModeDiagnostics, MessageService};
+use crate::service::{
+    AgentMcpSettings, AgentSkillsSettings, AgentSwarmSettings, CodeModeDiagnostics, MessageService,
+};
 use crate::skills::{SkillConfigPaths, SkillRegistry, SkillRuntime};
 
 const CODE_MODE_DIAG_OVERFLOW_SOURCE_KEY: &str = "__overflow__";
@@ -505,7 +507,18 @@ async fn build_runtime_handles(
                 match_min_score: config.agent.skills_match_min_score,
                 llm_rerank_enabled: config.agent.skills_llm_rerank_enabled,
             },
-        ),
+        )
+        .with_agent_swarm(AgentSwarmSettings {
+            enabled: config.agent.swarm.enabled,
+            auto_detect: config.agent.swarm.auto_detect,
+            max_depth: config.agent.swarm.max_depth,
+            max_agents: config.agent.swarm.max_agents,
+            max_parallel: config.agent.swarm.max_parallel,
+            max_node_timeout_ms: config.agent.swarm.max_node_timeout_ms,
+            max_run_timeout_ms: config.agent.swarm.max_run_timeout_ms,
+            reply_summary_enabled: config.agent.swarm.reply_summary_enabled,
+            audit_retention_days: config.agent.swarm.audit_retention_days,
+        }),
     );
 
     let channel_plugins = load_channel_plugins(config, channel_registry)?;

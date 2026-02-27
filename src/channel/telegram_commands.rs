@@ -7,6 +7,7 @@ pub(super) enum TelegramSlashCommand {
     WhoAmI,
     Mcp { tail: String },
     Skills { tail: String },
+    Agents { tail: String },
     Task { tail: String },
     Unknown { name: String },
 }
@@ -263,6 +264,18 @@ pub(super) async fn maybe_handle_telegram_command(
         }
         TelegramSlashCommand::Task { tail } => {
             handle_telegram_task_command(
+                ctx,
+                sender,
+                message,
+                tail.as_str(),
+                is_private_chat,
+                command_settings,
+            )
+            .await?;
+            Ok(true)
+        }
+        TelegramSlashCommand::Agents { tail } => {
+            handle_telegram_agents_command(
                 ctx,
                 sender,
                 message,
@@ -566,6 +579,207 @@ pub(super) async fn handle_telegram_task_command(
                 &format!(
                     "未知 task 子命令: {action}\n\n{}",
                     telegram_task_help_text(&command_settings.scheduler.default_timezone)
+                ),
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+pub(super) async fn handle_telegram_agents_command(
+    ctx: &ChannelContext,
+    sender: &TelegramSender,
+    message: &TelegramMessage,
+    tail: &str,
+    is_private_chat: bool,
+    command_settings: &TelegramCommandSettings,
+) -> anyhow::Result<()> {
+    if !is_private_chat {
+        send_telegram_command_reply(sender, message, "请私聊使用 /agents 命令。").await?;
+        return Ok(());
+    }
+
+    match evaluate_private_chat_access(
+        message.from.as_ref().map(|u| u.id),
+        &command_settings.admin_user_ids,
+    ) {
+        PrivateChatAccess::Allowed => {}
+        PrivateChatAccess::MissingAdminAllowlist => {
+            send_telegram_command_reply(
+                sender,
+                message,
+                &format!(
+                    "管理员白名单未配置，/agents 不可用。\n{}\n\n请在 .env.realtest 中配置 TELEGRAM_ADMIN_USER_IDS。",
+                    telegram_whoami_hint(message)
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+        PrivateChatAccess::Unauthorized => {
+            send_telegram_command_reply(
+                sender,
+                message,
+                &format!(
+                    "无权限使用 /agents。\n{}\n\n如需开通，请让管理员把你的 ID 加入 TELEGRAM_ADMIN_USER_IDS。",
+                    telegram_whoami_hint(message)
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
+    let owner_user_id = message
+        .from
+        .as_ref()
+        .map(|u| u.id)
+        .unwrap_or(message.chat.id);
+    let owner_user_id_text = owner_user_id.to_string();
+
+    let parsed_tail = if tail.trim().is_empty() {
+        vec!["ls".to_string()]
+    } else {
+        shlex::split(tail)
+            .ok_or_else(|| anyhow::anyhow!("命令参数错误: 引号未闭合"))?
+            .into_iter()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .collect::<Vec<_>>()
+    };
+    if parsed_tail.is_empty() {
+        send_telegram_command_reply(sender, message, &telegram_agents_help_text()).await?;
+        return Ok(());
+    }
+
+    let (action, args): (&str, &[String]) = if parsed_tail[0].starts_with('-') {
+        ("ls", parsed_tail.as_slice())
+    } else {
+        (parsed_tail[0].as_str(), &parsed_tail[1..])
+    };
+
+    match action {
+        "ls" | "list" => {
+            let mut limit: usize = 20;
+            let mut all = false;
+            let mut idx = 0usize;
+            while idx < args.len() {
+                match args[idx].as_str() {
+                    "--all" => {
+                        all = true;
+                        idx += 1;
+                    }
+                    "--limit" => {
+                        let Some(raw) = args.get(idx + 1) else {
+                            send_telegram_command_reply(
+                                sender,
+                                message,
+                                "缺少 --limit 参数值，例如 /agents ls --limit 20",
+                            )
+                            .await?;
+                            return Ok(());
+                        };
+                        limit = raw.parse::<usize>().unwrap_or(20).clamp(1, 100);
+                        idx += 2;
+                    }
+                    other => {
+                        send_telegram_command_reply(
+                            sender,
+                            message,
+                            &format!("未知参数: {other}\n\n{}", telegram_agents_help_text()),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
+            }
+
+            let user_filter = if all {
+                None
+            } else {
+                Some(owner_user_id_text.clone())
+            };
+            let runs = ctx
+                .service
+                .list_agent_swarm_runs(ctx.channel_name.clone(), user_filter, limit)
+                .await?;
+            if runs.is_empty() {
+                send_telegram_command_reply(sender, message, "暂无 agent 运行记录。").await?;
+                return Ok(());
+            }
+
+            let mut lines = Vec::new();
+            lines.push("最近 Agent 运行:".to_string());
+            for run in runs {
+                let finished = run
+                    .finished_at_unix
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                lines.push(format!(
+                    "- {} [{}] user={} agents={} started={} finished={} task={}",
+                    run.run_id,
+                    run.status.as_str(),
+                    run.user_id,
+                    run.agent_count,
+                    run.started_at_unix,
+                    finished,
+                    truncate_chars(run.root_task.trim(), 48)
+                ));
+            }
+            send_telegram_command_reply(sender, message, &lines.join("\n")).await?;
+        }
+        "tree" => {
+            let Some(run_id) = args.first() else {
+                send_telegram_command_reply(
+                    sender,
+                    message,
+                    "缺少 run_id。\n示例: /agents tree <run_id>",
+                )
+                .await?;
+                return Ok(());
+            };
+            let nodes = ctx
+                .service
+                .load_agent_swarm_tree(ctx.channel_name.clone(), run_id.to_string())
+                .await?;
+            if nodes.is_empty() {
+                send_telegram_command_reply(sender, message, "未找到对应 run 的代理树。").await?;
+                return Ok(());
+            }
+
+            let tree_text = format_agent_swarm_tree_text(run_id, &nodes);
+            send_telegram_command_reply(sender, message, &tree_text).await?;
+        }
+        "show" | "detail" => {
+            let Some(agent_id) = args.first() else {
+                send_telegram_command_reply(
+                    sender,
+                    message,
+                    "缺少 agent_id。\n示例: /agents show <agent_id>",
+                )
+                .await?;
+                return Ok(());
+            };
+            let Some(node) = ctx
+                .service
+                .load_agent_swarm_node(ctx.channel_name.clone(), agent_id.to_string())
+                .await?
+            else {
+                send_telegram_command_reply(sender, message, "未找到对应 agent。").await?;
+                return Ok(());
+            };
+            let text = format_agent_swarm_node_detail_text(&node);
+            send_telegram_command_reply(sender, message, &text).await?;
+        }
+        _ => {
+            send_telegram_command_reply(
+                sender,
+                message,
+                &format!(
+                    "未知 agents 子命令: {action}\n\n{}",
+                    telegram_agents_help_text()
                 ),
             )
             .await?;
@@ -1322,6 +1536,7 @@ pub(super) fn parse_telegram_slash_command(
         "whoami" => Some(TelegramSlashCommand::WhoAmI),
         "mcp" => Some(TelegramSlashCommand::Mcp { tail }),
         "skills" | "skill" => Some(TelegramSlashCommand::Skills { tail }),
+        "agents" | "agent" => Some(TelegramSlashCommand::Agents { tail }),
         "task" => Some(TelegramSlashCommand::Task { tail }),
         _ => Some(TelegramSlashCommand::Unknown { name: command }),
     }
@@ -1343,7 +1558,82 @@ pub(super) fn telegram_help_text() -> String {
         "/whoami - 查看你的 Telegram 用户 ID",
         "/mcp - 管理 MCP 服务器（仅私聊管理员）",
         "/skills - 管理 Skills（仅私聊管理员）",
+        "/agents - 查看 Agent 审计（仅私聊管理员）",
         "/task - 管理定时任务（仅私聊管理员）",
+    ]
+    .join("\n")
+}
+
+pub(super) fn telegram_agents_help_text() -> String {
+    [
+        "Agent 审计命令:",
+        "/agents ls [--limit 20] [--all]",
+        "/agents tree <run_id>",
+        "/agents show <agent_id>",
+    ]
+    .join("\n")
+}
+
+pub(super) fn format_agent_swarm_tree_text(
+    run_id: &str,
+    nodes: &[crate::memory::AgentSwarmNodeRecord],
+) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!("Agent 树: {run_id}"));
+    for node in nodes {
+        let indent = "  ".repeat(node.depth.min(16));
+        let exit = node
+            .exit_status
+            .map(|v| v.as_str().to_string())
+            .unwrap_or_else(|| "-".to_string());
+        lines.push(format!(
+            "{}- {} ({}) state={} exit={}",
+            indent,
+            node.nickname,
+            node.role_name,
+            node.state.as_str(),
+            exit
+        ));
+    }
+    lines.join("\n")
+}
+
+pub(super) fn format_agent_swarm_node_detail_text(
+    node: &crate::memory::AgentSwarmNodeRecord,
+) -> String {
+    let exit = node
+        .exit_status
+        .map(|v| v.as_str().to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let finished = node
+        .finished_at_unix
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    [
+        format!("agent_id: {}", node.agent_id),
+        format!("run_id: {}", node.run_id),
+        format!(
+            "parent: {}",
+            node.parent_agent_id
+                .clone()
+                .unwrap_or_else(|| "-".to_string())
+        ),
+        format!("nickname: {}", node.nickname),
+        format!("role: {} ({})", node.role_name, node.role_definition),
+        format!("depth: {}", node.depth),
+        format!("state: {}", node.state.as_str()),
+        format!("exit: {}", exit),
+        format!("started: {}", node.started_at_unix),
+        format!("finished: {}", finished),
+        format!("task: {}", node.task),
+        format!(
+            "summary: {}",
+            node.summary.clone().unwrap_or_else(|| "-".to_string())
+        ),
+        format!(
+            "error: {}",
+            node.error.clone().unwrap_or_else(|| "-".to_string())
+        ),
     ]
     .join("\n")
 }
@@ -1394,6 +1684,7 @@ pub(super) fn telegram_registered_commands() -> Vec<(&'static str, &'static str)
         ("whoami", "查看当前用户ID"),
         ("mcp", "管理 MCP 服务器"),
         ("skills", "管理 Skills"),
+        ("agents", "查看 Agent 审计"),
         ("task", "管理定时任务"),
     ]
 }
