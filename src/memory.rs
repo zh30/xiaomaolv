@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
+use chrono::{Datelike, Local, TimeZone};
 use reqwest::Client;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -355,6 +356,7 @@ impl SqliteMemoryStore {
         user_id: &str,
         channel: &str,
         min_created_at: i64,
+        max_created_at: Option<i64>,
         limit: usize,
     ) -> anyhow::Result<Vec<MemoryChunkCandidateRecord>> {
         let rows = sqlx::query(
@@ -363,12 +365,14 @@ impl SqliteMemoryStore {
              WHERE user_id = ?1
                AND channel = ?2
                AND created_at >= ?3
+               AND (?4 IS NULL OR created_at < ?4)
              ORDER BY created_at DESC
-             LIMIT ?4",
+             LIMIT ?5",
         )
         .bind(user_id)
         .bind(channel)
         .bind(min_created_at.max(0))
+        .bind(max_created_at)
         .bind(limit.max(1) as i64)
         .fetch_all(&self.pool)
         .await
@@ -2354,6 +2358,12 @@ impl MemoryBackend for HybridSqliteZvecMemoryBackend {
                     if text.is_empty() {
                         return None;
                     }
+                    let created_at = hit.resolved_created_at().unwrap_or_else(unix_ts);
+                    if let Some(window) = detect_temporal_day_window(&req.query_text)
+                        && (created_at < window.start_unix || created_at >= window.end_unix)
+                    {
+                        return None;
+                    }
                     let score = normalize_memory_score(hit.score);
                     if score < self.options.min_score {
                         return None;
@@ -2362,7 +2372,7 @@ impl MemoryBackend for HybridSqliteZvecMemoryBackend {
                         text,
                         score,
                         source: "vec".to_string(),
-                        created_at: unix_ts(),
+                        created_at,
                     })
                 })
                 .collect::<Vec<_>>(),
@@ -2629,13 +2639,23 @@ async fn collect_local_keyword_candidates(
     }
 
     let lookback_secs = (req.semantic_lookback_days.max(1) as i64).saturating_mul(86_400);
-    let min_created_at = unix_ts().saturating_sub(lookback_secs);
+    let now = unix_ts();
+    let mut min_created_at = now.saturating_sub(lookback_secs);
+    let mut max_created_at = None;
+    if let Some(window) = detect_temporal_day_window(&req.query_text) {
+        min_created_at = min_created_at.max(window.start_unix);
+        max_created_at = Some(window.end_unix);
+        if window.end_unix <= min_created_at {
+            return Ok(vec![]);
+        }
+    }
 
     let rows = store
         .load_chunk_candidates(
             &req.user_id,
             &req.channel,
             min_created_at,
+            max_created_at,
             candidate_limit.max(topk),
         )
         .await?;
@@ -2883,9 +2903,10 @@ fn merge_memory_candidates_into_context(
         out.push(StoredMessage {
             role: MessageRole::System,
             content: format!(
-                "[memory score={:.3} src={}] {}",
+                "[memory score={:.3} src={} at={}] {}",
                 normalize_memory_score(candidate.score),
                 candidate.source,
+                format_memory_timestamp(candidate.created_at),
                 snippet
             ),
         });
@@ -2899,6 +2920,56 @@ fn normalize_memory_score(score: f32) -> f32 {
         score.clamp(0.0, 1.0)
     } else {
         0.0
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TemporalDayWindow {
+    start_unix: i64,
+    end_unix: i64,
+}
+
+fn detect_temporal_day_window(query_text: &str) -> Option<TemporalDayWindow> {
+    let query = query_text.trim();
+    if query.is_empty() {
+        return None;
+    }
+    let lower = query.to_ascii_lowercase();
+
+    let days_ago: i64 = if query.contains("前天") || lower.contains("day before yesterday") {
+        2
+    } else if query.contains("昨天") || lower.contains("yesterday") {
+        1
+    } else if query.contains("今天") || lower.contains("today") {
+        0
+    } else {
+        return None;
+    };
+
+    let today = Local::now().date_naive();
+    let target_date = today.checked_sub_signed(chrono::Duration::days(days_ago))?;
+    let start = Local
+        .with_ymd_and_hms(
+            target_date.year(),
+            target_date.month(),
+            target_date.day(),
+            0,
+            0,
+            0,
+        )
+        .single()?;
+    let end = start + chrono::Duration::days(1);
+
+    Some(TemporalDayWindow {
+        start_unix: start.timestamp(),
+        end_unix: end.timestamp(),
+    })
+}
+
+fn format_memory_timestamp(ts: i64) -> String {
+    match Local.timestamp_opt(ts, 0).single() {
+        Some(dt) => dt.format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
+        None => format!("unix:{ts}"),
     }
 }
 
@@ -2993,6 +3064,12 @@ struct SidecarMemoryHit {
     message: Option<String>,
     #[serde(default)]
     score: f32,
+    #[serde(default)]
+    created_at: Option<i64>,
+    #[serde(default)]
+    timestamp: Option<i64>,
+    #[serde(default)]
+    ts: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3021,6 +3098,10 @@ impl SidecarMemoryHit {
             .as_deref()
             .or(self.content.as_deref())
             .or(self.message.as_deref())
+    }
+
+    fn resolved_created_at(&self) -> Option<i64> {
+        self.created_at.or(self.timestamp).or(self.ts)
     }
 }
 
