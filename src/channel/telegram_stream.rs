@@ -9,7 +9,7 @@ pub(super) struct TelegramStreamSink<'a> {
     reply_to_message_id: Option<i64>,
     prefer_draft: bool,
     draft_supported: bool,
-    draft_message_id: String,
+    draft_id: i64,
     min_edit_interval: Duration,
     message_id: Option<i64>,
     tail_message_ids: Vec<i64>,
@@ -22,6 +22,7 @@ impl<'a> TelegramStreamSink<'a> {
     pub(super) fn new(
         sender: &'a TelegramSender,
         chat_id: i64,
+        is_private_chat: bool,
         message_thread_id: Option<i64>,
         reply_to_message_id: Option<i64>,
         prefer_draft: bool,
@@ -33,8 +34,8 @@ impl<'a> TelegramStreamSink<'a> {
             message_thread_id,
             reply_to_message_id,
             prefer_draft,
-            draft_supported: message_thread_id.is_some() && reply_to_message_id.is_none(),
-            draft_message_id: build_draft_message_id(chat_id, message_thread_id),
+            draft_supported: is_private_chat && reply_to_message_id.is_none(),
+            draft_id: build_draft_id(chat_id, message_thread_id),
             min_edit_interval,
             message_id: None,
             tail_message_ids: Vec::new(),
@@ -51,7 +52,9 @@ impl<'a> TelegramStreamSink<'a> {
 
         self.pending_text = full_text.to_string();
         let parts = render_telegram_text_parts(&self.pending_text, TELEGRAM_MAX_TEXT_CHARS);
-        if !parts.is_empty() && parts == self.rendered_parts {
+        let waiting_final_after_draft =
+            self.prefer_draft && self.draft_supported && self.message_id.is_none();
+        if !parts.is_empty() && parts == self.rendered_parts && !waiting_final_after_draft {
             return Ok(());
         }
 
@@ -122,7 +125,7 @@ impl<'a> TelegramStreamSink<'a> {
                     self.chat_id,
                     self.message_thread_id,
                     self.reply_to_message_id,
-                    &self.draft_message_id,
+                    self.draft_id,
                     &self.pending_text,
                 )
                 .await

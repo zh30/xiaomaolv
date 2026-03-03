@@ -2,15 +2,15 @@ use super::{
     GroupDecisionKind, GroupSignalInput, McpCommandAccess, PrivateChatAccess,
     TELEGRAM_MAX_TEXT_CHARS, TelegramCommandSettings, TelegramGroupTriggerMode,
     TelegramGroupUserProfile, TelegramReplyMessage, TelegramSchedulerSettings,
-    TelegramSlashCommand, TelegramUser, build_draft_message_id,
-    build_group_member_identity_context, build_scheduler_owner_mention,
-    build_scheduler_reminder_outbound_text, detect_scheduler_job_operation_keyword,
-    detect_vocative_learned_alias_prefix, evaluate_group_decision, evaluate_mcp_command_access,
-    evaluate_private_chat_access, extract_dynamic_alias_candidates,
-    extract_realtime_name_correction, extract_scheduler_job_id, extract_vocative_alias_candidate,
-    format_agent_swarm_node_detail_text, format_agent_swarm_tree_text, is_reply_to_bot_message,
-    looks_like_scheduler_list_text, message_mentions_bot, parse_admin_user_ids,
-    parse_telegram_slash_command, render_telegram_text_parts, scheduler_confirm_inline_keyboard,
+    TelegramSlashCommand, TelegramUser, build_draft_id, build_group_member_identity_context,
+    build_scheduler_owner_mention, build_scheduler_reminder_outbound_text,
+    detect_scheduler_job_operation_keyword, detect_vocative_learned_alias_prefix,
+    evaluate_group_decision, evaluate_mcp_command_access, evaluate_private_chat_access,
+    extract_dynamic_alias_candidates, extract_realtime_name_correction, extract_scheduler_job_id,
+    extract_vocative_alias_candidate, format_agent_swarm_node_detail_text,
+    format_agent_swarm_tree_text, is_reply_to_bot_message, looks_like_scheduler_list_text,
+    message_mentions_bot, parse_admin_user_ids, parse_telegram_slash_command,
+    render_telegram_text_parts, scheduler_confirm_inline_keyboard, send_message_draft_payload,
     short_description_payload, telegram_help_text, telegram_registered_commands,
     telegram_scheduler_requires_confirm, telegram_session_id, text_implies_latest_target,
     truncate_chars, try_build_relative_reminder_draft_from_text, typing_action_payload,
@@ -81,11 +81,19 @@ fn unclosed_think_is_suppressed() {
 }
 
 #[test]
-fn draft_message_id_format_is_stable() {
-    let draft_id = build_draft_message_id(-100123, Some(88));
-    assert!(draft_id.starts_with("xm-"));
-    assert!(draft_id.contains("-100123-88-"));
-    assert!(draft_id.len() < 128);
+fn draft_id_is_positive_and_within_int32_range() {
+    let draft_id = build_draft_id(-100123, Some(88));
+    assert!(draft_id > 0);
+    assert!(draft_id <= i64::from(i32::MAX));
+}
+
+#[test]
+fn send_message_draft_payload_uses_new_draft_id_field() {
+    let payload = send_message_draft_payload(6028409442, None, None, 12345, "hello", None);
+    assert_eq!(payload["chat_id"], 6028409442_i64);
+    assert_eq!(payload["draft_id"], 12345);
+    assert_eq!(payload["text"], "hello");
+    assert!(payload.get("draft_message_id").is_none());
 }
 
 #[test]

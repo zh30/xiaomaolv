@@ -636,6 +636,34 @@ pub(super) fn typing_action_payload(chat_id: i64, message_thread_id: Option<i64>
     payload
 }
 
+pub(super) fn send_message_draft_payload(
+    chat_id: i64,
+    message_thread_id: Option<i64>,
+    reply_to_message_id: Option<i64>,
+    draft_id: i64,
+    text: &str,
+    parse_mode: Option<&'static str>,
+) -> Value {
+    let mut payload = serde_json::json!({
+        "chat_id": chat_id,
+        "draft_id": draft_id,
+        "text": text
+    });
+    if let Some(thread_id) = message_thread_id {
+        payload["message_thread_id"] = serde_json::json!(thread_id);
+    }
+    if let Some(reply_to) = reply_to_message_id {
+        payload["reply_parameters"] = serde_json::json!({
+            "message_id": reply_to,
+            "allow_sending_without_reply": true
+        });
+    }
+    if let Some(mode) = parse_mode {
+        payload["parse_mode"] = serde_json::json!(mode);
+    }
+    payload
+}
+
 pub(super) fn short_description_payload(short_description: &str) -> Value {
     serde_json::json!({
         "short_description": short_description
@@ -653,11 +681,13 @@ pub(super) fn current_unix_timestamp_i64() -> i64 {
     current_unix_timestamp() as i64
 }
 
-pub(super) fn build_draft_message_id(chat_id: i64, message_thread_id: Option<i64>) -> String {
-    let millis = SystemTime::now()
+pub(super) fn build_draft_id(chat_id: i64, message_thread_id: Option<i64>) -> i64 {
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
+        .map(|d| d.as_nanos() as i64)
         .unwrap_or(0);
-    let thread = message_thread_id.unwrap_or(0);
-    format!("xm-{chat_id}-{thread}-{millis}")
+    let thread = message_thread_id.unwrap_or_default();
+    let mixed = nanos ^ chat_id.rotate_left(11) ^ thread.rotate_left(19);
+    let bounded = (mixed.unsigned_abs() as i64) & i64::from(i32::MAX);
+    bounded.max(1)
 }

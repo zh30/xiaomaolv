@@ -405,7 +405,7 @@ impl TelegramSender {
         chat_id: i64,
         message_thread_id: Option<i64>,
         reply_to_message_id: Option<i64>,
-        draft_message_id: &str,
+        draft_id: i64,
         text: &str,
     ) -> anyhow::Result<()> {
         let parts = render_telegram_text_parts(text, TELEGRAM_MAX_TEXT_CHARS);
@@ -417,23 +417,14 @@ impl TelegramSender {
             "https://api.telegram.org/bot{}/sendMessageDraft",
             self.bot_token
         );
-        let mut payload = serde_json::json!({
-            "chat_id": chat_id,
-            "draft_message_id": draft_message_id,
-            "text": first.text
-        });
-        if let Some(thread_id) = message_thread_id {
-            payload["message_thread_id"] = serde_json::json!(thread_id);
-        }
-        if let Some(reply_to) = reply_to_message_id {
-            payload["reply_parameters"] = serde_json::json!({
-                "message_id": reply_to,
-                "allow_sending_without_reply": true
-            });
-        }
-        if let Some(mode) = first.parse_mode {
-            payload["parse_mode"] = serde_json::json!(mode);
-        }
+        let payload = send_message_draft_payload(
+            chat_id,
+            message_thread_id,
+            reply_to_message_id,
+            draft_id,
+            &first.text,
+            first.parse_mode,
+        );
 
         let response = self
             .client

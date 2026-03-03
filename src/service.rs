@@ -2459,6 +2459,9 @@ struct BufferedStreamSink {
     deltas: Vec<String>,
 }
 
+const STREAM_REPLAY_CHUNK_CHARS: usize = 96;
+const STREAM_REPLAY_DELAY_MS: u64 = 220;
+
 #[async_trait::async_trait]
 impl StreamSink for BufferedStreamSink {
     async fn on_delta(&mut self, delta: &str) -> anyhow::Result<()> {
@@ -2479,18 +2482,49 @@ impl BufferedStreamSink {
         fallback_text: &str,
         sink: &mut dyn StreamSink,
     ) -> anyhow::Result<()> {
-        if self.deltas.is_empty() {
-            if !fallback_text.is_empty() {
-                sink.on_delta(fallback_text).await?;
-            }
+        let replay_text = if self.deltas.is_empty() {
+            fallback_text.to_string()
+        } else {
+            self.rendered_text()
+        };
+
+        if replay_text.is_empty() {
             return Ok(());
         }
 
-        for delta in &self.deltas {
-            sink.on_delta(delta).await?;
+        let chunks = chunk_text_for_stream_replay(&replay_text, STREAM_REPLAY_CHUNK_CHARS);
+        for (idx, chunk) in chunks.iter().enumerate() {
+            sink.on_delta(chunk).await?;
+            if idx + 1 < chunks.len() {
+                tokio::time::sleep(Duration::from_millis(STREAM_REPLAY_DELAY_MS)).await;
+            }
         }
         Ok(())
     }
+}
+
+fn chunk_text_for_stream_replay(text: &str, max_chars: usize) -> Vec<String> {
+    let limit = max_chars.max(1);
+    if text.is_empty() {
+        return Vec::new();
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_chars = 0usize;
+    for ch in text.chars() {
+        current.push(ch);
+        current_chars += 1;
+        if current_chars >= limit {
+            chunks.push(current);
+            current = String::new();
+            current_chars = 0;
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 impl McpLoopTelemetry {
@@ -3430,11 +3464,12 @@ mod tests {
     use super::{
         AgentMcpSettings, BUILTIN_MCP_SERVER_NAME, BUILTIN_MCP_TOOL_CURRENT_TIME,
         CodeModeCircuitChange, MessageService, apply_context_budget, build_mcp_system_prompt,
-        code_mode_timeout_ratio, extract_primary_user_text, infer_timezone_from_time_query,
-        is_explicit_current_time_query, looks_like_time_query, next_code_mode_timeout_streak,
-        parse_mcp_tool_call, parse_scheduler_intent_json, render_fast_time_answer,
-        should_open_code_mode_timeout_circuit, should_probe_code_mode_timeout_circuit,
-        should_warn_code_mode_timeouts, truncate_json_value, weekday_to_chinese, zodiac_for_year,
+        chunk_text_for_stream_replay, code_mode_timeout_ratio, extract_primary_user_text,
+        infer_timezone_from_time_query, is_explicit_current_time_query, looks_like_time_query,
+        next_code_mode_timeout_streak, parse_mcp_tool_call, parse_scheduler_intent_json,
+        render_fast_time_answer, should_open_code_mode_timeout_circuit,
+        should_probe_code_mode_timeout_circuit, should_warn_code_mode_timeouts,
+        truncate_json_value, weekday_to_chinese, zodiac_for_year,
     };
     use crate::code_mode::{AgentCodeModeSettings, CodeModeAuditRecord};
     use crate::domain::{MessageRole, StoredMessage};
@@ -3556,6 +3591,15 @@ mod tests {
                 .expect("parsed");
         assert_eq!(parsed.server, "search");
         assert_eq!(parsed.tool, "web");
+    }
+
+    #[test]
+    fn stream_replay_chunker_preserves_text_and_bounds_chunk_size() {
+        let text = "abcdefghijklmnopqrstuvwxyz";
+        let chunks = chunk_text_for_stream_replay(text, 5);
+        assert_eq!(chunks.concat(), text);
+        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 5));
+        assert!(chunks.len() > 1);
     }
 
     #[test]

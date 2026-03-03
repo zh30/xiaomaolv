@@ -466,6 +466,7 @@ async fn dispatch_telegram_reply(config: ReplyDispatchConfig<'_>) -> anyhow::Res
         let mut sink = TelegramStreamSink::new(
             sender,
             meta.chat_id,
+            meta.is_private_chat,
             meta.message_thread_id,
             outbound_reply_to_message_id,
             streaming_prefer_draft,
