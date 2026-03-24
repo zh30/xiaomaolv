@@ -18,6 +18,7 @@ use crate::code_mode::{
 use crate::domain::{IncomingMessage, MessageRole, OutgoingMessage, StoredMessage};
 use crate::harness::compactor::{CompactionRequest, CompactionStrategy, Compactor};
 use crate::harness::trajectory::{ToolCallRecord, TrajectoryLogger, new_trajectory_id};
+use crate::harness::verifier::ToolCallVerifier;
 use crate::mcp::{BUILTIN_MCP_SERVER_NAME, BUILTIN_MCP_TOOL_CURRENT_TIME, McpRuntime, McpToolInfo};
 use crate::memory::{
     AgentSwarmCleanupRequest, AgentSwarmNodeExitStatus, AgentSwarmNodeLoadRequest,
@@ -206,6 +207,7 @@ pub struct MessageService {
     context_memory_budget_ratio: u8,
     context_min_recent_messages: usize,
     trajectory_logger: Option<TrajectoryLogger>,
+    tool_verifier: Option<Arc<dyn ToolCallVerifier>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,6 +346,7 @@ impl MessageService {
             context_memory_budget_ratio: 35,
             context_min_recent_messages: 8,
             trajectory_logger: None,
+            tool_verifier: None,
         }
     }
 
@@ -392,6 +395,11 @@ impl MessageService {
 
     pub fn with_trajectory_logger(mut self, logger: TrajectoryLogger) -> Self {
         self.trajectory_logger = Some(logger);
+        self
+    }
+
+    pub fn with_tool_verifier(mut self, verifier: Arc<dyn ToolCallVerifier>) -> Self {
+        self.tool_verifier = Some(verifier);
         self
     }
 
@@ -2094,18 +2102,28 @@ impl MessageService {
                     let result_clone = result.clone();
                     let args_clone = tool_call.arguments.clone();
 
+                    // Create record for verification
+                    let record = ToolCallRecord {
+                        server: tool_call.server.clone(),
+                        tool: tool_call.tool.clone(),
+                        arguments: args_clone,
+                        result: result_clone,
+                        ok: true,
+                        duration_ms: tool_duration_ms,
+                        iteration,
+                    };
+
                     // Log tool call to trajectory
                     if let Some(ref logger) = self.trajectory_logger {
-                        let record = ToolCallRecord {
-                            server: tool_call.server.clone(),
-                            tool: tool_call.tool.clone(),
-                            arguments: args_clone,
-                            result: result_clone,
-                            ok: true,
-                            duration_ms: tool_duration_ms,
-                            iteration,
-                        };
-                        let _ = logger.log_tool_call(&trajectory_id, record).await;
+                        let _ = logger.log_tool_call(&trajectory_id, record.clone()).await;
+                    }
+
+                    // Verify tool call
+                    if let Some(ref verifier) = self.tool_verifier {
+                        let verification = verifier.verify(&record);
+                        if !verification.passed {
+                            warn!(?verification.issues, "Tool call verification failed");
+                        }
                     }
 
                     serde_json::json!({
@@ -2121,18 +2139,28 @@ impl MessageService {
                     let args_clone = tool_call.arguments.clone();
                     let error_json = serde_json::json!({"error": err.to_string()});
 
+                    // Create record for verification
+                    let record = ToolCallRecord {
+                        server: tool_call.server.clone(),
+                        tool: tool_call.tool.clone(),
+                        arguments: args_clone,
+                        result: error_json.clone(),
+                        ok: false,
+                        duration_ms: tool_duration_ms,
+                        iteration,
+                    };
+
                     // Log tool call to trajectory
                     if let Some(ref logger) = self.trajectory_logger {
-                        let record = ToolCallRecord {
-                            server: tool_call.server.clone(),
-                            tool: tool_call.tool.clone(),
-                            arguments: args_clone,
-                            result: error_json,
-                            ok: false,
-                            duration_ms: tool_duration_ms,
-                            iteration,
-                        };
-                        let _ = logger.log_tool_call(&trajectory_id, record).await;
+                        let _ = logger.log_tool_call(&trajectory_id, record.clone()).await;
+                    }
+
+                    // Verify tool call
+                    if let Some(ref verifier) = self.tool_verifier {
+                        let verification = verifier.verify(&record);
+                        if !verification.passed {
+                            warn!(?verification.issues, "Tool call verification failed");
+                        }
                     }
 
                     serde_json::json!({
@@ -2276,18 +2304,28 @@ impl MessageService {
                     let result_clone = result.clone();
                     let args_clone = tool_call.arguments.clone();
 
+                    // Create record for verification
+                    let record = ToolCallRecord {
+                        server: tool_call.server.clone(),
+                        tool: tool_call.tool.clone(),
+                        arguments: args_clone,
+                        result: result_clone,
+                        ok: true,
+                        duration_ms: tool_duration_ms,
+                        iteration,
+                    };
+
                     // Log tool call to trajectory
                     if let Some(ref logger) = self.trajectory_logger {
-                        let record = ToolCallRecord {
-                            server: tool_call.server.clone(),
-                            tool: tool_call.tool.clone(),
-                            arguments: args_clone,
-                            result: result_clone,
-                            ok: true,
-                            duration_ms: tool_duration_ms,
-                            iteration,
-                        };
-                        let _ = logger.log_tool_call(&trajectory_id, record).await;
+                        let _ = logger.log_tool_call(&trajectory_id, record.clone()).await;
+                    }
+
+                    // Verify tool call
+                    if let Some(ref verifier) = self.tool_verifier {
+                        let verification = verifier.verify(&record);
+                        if !verification.passed {
+                            warn!(?verification.issues, "Tool call verification failed");
+                        }
                     }
 
                     serde_json::json!({
@@ -2303,18 +2341,28 @@ impl MessageService {
                     let args_clone = tool_call.arguments.clone();
                     let error_json = serde_json::json!({"error": err.to_string()});
 
+                    // Create record for verification
+                    let record = ToolCallRecord {
+                        server: tool_call.server.clone(),
+                        tool: tool_call.tool.clone(),
+                        arguments: args_clone,
+                        result: error_json.clone(),
+                        ok: false,
+                        duration_ms: tool_duration_ms,
+                        iteration,
+                    };
+
                     // Log tool call to trajectory
                     if let Some(ref logger) = self.trajectory_logger {
-                        let record = ToolCallRecord {
-                            server: tool_call.server.clone(),
-                            tool: tool_call.tool.clone(),
-                            arguments: args_clone,
-                            result: error_json,
-                            ok: false,
-                            duration_ms: tool_duration_ms,
-                            iteration,
-                        };
-                        let _ = logger.log_tool_call(&trajectory_id, record).await;
+                        let _ = logger.log_tool_call(&trajectory_id, record.clone()).await;
+                    }
+
+                    // Verify tool call
+                    if let Some(ref verifier) = self.tool_verifier {
+                        let verification = verifier.verify(&record);
+                        if !verification.passed {
+                            warn!(?verification.issues, "Tool call verification failed");
+                        }
                     }
 
                     serde_json::json!({
