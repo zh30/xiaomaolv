@@ -462,9 +462,7 @@ pub(super) fn extract_vocative_alias_candidate(text: &str, bot_username: &str) -
     if candidate.is_empty() {
         return None;
     }
-    if normalize_display_name(&candidate).is_none() {
-        return None;
-    }
+    normalize_display_name(&candidate)?;
     if !is_dynamic_alias_candidate(&candidate, &own) {
         return None;
     }

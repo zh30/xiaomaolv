@@ -16,9 +16,7 @@ use crate::code_mode::{
     CodeModePlanner, DisabledCodeModePlanner, execute_plan_via_subprocess,
 };
 use crate::domain::{IncomingMessage, MessageRole, OutgoingMessage, StoredMessage};
-use crate::harness::trajectory::{
-    ToolCallRecord, TrajectoryLogger, new_trajectory_id,
-};
+use crate::harness::trajectory::{ToolCallRecord, TrajectoryLogger, new_trajectory_id};
 use crate::mcp::{BUILTIN_MCP_SERVER_NAME, BUILTIN_MCP_TOOL_CURRENT_TIME, McpRuntime, McpToolInfo};
 use crate::memory::{
     AgentSwarmCleanupRequest, AgentSwarmNodeExitStatus, AgentSwarmNodeLoadRequest,
@@ -1964,16 +1962,25 @@ impl MessageService {
         mut history: Vec<StoredMessage>,
         tools: Vec<McpToolInfo>,
         runtime: McpRuntime,
-        _incoming: &IncomingMessage,
+        incoming: &IncomingMessage,
     ) -> anyhow::Result<String> {
         let mut telemetry = McpLoopTelemetry::new(tools.len());
         let trajectory_id = new_trajectory_id();
-        let _started_at = chrono::Utc::now();
-        let _model = "unknown".to_string();
+        let model = "unknown".to_string();
 
-        // Note: Trajectory logger would be set up here if enabled
-        // For now, we log tool calls and finish at the end
-        let _trajectory_id = &trajectory_id;
+        if let Some(ref logger) = self.trajectory_logger
+            && let Err(e) = logger
+                .start_trajectory(
+                    &trajectory_id,
+                    &incoming.session_id,
+                    &incoming.channel,
+                    &incoming.user_id,
+                    &model,
+                )
+                .await
+        {
+            tracing::warn!(error = %e, "failed to start trajectory");
+        }
 
         history.push(StoredMessage {
             role: MessageRole::System,
@@ -2121,15 +2128,25 @@ impl MessageService {
         tools: Vec<McpToolInfo>,
         runtime: McpRuntime,
         sink: &mut dyn StreamSink,
-        _incoming: &IncomingMessage,
+        incoming: &IncomingMessage,
     ) -> anyhow::Result<String> {
         let mut telemetry = McpLoopTelemetry::new(tools.len());
         let trajectory_id = new_trajectory_id();
-        let started_at = chrono::Utc::now();
         let model = "unknown".to_string();
 
-        // Note: Trajectory logger would be set up here if enabled
-        let _ = (&trajectory_id, &started_at, &model);
+        if let Some(ref logger) = self.trajectory_logger
+            && let Err(e) = logger
+                .start_trajectory(
+                    &trajectory_id,
+                    &incoming.session_id,
+                    &incoming.channel,
+                    &incoming.user_id,
+                    &model,
+                )
+                .await
+        {
+            tracing::warn!(error = %e, "failed to start trajectory");
+        }
 
         history.push(StoredMessage {
             role: MessageRole::System,

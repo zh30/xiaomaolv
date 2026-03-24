@@ -502,9 +502,7 @@ fn parse_relative_delay_secs(text: &str) -> Option<i64> {
                 break;
             }
         }
-        let Some(start) = digit_start else {
-            return None;
-        };
+        let start = digit_start?;
         let mut end = start;
         for (off, ch) in text[start..].char_indices() {
             if ch.is_ascii_digit() {

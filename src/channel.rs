@@ -277,7 +277,13 @@ pub struct TelegramSender {
 impl TelegramSender {
     pub fn new(bot_token: String) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .pool_max_idle_per_host(10)
+                .pool_idle_timeout(std::time::Duration::from_secs(30))
+                .tcp_keepalive(std::time::Duration::from_secs(30))
+                .http1_title_case_headers()
+                .build()
+                .expect("failed to build Telegram HTTP client"),
             bot_token,
         }
     }
@@ -1474,7 +1480,13 @@ impl ChannelPlugin for TelegramChannelPlugin {
                 None
             };
 
-            let client = Client::new();
+            let client = Client::builder()
+                .pool_max_idle_per_host(5)
+                .pool_idle_timeout(std::time::Duration::from_secs(30))
+                .tcp_keepalive(std::time::Duration::from_secs(30))
+                .http1_title_case_headers()
+                .build()
+                .expect("failed to build Telegram polling HTTP client");
             let mut offset: i64 = 0;
             {
                 let mut diag = polling_diag_state.lock().await;

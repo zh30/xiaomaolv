@@ -233,6 +233,10 @@ impl SkillRegistry {
                 "{DEFAULT_USER_AGENT}/{}",
                 env!("CARGO_PKG_VERSION")
             ))
+            .pool_max_idle_per_host(10)
+            .pool_idle_timeout(std::time::Duration::from_secs(30))
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .http1_title_case_headers()
             .build()
             .context("failed to build skills http client")?;
         Ok(Self { paths, http })

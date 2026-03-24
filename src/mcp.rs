@@ -517,7 +517,13 @@ impl McpRuntime {
     pub fn new(servers: HashMap<String, McpServerConfig>) -> Self {
         Self {
             servers,
-            http_client: reqwest::Client::new(),
+            http_client: reqwest::Client::builder()
+                .pool_max_idle_per_host(10)
+                .pool_idle_timeout(std::time::Duration::from_secs(30))
+                .tcp_keepalive(std::time::Duration::from_secs(30))
+                .http1_title_case_headers()
+                .build()
+                .expect("failed to build MCP HTTP client"),
             session_pool: Arc::new(McpSessionPool::default()),
             tool_cache: Arc::new(RwLock::new(HashMap::new())),
         }

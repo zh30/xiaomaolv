@@ -45,6 +45,8 @@ struct RuntimeHandles {
 #[derive(Clone)]
 pub struct AppState {
     runtime: Arc<RwLock<RuntimeHandles>>,
+    /// Separate mcp_runtime field to avoid locking runtime RwLock for MCP endpoints
+    mcp_runtime: Arc<RwLock<McpRuntime>>,
     worker_supervisor: Arc<AsyncMutex<WorkerSupervisor>>,
     config_ui: Option<Arc<ConfigUiManager>>,
     pub semaphore: Arc<Semaphore>,
@@ -389,9 +391,13 @@ async fn build_state(
     )
     .await?;
 
+    // Extract mcp_runtime for direct access (avoids locking runtime RwLock for MCP endpoints)
+    let mcp_runtime = runtime.mcp_runtime.clone();
+
     let state =
         AppState {
             runtime: Arc::new(RwLock::new(runtime)),
+            mcp_runtime,
             worker_supervisor,
             config_ui,
             semaphore: Arc::new(Semaphore::new(config.app.concurrency_limit.max(1))),
@@ -546,12 +552,18 @@ impl AppState {
         )
         .await?;
 
+        // Extract mcp_runtime before moving runtime into RwLock
+        let new_mcp_runtime = runtime.mcp_runtime.clone();
+
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let workers = start_channel_workers(&runtime, shutdown_rx).await?;
 
         {
             let mut current_runtime = self.runtime.write().await;
             *current_runtime = runtime;
+            // Replace the inner McpRuntime - need to deref Arc to get RwLock
+            let mut mcp_guard = (*self.mcp_runtime).write().await;
+            *mcp_guard = new_mcp_runtime.read().await.clone();
         }
 
         let mut supervisor = self.worker_supervisor.lock().await;
@@ -1962,10 +1974,10 @@ async fn get_mcp_servers(
         )
     })?;
 
-    let runtime_state = state.runtime.read().await.clone();
-    let runtime = runtime_state.mcp_runtime.read().await.clone();
+    // Direct access to mcp_runtime without locking runtime RwLock
+    let mcp_runtime = state.mcp_runtime.read().await;
     Ok(Json(McpServersResponse {
-        servers: runtime.servers(),
+        servers: mcp_runtime.servers(),
     }))
 }
 
@@ -2021,9 +2033,9 @@ async fn get_mcp_tools(
         )
     })?;
 
-    let runtime_state = state.runtime.read().await.clone();
-    let runtime = runtime_state.mcp_runtime.read().await.clone();
-    let tools = runtime
+    // Direct access to mcp_runtime without locking runtime RwLock
+    let mcp_runtime = state.mcp_runtime.read().await;
+    let tools = mcp_runtime
         .list_tools(query.server.as_deref())
         .await
         .map_err(internal_err("failed to list mcp tools"))?;
@@ -2043,9 +2055,9 @@ async fn post_mcp_tool_call(
         )
     })?;
 
-    let runtime_state = state.runtime.read().await.clone();
-    let runtime = runtime_state.mcp_runtime.read().await.clone();
-    let result = runtime
+    // Direct access to mcp_runtime without locking runtime RwLock
+    let mcp_runtime = state.mcp_runtime.read().await;
+    let result = mcp_runtime
         .call_tool(&server, &tool, args)
         .await
         .map_err(internal_err("failed to call mcp tool"))?;

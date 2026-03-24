@@ -1,6 +1,5 @@
 use xiaomaolv::harness::trajectory::{
-    ToolCallRecord, TrajectoryExitReason, TrajectoryFilter, TrajectoryLogger,
-    new_trajectory_id,
+    ToolCallRecord, TrajectoryExitReason, TrajectoryFilter, TrajectoryLogger, new_trajectory_id,
 };
 use xiaomaolv::memory::{SqliteMemoryBackend, SqliteMemoryStore};
 
@@ -19,7 +18,13 @@ async fn test_trajectory_records_tool_calls() {
 
     // Start trajectory (creates header record)
     logger
-        .start_trajectory(&trajectory_id, &session_id, &channel, &user_id, "test-model")
+        .start_trajectory(
+            &trajectory_id,
+            &session_id,
+            &channel,
+            &user_id,
+            "test-model",
+        )
         .await
         .expect("start trajectory");
 
@@ -76,7 +81,13 @@ async fn test_trajectory_captures_final_answer() {
 
     // Start trajectory (creates header record)
     logger
-        .start_trajectory(&trajectory_id, &session_id, &channel, &user_id, "test-model")
+        .start_trajectory(
+            &trajectory_id,
+            &session_id,
+            &channel,
+            &user_id,
+            "test-model",
+        )
         .await
         .expect("start trajectory");
 

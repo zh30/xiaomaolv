@@ -149,10 +149,16 @@ mod tests {
     #[test]
     fn test_trajectory_exit_reason_serialization() {
         assert_eq!(TrajectoryExitReason::FinalAnswer.as_str(), "final_answer");
-        assert_eq!(TrajectoryExitReason::MaxIterations.as_str(), "max_iterations");
+        assert_eq!(
+            TrajectoryExitReason::MaxIterations.as_str(),
+            "max_iterations"
+        );
         assert_eq!(TrajectoryExitReason::ToolError.as_str(), "tool_error");
         assert_eq!(TrajectoryExitReason::Timeout.as_str(), "timeout");
-        assert_eq!(TrajectoryExitReason::InternalError.as_str(), "internal_error");
+        assert_eq!(
+            TrajectoryExitReason::InternalError.as_str(),
+            "internal_error"
+        );
     }
 
     #[test]

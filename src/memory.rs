@@ -1402,9 +1402,7 @@ impl SqliteMemoryStore {
             .fetch_all(&self.pool)
             .await
             .context("failed to query trajectories")?
-        } else if let (Some(session_id), Some(channel)) =
-            (&filter.session_id, &filter.channel)
-        {
+        } else if let (Some(session_id), Some(channel)) = (&filter.session_id, &filter.channel) {
             sqlx::query_as::<_, RowTuple>(
                 "SELECT t.id, t.session_id, t.channel, t.user_id, t.started_at,
                         t.finished_at, t.final_answer, t.exit_reason, t.model, t.total_tokens
@@ -1418,9 +1416,7 @@ impl SqliteMemoryStore {
             .fetch_all(&self.pool)
             .await
             .context("failed to query trajectories")?
-        } else if let (Some(session_id), Some(user_id)) =
-            (&filter.session_id, &filter.user_id)
-        {
+        } else if let (Some(session_id), Some(user_id)) = (&filter.session_id, &filter.user_id) {
             sqlx::query_as::<_, RowTuple>(
                 "SELECT t.id, t.session_id, t.channel, t.user_id, t.started_at,
                         t.finished_at, t.final_answer, t.exit_reason, t.model, t.total_tokens
@@ -1434,9 +1430,7 @@ impl SqliteMemoryStore {
             .fetch_all(&self.pool)
             .await
             .context("failed to query trajectories")?
-        } else if let (Some(channel), Some(user_id)) =
-            (&filter.channel, &filter.user_id)
-        {
+        } else if let (Some(channel), Some(user_id)) = (&filter.channel, &filter.user_id) {
             sqlx::query_as::<_, RowTuple>(
                 "SELECT t.id, t.session_id, t.channel, t.user_id, t.started_at,
                         t.finished_at, t.final_answer, t.exit_reason, t.model, t.total_tokens
@@ -1529,8 +1523,7 @@ impl SqliteMemoryStore {
                 user_id: user_id.unwrap_or_default(),
                 started_at: chrono::DateTime::from_timestamp(started_at, 0)
                     .unwrap_or_else(chrono::Utc::now),
-                finished_at: finished_at
-                    .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0)),
+                finished_at: finished_at.and_then(|ts| chrono::DateTime::from_timestamp(ts, 0)),
                 tool_calls,
                 final_answer,
                 exit_reason: crate::harness::trajectory::TrajectoryExitReason::from_db(

@@ -125,6 +125,10 @@ pub struct OpenAiCompatibleProvider {
 impl OpenAiCompatibleProvider {
     pub fn from_config(cfg: &ProviderConfig) -> anyhow::Result<Self> {
         let client = Client::builder()
+            .pool_max_idle_per_host(20)
+            .pool_idle_timeout(std::time::Duration::from_secs(30))
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .http1_title_case_headers()
             .build()
             .context("failed to build reqwest client")?;
 
@@ -514,7 +518,9 @@ fn is_message_shape_error(status: StatusCode, body: &str) -> bool {
     if status != StatusCode::BAD_REQUEST {
         return false;
     }
-    let lower = body.to_lowercase();
+    // Only check first 256 chars to avoid allocating large strings for huge error bodies
+    let check_len = body.len().min(256);
+    let lower = &body[..check_len];
     lower.contains("invalid chat setting")
         || lower.contains("expr_path=messages")
         || lower.contains("missing required parameter")
