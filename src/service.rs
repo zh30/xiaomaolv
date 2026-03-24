@@ -160,6 +160,7 @@ impl Default for AgentSwarmSettings {
 #[derive(Debug, Clone)]
 pub struct AgentCompactionSettings {
     pub enabled: bool,
+    pub strategy: CompactionStrategy,
     pub head_count: usize,
     pub tail_count: usize,
     pub message_count_threshold: usize,
@@ -169,6 +170,10 @@ impl Default for AgentCompactionSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            strategy: CompactionStrategy::HeadTail {
+                head_count: 2,
+                tail_count: 2,
+            },
             head_count: 2,
             tail_count: 2,
             message_count_threshold: 20,
@@ -427,8 +432,21 @@ impl MessageService {
 
         // Set up compactor if enabled
         if config.enable_compaction {
+            let strategy = match config.compaction_strategy.as_str() {
+                "head_tail" => CompactionStrategy::HeadTail {
+                    head_count: config.compaction_head_count,
+                    tail_count: config.compaction_tail_count,
+                },
+                "age_based" => CompactionStrategy::AgeBased { max_age_days: 7 },
+                "budget_based" => CompactionStrategy::BudgetBased { max_tokens: 16000 },
+                _ => CompactionStrategy::HeadTail {
+                    head_count: config.compaction_head_count,
+                    tail_count: config.compaction_tail_count,
+                },
+            };
             self.agent_compaction = AgentCompactionSettings {
                 enabled: true,
+                strategy,
                 head_count: config.compaction_head_count,
                 tail_count: config.compaction_tail_count,
                 message_count_threshold: config.compaction_message_threshold,
@@ -2713,10 +2731,7 @@ impl MessageService {
 
         let request = CompactionRequest {
             messages: history,
-            strategy: CompactionStrategy::HeadTail {
-                head_count: self.agent_compaction.head_count,
-                tail_count: self.agent_compaction.tail_count,
-            },
+            strategy: self.agent_compaction.strategy.clone(),
         };
 
         let result = compactor.compact(request, self.provider.clone()).await?;
