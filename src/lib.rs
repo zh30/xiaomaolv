@@ -2,6 +2,7 @@ pub mod channel;
 pub mod code_mode;
 pub mod config;
 pub mod domain;
+pub mod harness;
 pub mod http;
 pub mod mcp;
 pub mod mcp_commands;

@@ -37,6 +37,15 @@ impl SqliteMemoryStore {
             .await
             .with_context(|| format!("failed to connect sqlite database: {database_url}"))?;
 
+        // Set WAL autocheckpoint to 1000 pages (about 4MB with default page size)
+        // This helps manage WAL file size and improves read performance
+        if !is_in_memory_sqlite_url(database_url) {
+            sqlx::query("PRAGMA wal_autocheckpoint = 1000")
+                .execute(&pool)
+                .await
+                .context("failed to set wal_autocheckpoint")?;
+        }
+
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -287,6 +296,59 @@ impl SqliteMemoryStore {
         .await
         .context("failed to initialize agent_swarm_nodes started index")?;
 
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS mcp_trajectories (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                user_id TEXT,
+                started_at INTEGER NOT NULL,
+                finished_at INTEGER,
+                final_answer TEXT,
+                exit_reason TEXT NOT NULL,
+                model TEXT NOT NULL,
+                total_tokens INTEGER,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize mcp_trajectories table")?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS mcp_trajectory_tool_calls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trajectory_id TEXT NOT NULL REFERENCES mcp_trajectories(id),
+                iteration INTEGER NOT NULL,
+                server TEXT NOT NULL,
+                tool TEXT NOT NULL,
+                arguments TEXT NOT NULL,
+                result TEXT NOT NULL,
+                ok INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                UNIQUE(trajectory_id, iteration, server, tool)
+            );",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize mcp_trajectory_tool_calls table")?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_trajectory_session
+             ON mcp_trajectories(session_id, started_at);",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize trajectory session index")?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_trajectory_channel
+             ON mcp_trajectories(channel, started_at);",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize trajectory channel index")?;
+
         Ok(Self { pool })
     }
 
@@ -397,28 +459,72 @@ impl SqliteMemoryStore {
         chat_id: i64,
         aliases: &[String],
     ) -> anyhow::Result<()> {
+        // Filter and normalize aliases first
+        let normalized_aliases: Vec<&str> = aliases
+            .iter()
+            .map(|a| a.trim())
+            .filter(|a| !a.is_empty())
+            .collect();
+
+        if normalized_aliases.is_empty() {
+            return Ok(());
+        }
+
+        // Use raw_sql with manual parameter building for batch insert
+        // This avoids the complexity of building a single multi-row INSERT with functions
         let mut tx = self
             .pool
             .begin()
             .await
             .context("failed to begin telegram group alias tx")?;
 
-        for alias in aliases {
-            let normalized = alias.trim();
-            if normalized.is_empty() {
-                continue;
-            }
-            sqlx::query(
+        // Get current timestamp once for all inserts in this batch
+        let now_unix = sqlx::query_scalar::<_, i64>("SELECT unixepoch()")
+            .fetch_one(&mut *tx)
+            .await
+            .context("failed to get current unix timestamp")?;
+
+        // Build batch INSERT with multiple VALUES clauses
+        // Each row has 4 columns: channel, chat_id, alias, learned_at
+        // We use 4 placeholders per row
+        const MAX_ROWS_PER_QUERY: usize = 50;
+
+        for chunk in normalized_aliases.chunks(MAX_ROWS_PER_QUERY) {
+            let placeholders: Vec<String> = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    let base = i * 4; // 4 params per alias
+                    format!(
+                        "(?{}, ?{}, ?{}, ?{})",
+                        base + 1,
+                        base + 2,
+                        base + 3,
+                        base + 4
+                    )
+                })
+                .collect();
+
+            let query = format!(
                 "INSERT OR IGNORE INTO telegram_group_aliases
                  (channel, chat_id, alias, learned_at)
-                 VALUES (?1, ?2, ?3, unixepoch())",
-            )
-            .bind(channel)
-            .bind(chat_id)
-            .bind(normalized)
-            .execute(&mut *tx)
-            .await
-            .context("failed to upsert telegram group alias")?;
+                 VALUES {}",
+                placeholders.join(", ")
+            );
+
+            let mut query_builder = sqlx::query(&query);
+            for alias in chunk {
+                query_builder = query_builder
+                    .bind(channel)
+                    .bind(chat_id)
+                    .bind(*alias)
+                    .bind(now_unix);
+            }
+
+            query_builder
+                .execute(&mut *tx)
+                .await
+                .context("failed to batch upsert telegram group aliases")?;
         }
 
         tx.commit()
@@ -688,11 +794,10 @@ impl SqliteMemoryStore {
             .begin()
             .await
             .context("failed to begin scheduler tx")?;
+
+        // Step 1: SELECT due job IDs only (minimal data transfer)
         let rows = sqlx::query(
-            "SELECT job_id, channel, chat_id, message_thread_id, owner_user_id, status, task_kind,
-                    payload, schedule_kind, timezone, run_at_unix, cron_expr, policy_json, next_run_at_unix,
-                    last_run_at_unix, last_error, run_count, failure_streak, max_runs, lease_token,
-                    lease_until_unix, created_at, updated_at
+            "SELECT job_id
              FROM telegram_scheduler_jobs
              WHERE channel = ?1
                AND status = 'active'
@@ -707,46 +812,73 @@ impl SqliteMemoryStore {
         .bind(limit.max(1) as i64)
         .fetch_all(&mut *tx)
         .await
-        .context("failed to query due telegram scheduler jobs")?;
+        .context("failed to query due telegram scheduler job ids")?;
+
+        if rows.is_empty() {
+            tx.commit()
+                .await
+                .context("failed to commit empty scheduler tx")?;
+            return Ok(Vec::new());
+        }
+
+        // Collect job_ids for batch update
+        let job_ids: Vec<&str> = rows.iter().map(|r| r.get("job_id")).collect();
 
         let lease_until_unix = now_unix + lease_secs.max(1);
-        let mut claimed = Vec::new();
-        for row in rows {
-            let job = telegram_scheduler_job_from_row(row)
-                .context("failed to decode due telegram scheduler job")?;
-            let updated = sqlx::query(
-                "UPDATE telegram_scheduler_jobs
-                 SET lease_token = ?1,
-                     lease_until_unix = ?2,
-                     updated_at = unixepoch()
-                 WHERE channel = ?3
-                   AND job_id = ?4
-                   AND status = 'active'
-                   AND (lease_until_unix IS NULL OR lease_until_unix <= ?5)",
-            )
-            .bind(lease_token)
-            .bind(lease_until_unix)
-            .bind(channel)
-            .bind(&job.job_id)
-            .bind(now_unix)
-            .execute(&mut *tx)
-            .await
-            .context("failed to claim telegram scheduler job")?;
 
-            if updated.rows_affected() == 0 {
-                continue;
-            }
+        // Step 2: Batch UPDATE - single query for all due jobs
+        // Use json_each to expand job_ids array for IN clause
+        let job_ids_json = serde_json::to_string(&job_ids)
+            .context("failed to serialize job_ids for batch claim")?;
 
-            claimed.push(TelegramSchedulerJobRecord {
-                lease_token: Some(lease_token.to_string()),
-                lease_until_unix: Some(lease_until_unix),
-                ..job
-            });
-        }
+        sqlx::query(
+            "UPDATE telegram_scheduler_jobs
+             SET lease_token = ?1,
+                 lease_until_unix = ?2,
+                 updated_at = unixepoch()
+             WHERE channel = ?3
+               AND status = 'active'
+               AND job_id IN (SELECT value FROM json_each(?4))
+               AND (lease_until_unix IS NULL OR lease_until_unix <= ?5)",
+        )
+        .bind(lease_token)
+        .bind(lease_until_unix)
+        .bind(channel)
+        .bind(&job_ids_json)
+        .bind(now_unix)
+        .execute(&mut *tx)
+        .await
+        .context("failed to batch claim telegram scheduler jobs")?;
+
+        // Step 3: SELECT back the claimed jobs with updated lease info
+        let claimed_rows = sqlx::query(
+            "SELECT job_id, channel, chat_id, message_thread_id, owner_user_id, status, task_kind,
+                    payload, schedule_kind, timezone, run_at_unix, cron_expr, policy_json, next_run_at_unix,
+                    last_run_at_unix, last_error, run_count, failure_streak, max_runs, lease_token,
+                    lease_until_unix, created_at, updated_at
+             FROM telegram_scheduler_jobs
+             WHERE channel = ?1
+               AND lease_token = ?2",
+        )
+        .bind(channel)
+        .bind(lease_token)
+        .fetch_all(&mut *tx)
+        .await
+        .context("failed to query claimed telegram scheduler jobs")?;
+
+        let claimed: Vec<TelegramSchedulerJobRecord> = claimed_rows
+            .into_iter()
+            .map(|row| {
+                telegram_scheduler_job_from_row(row)
+                    .context("failed to decode claimed telegram scheduler job")
+            })
+            .collect::<anyhow::Result<Vec<_>>>()
+            .context("failed to decode claimed telegram scheduler jobs")?;
 
         tx.commit()
             .await
             .context("failed to commit scheduler claim tx")?;
+
         Ok(claimed)
     }
 
@@ -1161,6 +1293,291 @@ impl SqliteMemoryStore {
             .await
             .context("failed to commit agent swarm cleanup tx")?;
         Ok(deleted.rows_affected() as i64)
+    }
+
+    pub async fn insert_trajectory_tool_call(
+        &self,
+        trajectory_id: &str,
+        record: crate::harness::trajectory::ToolCallRecord,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO mcp_trajectory_tool_calls
+             (trajectory_id, iteration, server, tool, arguments, result, ok, duration_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )
+        .bind(trajectory_id)
+        .bind(record.iteration as i64)
+        .bind(&record.server)
+        .bind(&record.tool)
+        .bind(serde_json::to_string(&record.arguments).unwrap_or_default())
+        .bind(serde_json::to_string(&record.result).unwrap_or_default())
+        .bind(record.ok)
+        .bind(record.duration_ms as i64)
+        .execute(&self.pool)
+        .await
+        .context("failed to insert trajectory tool call")?;
+        Ok(())
+    }
+
+    pub async fn start_trajectory(
+        &self,
+        trajectory_id: &str,
+        session_id: &str,
+        channel: &str,
+        user_id: &str,
+        model: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO mcp_trajectories
+             (id, session_id, channel, user_id, started_at, exit_reason, model)
+             VALUES (?1, ?2, ?3, ?4, unixepoch(), 'final_answer', ?5)",
+        )
+        .bind(trajectory_id)
+        .bind(session_id)
+        .bind(channel)
+        .bind(user_id)
+        .bind(model)
+        .execute(&self.pool)
+        .await
+        .context("failed to start trajectory")?;
+        Ok(())
+    }
+
+    pub async fn finish_trajectory(
+        &self,
+        trajectory_id: &str,
+        final_answer: Option<String>,
+        exit_reason: crate::harness::trajectory::TrajectoryExitReason,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE mcp_trajectories
+             SET finished_at = unixepoch(),
+                 final_answer = ?2,
+                 exit_reason = ?3
+             WHERE id = ?1",
+        )
+        .bind(trajectory_id)
+        .bind(&final_answer)
+        .bind(exit_reason.as_str())
+        .execute(&self.pool)
+        .await
+        .context("failed to finish trajectory")?;
+        Ok(())
+    }
+
+    pub async fn query_trajectories(
+        &self,
+        filter: crate::harness::trajectory::TrajectoryFilter,
+    ) -> anyhow::Result<Vec<crate::harness::trajectory::TrajectoryRecord>> {
+        type RowTuple = (
+            String,
+            String,
+            String,
+            Option<String>,
+            i64,
+            Option<i64>,
+            Option<String>,
+            String,
+            String,
+            Option<i64>,
+        );
+
+        let limit = filter.limit as i64;
+
+        // Build and execute query based on which filters are present
+        let rows: Vec<RowTuple> = if let (Some(session_id), Some(channel), Some(user_id)) =
+            (&filter.session_id, &filter.channel, &filter.user_id)
+        {
+            sqlx::query_as::<_, RowTuple>(
+                "SELECT t.id, t.session_id, t.channel, t.user_id, t.started_at,
+                        t.finished_at, t.final_answer, t.exit_reason, t.model, t.total_tokens
+                 FROM mcp_trajectories t
+                 WHERE t.session_id = ? AND t.channel = ? AND t.user_id = ?
+                 ORDER BY t.started_at DESC LIMIT ?",
+            )
+            .bind(session_id)
+            .bind(channel)
+            .bind(user_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to query trajectories")?
+        } else if let (Some(session_id), Some(channel)) =
+            (&filter.session_id, &filter.channel)
+        {
+            sqlx::query_as::<_, RowTuple>(
+                "SELECT t.id, t.session_id, t.channel, t.user_id, t.started_at,
+                        t.finished_at, t.final_answer, t.exit_reason, t.model, t.total_tokens
+                 FROM mcp_trajectories t
+                 WHERE t.session_id = ? AND t.channel = ?
+                 ORDER BY t.started_at DESC LIMIT ?",
+            )
+            .bind(session_id)
+            .bind(channel)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to query trajectories")?
+        } else if let (Some(session_id), Some(user_id)) =
+            (&filter.session_id, &filter.user_id)
+        {
+            sqlx::query_as::<_, RowTuple>(
+                "SELECT t.id, t.session_id, t.channel, t.user_id, t.started_at,
+                        t.finished_at, t.final_answer, t.exit_reason, t.model, t.total_tokens
+                 FROM mcp_trajectories t
+                 WHERE t.session_id = ? AND t.user_id = ?
+                 ORDER BY t.started_at DESC LIMIT ?",
+            )
+            .bind(session_id)
+            .bind(user_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to query trajectories")?
+        } else if let (Some(channel), Some(user_id)) =
+            (&filter.channel, &filter.user_id)
+        {
+            sqlx::query_as::<_, RowTuple>(
+                "SELECT t.id, t.session_id, t.channel, t.user_id, t.started_at,
+                        t.finished_at, t.final_answer, t.exit_reason, t.model, t.total_tokens
+                 FROM mcp_trajectories t
+                 WHERE t.channel = ? AND t.user_id = ?
+                 ORDER BY t.started_at DESC LIMIT ?",
+            )
+            .bind(channel)
+            .bind(user_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to query trajectories")?
+        } else if let Some(session_id) = &filter.session_id {
+            sqlx::query_as::<_, RowTuple>(
+                "SELECT t.id, t.session_id, t.channel, t.user_id, t.started_at,
+                        t.finished_at, t.final_answer, t.exit_reason, t.model, t.total_tokens
+                 FROM mcp_trajectories t
+                 WHERE t.session_id = ?
+                 ORDER BY t.started_at DESC LIMIT ?",
+            )
+            .bind(session_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to query trajectories")?
+        } else if let Some(channel) = &filter.channel {
+            sqlx::query_as::<_, RowTuple>(
+                "SELECT t.id, t.session_id, t.channel, t.user_id, t.started_at,
+                        t.finished_at, t.final_answer, t.exit_reason, t.model, t.total_tokens
+                 FROM mcp_trajectories t
+                 WHERE t.channel = ?
+                 ORDER BY t.started_at DESC LIMIT ?",
+            )
+            .bind(channel)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to query trajectories")?
+        } else if let Some(user_id) = &filter.user_id {
+            sqlx::query_as::<_, RowTuple>(
+                "SELECT t.id, t.session_id, t.channel, t.user_id, t.started_at,
+                        t.finished_at, t.final_answer, t.exit_reason, t.model, t.total_tokens
+                 FROM mcp_trajectories t
+                 WHERE t.user_id = ?
+                 ORDER BY t.started_at DESC LIMIT ?",
+            )
+            .bind(user_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to query trajectories")?
+        } else {
+            // No filters, just get all with limit
+            sqlx::query_as::<_, RowTuple>(
+                "SELECT t.id, t.session_id, t.channel, t.user_id, t.started_at,
+                        t.finished_at, t.final_answer, t.exit_reason, t.model, t.total_tokens
+                 FROM mcp_trajectories t
+                 ORDER BY t.started_at DESC LIMIT ?",
+            )
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to query trajectories")?
+        };
+
+        let mut results = Vec::new();
+        for (
+            id,
+            session_id,
+            channel,
+            user_id,
+            started_at,
+            finished_at,
+            final_answer,
+            exit_reason,
+            model,
+            total_tokens,
+        ) in rows
+        {
+            let tool_calls = self
+                .load_trajectory_tool_calls(&id)
+                .await
+                .unwrap_or_default();
+
+            results.push(crate::harness::trajectory::TrajectoryRecord {
+                id,
+                session_id,
+                channel,
+                user_id: user_id.unwrap_or_default(),
+                started_at: chrono::DateTime::from_timestamp(started_at, 0)
+                    .unwrap_or_else(chrono::Utc::now),
+                finished_at: finished_at
+                    .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0)),
+                tool_calls,
+                final_answer,
+                exit_reason: crate::harness::trajectory::TrajectoryExitReason::from_db(
+                    &exit_reason,
+                ),
+                model,
+                total_tokens: total_tokens.map(|v| v as u64),
+            });
+        }
+
+        Ok(results)
+    }
+
+    async fn load_trajectory_tool_calls(
+        &self,
+        trajectory_id: &str,
+    ) -> anyhow::Result<Vec<crate::harness::trajectory::ToolCallRecord>> {
+        let rows = sqlx::query(
+            "SELECT iteration, server, tool, arguments, result, ok, duration_ms
+             FROM mcp_trajectory_tool_calls
+             WHERE trajectory_id = ?1
+             ORDER BY iteration ASC, server ASC, tool ASC",
+        )
+        .bind(trajectory_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to load trajectory tool calls")?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let iteration: i64 = row.get("iteration");
+                let ok: i64 = row.get("ok");
+                let duration_ms: i64 = row.get("duration_ms");
+                let arguments: String = row.get("arguments");
+                let result: String = row.get("result");
+                crate::harness::trajectory::ToolCallRecord {
+                    server: row.get("server"),
+                    tool: row.get("tool"),
+                    arguments: serde_json::from_str(&arguments).unwrap_or(serde_json::Value::Null),
+                    result: serde_json::from_str(&result).unwrap_or(serde_json::Value::Null),
+                    ok: ok != 0,
+                    duration_ms: duration_ms as u64,
+                    iteration: iteration as usize,
+                }
+            })
+            .collect())
     }
 }
 
@@ -1860,6 +2277,37 @@ pub trait MemoryBackend: Send + Sync {
     ) -> anyhow::Result<i64> {
         Ok(0)
     }
+    async fn insert_trajectory_tool_call(
+        &self,
+        _trajectory_id: &str,
+        _record: crate::harness::trajectory::ToolCallRecord,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn start_trajectory(
+        &self,
+        _trajectory_id: &str,
+        _session_id: &str,
+        _channel: &str,
+        _user_id: &str,
+        _model: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn finish_trajectory(
+        &self,
+        _trajectory_id: &str,
+        _final_answer: Option<String>,
+        _exit_reason: crate::harness::trajectory::TrajectoryExitReason,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn query_trajectories(
+        &self,
+        _filter: crate::harness::trajectory::TrajectoryFilter,
+    ) -> anyhow::Result<Vec<crate::harness::trajectory::TrajectoryRecord>> {
+        Ok(vec![])
+    }
 }
 
 #[derive(Clone)]
@@ -2137,6 +2585,47 @@ impl MemoryBackend for SqliteMemoryBackend {
             .cleanup_agent_swarm_audit(&req.channel, req.before_unix)
             .await
     }
+
+    async fn insert_trajectory_tool_call(
+        &self,
+        trajectory_id: &str,
+        record: crate::harness::trajectory::ToolCallRecord,
+    ) -> anyhow::Result<()> {
+        self.store
+            .insert_trajectory_tool_call(trajectory_id, record)
+            .await
+    }
+
+    async fn start_trajectory(
+        &self,
+        trajectory_id: &str,
+        session_id: &str,
+        channel: &str,
+        user_id: &str,
+        model: &str,
+    ) -> anyhow::Result<()> {
+        self.store
+            .start_trajectory(trajectory_id, session_id, channel, user_id, model)
+            .await
+    }
+
+    async fn finish_trajectory(
+        &self,
+        trajectory_id: &str,
+        final_answer: Option<String>,
+        exit_reason: crate::harness::trajectory::TrajectoryExitReason,
+    ) -> anyhow::Result<()> {
+        self.store
+            .finish_trajectory(trajectory_id, final_answer, exit_reason)
+            .await
+    }
+
+    async fn query_trajectories(
+        &self,
+        filter: crate::harness::trajectory::TrajectoryFilter,
+    ) -> anyhow::Result<Vec<crate::harness::trajectory::TrajectoryRecord>> {
+        self.store.query_trajectories(filter).await
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2180,7 +2669,13 @@ pub struct ZvecSidecarClient {
 impl ZvecSidecarClient {
     pub fn new(cfg: ZvecSidecarConfig) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .pool_max_idle_per_host(10)
+                .pool_idle_timeout(std::time::Duration::from_secs(30))
+                .tcp_keepalive(std::time::Duration::from_secs(30))
+                .http1_title_case_headers()
+                .build()
+                .expect("failed to build zvec sidecar HTTP client"),
             cfg,
         }
     }
@@ -2616,6 +3111,47 @@ impl MemoryBackend for HybridSqliteZvecMemoryBackend {
         self.store
             .cleanup_agent_swarm_audit(&req.channel, req.before_unix)
             .await
+    }
+
+    async fn insert_trajectory_tool_call(
+        &self,
+        trajectory_id: &str,
+        record: crate::harness::trajectory::ToolCallRecord,
+    ) -> anyhow::Result<()> {
+        self.store
+            .insert_trajectory_tool_call(trajectory_id, record)
+            .await
+    }
+
+    async fn start_trajectory(
+        &self,
+        trajectory_id: &str,
+        session_id: &str,
+        channel: &str,
+        user_id: &str,
+        model: &str,
+    ) -> anyhow::Result<()> {
+        self.store
+            .start_trajectory(trajectory_id, session_id, channel, user_id, model)
+            .await
+    }
+
+    async fn finish_trajectory(
+        &self,
+        trajectory_id: &str,
+        final_answer: Option<String>,
+        exit_reason: crate::harness::trajectory::TrajectoryExitReason,
+    ) -> anyhow::Result<()> {
+        self.store
+            .finish_trajectory(trajectory_id, final_answer, exit_reason)
+            .await
+    }
+
+    async fn query_trajectories(
+        &self,
+        filter: crate::harness::trajectory::TrajectoryFilter,
+    ) -> anyhow::Result<Vec<crate::harness::trajectory::TrajectoryRecord>> {
+        self.store.query_trajectories(filter).await
     }
 }
 

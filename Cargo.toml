@@ -15,7 +15,7 @@ path = "src/main.rs"
 anyhow = "1"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros"] }
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 chrono-tz = "0.10"
 clap = { version = "4.5", features = ["derive"] }
 cron = "0.15"

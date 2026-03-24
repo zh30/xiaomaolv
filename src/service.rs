@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
-use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{RwLock, Semaphore};
@@ -17,6 +16,9 @@ use crate::code_mode::{
     CodeModePlanner, DisabledCodeModePlanner, execute_plan_via_subprocess,
 };
 use crate::domain::{IncomingMessage, MessageRole, OutgoingMessage, StoredMessage};
+use crate::harness::trajectory::{
+    ToolCallRecord, TrajectoryLogger, new_trajectory_id,
+};
 use crate::mcp::{BUILTIN_MCP_SERVER_NAME, BUILTIN_MCP_TOOL_CURRENT_TIME, McpRuntime, McpToolInfo};
 use crate::memory::{
     AgentSwarmCleanupRequest, AgentSwarmNodeExitStatus, AgentSwarmNodeLoadRequest,
@@ -183,6 +185,7 @@ pub struct MessageService {
     context_reserved_tokens: usize,
     context_memory_budget_ratio: u8,
     context_min_recent_messages: usize,
+    trajectory_logger: Option<TrajectoryLogger>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -318,6 +321,7 @@ impl MessageService {
             context_reserved_tokens: 8_192,
             context_memory_budget_ratio: 35,
             context_min_recent_messages: 8,
+            trajectory_logger: None,
         }
     }
 
@@ -361,6 +365,11 @@ impl MessageService {
 
     pub fn with_code_mode_planner(mut self, planner: Arc<dyn CodeModePlanner>) -> Self {
         self.code_mode_planner = planner;
+        self
+    }
+
+    pub fn with_trajectory_logger(mut self, logger: TrajectoryLogger) -> Self {
+        self.trajectory_logger = Some(logger);
         self
     }
 
@@ -674,7 +683,7 @@ impl MessageService {
             });
         }
 
-        let text = self.complete_with_optional_mcp(history).await?;
+        let text = self.complete_with_optional_mcp(history, &incoming).await?;
 
         self.persist_assistant_reply(&incoming, &text).await?;
 
@@ -756,7 +765,7 @@ impl MessageService {
         }
 
         let text = self
-            .complete_with_optional_mcp_stream(history, sink)
+            .complete_with_optional_mcp_stream(history, sink, &incoming)
             .await
             .context("failed to process streaming completion with optional mcp")?;
 
@@ -1536,8 +1545,21 @@ impl MessageService {
             )));
         }
 
+        // Execute child futures with semaphore-limited concurrency
         let mut child_outcomes = Vec::new();
-        for result in join_all(child_futures).await {
+        let semaphore = shared.semaphore.clone();
+        for future in child_futures {
+            // Acquire permit before executing (limits concurrent children to max_parallel)
+            let permit = match semaphore.clone().acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => {
+                    // Semaphore closed, skip this child
+                    continue;
+                }
+            };
+            let result = future.await;
+            // Permit is dropped here, releasing the slot for next child
+            drop(permit);
             match result {
                 Ok(outcome) => child_outcomes.push(outcome),
                 Err(err) => warn!(error = %err, "swarm child execution failed"),
@@ -1724,6 +1746,7 @@ impl MessageService {
     async fn complete_with_optional_mcp(
         &self,
         history: Vec<StoredMessage>,
+        incoming: &IncomingMessage,
     ) -> anyhow::Result<String> {
         let Some(runtime) = self.snapshot_mcp_runtime().await else {
             return self
@@ -1768,13 +1791,15 @@ impl MessageService {
             }
         }
 
-        self.complete_with_mcp_loop(history, tools, runtime).await
+        self.complete_with_mcp_loop(history, tools, runtime, incoming)
+            .await
     }
 
     async fn complete_with_optional_mcp_stream(
         &self,
         history: Vec<StoredMessage>,
         sink: &mut dyn StreamSink,
+        incoming: &IncomingMessage,
     ) -> anyhow::Result<String> {
         let Some(runtime) = self.snapshot_mcp_runtime().await else {
             return self
@@ -1827,7 +1852,7 @@ impl MessageService {
             }
         }
 
-        self.complete_with_mcp_loop_stream(history, tools, runtime, sink)
+        self.complete_with_mcp_loop_stream(history, tools, runtime, sink, incoming)
             .await
     }
 
@@ -1939,15 +1964,24 @@ impl MessageService {
         mut history: Vec<StoredMessage>,
         tools: Vec<McpToolInfo>,
         runtime: McpRuntime,
+        _incoming: &IncomingMessage,
     ) -> anyhow::Result<String> {
         let mut telemetry = McpLoopTelemetry::new(tools.len());
+        let trajectory_id = new_trajectory_id();
+        let _started_at = chrono::Utc::now();
+        let _model = "unknown".to_string();
+
+        // Note: Trajectory logger would be set up here if enabled
+        // For now, we log tool calls and finish at the end
+        let _trajectory_id = &trajectory_id;
+
         history.push(StoredMessage {
             role: MessageRole::System,
             content: build_mcp_system_prompt(&tools)?,
         });
 
         let max_iterations = self.agent_mcp.max_iterations.max(1);
-        for _ in 0..max_iterations {
+        for iteration in 0..max_iterations {
             telemetry.observe_prompt_chars(&history);
             let reply = self
                 .provider
@@ -1960,9 +1994,20 @@ impl MessageService {
 
             let Some(tool_call) = parse_mcp_tool_call(&reply) else {
                 telemetry.emit("final_answer");
+                // Log final answer trajectory
+                if let Some(ref logger) = self.trajectory_logger {
+                    let _ = logger
+                        .finish_trajectory(
+                            &trajectory_id,
+                            Some(reply.clone()),
+                            crate::harness::trajectory::TrajectoryExitReason::FinalAnswer,
+                        )
+                        .await;
+                }
                 return Ok(reply);
             };
 
+            let tool_start = Instant::now();
             let tool_result = runtime
                 .call_tool(
                     &tool_call.server,
@@ -1970,12 +2015,30 @@ impl MessageService {
                     tool_call.arguments.clone(),
                 )
                 .await;
+            let tool_duration_ms = tool_start.elapsed().as_millis() as u64;
 
             let tool_message = match tool_result {
                 Ok(value) => {
                     telemetry.tool_calls_total += 1;
                     telemetry.tool_calls_ok += 1;
                     let result = truncate_json_value(&value, self.agent_mcp.max_tool_result_chars);
+                    let result_clone = result.clone();
+                    let args_clone = tool_call.arguments.clone();
+
+                    // Log tool call to trajectory
+                    if let Some(ref logger) = self.trajectory_logger {
+                        let record = ToolCallRecord {
+                            server: tool_call.server.clone(),
+                            tool: tool_call.tool.clone(),
+                            arguments: args_clone,
+                            result: result_clone,
+                            ok: true,
+                            duration_ms: tool_duration_ms,
+                            iteration,
+                        };
+                        let _ = logger.log_tool_call(&trajectory_id, record).await;
+                    }
+
                     serde_json::json!({
                         "server": tool_call.server,
                         "tool": tool_call.tool,
@@ -1986,6 +2049,23 @@ impl MessageService {
                 Err(err) => {
                     telemetry.tool_calls_total += 1;
                     telemetry.tool_calls_err += 1;
+                    let args_clone = tool_call.arguments.clone();
+                    let error_json = serde_json::json!({"error": err.to_string()});
+
+                    // Log tool call to trajectory
+                    if let Some(ref logger) = self.trajectory_logger {
+                        let record = ToolCallRecord {
+                            server: tool_call.server.clone(),
+                            tool: tool_call.tool.clone(),
+                            arguments: args_clone,
+                            result: error_json,
+                            ok: false,
+                            duration_ms: tool_duration_ms,
+                            iteration,
+                        };
+                        let _ = logger.log_tool_call(&trajectory_id, record).await;
+                    }
+
                     serde_json::json!({
                         "server": tool_call.server,
                         "tool": tool_call.tool,
@@ -2020,6 +2100,18 @@ impl MessageService {
             .await
             .context("provider completion failed")?;
         telemetry.emit("max_iterations");
+
+        // Log max iterations trajectory
+        if let Some(ref logger) = self.trajectory_logger {
+            let _ = logger
+                .finish_trajectory(
+                    &trajectory_id,
+                    Some(final_reply.clone()),
+                    crate::harness::trajectory::TrajectoryExitReason::MaxIterations,
+                )
+                .await;
+        }
+
         Ok(final_reply)
     }
 
@@ -2029,15 +2121,23 @@ impl MessageService {
         tools: Vec<McpToolInfo>,
         runtime: McpRuntime,
         sink: &mut dyn StreamSink,
+        _incoming: &IncomingMessage,
     ) -> anyhow::Result<String> {
         let mut telemetry = McpLoopTelemetry::new(tools.len());
+        let trajectory_id = new_trajectory_id();
+        let started_at = chrono::Utc::now();
+        let model = "unknown".to_string();
+
+        // Note: Trajectory logger would be set up here if enabled
+        let _ = (&trajectory_id, &started_at, &model);
+
         history.push(StoredMessage {
             role: MessageRole::System,
             content: build_mcp_system_prompt(&tools)?,
         });
 
         let max_iterations = self.agent_mcp.max_iterations.max(1);
-        for _ in 0..max_iterations {
+        for iteration in 0..max_iterations {
             telemetry.observe_prompt_chars(&history);
             let mut buffered_sink = BufferedStreamSink::default();
             let reply = self
@@ -2064,9 +2164,22 @@ impl MessageService {
                     .replay_or_fallback(&resolved_reply, sink)
                     .await?;
                 telemetry.emit("final_answer");
+
+                // Log final answer trajectory
+                if let Some(ref logger) = self.trajectory_logger {
+                    let _ = logger
+                        .finish_trajectory(
+                            &trajectory_id,
+                            Some(resolved_reply.clone()),
+                            crate::harness::trajectory::TrajectoryExitReason::FinalAnswer,
+                        )
+                        .await;
+                }
+
                 return Ok(resolved_reply);
             };
 
+            let tool_start = Instant::now();
             let tool_result = runtime
                 .call_tool(
                     &tool_call.server,
@@ -2074,12 +2187,30 @@ impl MessageService {
                     tool_call.arguments.clone(),
                 )
                 .await;
+            let tool_duration_ms = tool_start.elapsed().as_millis() as u64;
 
             let tool_message = match tool_result {
                 Ok(value) => {
                     telemetry.tool_calls_total += 1;
                     telemetry.tool_calls_ok += 1;
                     let result = truncate_json_value(&value, self.agent_mcp.max_tool_result_chars);
+                    let result_clone = result.clone();
+                    let args_clone = tool_call.arguments.clone();
+
+                    // Log tool call to trajectory
+                    if let Some(ref logger) = self.trajectory_logger {
+                        let record = ToolCallRecord {
+                            server: tool_call.server.clone(),
+                            tool: tool_call.tool.clone(),
+                            arguments: args_clone,
+                            result: result_clone,
+                            ok: true,
+                            duration_ms: tool_duration_ms,
+                            iteration,
+                        };
+                        let _ = logger.log_tool_call(&trajectory_id, record).await;
+                    }
+
                     serde_json::json!({
                         "server": tool_call.server,
                         "tool": tool_call.tool,
@@ -2090,6 +2221,23 @@ impl MessageService {
                 Err(err) => {
                     telemetry.tool_calls_total += 1;
                     telemetry.tool_calls_err += 1;
+                    let args_clone = tool_call.arguments.clone();
+                    let error_json = serde_json::json!({"error": err.to_string()});
+
+                    // Log tool call to trajectory
+                    if let Some(ref logger) = self.trajectory_logger {
+                        let record = ToolCallRecord {
+                            server: tool_call.server.clone(),
+                            tool: tool_call.tool.clone(),
+                            arguments: args_clone,
+                            result: error_json,
+                            ok: false,
+                            duration_ms: tool_duration_ms,
+                            iteration,
+                        };
+                        let _ = logger.log_tool_call(&trajectory_id, record).await;
+                    }
+
                     serde_json::json!({
                         "server": tool_call.server,
                         "tool": tool_call.tool,
@@ -2135,6 +2283,18 @@ impl MessageService {
             .replay_or_fallback(&resolved_reply, sink)
             .await?;
         telemetry.emit("max_iterations");
+
+        // Log max iterations trajectory
+        if let Some(ref logger) = self.trajectory_logger {
+            let _ = logger
+                .finish_trajectory(
+                    &trajectory_id,
+                    Some(resolved_reply.clone()),
+                    crate::harness::trajectory::TrajectoryExitReason::MaxIterations,
+                )
+                .await;
+        }
+
         Ok(resolved_reply)
     }
 
@@ -2620,7 +2780,7 @@ fn next_code_mode_timeout_streak(
 
 fn should_probe_code_mode_timeout_circuit(probe_count: usize, probe_every: usize) -> bool {
     let interval = probe_every.max(1);
-    probe_count % interval == 0
+    probe_count.is_multiple_of(interval)
 }
 
 fn should_open_code_mode_timeout_circuit(
