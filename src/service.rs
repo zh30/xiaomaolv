@@ -16,6 +16,7 @@ use crate::code_mode::{
     CodeModePlanner, DisabledCodeModePlanner, execute_plan_via_subprocess,
 };
 use crate::domain::{IncomingMessage, MessageRole, OutgoingMessage, StoredMessage};
+use crate::harness::compactor::{CompactionRequest, CompactionStrategy, Compactor};
 use crate::harness::trajectory::{ToolCallRecord, TrajectoryLogger, new_trajectory_id};
 use crate::mcp::{BUILTIN_MCP_SERVER_NAME, BUILTIN_MCP_TOOL_CURRENT_TIME, McpRuntime, McpToolInfo};
 use crate::memory::{
@@ -153,6 +154,25 @@ impl Default for AgentSwarmSettings {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct AgentCompactionSettings {
+    pub enabled: bool,
+    pub head_count: usize,
+    pub tail_count: usize,
+    pub message_count_threshold: usize,
+}
+
+impl Default for AgentCompactionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            head_count: 2,
+            tail_count: 2,
+            message_count_threshold: 20,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct MessageService {
     provider: Arc<dyn ChatProvider>,
@@ -164,6 +184,8 @@ pub struct MessageService {
     agent_code_mode: AgentCodeModeSettings,
     agent_skills: AgentSkillsSettings,
     agent_swarm: AgentSwarmSettings,
+    agent_compaction: AgentCompactionSettings,
+    compactor: Option<Compactor>,
     swarm_run_counter: Arc<AtomicUsize>,
     code_mode_timeout_alert_streak: Arc<AtomicUsize>,
     code_mode_timeout_circuit_open: Arc<AtomicBool>,
@@ -300,6 +322,8 @@ impl MessageService {
             agent_code_mode: AgentCodeModeSettings::default(),
             agent_skills: AgentSkillsSettings::default(),
             agent_swarm: AgentSwarmSettings::default(),
+            agent_compaction: AgentCompactionSettings::default(),
+            compactor: None,
             swarm_run_counter: Arc::new(AtomicUsize::new(0)),
             code_mode_timeout_alert_streak: Arc::new(AtomicUsize::new(0)),
             code_mode_timeout_circuit_open: Arc::new(AtomicBool::new(false)),
@@ -368,6 +392,12 @@ impl MessageService {
 
     pub fn with_trajectory_logger(mut self, logger: TrajectoryLogger) -> Self {
         self.trajectory_logger = Some(logger);
+        self
+    }
+
+    pub fn with_compaction(mut self, settings: AgentCompactionSettings) -> Self {
+        self.agent_compaction = settings;
+        self.compactor = Some(Compactor::new(self.agent_compaction.enabled));
         self
     }
 
@@ -659,13 +689,29 @@ impl MessageService {
             })
             .await
             .context("failed to load history")?;
-        let history = apply_context_budget(
+        let mut history = apply_context_budget(
             history,
             self.context_window_tokens,
             self.context_reserved_tokens,
             self.context_memory_budget_ratio,
             self.context_min_recent_messages,
         );
+
+        // Apply compaction if enabled and threshold is met
+        if self.agent_compaction.enabled
+            && history.len() >= self.agent_compaction.message_count_threshold
+            && self.compactor.is_some()
+        {
+            match self.apply_compaction(history.clone()).await {
+                Ok(compacted) => {
+                    history = compacted;
+                }
+                Err(err) => {
+                    warn!(error = %err, "compaction failed, using original history");
+                }
+            }
+        }
+
         let history = self.apply_skills_prompt(history, &incoming.text).await;
         let history = self
             .append_builtin_time_context_if_needed(history, &incoming.text)
@@ -737,13 +783,29 @@ impl MessageService {
             })
             .await
             .context("failed to load history")?;
-        let history = apply_context_budget(
+        let mut history = apply_context_budget(
             history,
             self.context_window_tokens,
             self.context_reserved_tokens,
             self.context_memory_budget_ratio,
             self.context_min_recent_messages,
         );
+
+        // Apply compaction if enabled and threshold is met
+        if self.agent_compaction.enabled
+            && history.len() >= self.agent_compaction.message_count_threshold
+            && self.compactor.is_some()
+        {
+            match self.apply_compaction(history.clone()).await {
+                Ok(compacted) => {
+                    history = compacted;
+                }
+                Err(err) => {
+                    warn!(error = %err, "compaction failed, using original history");
+                }
+            }
+        }
+
         let history = self.apply_skills_prompt(history, &incoming.text).await;
         let history = self
             .append_builtin_time_context_if_needed(history, &incoming.text)
@@ -2490,6 +2552,36 @@ impl MessageService {
         }
         let runtime = self.skills_runtime.as_ref()?;
         Some(runtime.read().await.clone())
+    }
+
+    async fn apply_compaction(
+        &self,
+        history: Vec<StoredMessage>,
+    ) -> anyhow::Result<Vec<StoredMessage>> {
+        // Return early if compaction is not enabled or not needed
+        if !self.agent_compaction.enabled {
+            return Ok(history);
+        }
+
+        if history.len() < self.agent_compaction.message_count_threshold {
+            return Ok(history);
+        }
+
+        let Some(compactor) = &self.compactor else {
+            return Ok(history);
+        };
+
+        let request = CompactionRequest {
+            messages: history,
+            strategy: CompactionStrategy::HeadTail {
+                head_count: self.agent_compaction.head_count,
+                tail_count: self.agent_compaction.tail_count,
+            },
+        };
+
+        let result = compactor.compact(request, self.provider.clone()).await?;
+
+        Ok(result.compacted_messages)
     }
 
     async fn apply_skills_prompt(
