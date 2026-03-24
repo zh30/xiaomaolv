@@ -1133,6 +1133,20 @@ impl MessageService {
             .context("failed to cleanup agent swarm audit")
     }
 
+    pub async fn get_trajectory_detail(
+        &self,
+        trajectory_id: String,
+    ) -> anyhow::Result<Option<crate::harness::trajectory::TrajectoryRecord>> {
+        self.memory.get_trajectory(&trajectory_id).await
+    }
+
+    pub async fn query_trajectories(
+        &self,
+        filter: crate::harness::trajectory::TrajectoryFilter,
+    ) -> anyhow::Result<Vec<crate::harness::trajectory::TrajectoryRecord>> {
+        self.memory.query_trajectories(filter).await
+    }
+
     async fn try_swarm_reply(
         &self,
         incoming: &IncomingMessage,

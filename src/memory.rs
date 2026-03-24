@@ -1365,6 +1365,73 @@ impl SqliteMemoryStore {
         Ok(())
     }
 
+    pub async fn get_trajectory(
+        &self,
+        trajectory_id: &str,
+    ) -> anyhow::Result<Option<crate::harness::trajectory::TrajectoryRecord>> {
+        type RowTuple = (
+            String,
+            String,
+            String,
+            Option<String>,
+            i64,
+            Option<i64>,
+            Option<String>,
+            String,
+            String,
+            Option<i64>,
+        );
+
+        let row = sqlx::query_as::<_, RowTuple>(
+            "SELECT id, session_id, channel, user_id, started_at,
+                    finished_at, final_answer, exit_reason, model, total_tokens
+             FROM mcp_trajectories
+             WHERE id = ?",
+        )
+        .bind(trajectory_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to get trajectory")?;
+
+        match row {
+            Some((
+                id,
+                session_id,
+                channel,
+                user_id,
+                started_at,
+                finished_at,
+                final_answer,
+                exit_reason,
+                model,
+                total_tokens,
+            )) => {
+                let tool_calls = self
+                    .load_trajectory_tool_calls(&id)
+                    .await
+                    .unwrap_or_default();
+
+                Ok(Some(crate::harness::trajectory::TrajectoryRecord {
+                    id,
+                    session_id,
+                    channel,
+                    user_id: user_id.unwrap_or_default(),
+                    started_at: chrono::DateTime::from_timestamp(started_at, 0)
+                        .unwrap_or_else(chrono::Utc::now),
+                    finished_at: finished_at.and_then(|ts| chrono::DateTime::from_timestamp(ts, 0)),
+                    tool_calls,
+                    final_answer,
+                    exit_reason: crate::harness::trajectory::TrajectoryExitReason::from_db(
+                        &exit_reason,
+                    ),
+                    model,
+                    total_tokens: total_tokens.map(|v| v as u64),
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
     pub async fn query_trajectories(
         &self,
         filter: crate::harness::trajectory::TrajectoryFilter,
@@ -2295,6 +2362,12 @@ pub trait MemoryBackend: Send + Sync {
     ) -> anyhow::Result<()> {
         Ok(())
     }
+    async fn get_trajectory(
+        &self,
+        _trajectory_id: &str,
+    ) -> anyhow::Result<Option<crate::harness::trajectory::TrajectoryRecord>> {
+        Ok(None)
+    }
     async fn query_trajectories(
         &self,
         _filter: crate::harness::trajectory::TrajectoryFilter,
@@ -2611,6 +2684,13 @@ impl MemoryBackend for SqliteMemoryBackend {
         self.store
             .finish_trajectory(trajectory_id, final_answer, exit_reason)
             .await
+    }
+
+    async fn get_trajectory(
+        &self,
+        trajectory_id: &str,
+    ) -> anyhow::Result<Option<crate::harness::trajectory::TrajectoryRecord>> {
+        self.store.get_trajectory(trajectory_id).await
     }
 
     async fn query_trajectories(
@@ -3138,6 +3218,13 @@ impl MemoryBackend for HybridSqliteZvecMemoryBackend {
         self.store
             .finish_trajectory(trajectory_id, final_answer, exit_reason)
             .await
+    }
+
+    async fn get_trajectory(
+        &self,
+        trajectory_id: &str,
+    ) -> anyhow::Result<Option<crate::harness::trajectory::TrajectoryRecord>> {
+        self.store.get_trajectory(trajectory_id).await
     }
 
     async fn query_trajectories(

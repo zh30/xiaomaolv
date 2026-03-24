@@ -598,6 +598,8 @@ fn build_axum_router(state: AppState, http_enabled: bool) -> Router {
             "/v1/channels/{channel}/inbound/{secret}",
             post(post_channel_inbound_with_secret),
         )
+        .route("/v1/harness/trajectories", get(list_trajectories))
+        .route("/v1/harness/trajectories/{id}", get(get_trajectory))
         .with_state(state)
 }
 
@@ -2176,6 +2178,60 @@ async fn post_channel_inbound_with_secret(
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     dispatch_channel_inbound(state, channel, Some(secret), payload).await
+}
+
+// ============================================================================
+// Trajectory query endpoints
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+struct TrajectoryQuery {
+    session_id: Option<String>,
+    channel: Option<String>,
+    user_id: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct TrajectoryListResponse {
+    trajectories: Vec<crate::harness::trajectory::TrajectoryRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct TrajectoryDetailResponse {
+    trajectory: Option<crate::harness::trajectory::TrajectoryRecord>,
+}
+
+async fn list_trajectories(
+    State(state): State<AppState>,
+    Query(params): Query<TrajectoryQuery>,
+) -> Result<Json<TrajectoryListResponse>, (StatusCode, String)> {
+    let runtime_state = state.runtime.read().await;
+    let filter = crate::harness::trajectory::TrajectoryFilter {
+        session_id: params.session_id,
+        channel: params.channel,
+        user_id: params.user_id,
+        limit: params.limit.unwrap_or(100),
+    };
+    let trajectories = runtime_state
+        .service
+        .query_trajectories(filter)
+        .await
+        .map_err(internal_err("failed to query trajectories"))?;
+    Ok(Json(TrajectoryListResponse { trajectories }))
+}
+
+async fn get_trajectory(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<TrajectoryDetailResponse>, (StatusCode, String)> {
+    let runtime_state = state.runtime.read().await;
+    let trajectory = runtime_state
+        .service
+        .get_trajectory_detail(id)
+        .await
+        .map_err(internal_err("failed to get trajectory"))?;
+    Ok(Json(TrajectoryDetailResponse { trajectory }))
 }
 
 async fn dispatch_channel_inbound(
