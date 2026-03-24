@@ -292,6 +292,8 @@ pub struct AgentConfig {
     #[serde(default)]
     pub swarm: AgentSwarmConfig,
     #[serde(default)]
+    pub harness: AgentHarnessConfig,
+    #[serde(default)]
     pub code_mode: AgentCodeModeSettings,
 }
 
@@ -333,6 +335,44 @@ impl Default for AgentSwarmConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentHarnessConfig {
+    #[serde(default)]
+    pub enable_trajectory: bool,
+    #[serde(default)]
+    pub enable_compaction: bool,
+    #[serde(default = "default_compaction_strategy")]
+    pub compaction_strategy: String,
+    #[serde(default = "default_compaction_head_count")]
+    pub compaction_head_count: usize,
+    #[serde(default = "default_compaction_tail_count")]
+    pub compaction_tail_count: usize,
+    #[serde(default = "default_compaction_message_threshold")]
+    pub compaction_message_threshold: usize,
+    #[serde(default)]
+    pub enable_verification: bool,
+    #[serde(default = "default_verification_max_tool_duration_ms")]
+    pub verification_max_tool_duration_ms: u64,
+    #[serde(default)]
+    pub verification_warn_ratio: f64,
+}
+
+impl Default for AgentHarnessConfig {
+    fn default() -> Self {
+        Self {
+            enable_trajectory: false,
+            enable_compaction: false,
+            compaction_strategy: default_compaction_strategy(),
+            compaction_head_count: default_compaction_head_count(),
+            compaction_tail_count: default_compaction_tail_count(),
+            compaction_message_threshold: default_compaction_message_threshold(),
+            enable_verification: false,
+            verification_max_tool_duration_ms: default_verification_max_tool_duration_ms(),
+            verification_warn_ratio: 0.8,
+        }
+    }
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
@@ -345,6 +385,7 @@ impl Default for AgentConfig {
             skills_match_min_score: default_agent_skills_match_min_score(),
             skills_llm_rerank_enabled: default_agent_skills_llm_rerank_enabled(),
             swarm: AgentSwarmConfig::default(),
+            harness: AgentHarnessConfig::default(),
             code_mode: AgentCodeModeSettings::default(),
         }
     }
@@ -643,6 +684,26 @@ fn default_agent_swarm_reply_summary_enabled() -> bool {
 
 fn default_agent_swarm_audit_retention_days() -> u32 {
     30
+}
+
+fn default_compaction_strategy() -> String {
+    "head_tail".to_string()
+}
+
+fn default_compaction_head_count() -> usize {
+    10
+}
+
+fn default_compaction_tail_count() -> usize {
+    10
+}
+
+fn default_compaction_message_threshold() -> usize {
+    20
+}
+
+fn default_verification_max_tool_duration_ms() -> u64 {
+    5000
 }
 
 fn resolve_env_placeholder(value: &str) -> String {

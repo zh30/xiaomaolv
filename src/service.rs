@@ -15,11 +15,12 @@ use crate::code_mode::{
     AgentCodeModeSettings, CodeModeAuditRecord, CodeModeExecutionMode, CodeModeExecutor,
     CodeModePlanner, DisabledCodeModePlanner, execute_plan_via_subprocess,
 };
+use crate::config::AgentHarnessConfig;
 use crate::domain::{IncomingMessage, MessageRole, OutgoingMessage, StoredMessage};
 use crate::harness::compactor::{CompactionRequest, CompactionStrategy, Compactor};
 use crate::harness::observability::TrajectoryMetrics;
 use crate::harness::trajectory::{ToolCallRecord, TrajectoryLogger, new_trajectory_id};
-use crate::harness::verifier::ToolCallVerifier;
+use crate::harness::verifier::{TimingVerifier, ToolCallVerifier};
 use crate::mcp::{BUILTIN_MCP_SERVER_NAME, BUILTIN_MCP_TOOL_CURRENT_TIME, McpRuntime, McpToolInfo};
 use crate::memory::{
     AgentSwarmCleanupRequest, AgentSwarmNodeExitStatus, AgentSwarmNodeLoadRequest,
@@ -414,6 +415,35 @@ impl MessageService {
     pub fn with_compaction(mut self, settings: AgentCompactionSettings) -> Self {
         self.agent_compaction = settings;
         self.compactor = Some(Compactor::new(self.agent_compaction.enabled));
+        self
+    }
+
+    /// Apply harness configuration from AgentHarnessConfig
+    pub fn with_harness_config(mut self, config: &AgentHarnessConfig) -> Self {
+        // Set up trajectory logger if enabled
+        if config.enable_trajectory {
+            self.trajectory_logger = Some(TrajectoryLogger::new(self.memory.clone(), true));
+        }
+
+        // Set up compactor if enabled
+        if config.enable_compaction {
+            self.agent_compaction = AgentCompactionSettings {
+                enabled: true,
+                head_count: config.compaction_head_count,
+                tail_count: config.compaction_tail_count,
+                message_count_threshold: config.compaction_message_threshold,
+            };
+            self.compactor = Some(Compactor::new(true));
+        }
+
+        // Set up tool verifier if enabled
+        if config.enable_verification {
+            self.tool_verifier = Some(Arc::new(TimingVerifier::new(
+                config.verification_max_tool_duration_ms,
+                config.verification_warn_ratio,
+            )) as Arc<dyn ToolCallVerifier>);
+        }
+
         self
     }
 

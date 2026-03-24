@@ -89,6 +89,22 @@ skills_max_prompt_chars = 8000
 skills_match_min_score = 0.45
 skills_llm_rerank_enabled = false
 
+[agent.harness]
+# Enable trajectory logging for feedback loops (default: false)
+enable_trajectory = true
+
+# Enable context compaction for long conversations (default: false)
+enable_compaction = false
+compaction_strategy = "head_tail"  # head_tail | age_based | budget_based
+compaction_head_count = 10
+compaction_tail_count = 10
+compaction_message_threshold = 20
+
+# Enable tool call verification (default: false)
+enable_verification = false
+verification_max_tool_duration_ms = 5000
+verification_warn_ratio = 0.8
+
 [agent.code_mode]
 enabled = false
 shadow_mode = true

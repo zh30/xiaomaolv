@@ -524,7 +524,8 @@ async fn build_runtime_handles(
             max_run_timeout_ms: config.agent.swarm.max_run_timeout_ms,
             reply_summary_enabled: config.agent.swarm.reply_summary_enabled,
             audit_retention_days: config.agent.swarm.audit_retention_days,
-        }),
+        })
+        .with_harness_config(&config.agent.harness),
     );
 
     let channel_plugins = load_channel_plugins(config, channel_registry)?;
