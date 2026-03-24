@@ -32,11 +32,8 @@ impl TrajectoryMetrics {
         .expect("failed to create trajectories_total counter");
 
         let tool_calls_total = IntCounterVec::new(
-            prometheus::Opts::new(
-                "xiaomaolv_tool_calls_total",
-                "Total number of tool calls recorded",
-            )
-            .namespace("xiaomaolv"),
+            prometheus::Opts::new("tool_calls_total", "Total number of tool calls recorded")
+                .namespace("xiaomaolv"),
             &["server", "tool"],
         )
         .expect("failed to create tool_calls_total counter");
@@ -60,7 +57,7 @@ impl TrajectoryMetrics {
 
         let tool_call_duration_seconds = HistogramVec::new(
             HistogramOpts::new(
-                "xiaomaolv_tool_call_duration_seconds",
+                "tool_call_duration_seconds",
                 "Duration of tool calls in seconds",
             )
             .namespace("xiaomaolv")

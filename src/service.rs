@@ -17,6 +17,7 @@ use crate::code_mode::{
 };
 use crate::domain::{IncomingMessage, MessageRole, OutgoingMessage, StoredMessage};
 use crate::harness::compactor::{CompactionRequest, CompactionStrategy, Compactor};
+use crate::harness::observability::TrajectoryMetrics;
 use crate::harness::trajectory::{ToolCallRecord, TrajectoryLogger, new_trajectory_id};
 use crate::harness::verifier::ToolCallVerifier;
 use crate::mcp::{BUILTIN_MCP_SERVER_NAME, BUILTIN_MCP_TOOL_CURRENT_TIME, McpRuntime, McpToolInfo};
@@ -207,6 +208,7 @@ pub struct MessageService {
     context_memory_budget_ratio: u8,
     context_min_recent_messages: usize,
     trajectory_logger: Option<TrajectoryLogger>,
+    trajectory_metrics: Option<TrajectoryMetrics>,
     tool_verifier: Option<Arc<dyn ToolCallVerifier>>,
 }
 
@@ -346,6 +348,7 @@ impl MessageService {
             context_memory_budget_ratio: 35,
             context_min_recent_messages: 8,
             trajectory_logger: None,
+            trajectory_metrics: None,
             tool_verifier: None,
         }
     }
@@ -395,6 +398,11 @@ impl MessageService {
 
     pub fn with_trajectory_logger(mut self, logger: TrajectoryLogger) -> Self {
         self.trajectory_logger = Some(logger);
+        self
+    }
+
+    pub fn with_trajectory_metrics(mut self, metrics: TrajectoryMetrics) -> Self {
+        self.trajectory_metrics = Some(metrics);
         self
     }
 
@@ -2132,6 +2140,16 @@ impl MessageService {
                         let _ = logger.log_tool_call(&trajectory_id, record.clone()).await;
                     }
 
+                    // Record tool call metrics
+                    if let Some(ref metrics) = self.trajectory_metrics {
+                        metrics.record_tool_call(
+                            tool_duration_ms,
+                            &tool_call.server,
+                            &tool_call.tool,
+                            true,
+                        );
+                    }
+
                     // Verify tool call
                     if let Some(ref verifier) = self.tool_verifier {
                         let verification = verifier.verify(&record);
@@ -2167,6 +2185,16 @@ impl MessageService {
                     // Log tool call to trajectory
                     if let Some(ref logger) = self.trajectory_logger {
                         let _ = logger.log_tool_call(&trajectory_id, record.clone()).await;
+                    }
+
+                    // Record tool call metrics
+                    if let Some(ref metrics) = self.trajectory_metrics {
+                        metrics.record_tool_call(
+                            tool_duration_ms,
+                            &tool_call.server,
+                            &tool_call.tool,
+                            false,
+                        );
                     }
 
                     // Verify tool call
@@ -2334,6 +2362,16 @@ impl MessageService {
                         let _ = logger.log_tool_call(&trajectory_id, record.clone()).await;
                     }
 
+                    // Record tool call metrics
+                    if let Some(ref metrics) = self.trajectory_metrics {
+                        metrics.record_tool_call(
+                            tool_duration_ms,
+                            &tool_call.server,
+                            &tool_call.tool,
+                            true,
+                        );
+                    }
+
                     // Verify tool call
                     if let Some(ref verifier) = self.tool_verifier {
                         let verification = verifier.verify(&record);
@@ -2369,6 +2407,16 @@ impl MessageService {
                     // Log tool call to trajectory
                     if let Some(ref logger) = self.trajectory_logger {
                         let _ = logger.log_tool_call(&trajectory_id, record.clone()).await;
+                    }
+
+                    // Record tool call metrics
+                    if let Some(ref metrics) = self.trajectory_metrics {
+                        metrics.record_tool_call(
+                            tool_duration_ms,
+                            &tool_call.server,
+                            &tool_call.tool,
+                            false,
+                        );
                     }
 
                     // Verify tool call

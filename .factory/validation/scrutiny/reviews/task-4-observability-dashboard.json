@@ -1,0 +1,67 @@
+{
+  "featureId": "task-4-observability-dashboard",
+  "reviewedAt": "2026-03-24T12:00:00Z",
+  "commitId": "5c9ddca",
+  "transcriptSkeletonReviewed": false,
+  "diffReviewed": true,
+  "status": "fail",
+  "codeReview": {
+    "summary": "Implementation adds Prometheus metrics and HTTP endpoints for trajectory analysis. However, there is a critical bug in metric naming: some metrics use both a 'xiaomaolv_' prefix in the name AND a 'namespace(\"xiaomaolv\")' call, which results in double-prefixed names like 'xiaomaolv_xiaomaolv_tool_calls_total'. Tests do not validate actual metric names from the registry.",
+    "issues": [
+      {
+        "file": "src/harness/observability.rs",
+        "line": 36-43",
+        "severity": "blocking",
+        "description": "Metric naming bug: `tool_calls_total` uses both name 'xiaomaolv_tool_calls_total' AND namespace('xiaomaolv'). The prometheus crate namespace prepends 'xiaomaolv_' to the name, resulting in 'xiaomaolv_xiaomaolv_tool_calls_total'. Same issue at line 63 for 'tool_call_duration_seconds'. Should either remove 'xiaomaolv_' prefix from name when using namespace, or remove namespace when name already has prefix."
+      },
+      {
+        "file": "src/harness/observability.rs",
+        "line": 110",
+        "severity": "non_blocking",
+        "description": "record_trajectory takes '_tool_calls: usize' parameter that is never used. The parameter is documented but not utilized - just prefixed with underscore."
+      },
+      {
+        "file": "src/harness/observability.rs",
+        "line": 117",
+        "severity": "non_blocking",
+        "description": "record_tool_call takes '_ok: bool' parameter that is never used. The parameter is documented but not utilized - just prefixed with underscore."
+      },
+      {
+        "file": "src/harness/observability.rs",
+        "line": 29-68",
+        "severity": "non_blocking",
+        "description": "Inconsistent metric naming: some metrics (trajectories_total, avg_iterations_per_trajectory, trajectory_duration_seconds) use just 'xiaomaolv_' prefix without namespace, while others (tool_calls_total, tool_call_duration_seconds) use both prefix and namespace. This inconsistency makes metrics harder to discover and query in Prometheus."
+      },
+      {
+        "file": "tests/harness_observability.rs",
+        "line": 1-172",
+        "severity": "non_blocking",
+        "description": "Tests do not validate actual metric names registered in the Prometheus Registry. Tests only check counter values and gauge values, not the string metric names. The double-prefix bug would not be caught by these tests."
+      }
+    ]
+  },
+  "sharedStateObservations": [
+    {
+      "area": "conventions",
+      "observation": "The AGENTS.md file does not document the new harness/observability.rs module. The harness module now contains trajectory.rs, compactor.rs, verifier.rs, and observability.rs but AGENTS.md only mentions 'observability dashboard and metrics' without details on module structure.",
+      "evidence": "AGENTS.md module table shows only 'harness' in service.rs description but no dedicated harness module documentation"
+    },
+    {
+      "area": "conventions",
+      "observation": "TrajectoryMetrics::new() registers metrics but the Registry is created locally in tests and not exposed via application state. There is no integration point where production code would create and store TrajectoryMetrics for actual use.",
+      "evidence": "src/harness/observability.rs creates metrics but they are not wired into Service or AppState"
+    },
+    {
+      "area": "skills",
+      "observation": "Mission directory with handoffs/ and worker-transcripts.jsonl does not exist at .factory/mission/. Cannot verify if worker followed skill procedure or review skillFeedback. Code review is based solely on diff and tests.",
+      "evidence": "Glob for .factory/mission/**/features.json returned no matches"
+    },
+    {
+      "area": "knowledge",
+      "observation": "The plan document at docs/plans/2026-03-24-agent-harness-optimization.md exists and appears to be the source for this feature, but it's not linked or referenced in AGENTS.md. This makes it unclear where feature requirements originate.",
+      "evidence": "docs/plans/ directory exists but AGENTS.md has no reference to planning documents"
+    }
+  ],
+  "addressesFailureFrom": null,
+  "summary": "Code quality review failed due to blocking metric naming bug. The prometheus namespace and name prefix are being combined incorrectly, resulting in 'xiaomaolv_xiaomaolv_' double prefixes on tool_calls_total and tool_call_duration_seconds metrics. Additionally, the TrajectoryMetrics struct is defined but not wired into the application state, so it cannot actually collect metrics in production. The feature appears incomplete - HTTP endpoints exist but the metrics infrastructure is not integrated into the service that would call it."
+}
