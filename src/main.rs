@@ -247,6 +247,8 @@ timeout_auto_shadow_streak = 3
 max_result_chars = 12000
 execution_mode = "local" # local | subprocess
 subprocess_timeout_secs = 8
+# Code Mode allows only MCP tools whose server config declares matching
+# code_mode_capabilities. Tools with missing capability metadata are denied.
 allow_network = false
 allow_filesystem = false
 allow_env = false

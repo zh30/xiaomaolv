@@ -70,6 +70,7 @@ async fn custom_provider_can_be_registered_and_built() {
                 role: MessageRole::User,
                 content: "hello".to_string(),
             }],
+            ..Default::default()
         })
         .await
         .expect("complete");
@@ -116,6 +117,7 @@ async fn custom_provider_without_stream_impl_uses_default_stream_fallback() {
                     role: MessageRole::User,
                     content: "hello".to_string(),
                 }],
+                ..Default::default()
             },
             &mut sink,
         )

@@ -7,11 +7,14 @@ use anyhow::{Context, bail};
 use axum::extract::{Path, Query, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
-use axum::response::Html;
+use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use prometheus::Registry;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, RwLock, Semaphore, watch};
+use tower_http::cors::{Any, CorsLayer};
+use tower_http::trace::TraceLayer;
 use tracing::warn;
 
 use crate::channel::{
@@ -21,6 +24,7 @@ use crate::channel::{
 use crate::code_mode::LlmCodeModePlanner;
 use crate::config::AppConfig;
 use crate::domain::IncomingMessage;
+use crate::harness::observability::TrajectoryMetrics;
 use crate::mcp::{McpConfigPaths, McpRegistry, McpRuntime};
 use crate::memory::{
     HybridRetrievalOptions, HybridSqliteZvecMemoryBackend, MemoryBackend, SqliteMemoryBackend,
@@ -33,6 +37,51 @@ use crate::service::{
 use crate::skills::{SkillConfigPaths, SkillRegistry, SkillRuntime};
 
 const CODE_MODE_DIAG_OVERFLOW_SOURCE_KEY: &str = "__overflow__";
+
+#[derive(Debug)]
+enum ApiError {
+    BadRequest(String),
+    Unauthorized(String),
+    NotFound(String),
+    RateLimited(String),
+    Internal(anyhow::Error),
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        let (status, message) = match &self {
+            ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
+            ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
+            ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
+            ApiError::RateLimited(msg) => (StatusCode::TOO_MANY_REQUESTS, msg.clone()),
+            ApiError::Internal(err) => {
+                // Log the full error internally but return a generic message
+                tracing::error!(error = %err, "internal server error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal server error".to_string(),
+                )
+            }
+        };
+        let body = serde_json::json!({
+            "error": {
+                "code": status.as_u16(),
+                "message": message,
+            }
+        });
+        (status, Json(body)).into_response()
+    }
+}
+
+impl From<ChannelPluginError> for ApiError {
+    fn from(err: ChannelPluginError) -> Self {
+        match err {
+            ChannelPluginError::BadRequest(msg) => ApiError::BadRequest(msg),
+            ChannelPluginError::Unauthorized(msg) => ApiError::Unauthorized(msg),
+            ChannelPluginError::Internal(inner) => ApiError::Internal(inner),
+        }
+    }
+}
 
 #[derive(Clone)]
 struct RuntimeHandles {
@@ -52,6 +101,8 @@ pub struct AppState {
     pub semaphore: Arc<Semaphore>,
     pub code_mode_diag_bearer_token: Option<String>,
     code_mode_diag_rate_limiter: Arc<FixedWindowRateLimiter>,
+    api_rate_limiter: Arc<FixedWindowRateLimiter>,
+    api_key: Option<String>,
 }
 
 struct WorkerSupervisor {
@@ -388,6 +439,7 @@ async fn build_state(
         provider_override,
         &provider_registry,
         &channel_registry,
+        None,
     )
     .await?;
 
@@ -415,6 +467,11 @@ async fn build_state(
                 60,
                 config.channels.http.diag_rate_limit_per_minute,
             )),
+            api_rate_limiter: Arc::new(FixedWindowRateLimiter::new(
+                60,
+                config.channels.http.rate_limit_per_minute,
+            )),
+            api_key: config.app.api_key.clone(),
         };
 
     Ok((state, http_enabled))
@@ -426,6 +483,7 @@ async fn build_runtime_handles(
     provider_override: Option<Arc<dyn ChatProvider>>,
     provider_registry: &ProviderRegistry,
     channel_registry: &ChannelRegistry,
+    env_overrides: Option<&HashMap<String, String>>,
 ) -> anyhow::Result<RuntimeHandles> {
     let provider = if let Some(p) = provider_override {
         p
@@ -482,74 +540,93 @@ async fn build_runtime_handles(
     let mcp_runtime = Arc::new(RwLock::new(load_mcp_runtime().await));
     let skills_runtime = Arc::new(RwLock::new(load_skill_runtime().await));
     let code_mode_planner = Arc::new(LlmCodeModePlanner::new(provider.clone()));
-    let service = Arc::new(
-        MessageService::new_with_backend(
-            provider,
-            memory_backend,
-            Some(mcp_runtime.clone()),
-            AgentMcpSettings {
-                enabled: config.agent.mcp_enabled,
-                max_iterations: config.agent.mcp_max_iterations,
-                max_tool_result_chars: config.agent.mcp_max_tool_result_chars,
-            },
-            max_recent_turns,
-            config.memory.max_semantic_memories,
-            config.memory.semantic_lookback_days,
-        )
-        .with_context_budget(
-            config.memory.context_window_tokens,
-            config.memory.context_reserved_tokens,
-            config.memory.context_memory_budget_ratio,
-            config.memory.context_min_recent_messages,
-        )
-        .with_agent_code_mode(config.agent.code_mode.clone())
-        .with_code_mode_planner(code_mode_planner)
-        .with_agent_skills(
-            Some(skills_runtime.clone()),
-            AgentSkillsSettings {
-                enabled: config.agent.skills_enabled,
-                max_selected: config.agent.skills_max_selected,
-                max_prompt_chars: config.agent.skills_max_prompt_chars,
-                match_min_score: config.agent.skills_match_min_score,
-                llm_rerank_enabled: config.agent.skills_llm_rerank_enabled,
-            },
-        )
-        .with_agent_swarm(AgentSwarmSettings {
-            enabled: config.agent.swarm.enabled,
-            auto_detect: config.agent.swarm.auto_detect,
-            max_depth: config.agent.swarm.max_depth,
-            max_agents: config.agent.swarm.max_agents,
-            max_parallel: config.agent.swarm.max_parallel,
-            max_node_timeout_ms: config.agent.swarm.max_node_timeout_ms,
-            max_run_timeout_ms: config.agent.swarm.max_run_timeout_ms,
-            reply_summary_enabled: config.agent.swarm.reply_summary_enabled,
-            audit_retention_days: config.agent.swarm.audit_retention_days,
-        })
-        .with_harness_config(&config.agent.harness),
-    );
+    let trajectory_metrics =
+        if config.agent.harness.enable_trajectory || config.agent.harness.enable_verification {
+            let registry = Registry::new();
+            Some(TrajectoryMetrics::new(&registry))
+        } else {
+            None
+        };
+    let mut service = MessageService::new_with_backend(
+        provider,
+        memory_backend,
+        Some(mcp_runtime.clone()),
+        AgentMcpSettings {
+            enabled: config.agent.mcp_enabled,
+            max_iterations: config.agent.mcp_max_iterations,
+            max_tool_result_chars: config.agent.mcp_max_tool_result_chars,
+        },
+        max_recent_turns,
+        config.memory.max_semantic_memories,
+        config.memory.semantic_lookback_days,
+    )
+    .with_context_budget(
+        config.memory.context_window_tokens,
+        config.memory.context_reserved_tokens,
+        config.memory.context_memory_budget_ratio,
+        config.memory.context_min_recent_messages,
+    )
+    .with_agent_code_mode(config.agent.code_mode.clone())
+    .with_code_mode_planner(code_mode_planner)
+    .with_agent_skills(
+        Some(skills_runtime.clone()),
+        AgentSkillsSettings {
+            enabled: config.agent.skills_enabled,
+            max_selected: config.agent.skills_max_selected,
+            max_prompt_chars: config.agent.skills_max_prompt_chars,
+            match_min_score: config.agent.skills_match_min_score,
+            llm_rerank_enabled: config.agent.skills_llm_rerank_enabled,
+        },
+    )
+    .with_agent_swarm(AgentSwarmSettings {
+        enabled: config.agent.swarm.enabled,
+        auto_detect: config.agent.swarm.auto_detect,
+        max_depth: config.agent.swarm.max_depth,
+        max_agents: config.agent.swarm.max_agents,
+        max_parallel: config.agent.swarm.max_parallel,
+        max_node_timeout_ms: config.agent.swarm.max_node_timeout_ms,
+        max_run_timeout_ms: config.agent.swarm.max_run_timeout_ms,
+        reply_summary_enabled: config.agent.swarm.reply_summary_enabled,
+        audit_retention_days: config.agent.swarm.audit_retention_days,
+    })
+    .with_harness_config(&config.agent.harness);
+    if let Some(metrics) = trajectory_metrics {
+        service = service.with_trajectory_metrics(metrics);
+    }
+    let service = Arc::new(service);
 
     let channel_plugins = load_channel_plugins(config, channel_registry)?;
     Ok(RuntimeHandles {
         service,
         channel_plugins: Arc::new(channel_plugins),
         mcp_runtime,
-        locale: std::env::var("XIAOMAOLV_LOCALE")
-            .ok()
+        locale: env_overrides
+            .and_then(|m| m.get("XIAOMAOLV_LOCALE").cloned())
             .and_then(|value| normalize_supported_locale(&value))
+            .or_else(|| {
+                std::env::var("XIAOMAOLV_LOCALE")
+                    .ok()
+                    .and_then(|value| normalize_supported_locale(&value))
+            })
             .or_else(|| normalize_supported_locale(&config.app.locale))
             .unwrap_or_else(|| "en-US".to_string()),
     })
 }
 
 impl AppState {
-    async fn reload_runtime_from_config(&self, manager: &ConfigUiManager) -> anyhow::Result<()> {
-        let config = AppConfig::from_path(&manager.config_path).await?;
+    async fn reload_runtime_from_config(
+        &self,
+        manager: &ConfigUiManager,
+        env_overrides: &HashMap<String, String>,
+    ) -> anyhow::Result<()> {
+        let config = AppConfig::from_path_with_env(&manager.config_path, env_overrides).await?;
         let runtime = build_runtime_handles(
             &config,
             &manager.database_url,
             manager.provider_override.clone(),
             &manager.provider_registry,
             &manager.channel_registry,
+            Some(env_overrides),
         )
         .await?;
 
@@ -602,6 +679,13 @@ fn build_axum_router(state: AppState, http_enabled: bool) -> Router {
         .route("/v1/harness/trajectories", get(list_trajectories))
         .route("/v1/harness/trajectories/{id}", get(get_trajectory))
         .with_state(state)
+        .layer(TraceLayer::new_for_http())
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
 }
 
 async fn start_channel_workers(
@@ -854,6 +938,40 @@ struct HttpMessageRequest {
     session_id: String,
     user_id: String,
     text: String,
+}
+
+impl HttpMessageRequest {
+    fn validate(&self) -> Result<(), ApiError> {
+        if self.session_id.trim().is_empty() {
+            return Err(ApiError::BadRequest(
+                "session_id must not be empty".to_string(),
+            ));
+        }
+        if self.session_id.len() > 256 {
+            return Err(ApiError::BadRequest(
+                "session_id must not exceed 256 characters".to_string(),
+            ));
+        }
+        if self.user_id.trim().is_empty() {
+            return Err(ApiError::BadRequest(
+                "user_id must not be empty".to_string(),
+            ));
+        }
+        if self.user_id.len() > 256 {
+            return Err(ApiError::BadRequest(
+                "user_id must not exceed 256 characters".to_string(),
+            ));
+        }
+        if self.text.trim().is_empty() {
+            return Err(ApiError::BadRequest("text must not be empty".to_string()));
+        }
+        if self.text.len() > 131072 {
+            return Err(ApiError::BadRequest(
+                "text must not exceed 128KB".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1550,10 +1668,9 @@ async fn get_setup_page() -> Html<&'static str> {
 async fn get_config_ui_state(
     State(state): State<AppState>,
     Query(query): Query<ConfigUiStateQuery>,
-) -> Result<Json<ConfigUiStateResponse>, (StatusCode, String)> {
+) -> Result<Json<ConfigUiStateResponse>, ApiError> {
     let Some(manager) = state.config_ui.clone() else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
+        return Err(ApiError::NotFound(
             "config ui is unavailable for this runtime".to_string(),
         ));
     };
@@ -1577,10 +1694,9 @@ async fn get_config_ui_state(
 async fn post_config_ui_save(
     State(state): State<AppState>,
     Json(req): Json<ConfigUiSaveRequest>,
-) -> Result<Json<ConfigUiSaveResponse>, (StatusCode, String)> {
+) -> Result<Json<ConfigUiSaveResponse>, ApiError> {
     let Some(manager) = state.config_ui.clone() else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
+        return Err(ApiError::NotFound(
             "config ui is unavailable for this runtime".to_string(),
         ));
     };
@@ -1603,8 +1719,7 @@ async fn post_config_ui_save(
     }
 
     if accepted_keys == 0 {
-        return Err((
-            StatusCode::BAD_REQUEST,
+        return Err(ApiError::BadRequest(
             "no supported config keys provided".to_string(),
         ));
     }
@@ -1617,10 +1732,10 @@ async fn post_config_ui_save(
                 .cloned()
                 .unwrap_or_else(|| effective_field_value(spec, &BTreeMap::new()));
             if is_missing_required_value(&value) {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    format!("required field '{}' is missing", spec.key),
-                ));
+                return Err(ApiError::BadRequest(format!(
+                    "required field '{}' is missing",
+                    spec.key
+                )));
             }
         }
     }
@@ -1653,20 +1768,14 @@ async fn post_config_ui_save(
         })
         .map_err(internal_err("failed to write env file"))?;
 
-    for spec in CONFIG_UI_FIELDS {
-        let value = known.get(spec.key).cloned().unwrap_or_default();
-        // SAFETY: setup page mutates process env from explicit user action to rebuild runtime in-place.
-        unsafe {
-            if value.is_empty() {
-                std::env::remove_var(spec.key);
-            } else {
-                std::env::set_var(spec.key, &value);
-            }
-        }
-    }
+    // Build env overrides from the saved values so that config placeholder resolution
+    // can pick them up without mutating process-global env vars (which is UB in
+    // multi-threaded async runtimes per the Rust docs for std::env::set_var).
+    let env_overrides: HashMap<String, String> =
+        known.into_iter().filter(|(_, v)| !v.is_empty()).collect();
 
     state
-        .reload_runtime_from_config(&manager)
+        .reload_runtime_from_config(&manager, &env_overrides)
         .await
         .map_err(internal_err("failed to reload runtime after saving config"))?;
 
@@ -1969,12 +2078,12 @@ const SETUP_PAGE_HTML: &str = r#"<!doctype html>
 
 async fn get_mcp_servers(
     State(state): State<AppState>,
-) -> Result<Json<McpServersResponse>, (StatusCode, String)> {
+    headers: HeaderMap,
+) -> Result<Json<McpServersResponse>, ApiError> {
+    verify_api_key(&state, &headers)?;
+    check_rate_limit(&state, &headers)?;
     let _permit = state.semaphore.acquire().await.map_err(|err| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("concurrency semaphore closed: {err}"),
-        )
+        ApiError::Internal(anyhow::anyhow!("concurrency semaphore closed: {err}"))
     })?;
 
     // Direct access to mcp_runtime without locking runtime RwLock
@@ -1987,14 +2096,11 @@ async fn get_mcp_servers(
 async fn get_code_mode_diag(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<CodeModeDiagnostics>, (StatusCode, String)> {
+) -> Result<Json<CodeModeDiagnostics>, ApiError> {
     guard_code_mode_diag_access(&state, &headers)?;
 
     let _permit = state.semaphore.acquire().await.map_err(|err| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("concurrency semaphore closed: {err}"),
-        )
+        ApiError::Internal(anyhow::anyhow!("concurrency semaphore closed: {err}"))
     })?;
 
     let runtime_state = state.runtime.read().await.clone();
@@ -2004,14 +2110,11 @@ async fn get_code_mode_diag(
 async fn get_code_mode_metrics(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<(HeaderMap, String), (StatusCode, String)> {
+) -> Result<(HeaderMap, String), ApiError> {
     guard_code_mode_diag_access(&state, &headers)?;
 
     let _permit = state.semaphore.acquire().await.map_err(|err| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("concurrency semaphore closed: {err}"),
-        )
+        ApiError::Internal(anyhow::anyhow!("concurrency semaphore closed: {err}"))
     })?;
 
     let mut response_headers = HeaderMap::new();
@@ -2021,19 +2124,26 @@ async fn get_code_mode_metrics(
     );
     Ok((response_headers, {
         let runtime_state = state.runtime.read().await.clone();
-        runtime_state.service.code_mode_metrics_prometheus()
+        let mut metrics = runtime_state.service.code_mode_metrics_prometheus();
+        if let Some(harness_metrics) = runtime_state.service.harness_metrics_prometheus() {
+            if !metrics.ends_with('\n') {
+                metrics.push('\n');
+            }
+            metrics.push_str(&harness_metrics);
+        }
+        metrics
     }))
 }
 
 async fn get_mcp_tools(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<McpToolsQuery>,
-) -> Result<Json<McpToolsResponse>, (StatusCode, String)> {
+) -> Result<Json<McpToolsResponse>, ApiError> {
+    verify_api_key(&state, &headers)?;
+    check_rate_limit(&state, &headers)?;
     let _permit = state.semaphore.acquire().await.map_err(|err| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("concurrency semaphore closed: {err}"),
-        )
+        ApiError::Internal(anyhow::anyhow!("concurrency semaphore closed: {err}"))
     })?;
 
     // Direct access to mcp_runtime without locking runtime RwLock
@@ -2048,14 +2158,14 @@ async fn get_mcp_tools(
 
 async fn post_mcp_tool_call(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((server, tool)): Path<(String, String)>,
     Json(args): Json<serde_json::Value>,
-) -> Result<Json<McpCallResponse>, (StatusCode, String)> {
+) -> Result<Json<McpCallResponse>, ApiError> {
+    verify_api_key(&state, &headers)?;
+    check_rate_limit(&state, &headers)?;
     let _permit = state.semaphore.acquire().await.map_err(|err| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("concurrency semaphore closed: {err}"),
-        )
+        ApiError::Internal(anyhow::anyhow!("concurrency semaphore closed: {err}"))
     })?;
 
     // Direct access to mcp_runtime without locking runtime RwLock
@@ -2074,14 +2184,16 @@ async fn post_mcp_tool_call(
 
 async fn post_message(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<HttpMessageRequest>,
-) -> Result<Json<HttpMessageResponse>, (StatusCode, String)> {
+) -> Result<Json<HttpMessageResponse>, ApiError> {
+    verify_api_key(&state, &headers)?;
+    check_rate_limit(&state, &headers)?;
     let _permit = state.semaphore.acquire().await.map_err(|err| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("concurrency semaphore closed: {err}"),
-        )
+        ApiError::Internal(anyhow::anyhow!("concurrency semaphore closed: {err}"))
     })?;
+
+    req.validate()?;
 
     let runtime_state = state.runtime.read().await.clone();
     let out = runtime_state
@@ -2101,9 +2213,12 @@ async fn post_message(
 
 async fn post_channel_inbound(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(channel): Path<String>,
     Json(payload): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, ApiError> {
+    verify_api_key(&state, &headers)?;
+    check_rate_limit(&state, &headers)?;
     dispatch_channel_inbound(state, channel, None, payload).await
 }
 
@@ -2115,26 +2230,21 @@ struct ChannelModeResponse {
 
 async fn get_channel_mode(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(channel): Path<String>,
-) -> Result<Json<ChannelModeResponse>, (StatusCode, String)> {
+) -> Result<Json<ChannelModeResponse>, ApiError> {
+    verify_api_key(&state, &headers)?;
+    check_rate_limit(&state, &headers)?;
     let runtime_state = state.runtime.read().await.clone();
     let plugin = runtime_state
         .channel_plugins
         .get(&channel)
         .cloned()
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                format!("channel '{}' is not configured", channel),
-            )
-        })?;
+        .ok_or_else(|| ApiError::NotFound(format!("channel '{}' is not configured", channel)))?;
 
-    let mode = plugin.mode().ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            format!("channel '{}' does not expose mode", channel),
-        )
-    })?;
+    let mode = plugin
+        .mode()
+        .ok_or_else(|| ApiError::NotFound(format!("channel '{}' does not expose mode", channel)))?;
 
     Ok(Json(ChannelModeResponse {
         channel,
@@ -2144,19 +2254,17 @@ async fn get_channel_mode(
 
 async fn get_channel_diag(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(channel): Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, ApiError> {
+    verify_api_key(&state, &headers)?;
+    check_rate_limit(&state, &headers)?;
     let runtime_state = state.runtime.read().await.clone();
     let plugin = runtime_state
         .channel_plugins
         .get(&channel)
         .cloned()
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                format!("channel '{}' is not configured", channel),
-            )
-        })?;
+        .ok_or_else(|| ApiError::NotFound(format!("channel '{}' is not configured", channel)))?;
 
     let diag = plugin
         .diagnostics()
@@ -2164,10 +2272,7 @@ async fn get_channel_diag(
         .map_err(internal_err("failed to collect channel diagnostics"))?;
 
     let body = diag.ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            format!("channel '{}' does not expose diagnostics", channel),
-        )
+        ApiError::NotFound(format!("channel '{}' does not expose diagnostics", channel))
     })?;
 
     Ok(Json(body))
@@ -2175,9 +2280,12 @@ async fn get_channel_diag(
 
 async fn post_channel_inbound_with_secret(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((channel, secret)): Path<(String, String)>,
     Json(payload): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, ApiError> {
+    verify_api_key(&state, &headers)?;
+    check_rate_limit(&state, &headers)?;
     dispatch_channel_inbound(state, channel, Some(secret), payload).await
 }
 
@@ -2190,6 +2298,8 @@ struct TrajectoryQuery {
     session_id: Option<String>,
     channel: Option<String>,
     user_id: Option<String>,
+    exit_reason: Option<String>,
+    has_tool_errors: Option<bool>,
     limit: Option<usize>,
 }
 
@@ -2205,13 +2315,23 @@ struct TrajectoryDetailResponse {
 
 async fn list_trajectories(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<TrajectoryQuery>,
-) -> Result<Json<TrajectoryListResponse>, (StatusCode, String)> {
+) -> Result<Json<TrajectoryListResponse>, ApiError> {
+    verify_api_key(&state, &headers)?;
+    check_rate_limit(&state, &headers)?;
     let runtime_state = state.runtime.read().await;
+    let exit_reason = params
+        .exit_reason
+        .as_deref()
+        .map(parse_trajectory_exit_reason)
+        .transpose()?;
     let filter = crate::harness::trajectory::TrajectoryFilter {
         session_id: params.session_id,
         channel: params.channel,
         user_id: params.user_id,
+        exit_reason,
+        has_tool_errors: params.has_tool_errors,
         limit: params.limit.unwrap_or(100),
     };
     let trajectories = runtime_state
@@ -2224,8 +2344,11 @@ async fn list_trajectories(
 
 async fn get_trajectory(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<Json<TrajectoryDetailResponse>, (StatusCode, String)> {
+) -> Result<Json<TrajectoryDetailResponse>, ApiError> {
+    verify_api_key(&state, &headers)?;
+    check_rate_limit(&state, &headers)?;
     let runtime_state = state.runtime.read().await;
     let trajectory = runtime_state
         .service
@@ -2235,17 +2358,29 @@ async fn get_trajectory(
     Ok(Json(TrajectoryDetailResponse { trajectory }))
 }
 
+fn parse_trajectory_exit_reason(
+    value: &str,
+) -> Result<crate::harness::trajectory::TrajectoryExitReason, ApiError> {
+    match value {
+        "final_answer" => Ok(crate::harness::trajectory::TrajectoryExitReason::FinalAnswer),
+        "max_iterations" => Ok(crate::harness::trajectory::TrajectoryExitReason::MaxIterations),
+        "tool_error" => Ok(crate::harness::trajectory::TrajectoryExitReason::ToolError),
+        "timeout" => Ok(crate::harness::trajectory::TrajectoryExitReason::Timeout),
+        "internal_error" => Ok(crate::harness::trajectory::TrajectoryExitReason::InternalError),
+        _ => Err(ApiError::BadRequest(format!(
+            "unsupported trajectory exit_reason: {value}"
+        ))),
+    }
+}
+
 async fn dispatch_channel_inbound(
     state: AppState,
     channel_name: String,
     path_secret: Option<String>,
     payload: serde_json::Value,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let _permit = state.semaphore.acquire().await.map_err(|err| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("concurrency semaphore closed: {err}"),
-        )
+        ApiError::Internal(anyhow::anyhow!("concurrency semaphore closed: {err}"))
     })?;
 
     let runtime_state = state.runtime.read().await.clone();
@@ -2254,10 +2389,7 @@ async fn dispatch_channel_inbound(
         .get(&channel_name)
         .cloned()
         .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                format!("channel '{}' is not configured", channel_name),
-            )
+            ApiError::NotFound(format!("channel '{}' is not configured", channel_name))
         })?;
 
     let response = plugin
@@ -2271,47 +2403,71 @@ async fn dispatch_channel_inbound(
                 path_secret,
             },
         )
-        .await
-        .map_err(channel_err_to_http)?;
+        .await?;
 
     Ok(Json(response.body))
 }
 
-fn channel_err_to_http(err: ChannelPluginError) -> (StatusCode, String) {
-    match err {
-        ChannelPluginError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
-        ChannelPluginError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg),
-        ChannelPluginError::Internal(inner) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("channel plugin failed: {inner}"),
-        ),
+fn internal_err(message: &'static str) -> impl Fn(anyhow::Error) -> ApiError {
+    move |err| ApiError::Internal(err.context(message))
+}
+
+fn verify_api_key(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let Some(ref expected_key) = state.api_key else {
+        return Ok(());
+    };
+    if expected_key.is_empty() {
+        return Ok(());
+    }
+    let provided = headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| {
+            let mut parts = h.splitn(2, char::is_whitespace);
+            let scheme = parts.next()?;
+            if scheme.eq_ignore_ascii_case("bearer") {
+                parts.next().map(str::trim)
+            } else {
+                None
+            }
+        })
+        .filter(|v| !v.is_empty());
+
+    match provided {
+        Some(token) if constant_time_eq(token.as_bytes(), expected_key.as_bytes()) => Ok(()),
+        _ => Err(ApiError::Unauthorized(
+            "invalid or missing API key".to_string(),
+        )),
     }
 }
 
-fn internal_err(message: &'static str) -> impl Fn(anyhow::Error) -> (StatusCode, String) {
-    move |err| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("{message}: {err}"),
-        )
+fn check_rate_limit(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let source = api_source_key(headers);
+    if !state.api_rate_limiter.allow(&source) {
+        return Err(ApiError::RateLimited("rate limit exceeded".to_string()));
     }
+    Ok(())
 }
 
-fn guard_code_mode_diag_access(
-    state: &AppState,
-    headers: &HeaderMap,
-) -> Result<(), (StatusCode, String)> {
+fn api_source_key(headers: &HeaderMap) -> String {
+    // Prefer authenticated user identity (API key hash would be ideal but key is secret),
+    // fallback to IP-based identification from proxy headers.
+    if let Some(value) = header_value_trimmed(headers, "x-api-key-id") {
+        return normalize_source_key(&value);
+    }
+    code_mode_diag_source_key(headers)
+}
+
+fn guard_code_mode_diag_access(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
     if !is_code_mode_diag_authorized(headers, state.code_mode_diag_bearer_token.as_deref()) {
-        return Err((
-            StatusCode::UNAUTHORIZED,
+        return Err(ApiError::Unauthorized(
             "code mode diagnostics unauthorized".to_string(),
         ));
     }
 
     let source_key = code_mode_diag_source_key(headers);
     if !state.code_mode_diag_rate_limiter.allow(&source_key) {
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
+        return Err(ApiError::RateLimited(
             "code mode diagnostics rate limited".to_string(),
         ));
     }
@@ -2342,12 +2498,12 @@ fn is_code_mode_diag_authorized(headers: &HeaderMap, expected_token: Option<&str
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let max_len = left.len().max(right.len());
-    let mut diff = left.len() ^ right.len();
-    for i in 0..max_len {
-        let a = left.get(i).copied().unwrap_or(0);
-        let b = right.get(i).copied().unwrap_or(0);
-        diff |= (a ^ b) as usize;
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for i in 0..left.len() {
+        diff |= left[i] ^ right[i];
     }
     diff == 0
 }

@@ -190,6 +190,17 @@ Key settings:
   - `skills_max_prompt_chars = 8000`
   - `skills_match_min_score = 0.45`
   - `skills_llm_rerank_enabled = false`
+- Agent Harness:
+  - Passive by default: `harness.enable_trajectory = false` records trajectories/metrics only when enabled and does not change model output.
+  - Output-affecting when enabled: `harness.enable_compaction = false` summarizes context before inference.
+  - `harness.compaction_strategy = "head_tail"` (`head_tail|age_based|budget_based`)
+  - `harness.compaction_head_count = 10`
+  - `harness.compaction_tail_count = 10`
+  - `harness.compaction_message_threshold = 20`
+  - `harness.compaction_age_max_days = 7`
+  - `harness.compaction_budget_max_tokens = 16000`
+  - Tool verification is passive in `observe` mode and output-affecting in `retry|block`: `harness.enable_verification = false`, `harness.verification_mode = "observe"`.
+  - Output verification is disabled by default: `harness.output_verification_mode = "off"` (`off|observe|revise_once|block`). `revise_once` performs one bounded rewrite.
 - Agent Code Mode (safe-by-default scaffold):
   - `code_mode.enabled = false`
   - `code_mode.shadow_mode = true`
@@ -207,6 +218,7 @@ Key settings:
   - `code_mode.allow_network = false`
   - `code_mode.allow_filesystem = false`
   - `code_mode.allow_env = false`
+  - Code Mode only runs MCP tools whose server config declares matching `code_mode_capabilities`; tools missing capability metadata are denied before execution. `subprocess` mode adds process isolation and timeout handling, but it is not an OS-level sandbox.
 
 <a id="hybrid-memory"></a>
 ## Optional: Hybrid Memory (SQLite + zvec sidecar)
@@ -313,6 +325,19 @@ xiaomaolv mcp rm tavily --scope all
 
 Merged priority: `project > user`.
 
+### Code Mode capability metadata
+
+Code Mode is fail-closed for MCP tool capabilities. Add `code_mode_capabilities` to each MCP server that should be callable from Code Mode:
+
+```toml
+[servers.internal-search]
+transport = "http"
+url = "http://127.0.0.1:8787/mcp"
+code_mode_capabilities = { network = true, filesystem = false, env = false }
+```
+
+When `[agent.code_mode] allow_network`, `allow_filesystem`, or `allow_env` is false, tools declaring that capability are rejected before execution. Tools with missing `code_mode_capabilities` are also rejected by Code Mode. The normal MCP JSON loop is unaffected.
+
 ### Runtime MCP HTTP endpoints
 
 - `GET /v1/mcp/servers`
@@ -396,6 +421,30 @@ skills_max_prompt_chars = 8000
 skills_match_min_score = 0.45
 skills_llm_rerank_enabled = false
 
+[agent.harness]
+# Defaults are shown here. Recommended for debugging/ops: enable_trajectory = true.
+# Passive: records trajectories and metrics; does not change model output.
+enable_trajectory = false
+
+# Output-affecting: summarizes older context before the model sees it.
+enable_compaction = false
+compaction_strategy = "head_tail" # head_tail | age_based | budget_based
+compaction_head_count = 10
+compaction_tail_count = 10
+compaction_message_threshold = 20
+compaction_age_max_days = 7
+compaction_budget_max_tokens = 16000
+
+# observe is passive; retry/block can change the final answer/tool flow.
+enable_verification = false
+verification_mode = "observe" # observe | retry | block
+verification_max_tool_duration_ms = 5000
+verification_warn_ratio = 0.8
+output_verification_mode = "off" # off | observe | revise_once | block
+output_verification_llm_enabled = false
+output_verification_max_prompt_chars = 6000
+output_verification_max_result_chars = 2000
+
 [agent.code_mode]
 enabled = false
 shadow_mode = true
@@ -410,6 +459,8 @@ timeout_auto_shadow_streak = 3
 max_result_chars = 12000
 execution_mode = "local" # local | subprocess
 subprocess_timeout_secs = 8
+# Code Mode allows only MCP tools whose server config declares matching
+# code_mode_capabilities. Tools with missing capability metadata are denied.
 allow_network = false
 allow_filesystem = false
 allow_env = false

@@ -178,6 +178,16 @@ curl -sS http://127.0.0.1:8080/v1/channels/telegram/mode
   - `skills_max_prompt_chars = 8000`
   - `skills_match_min_score = 0.45`
   - `skills_llm_rerank_enabled = false`
+  - `harness.enable_trajectory = false`（被动功能；开启后记录 trajectory/metrics，不改变模型输出；调试/运维建议开启）
+  - `harness.enable_compaction = false`（会影响输出；开启后会在推理前摘要较早上下文）
+  - `harness.compaction_strategy = "head_tail"`（`head_tail|age_based|budget_based`）
+  - `harness.compaction_head_count = 10`
+  - `harness.compaction_tail_count = 10`
+  - `harness.compaction_message_threshold = 20`
+  - `harness.compaction_age_max_days = 7`
+  - `harness.compaction_budget_max_tokens = 16000`
+  - `harness.enable_verification = false`；`harness.verification_mode = "observe"`（`observe` 为被动记录，`retry|block` 会影响工具流/最终回答）
+  - `harness.output_verification_mode = "off"`（`off|observe|revise_once|block`；`revise_once` 会执行一次有界改写）
   - `code_mode.enabled = false`（默认关闭）
   - `code_mode.shadow_mode = true`（灰度模式，仅审计不接管结果）
   - `code_mode.max_calls = 6`
@@ -194,6 +204,7 @@ curl -sS http://127.0.0.1:8080/v1/channels/telegram/mode
   - `code_mode.allow_network = false`
   - `code_mode.allow_filesystem = false`
   - `code_mode.allow_env = false`
+  - Code Mode 只会执行 MCP server 配置中声明了匹配 `code_mode_capabilities` 的工具；缺失 capability 元数据的工具会在执行前被拒绝。`subprocess` 模式提供独立进程与超时控制，但不是 OS 级沙箱。
 
 <a id="hybrid-memory"></a>
 ## 可选：启用混合记忆（SQLite + zvec sidecar）

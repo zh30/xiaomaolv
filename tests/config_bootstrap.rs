@@ -1,5 +1,5 @@
 use xiaomaolv::code_mode::CodeModeExecutionMode;
-use xiaomaolv::config::AppConfig;
+use xiaomaolv::config::{AppConfig, OutputVerificationMode, ToolVerificationMode};
 
 #[test]
 fn config_bootstrap_parses_minimal_toml() {
@@ -59,6 +59,88 @@ enabled = true
     assert!(!cfg.agent.code_mode.allow_network);
     assert!(!cfg.agent.code_mode.allow_filesystem);
     assert!(!cfg.agent.code_mode.allow_env);
+    assert!(!cfg.agent.harness.enable_trajectory);
+    assert!(!cfg.agent.harness.enable_compaction);
+    assert_eq!(cfg.agent.harness.compaction_strategy, "head_tail");
+    assert_eq!(cfg.agent.harness.compaction_head_count, 10);
+    assert_eq!(cfg.agent.harness.compaction_tail_count, 10);
+    assert_eq!(cfg.agent.harness.compaction_message_threshold, 20);
+    assert_eq!(cfg.agent.harness.compaction_age_max_days, 7);
+    assert_eq!(cfg.agent.harness.compaction_budget_max_tokens, 16_000);
+    assert!(!cfg.agent.harness.enable_verification);
+    assert_eq!(
+        cfg.agent.harness.verification_mode,
+        ToolVerificationMode::Observe
+    );
+    assert_eq!(cfg.agent.harness.verification_max_tool_duration_ms, 5000);
+    assert_eq!(cfg.agent.harness.verification_warn_ratio, 0.8);
+    assert_eq!(
+        cfg.agent.harness.output_verification_mode,
+        OutputVerificationMode::Off
+    );
+    assert!(!cfg.agent.harness.output_verification_llm_enabled);
+    assert_eq!(cfg.agent.harness.output_verification_max_prompt_chars, 6000);
+    assert_eq!(cfg.agent.harness.output_verification_max_result_chars, 2000);
+}
+
+#[test]
+fn config_bootstrap_parses_harness_verification_mode() {
+    let toml = r#"
+[app]
+bind = "127.0.0.1:8080"
+default_provider = "openai"
+
+[providers.openai]
+kind = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+api_key = "test-key"
+model = "gpt-4o-mini"
+
+[channels.http]
+enabled = true
+
+[agent.harness]
+enable_trajectory = true
+enable_compaction = true
+compaction_strategy = "budget_based"
+compaction_head_count = 3
+compaction_tail_count = 4
+compaction_message_threshold = 12
+compaction_age_max_days = 14
+compaction_budget_max_tokens = 4096
+enable_verification = true
+verification_mode = "block"
+verification_max_tool_duration_ms = 1234
+verification_warn_ratio = 0.5
+output_verification_mode = "revise_once"
+output_verification_llm_enabled = true
+output_verification_max_prompt_chars = 3456
+output_verification_max_result_chars = 789
+"#;
+
+    let cfg = AppConfig::from_toml(toml).expect("config should parse");
+    assert!(cfg.agent.harness.enable_trajectory);
+    assert!(cfg.agent.harness.enable_compaction);
+    assert_eq!(cfg.agent.harness.compaction_strategy, "budget_based");
+    assert_eq!(cfg.agent.harness.compaction_head_count, 3);
+    assert_eq!(cfg.agent.harness.compaction_tail_count, 4);
+    assert_eq!(cfg.agent.harness.compaction_message_threshold, 12);
+    assert_eq!(cfg.agent.harness.compaction_age_max_days, 14);
+    assert_eq!(cfg.agent.harness.compaction_budget_max_tokens, 4096);
+    assert!(cfg.agent.harness.enable_verification);
+    assert_eq!(
+        cfg.agent.harness.verification_mode,
+        ToolVerificationMode::Block
+    );
+    assert_eq!(cfg.agent.harness.verification_max_tool_duration_ms, 1234);
+    assert_eq!(cfg.agent.harness.verification_warn_ratio, 0.5);
+    assert_eq!(
+        cfg.agent.harness.output_verification_mode,
+        OutputVerificationMode::ReviseOnce
+    );
+    assert!(cfg.agent.harness.output_verification_llm_enabled);
+    assert_eq!(cfg.agent.harness.output_verification_max_prompt_chars, 3456);
+    assert_eq!(cfg.agent.harness.output_verification_max_result_chars, 789);
 }
 
 #[test]

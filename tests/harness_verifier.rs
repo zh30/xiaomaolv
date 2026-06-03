@@ -1,12 +1,15 @@
 use xiaomaolv::harness::trajectory::ToolCallRecord;
 use xiaomaolv::harness::verifier::{
-    CompositeVerifier, IssueSeverity, SchemaVerifier, TimingVerifier, ToolCallVerifier,
+    CompositeVerifier, IssueSeverity, ResultShapeVerifier, SchemaVerifier, TimingVerifier,
+    ToolCallVerifier, ToolSchemaVerifier,
 };
+use xiaomaolv::mcp::McpToolInfo;
 
 #[test]
 fn test_timing_verifier_flags_slow_calls() {
     let verifier = TimingVerifier::new(1000, 0.8);
     let slow_call = ToolCallRecord {
+        call_index: 0,
         server: "test".to_string(),
         tool: "slow_tool".to_string(),
         arguments: serde_json::json!({}),
@@ -26,6 +29,7 @@ fn test_timing_verifier_warns_near_threshold() {
     let verifier = TimingVerifier::new(1000, 0.8);
     // 900ms is 90% of 1000ms, should warn
     let near_threshold = ToolCallRecord {
+        call_index: 0,
         server: "test".to_string(),
         tool: "slow_tool".to_string(),
         arguments: serde_json::json!({}),
@@ -43,6 +47,7 @@ fn test_timing_verifier_warns_near_threshold() {
 fn test_timing_verifier_passes_fast_calls() {
     let verifier = TimingVerifier::new(1000, 0.8);
     let fast_call = ToolCallRecord {
+        call_index: 0,
         server: "test".to_string(),
         tool: "fast_tool".to_string(),
         arguments: serde_json::json!({}),
@@ -66,6 +71,7 @@ fn test_schema_verifier_accepts_all_json_values() {
 
     // String value
     let string_call = ToolCallRecord {
+        call_index: 0,
         server: "test".to_string(),
         tool: "tool".to_string(),
         arguments: serde_json::json!({}),
@@ -79,6 +85,7 @@ fn test_schema_verifier_accepts_all_json_values() {
 
     // Object value
     let object_call = ToolCallRecord {
+        call_index: 0,
         server: "test".to_string(),
         tool: "tool".to_string(),
         arguments: serde_json::json!({}),
@@ -92,6 +99,7 @@ fn test_schema_verifier_accepts_all_json_values() {
 
     // Array value
     let array_call = ToolCallRecord {
+        call_index: 0,
         server: "test".to_string(),
         tool: "tool".to_string(),
         arguments: serde_json::json!({}),
@@ -105,6 +113,7 @@ fn test_schema_verifier_accepts_all_json_values() {
 
     // Null value
     let null_call = ToolCallRecord {
+        call_index: 0,
         server: "test".to_string(),
         tool: "tool".to_string(),
         arguments: serde_json::json!({}),
@@ -121,6 +130,7 @@ fn test_schema_verifier_accepts_all_json_values() {
 fn test_schema_verifier_accepts_valid_json() {
     let verifier = SchemaVerifier::new();
     let valid_call = ToolCallRecord {
+        call_index: 0,
         server: "test".to_string(),
         tool: "good_tool".to_string(),
         arguments: serde_json::json!({}),
@@ -135,12 +145,89 @@ fn test_schema_verifier_accepts_valid_json() {
 }
 
 #[test]
+fn test_tool_schema_verifier_rejects_missing_required_argument() {
+    let verifier = ToolSchemaVerifier::new();
+    let tool = McpToolInfo {
+        server: "test".to_string(),
+        name: "search".to_string(),
+        description: None,
+        input_schema: serde_json::json!({
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "query": { "type": "string" }
+            }
+        }),
+        code_mode_capabilities: None,
+    };
+
+    let result = verifier.verify_arguments(&tool, &serde_json::json!({}));
+    assert!(!result.passed);
+    assert!(
+        result
+            .issues
+            .iter()
+            .any(|issue| issue.code == "MISSING_REQUIRED_ARGUMENT")
+    );
+}
+
+#[test]
+fn test_tool_schema_verifier_rejects_argument_type_mismatch() {
+    let verifier = ToolSchemaVerifier::new();
+    let tool = McpToolInfo {
+        server: "test".to_string(),
+        name: "search".to_string(),
+        description: None,
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "limit": { "type": "integer" }
+            }
+        }),
+        code_mode_capabilities: None,
+    };
+
+    let result = verifier.verify_arguments(&tool, &serde_json::json!({"limit": "ten"}));
+    assert!(!result.passed);
+    assert!(
+        result
+            .issues
+            .iter()
+            .any(|issue| issue.code == "ARGUMENT_TYPE_MISMATCH")
+    );
+}
+
+#[test]
+fn test_result_shape_verifier_rejects_common_failure_shapes() {
+    let verifier = ResultShapeVerifier::new();
+    for result in [
+        serde_json::json!(null),
+        serde_json::json!({}),
+        serde_json::json!({"error": "failed"}),
+        serde_json::json!({"truncated": "too large"}),
+    ] {
+        let call = ToolCallRecord {
+            call_index: 0,
+            server: "test".to_string(),
+            tool: "tool".to_string(),
+            arguments: serde_json::json!({}),
+            result,
+            ok: true,
+            duration_ms: 100,
+            iteration: 1,
+        };
+        assert!(!verifier.verify(&call).passed);
+    }
+}
+
+#[test]
 fn test_composite_verifier_aggregates_issues() {
     let verifier = CompositeVerifier::new()
         .add(TimingVerifier::new(1000, 0.8))
         .add(SchemaVerifier::new());
 
     let call = ToolCallRecord {
+        call_index: 0,
         server: "test".to_string(),
         tool: "tool".to_string(),
         arguments: serde_json::json!({}),
@@ -164,6 +251,7 @@ fn test_composite_verifier_collects_all_issues() {
         .add(SchemaVerifier::new());
 
     let call = ToolCallRecord {
+        call_index: 0,
         server: "test".to_string(),
         tool: "tool".to_string(),
         arguments: serde_json::json!({}),
@@ -188,6 +276,7 @@ fn test_verification_result_has_correct_confidence() {
 
     // Fast call - high confidence
     let fast_call = ToolCallRecord {
+        call_index: 0,
         server: "test".to_string(),
         tool: "fast".to_string(),
         arguments: serde_json::json!({}),
@@ -201,6 +290,7 @@ fn test_verification_result_has_correct_confidence() {
 
     // Slow call - lower confidence
     let slow_call = ToolCallRecord {
+        call_index: 0,
         server: "test".to_string(),
         tool: "slow".to_string(),
         arguments: serde_json::json!({}),
@@ -217,6 +307,7 @@ fn test_verification_result_has_correct_confidence() {
 fn test_verification_issue_contains_details() {
     let verifier = TimingVerifier::new(1000, 0.8);
     let slow_call = ToolCallRecord {
+        call_index: 0,
         server: "my-server".to_string(),
         tool: "my-tool".to_string(),
         arguments: serde_json::json!({"param": "value"}),
@@ -238,6 +329,7 @@ fn test_verification_issue_contains_details() {
 fn test_timing_verifier_with_zero_warn_ratio() {
     let verifier = TimingVerifier::new(1000, 0.0);
     let call = ToolCallRecord {
+        call_index: 0,
         server: "test".to_string(),
         tool: "tool".to_string(),
         arguments: serde_json::json!({}),

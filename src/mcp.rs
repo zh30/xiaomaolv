@@ -28,6 +28,22 @@ pub enum McpTransport {
     Http,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpToolCapabilities {
+    #[serde(default)]
+    pub network: bool,
+    #[serde(default)]
+    pub filesystem: bool,
+    #[serde(default)]
+    pub env: bool,
+}
+
+impl McpToolCapabilities {
+    pub fn none() -> Self {
+        Self::default()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerConfig {
     #[serde(default)]
@@ -44,6 +60,8 @@ pub struct McpServerConfig {
     pub headers: HashMap<String, String>,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+    #[serde(default)]
+    pub code_mode_capabilities: Option<McpToolCapabilities>,
 }
 
 impl McpServerConfig {
@@ -78,6 +96,7 @@ impl Default for McpServerConfig {
             url: None,
             headers: HashMap::new(),
             timeout_secs: default_timeout_secs(),
+            code_mode_capabilities: None,
         }
     }
 }
@@ -144,6 +163,7 @@ pub struct McpServerView {
     pub cwd: Option<String>,
     pub url: Option<String>,
     pub timeout_secs: u64,
+    pub code_mode_capabilities: Option<McpToolCapabilities>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,6 +185,8 @@ pub struct McpToolInfo {
     pub name: String,
     pub description: Option<String>,
     pub input_schema: Value,
+    #[serde(default)]
+    pub code_mode_capabilities: Option<McpToolCapabilities>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -202,6 +224,7 @@ impl McpRegistry {
             url: spec.url,
             headers: spec.headers,
             timeout_secs: spec.timeout_secs.max(1),
+            code_mode_capabilities: None,
         };
         server.validate(name)?;
         file.servers.insert(name.to_string(), server);
@@ -344,6 +367,7 @@ fn server_view(name: String, source: &str, cfg: McpServerConfig) -> McpServerVie
         cwd: cfg.cwd,
         url: cfg.url,
         timeout_secs: cfg.timeout_secs,
+        code_mode_capabilities: cfg.code_mode_capabilities,
     }
 }
 
@@ -655,6 +679,7 @@ impl McpRuntime {
                     name,
                     description,
                     input_schema,
+                    code_mode_capabilities: cfg.code_mode_capabilities.clone(),
                 })
             })
             .collect::<Vec<_>>();
@@ -914,6 +939,7 @@ fn builtin_mcp_tools() -> Vec<McpToolInfo> {
             },
             "additionalProperties": false
         }),
+        code_mode_capabilities: Some(McpToolCapabilities::none()),
     }]
 }
 
@@ -1129,6 +1155,28 @@ mod tests {
         initialize_calls: AtomicUsize,
         tools_list_calls: AtomicUsize,
         tools_call_calls: AtomicUsize,
+    }
+
+    #[test]
+    fn parses_code_mode_capabilities_from_mcp_config() {
+        let config: McpConfigFile = toml::from_str(
+            r#"
+[servers.demo]
+transport = "http"
+url = "http://127.0.0.1:8787/mcp"
+code_mode_capabilities = { network = true, filesystem = false, env = true }
+"#,
+        )
+        .expect("mcp config should parse");
+
+        let server = config.servers.get("demo").expect("demo server");
+        let capabilities = server
+            .code_mode_capabilities
+            .as_ref()
+            .expect("capabilities should be present");
+        assert!(capabilities.network);
+        assert!(!capabilities.filesystem);
+        assert!(capabilities.env);
     }
 
     async fn mock_http_mcp_handler(
@@ -1354,6 +1402,11 @@ mod tests {
                 url: Some(format!("http://{addr}/mcp")),
                 headers: HashMap::new(),
                 timeout_secs: 5,
+                code_mode_capabilities: Some(McpToolCapabilities {
+                    network: true,
+                    filesystem: false,
+                    env: false,
+                }),
             },
         );
         let runtime = McpRuntime::new(servers);
@@ -1363,6 +1416,13 @@ mod tests {
             .list_tools(Some("demo"))
             .await
             .expect("tools second");
+        let capabilities = tools_first[0]
+            .code_mode_capabilities
+            .as_ref()
+            .expect("tool capabilities should be propagated");
+        assert!(capabilities.network);
+        assert!(!capabilities.filesystem);
+        assert!(!capabilities.env);
         assert_eq!(tools_first.len(), 1);
         assert_eq!(tools_second.len(), 1);
 

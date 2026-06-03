@@ -44,6 +44,7 @@ tokio = { version = "1.48", features = [
   "time",
 ] }
 toml = "0.9"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 prometheus = "0.13"

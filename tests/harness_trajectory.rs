@@ -1,5 +1,6 @@
 use xiaomaolv::harness::trajectory::{
-    ToolCallRecord, TrajectoryExitReason, TrajectoryFilter, TrajectoryLogger, new_trajectory_id,
+    MAX_TRAJECTORY_QUERY_LIMIT, ToolCallRecord, TrajectoryExitReason, TrajectoryFilter,
+    TrajectoryLogger, new_trajectory_id,
 };
 use xiaomaolv::memory::{SqliteMemoryBackend, SqliteMemoryStore};
 
@@ -30,6 +31,7 @@ async fn test_trajectory_records_tool_calls() {
 
     // Insert a trajectory tool call
     let record = ToolCallRecord {
+        call_index: 0,
         server: "test-server".to_string(),
         tool: "test-tool".to_string(),
         arguments: serde_json::json!({"query": "test"}),
@@ -60,6 +62,8 @@ async fn test_trajectory_records_tool_calls() {
             session_id: Some(session_id.clone()),
             channel: Some(channel.clone()),
             user_id: Some(user_id.clone()),
+            exit_reason: None,
+            has_tool_errors: None,
             limit: 10,
         })
         .await
@@ -94,6 +98,7 @@ async fn test_trajectory_captures_final_answer() {
     // Insert multiple tool calls
     for i in 0..3 {
         let record = ToolCallRecord {
+            call_index: 0,
             server: "test-server".to_string(),
             tool: format!("tool-{}", i),
             arguments: serde_json::json!({"arg": i}),
@@ -125,6 +130,8 @@ async fn test_trajectory_captures_final_answer() {
             session_id: None,
             channel: None,
             user_id: None,
+            exit_reason: None,
+            has_tool_errors: None,
             limit: 100,
         })
         .await
@@ -170,6 +177,7 @@ async fn test_trajectory_filter_by_session() {
         .await
         .expect("start trajectory");
     let record_a1 = ToolCallRecord {
+        call_index: 0,
         server: "server".to_string(),
         tool: "tool1".to_string(),
         arguments: serde_json::json!({}),
@@ -198,6 +206,7 @@ async fn test_trajectory_filter_by_session() {
         .await
         .expect("start trajectory");
     let record_a2 = ToolCallRecord {
+        call_index: 0,
         server: "server".to_string(),
         tool: "tool2".to_string(),
         arguments: serde_json::json!({}),
@@ -226,6 +235,7 @@ async fn test_trajectory_filter_by_session() {
         .await
         .expect("start trajectory");
     let record_b1 = ToolCallRecord {
+        call_index: 0,
         server: "server".to_string(),
         tool: "tool3".to_string(),
         arguments: serde_json::json!({}),
@@ -253,6 +263,8 @@ async fn test_trajectory_filter_by_session() {
             session_id: Some(session_a.clone()),
             channel: None,
             user_id: None,
+            exit_reason: None,
+            has_tool_errors: None,
             limit: 10,
         })
         .await
@@ -264,6 +276,8 @@ async fn test_trajectory_filter_by_session() {
             session_id: Some(session_b.clone()),
             channel: None,
             user_id: None,
+            exit_reason: None,
+            has_tool_errors: None,
             limit: 10,
         })
         .await
@@ -285,6 +299,170 @@ async fn test_trajectory_filter_by_session() {
 }
 
 #[tokio::test]
+async fn test_trajectory_preserves_repeated_same_tool_calls() {
+    let store = SqliteMemoryStore::new("sqlite::memory:")
+        .await
+        .expect("init store");
+    let backend = SqliteMemoryBackend::new(store.clone());
+    let logger = TrajectoryLogger::new(Arc::new(backend), true);
+
+    let trajectory_id = new_trajectory_id();
+    logger
+        .start_trajectory(
+            &trajectory_id,
+            "repeat-session",
+            "test-channel",
+            "test-user",
+            "model-repeat",
+        )
+        .await
+        .expect("start trajectory");
+
+    for value in ["first", "second"] {
+        logger
+            .log_tool_call(
+                &trajectory_id,
+                ToolCallRecord {
+                    call_index: 0,
+                    server: "same-server".to_string(),
+                    tool: "same-tool".to_string(),
+                    arguments: serde_json::json!({"value": value}),
+                    result: serde_json::json!({"value": value}),
+                    ok: true,
+                    duration_ms: 10,
+                    iteration: 0,
+                },
+            )
+            .await
+            .expect("log repeated call");
+    }
+    logger
+        .finish_trajectory(
+            &trajectory_id,
+            Some("done".to_string()),
+            TrajectoryExitReason::FinalAnswer,
+        )
+        .await
+        .expect("finish");
+
+    let trajectories = logger
+        .query_trajectories(TrajectoryFilter {
+            session_id: Some("repeat-session".to_string()),
+            channel: None,
+            user_id: None,
+            exit_reason: None,
+            has_tool_errors: None,
+            limit: 10,
+        })
+        .await
+        .expect("query");
+    let trajectory = trajectories
+        .iter()
+        .find(|trajectory| trajectory.id == trajectory_id)
+        .expect("trajectory");
+
+    assert_eq!(trajectory.tool_calls.len(), 2);
+    assert_eq!(trajectory.tool_calls[0].call_index, 0);
+    assert_eq!(trajectory.tool_calls[1].call_index, 1);
+    assert_eq!(trajectory.tool_calls[0].result["value"], "first");
+    assert_eq!(trajectory.tool_calls[1].result["value"], "second");
+}
+
+#[tokio::test]
+async fn test_trajectory_query_clamps_limit_and_filters_tool_errors() {
+    let store = SqliteMemoryStore::new("sqlite::memory:")
+        .await
+        .expect("init store");
+    let backend = SqliteMemoryBackend::new(store.clone());
+    let logger = TrajectoryLogger::new(Arc::new(backend), true);
+
+    for idx in 0..(MAX_TRAJECTORY_QUERY_LIMIT + 5) {
+        let trajectory_id = format!("limit-trajectory-{idx}");
+        logger
+            .start_trajectory(
+                &trajectory_id,
+                "limit-session",
+                "test-channel",
+                "test-user",
+                "model-limit",
+            )
+            .await
+            .expect("start trajectory");
+        logger
+            .finish_trajectory(
+                &trajectory_id,
+                Some(format!("answer {idx}")),
+                TrajectoryExitReason::FinalAnswer,
+            )
+            .await
+            .expect("finish trajectory");
+    }
+
+    let clamped = logger
+        .query_trajectories(TrajectoryFilter {
+            session_id: Some("limit-session".to_string()),
+            channel: None,
+            user_id: None,
+            exit_reason: None,
+            has_tool_errors: None,
+            limit: usize::MAX,
+        })
+        .await
+        .expect("query clamped");
+    assert_eq!(clamped.len(), MAX_TRAJECTORY_QUERY_LIMIT);
+
+    let error_id = new_trajectory_id();
+    logger
+        .start_trajectory(
+            &error_id,
+            "error-session",
+            "test-channel",
+            "test-user",
+            "model-error",
+        )
+        .await
+        .expect("start error trajectory");
+    logger
+        .log_tool_call(
+            &error_id,
+            ToolCallRecord {
+                call_index: 0,
+                server: "server".to_string(),
+                tool: "tool".to_string(),
+                arguments: serde_json::json!({}),
+                result: serde_json::json!({"error": "failed"}),
+                ok: false,
+                duration_ms: 1,
+                iteration: 0,
+            },
+        )
+        .await
+        .expect("log failed tool call");
+    logger
+        .finish_trajectory(
+            &error_id,
+            Some("tool failed".to_string()),
+            TrajectoryExitReason::ToolError,
+        )
+        .await
+        .expect("finish error trajectory");
+
+    let tool_errors = logger
+        .query_trajectories(TrajectoryFilter {
+            session_id: Some("error-session".to_string()),
+            channel: None,
+            user_id: None,
+            exit_reason: Some(TrajectoryExitReason::ToolError),
+            has_tool_errors: Some(true),
+            limit: 10,
+        })
+        .await
+        .expect("query tool errors");
+    assert_eq!(tool_errors.len(), 1);
+    assert_eq!(tool_errors[0].id, error_id);
+}
+
+#[tokio::test]
 async fn test_trajectory_disabled_logger_does_nothing() {
     let store = SqliteMemoryStore::new("sqlite::memory:")
         .await
@@ -296,6 +474,7 @@ async fn test_trajectory_disabled_logger_does_nothing() {
 
     let trajectory_id = new_trajectory_id();
     let record = ToolCallRecord {
+        call_index: 0,
         server: "test-server".to_string(),
         tool: "test-tool".to_string(),
         arguments: serde_json::json!({"query": "test"}),
