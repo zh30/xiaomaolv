@@ -237,6 +237,27 @@ pub struct MessageService {
     output_verification_max_result_chars: usize,
 }
 
+struct CompletionOutcome {
+    text: String,
+    output_verified: bool,
+}
+
+impl CompletionOutcome {
+    fn unverified(text: String) -> Self {
+        Self {
+            text,
+            output_verified: false,
+        }
+    }
+
+    fn verified(text: String) -> Self {
+        Self {
+            text,
+            output_verified: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodeModeAttempt {
     Normal,
@@ -771,6 +792,7 @@ impl MessageService {
         history: &[StoredMessage],
         channel: &str,
         final_answer: String,
+        tool_calls: &[ToolCallRecord],
     ) -> anyhow::Result<String> {
         let Some(verifier) = &self.output_verifier else {
             return Ok(final_answer);
@@ -778,7 +800,7 @@ impl MessageService {
         let request = OutputVerificationRequest {
             final_answer: final_answer.clone(),
             recent_history: history.to_vec(),
-            tool_calls: Vec::new(),
+            tool_calls: tool_calls.to_vec(),
             channel: channel.to_string(),
             required_format: None,
         };
@@ -825,7 +847,7 @@ impl MessageService {
                 let revised_request = OutputVerificationRequest {
                     final_answer: revised.clone(),
                     recent_history: history.to_vec(),
-                    tool_calls: Vec::new(),
+                    tool_calls: tool_calls.to_vec(),
                     channel: channel.to_string(),
                     required_format: None,
                 };
@@ -912,7 +934,7 @@ impl MessageService {
 
         if let Some(swarm_text) = self.try_swarm_reply(&incoming, &history).await? {
             let swarm_text = self
-                .verify_final_answer(&history, &incoming.channel, swarm_text)
+                .verify_final_answer(&history, &incoming.channel, swarm_text, &[])
                 .await?;
             self.persist_assistant_reply(&incoming, &swarm_text).await?;
             return Ok(OutgoingMessage {
@@ -923,12 +945,15 @@ impl MessageService {
             });
         }
 
-        let text = self
+        let completion = self
             .complete_with_optional_mcp(history.clone(), &incoming)
             .await?;
-        let text = self
-            .verify_final_answer(&history, &incoming.channel, text)
-            .await?;
+        let text = if completion.output_verified {
+            completion.text
+        } else {
+            self.verify_final_answer(&history, &incoming.channel, completion.text, &[])
+                .await?
+        };
 
         self.persist_assistant_reply(&incoming, &text).await?;
 
@@ -2027,41 +2052,44 @@ impl MessageService {
         &self,
         history: Vec<StoredMessage>,
         incoming: &IncomingMessage,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<CompletionOutcome> {
         let Some(runtime) = self.snapshot_mcp_runtime().await else {
-            return self
+            let reply = self
                 .provider
                 .complete(CompletionRequest {
                     messages: history,
                     ..Default::default()
                 })
                 .await
-                .context("provider completion failed");
+                .context("provider completion failed")?;
+            return Ok(CompletionOutcome::unverified(reply));
         };
         let tools = match runtime.list_tools(None).await {
             Ok(tools) => tools,
             Err(err) => {
                 warn!(error = %err, "failed to list mcp tools, fallback to plain completion");
-                return self
+                let reply = self
                     .provider
                     .complete(CompletionRequest {
                         messages: history,
                         ..Default::default()
                     })
                     .await
-                    .context("provider completion failed");
+                    .context("provider completion failed")?;
+                return Ok(CompletionOutcome::unverified(reply));
             }
         };
 
         if tools.is_empty() {
-            return self
+            let reply = self
                 .provider
                 .complete(CompletionRequest {
                     messages: history,
                     ..Default::default()
                 })
                 .await
-                .context("provider completion failed");
+                .context("provider completion failed")?;
+            return Ok(CompletionOutcome::unverified(reply));
         }
 
         if self.agent_code_mode.enabled
@@ -2072,7 +2100,7 @@ impl MessageService {
                 .complete_with_code_mode(history.clone(), &tools, &runtime, force_shadow, incoming)
                 .await
             {
-                Ok(Some(reply)) => return Ok(reply),
+                Ok(Some(reply)) => return Ok(CompletionOutcome::verified(reply)),
                 Ok(None) => {}
                 Err(err) => {
                     warn!(error = %err, "code mode path failed, fallback to mcp json loop");
@@ -2082,6 +2110,7 @@ impl MessageService {
 
         self.complete_with_mcp_loop(history, tools, runtime, incoming)
             .await
+            .map(CompletionOutcome::verified)
     }
 
     async fn complete_with_optional_mcp_stream(
@@ -2273,10 +2302,12 @@ impl MessageService {
             &model,
         )
         .await;
+        let mut tool_calls = Vec::new();
         for (iteration, call) in execution.calls.iter().enumerate() {
-            trajectory
+            let record = trajectory
                 .log_tool_call(code_mode_tool_call_record(call, iteration))
                 .await;
+            tool_calls.push(record);
         }
 
         let mut next_history = history;
@@ -2292,7 +2323,7 @@ impl MessageService {
         let reply = match self
             .provider
             .complete(CompletionRequest {
-                messages: next_history,
+                messages: next_history.clone(),
                 ..Default::default()
             })
             .await
@@ -2303,6 +2334,18 @@ impl MessageService {
                     .finish(None, TrajectoryExitReason::InternalError)
                     .await;
                 return Err(err).context("provider completion failed after code mode execution");
+            }
+        };
+        let reply = match self
+            .verify_final_answer(&next_history, &incoming.channel, reply, &tool_calls)
+            .await
+        {
+            Ok(reply) => reply,
+            Err(err) => {
+                trajectory
+                    .finish(None, TrajectoryExitReason::InternalError)
+                    .await;
+                return Err(err).context("output verification failed after code mode execution");
             }
         };
         trajectory.observe_iteration(0);
@@ -2339,6 +2382,7 @@ impl MessageService {
 
         let max_iterations = self.agent_mcp.max_iterations.max(1);
         let mut verification_retry_used = false;
+        let mut tool_calls = Vec::new();
         for iteration in 0..max_iterations {
             telemetry.observe_prompt_chars(&history);
             let reply = match self
@@ -2363,6 +2407,18 @@ impl MessageService {
             let tool_call = match parse_mcp_tool_call_attempt(&reply) {
                 McpToolCallParse::Tool(tool_call) => tool_call,
                 McpToolCallParse::FinalAnswer => {
+                    let reply = match self
+                        .verify_final_answer(&history, &incoming.channel, reply, &tool_calls)
+                        .await
+                    {
+                        Ok(reply) => reply,
+                        Err(err) => {
+                            trajectory
+                                .finish(None, TrajectoryExitReason::InternalError)
+                                .await;
+                            return Err(err).context("output verification failed");
+                        }
+                    };
                     telemetry.emit("final_answer");
                     trajectory
                         .finish(Some(reply.clone()), TrajectoryExitReason::FinalAnswer)
@@ -2394,7 +2450,7 @@ impl MessageService {
                     let final_reply = match self
                         .provider
                         .complete(CompletionRequest {
-                            messages: history,
+                            messages: history.clone(),
                             ..Default::default()
                         })
                         .await
@@ -2408,6 +2464,19 @@ impl MessageService {
                                 .context("provider completion failed after mcp parse error");
                         }
                     };
+                    let final_reply = match self
+                        .verify_final_answer(&history, &incoming.channel, final_reply, &tool_calls)
+                        .await
+                    {
+                        Ok(reply) => reply,
+                        Err(err) => {
+                            trajectory
+                                .finish(None, TrajectoryExitReason::InternalError)
+                                .await;
+                            return Err(err)
+                                .context("output verification failed after mcp parse error");
+                        }
+                    };
                     telemetry.emit("tool_error");
                     trajectory
                         .finish(Some(final_reply.clone()), TrajectoryExitReason::ToolError)
@@ -2419,7 +2488,8 @@ impl MessageService {
             if let Err(verification) = validate_mcp_tool_call(&tools, &tool_call) {
                 warn_verification_failure(&verification);
                 let record = verification_failure_record(&tool_call, &verification, iteration);
-                trajectory.log_tool_call(record).await;
+                let record = trajectory.log_tool_call(record).await;
+                tool_calls.push(record);
                 if !verification_retry_used {
                     verification_retry_used = true;
                     history.push(StoredMessage {
@@ -2443,7 +2513,7 @@ impl MessageService {
                 let final_reply = match self
                     .provider
                     .complete(CompletionRequest {
-                        messages: history,
+                        messages: history.clone(),
                         ..Default::default()
                     })
                     .await
@@ -2455,6 +2525,19 @@ impl MessageService {
                             .await;
                         return Err(err)
                             .context("provider completion failed after mcp tool validation error");
+                    }
+                };
+                let final_reply = match self
+                    .verify_final_answer(&history, &incoming.channel, final_reply, &tool_calls)
+                    .await
+                {
+                    Ok(reply) => reply,
+                    Err(err) => {
+                        trajectory
+                            .finish(None, TrajectoryExitReason::InternalError)
+                            .await;
+                        return Err(err)
+                            .context("output verification failed after mcp tool validation error");
                     }
                 };
                 telemetry.emit("tool_error");
@@ -2501,7 +2584,8 @@ impl MessageService {
                         warn_verification_failure(verification);
                         annotate_record_with_verification_failure(&mut record, verification);
                     }
-                    trajectory.log_tool_call(record.clone()).await;
+                    let logged_record = trajectory.log_tool_call(record.clone()).await;
+                    tool_calls.push(logged_record);
 
                     if let Some(verification) = verification
                         && !verification.passed
@@ -2532,7 +2616,7 @@ impl MessageService {
                                 let final_reply = match self
                                     .provider
                                     .complete(CompletionRequest {
-                                        messages: history,
+                                        messages: history.clone(),
                                         ..Default::default()
                                     })
                                     .await
@@ -2544,6 +2628,25 @@ impl MessageService {
                                             .await;
                                         return Err(err).context(
                                             "provider completion failed after tool verification block",
+                                        );
+                                    }
+                                };
+                                let final_reply = match self
+                                    .verify_final_answer(
+                                        &history,
+                                        &incoming.channel,
+                                        final_reply,
+                                        &tool_calls,
+                                    )
+                                    .await
+                                {
+                                    Ok(reply) => reply,
+                                    Err(err) => {
+                                        trajectory
+                                            .finish(None, TrajectoryExitReason::InternalError)
+                                            .await;
+                                        return Err(err).context(
+                                            "output verification failed after tool verification block",
                                         );
                                     }
                                 };
@@ -2591,7 +2694,8 @@ impl MessageService {
                         warn_verification_failure(verification);
                         annotate_record_with_verification_failure(&mut record, verification);
                     }
-                    trajectory.log_tool_call(record.clone()).await;
+                    let logged_record = trajectory.log_tool_call(record.clone()).await;
+                    tool_calls.push(logged_record);
 
                     if let Some(verification) = verification
                         && !verification.passed
@@ -2622,7 +2726,7 @@ impl MessageService {
                                 let final_reply = match self
                                     .provider
                                     .complete(CompletionRequest {
-                                        messages: history,
+                                        messages: history.clone(),
                                         ..Default::default()
                                     })
                                     .await
@@ -2634,6 +2738,25 @@ impl MessageService {
                                             .await;
                                         return Err(err).context(
                                             "provider completion failed after tool verification block",
+                                        );
+                                    }
+                                };
+                                let final_reply = match self
+                                    .verify_final_answer(
+                                        &history,
+                                        &incoming.channel,
+                                        final_reply,
+                                        &tool_calls,
+                                    )
+                                    .await
+                                {
+                                    Ok(reply) => reply,
+                                    Err(err) => {
+                                        trajectory
+                                            .finish(None, TrajectoryExitReason::InternalError)
+                                            .await;
+                                        return Err(err).context(
+                                            "output verification failed after tool verification block",
                                         );
                                     }
                                 };
@@ -2680,7 +2803,7 @@ impl MessageService {
         let final_reply = match self
             .provider
             .complete(CompletionRequest {
-                messages: history,
+                messages: history.clone(),
                 ..Default::default()
             })
             .await
@@ -2691,6 +2814,18 @@ impl MessageService {
                     .finish(None, TrajectoryExitReason::InternalError)
                     .await;
                 return Err(err).context("provider completion failed");
+            }
+        };
+        let final_reply = match self
+            .verify_final_answer(&history, &incoming.channel, final_reply, &tool_calls)
+            .await
+        {
+            Ok(reply) => reply,
+            Err(err) => {
+                trajectory
+                    .finish(None, TrajectoryExitReason::InternalError)
+                    .await;
+                return Err(err).context("output verification failed after max iterations");
             }
         };
         telemetry.emit("max_iterations");
@@ -2733,6 +2868,7 @@ impl MessageService {
 
         let max_iterations = self.agent_mcp.max_iterations.max(1);
         let mut verification_retry_used = false;
+        let mut tool_calls = Vec::new();
         for iteration in 0..max_iterations {
             telemetry.observe_prompt_chars(&history);
             let mut buffered_sink = BufferedStreamSink::default();
@@ -2765,99 +2901,191 @@ impl MessageService {
                 streamed_reply.clone()
             };
 
-            let Some(tool_call) = parse_mcp_tool_call(&resolved_reply) else {
-                telemetry.emit("final_answer");
-                trajectory
-                    .finish(
-                        Some(resolved_reply.clone()),
-                        TrajectoryExitReason::FinalAnswer,
-                    )
-                    .await;
-                buffered_sink
-                    .replay_or_fallback(&resolved_reply, sink)
-                    .await?;
-
-                return Ok(resolved_reply);
+            let tool_call = match parse_mcp_tool_call_attempt(&resolved_reply) {
+                McpToolCallParse::Tool(tool_call) => tool_call,
+                McpToolCallParse::FinalAnswer => {
+                    let resolved_reply = match self
+                        .verify_final_answer(
+                            &history,
+                            &incoming.channel,
+                            resolved_reply,
+                            &tool_calls,
+                        )
+                        .await
+                    {
+                        Ok(reply) => reply,
+                        Err(err) => {
+                            trajectory
+                                .finish(None, TrajectoryExitReason::InternalError)
+                                .await;
+                            return Err(err).context("output verification failed");
+                        }
+                    };
+                    telemetry.emit("final_answer");
+                    trajectory
+                        .finish(
+                            Some(resolved_reply.clone()),
+                            TrajectoryExitReason::FinalAnswer,
+                        )
+                        .await;
+                    BufferedStreamSink::replay_text(&resolved_reply, sink).await?;
+                    return Ok(resolved_reply);
+                }
+                McpToolCallParse::ParseError(verification) => {
+                    warn_verification_failure(&verification);
+                    if !verification_retry_used {
+                        verification_retry_used = true;
+                        history.push(StoredMessage {
+                            role: MessageRole::Assistant,
+                            content: resolved_reply,
+                        });
+                        history.push(verification_feedback_message(
+                            &verification,
+                            ToolVerificationMode::Retry,
+                        ));
+                        continue;
+                    }
+                    history.push(StoredMessage {
+                        role: MessageRole::Assistant,
+                        content: resolved_reply,
+                    });
+                    history.push(verification_feedback_message(
+                        &verification,
+                        ToolVerificationMode::Block,
+                    ));
+                    let mut final_sink = BufferedStreamSink::default();
+                    let final_reply = match self
+                        .provider
+                        .complete_stream(
+                            CompletionRequest {
+                                messages: history.clone(),
+                                ..Default::default()
+                            },
+                            &mut final_sink,
+                        )
+                        .await
+                    {
+                        Ok(reply) => reply,
+                        Err(err) => {
+                            trajectory
+                                .finish(None, TrajectoryExitReason::InternalError)
+                                .await;
+                            return Err(err).context(
+                                "provider stream completion failed after mcp parse error",
+                            );
+                        }
+                    };
+                    let streamed_reply = final_sink.rendered_text();
+                    let resolved_final = if streamed_reply.trim().is_empty() {
+                        final_reply
+                    } else {
+                        streamed_reply
+                    };
+                    let resolved_final = match self
+                        .verify_final_answer(
+                            &history,
+                            &incoming.channel,
+                            resolved_final,
+                            &tool_calls,
+                        )
+                        .await
+                    {
+                        Ok(reply) => reply,
+                        Err(err) => {
+                            trajectory
+                                .finish(None, TrajectoryExitReason::InternalError)
+                                .await;
+                            return Err(err)
+                                .context("output verification failed after mcp parse error");
+                        }
+                    };
+                    telemetry.emit("tool_error");
+                    trajectory
+                        .finish(
+                            Some(resolved_final.clone()),
+                            TrajectoryExitReason::ToolError,
+                        )
+                        .await;
+                    BufferedStreamSink::replay_text(&resolved_final, sink).await?;
+                    return Ok(resolved_final);
+                }
             };
 
-            if let Some(schema_verifier) = &self.tool_schema_verifier
-                && let Some(tool_info) = tools
-                    .iter()
-                    .find(|tool| tool.server == tool_call.server && tool.name == tool_call.tool)
-            {
-                let verification =
-                    schema_verifier.verify_arguments(tool_info, &tool_call.arguments);
-                if !verification.passed {
-                    warn_verification_failure(&verification);
-                    match self.tool_verification_mode {
-                        ToolVerificationMode::Observe => {}
-                        ToolVerificationMode::Retry if !verification_retry_used => {
-                            verification_retry_used = true;
-                            let record =
-                                verification_failure_record(&tool_call, &verification, iteration);
-                            trajectory.log_tool_call(record).await;
-                            history.push(StoredMessage {
-                                role: MessageRole::Assistant,
-                                content: resolved_reply,
-                            });
-                            history.push(verification_feedback_message(
-                                &verification,
-                                ToolVerificationMode::Retry,
-                            ));
-                            continue;
-                        }
-                        ToolVerificationMode::Retry | ToolVerificationMode::Block => {
-                            let record =
-                                verification_failure_record(&tool_call, &verification, iteration);
-                            trajectory.log_tool_call(record).await;
-                            history.push(StoredMessage {
-                                role: MessageRole::Assistant,
-                                content: resolved_reply,
-                            });
-                            history.push(verification_feedback_message(
-                                &verification,
-                                ToolVerificationMode::Block,
-                            ));
-                            let mut final_sink = BufferedStreamSink::default();
-                            let final_reply = match self
-                                .provider
-                                .complete_stream(
-                                    CompletionRequest {
-                                        messages: history,
-                                        ..Default::default()
-                                    },
-                                    &mut final_sink,
-                                )
-                                .await
-                            {
-                                Ok(reply) => reply,
-                                Err(err) => {
-                                    trajectory
-                                        .finish(None, TrajectoryExitReason::InternalError)
-                                        .await;
-                                    return Err(err).context(
-                                        "provider stream completion failed after tool verification block",
-                                    );
-                                }
-                            };
-                            let streamed_reply = final_sink.rendered_text();
-                            let resolved_final = if streamed_reply.trim().is_empty() {
-                                final_reply
-                            } else {
-                                streamed_reply
-                            };
-                            telemetry.emit("tool_error");
-                            trajectory
-                                .finish(
-                                    Some(resolved_final.clone()),
-                                    TrajectoryExitReason::ToolError,
-                                )
-                                .await;
-                            final_sink.replay_or_fallback(&resolved_final, sink).await?;
-                            return Ok(resolved_final);
-                        }
-                    }
+            if let Err(verification) = validate_mcp_tool_call(&tools, &tool_call) {
+                warn_verification_failure(&verification);
+                let record = verification_failure_record(&tool_call, &verification, iteration);
+                let record = trajectory.log_tool_call(record).await;
+                tool_calls.push(record);
+                if !verification_retry_used {
+                    verification_retry_used = true;
+                    history.push(StoredMessage {
+                        role: MessageRole::Assistant,
+                        content: resolved_reply,
+                    });
+                    history.push(verification_feedback_message(
+                        &verification,
+                        ToolVerificationMode::Retry,
+                    ));
+                    continue;
                 }
+                history.push(StoredMessage {
+                    role: MessageRole::Assistant,
+                    content: resolved_reply,
+                });
+                history.push(verification_feedback_message(
+                    &verification,
+                    ToolVerificationMode::Block,
+                ));
+                let mut final_sink = BufferedStreamSink::default();
+                let final_reply = match self
+                    .provider
+                    .complete_stream(
+                        CompletionRequest {
+                            messages: history.clone(),
+                            ..Default::default()
+                        },
+                        &mut final_sink,
+                    )
+                    .await
+                {
+                    Ok(reply) => reply,
+                    Err(err) => {
+                        trajectory
+                            .finish(None, TrajectoryExitReason::InternalError)
+                            .await;
+                        return Err(err).context(
+                            "provider stream completion failed after mcp tool validation error",
+                        );
+                    }
+                };
+                let streamed_reply = final_sink.rendered_text();
+                let resolved_final = if streamed_reply.trim().is_empty() {
+                    final_reply
+                } else {
+                    streamed_reply
+                };
+                let resolved_final = match self
+                    .verify_final_answer(&history, &incoming.channel, resolved_final, &tool_calls)
+                    .await
+                {
+                    Ok(reply) => reply,
+                    Err(err) => {
+                        trajectory
+                            .finish(None, TrajectoryExitReason::InternalError)
+                            .await;
+                        return Err(err)
+                            .context("output verification failed after mcp tool validation error");
+                    }
+                };
+                telemetry.emit("tool_error");
+                trajectory
+                    .finish(
+                        Some(resolved_final.clone()),
+                        TrajectoryExitReason::ToolError,
+                    )
+                    .await;
+                BufferedStreamSink::replay_text(&resolved_final, sink).await?;
+                return Ok(resolved_final);
             }
 
             let tool_start = Instant::now();
@@ -2897,7 +3125,8 @@ impl MessageService {
                         warn_verification_failure(verification);
                         annotate_record_with_verification_failure(&mut record, verification);
                     }
-                    trajectory.log_tool_call(record.clone()).await;
+                    let logged_record = trajectory.log_tool_call(record.clone()).await;
+                    tool_calls.push(logged_record);
 
                     if let Some(verification) = verification
                         && !verification.passed
@@ -2930,7 +3159,7 @@ impl MessageService {
                                     .provider
                                     .complete_stream(
                                         CompletionRequest {
-                                            messages: history,
+                                            messages: history.clone(),
                                             ..Default::default()
                                         },
                                         &mut final_sink,
@@ -2953,6 +3182,25 @@ impl MessageService {
                                 } else {
                                     streamed_reply
                                 };
+                                let resolved_final = match self
+                                    .verify_final_answer(
+                                        &history,
+                                        &incoming.channel,
+                                        resolved_final,
+                                        &tool_calls,
+                                    )
+                                    .await
+                                {
+                                    Ok(reply) => reply,
+                                    Err(err) => {
+                                        trajectory
+                                            .finish(None, TrajectoryExitReason::InternalError)
+                                            .await;
+                                        return Err(err).context(
+                                            "output verification failed after tool verification block",
+                                        );
+                                    }
+                                };
                                 telemetry.emit("tool_error");
                                 trajectory
                                     .finish(
@@ -2960,7 +3208,7 @@ impl MessageService {
                                         TrajectoryExitReason::ToolError,
                                     )
                                     .await;
-                                final_sink.replay_or_fallback(&resolved_final, sink).await?;
+                                BufferedStreamSink::replay_text(&resolved_final, sink).await?;
                                 return Ok(resolved_final);
                             }
                         }
@@ -2998,7 +3246,8 @@ impl MessageService {
                         warn_verification_failure(verification);
                         annotate_record_with_verification_failure(&mut record, verification);
                     }
-                    trajectory.log_tool_call(record.clone()).await;
+                    let logged_record = trajectory.log_tool_call(record.clone()).await;
+                    tool_calls.push(logged_record);
 
                     if let Some(verification) = verification
                         && !verification.passed
@@ -3031,7 +3280,7 @@ impl MessageService {
                                     .provider
                                     .complete_stream(
                                         CompletionRequest {
-                                            messages: history,
+                                            messages: history.clone(),
                                             ..Default::default()
                                         },
                                         &mut final_sink,
@@ -3054,6 +3303,25 @@ impl MessageService {
                                 } else {
                                     streamed_reply
                                 };
+                                let resolved_final = match self
+                                    .verify_final_answer(
+                                        &history,
+                                        &incoming.channel,
+                                        resolved_final,
+                                        &tool_calls,
+                                    )
+                                    .await
+                                {
+                                    Ok(reply) => reply,
+                                    Err(err) => {
+                                        trajectory
+                                            .finish(None, TrajectoryExitReason::InternalError)
+                                            .await;
+                                        return Err(err).context(
+                                            "output verification failed after tool verification block",
+                                        );
+                                    }
+                                };
                                 telemetry.emit("tool_error");
                                 trajectory
                                     .finish(
@@ -3061,7 +3329,7 @@ impl MessageService {
                                         TrajectoryExitReason::ToolError,
                                     )
                                     .await;
-                                final_sink.replay_or_fallback(&resolved_final, sink).await?;
+                                BufferedStreamSink::replay_text(&resolved_final, sink).await?;
                                 return Ok(resolved_final);
                             }
                         }
@@ -3101,7 +3369,7 @@ impl MessageService {
             .provider
             .complete_stream(
                 CompletionRequest {
-                    messages: history,
+                    messages: history.clone(),
                     ..Default::default()
                 },
                 &mut buffered_sink,
@@ -3122,6 +3390,18 @@ impl MessageService {
         } else {
             streamed_reply
         };
+        let resolved_reply = match self
+            .verify_final_answer(&history, &incoming.channel, resolved_reply, &tool_calls)
+            .await
+        {
+            Ok(reply) => reply,
+            Err(err) => {
+                trajectory
+                    .finish(None, TrajectoryExitReason::InternalError)
+                    .await;
+                return Err(err).context("output verification failed after max iterations");
+            }
+        };
         telemetry.emit("max_iterations");
         trajectory
             .finish(
@@ -3129,9 +3409,7 @@ impl MessageService {
                 TrajectoryExitReason::MaxIterations,
             )
             .await;
-        buffered_sink
-            .replay_or_fallback(&resolved_reply, sink)
-            .await?;
+        BufferedStreamSink::replay_text(&resolved_reply, sink).await?;
 
         Ok(resolved_reply)
     }
@@ -3562,22 +3840,12 @@ impl BufferedStreamSink {
         self.deltas.concat()
     }
 
-    async fn replay_or_fallback(
-        &self,
-        fallback_text: &str,
-        sink: &mut dyn StreamSink,
-    ) -> anyhow::Result<()> {
-        let replay_text = if self.deltas.is_empty() {
-            fallback_text.to_string()
-        } else {
-            self.rendered_text()
-        };
-
-        if replay_text.is_empty() {
+    async fn replay_text(text: &str, sink: &mut dyn StreamSink) -> anyhow::Result<()> {
+        if text.is_empty() {
             return Ok(());
         }
 
-        let chunks = chunk_text_for_stream_replay(&replay_text, STREAM_REPLAY_CHUNK_CHARS);
+        let chunks = chunk_text_for_stream_replay(text, STREAM_REPLAY_CHUNK_CHARS);
         for (idx, chunk) in chunks.iter().enumerate() {
             sink.on_delta(chunk).await?;
             if idx + 1 < chunks.len() {
@@ -4157,6 +4425,7 @@ fn zodiac_for_year(year: i32) -> &'static str {
     SIGNS[idx]
 }
 
+#[cfg(test)]
 fn parse_mcp_tool_call(reply: &str) -> Option<ParsedMcpToolCall> {
     match parse_mcp_tool_call_attempt(reply) {
         McpToolCallParse::Tool(call) => Some(call),

@@ -212,16 +212,17 @@ impl TrajectoryRun {
         );
     }
 
-    pub async fn log_tool_call(&mut self, mut record: ToolCallRecord) {
+    pub async fn log_tool_call(&mut self, mut record: ToolCallRecord) -> ToolCallRecord {
         self.observe_iteration(record.iteration);
         record.call_index = self.tool_calls;
         self.tool_calls = self.tool_calls.saturating_add(1);
         if let Some(metrics) = &self.metrics {
             metrics.record_tool_call(record.duration_ms, &record.server, &record.tool, record.ok);
         }
+        let logged_record = record.clone();
 
         if !self.started {
-            return;
+            return logged_record;
         }
 
         if let Some(logger) = &self.logger
@@ -233,6 +234,7 @@ impl TrajectoryRun {
                 "failed to log trajectory tool call"
             );
         }
+        logged_record
     }
 
     pub async fn finish(
