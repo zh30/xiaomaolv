@@ -252,18 +252,21 @@ Core endpoints:
 - `GET /setup` (visual setup page)
 - `GET /v1/config/ui/state` (read setup page state)
 - `POST /v1/config/ui/save` (save and hot-reload config)
-- `POST /v1/messages`
+- `POST /v1/messages` (requires `Authorization: Bearer <app.api_key>` when `[app].api_key` is configured)
 - `GET /v1/code-mode/diag` (requires `Authorization: Bearer <channels.http.diag_bearer_token>`)
 - `GET /v1/code-mode/metrics` (Prometheus format, same bearer token as diag)
-- `GET /v1/channels/{channel}/mode`
-- `GET /v1/channels/{channel}/diag`
-- `POST /v1/channels/{channel}/inbound`
-- `POST /v1/channels/{channel}/inbound/{secret}`
+- `GET /v1/channels/{channel}/mode` (same app API key behavior as `/v1/messages`)
+- `GET /v1/channels/{channel}/diag` (same app API key behavior as `/v1/messages`)
+- `POST /v1/channels/{channel}/inbound` (same app API key behavior as `/v1/messages`)
+- `POST /v1/channels/{channel}/inbound/{secret}` (same app API key behavior as `/v1/messages`)
 
 Example:
 
+Omit the app API key header if `[app].api_key` is not configured.
+
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/messages \
+  -H 'authorization: Bearer YOUR_APP_API_KEY' \
   -H 'content-type: application/json' \
   -d '{"session_id":"demo-1","user_id":"u1","text":"hello"}'
 
@@ -344,10 +347,15 @@ When `[agent.code_mode] allow_network`, `allow_filesystem`, or `allow_env` is fa
 - `GET /v1/mcp/tools?server=<optional_server_name>`
 - `POST /v1/mcp/tools/{server}/{tool}`
 
+These endpoints require `Authorization: Bearer <app.api_key>` when `[app].api_key` is configured.
+
 Example call:
+
+Omit the app API key header if `[app].api_key` is not configured.
 
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/mcp/tools/internal-http/search \
+  -H 'authorization: Bearer YOUR_APP_API_KEY' \
   -H 'content-type: application/json' \
   -d '{"query":"rust async mcp"}'
 ```

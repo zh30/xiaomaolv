@@ -135,8 +135,11 @@ Startup online status uses Telegram `setMyShortDescription` and does not change 
 
 ## 5. Optional local HTTP channel test
 
+Omit the app API key header if `[app].api_key` is not configured.
+
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/messages \
+  -H 'authorization: Bearer YOUR_APP_API_KEY' \
   -H 'content-type: application/json' \
   -d '{"session_id":"realtest-1","user_id":"u1","text":"你好，做个自我介绍"}'
 ```
