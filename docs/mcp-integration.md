@@ -112,12 +112,17 @@ After `xiaomaolv serve`, MCP runtime endpoints are available:
 - `GET /v1/mcp/tools?server=<optional_name>`
 - `POST /v1/mcp/tools/{server}/{tool}`
 
+If `[app].api_key` is configured, include `Authorization: Bearer <app.api_key>` on these requests.
+
 Examples:
 
 ```bash
-curl -sS http://127.0.0.1:8080/v1/mcp/servers
-curl -sS "http://127.0.0.1:8080/v1/mcp/tools?server=tavily"
+curl -sS http://127.0.0.1:8080/v1/mcp/servers \
+  -H 'authorization: Bearer YOUR_APP_API_KEY'
+curl -sS "http://127.0.0.1:8080/v1/mcp/tools?server=tavily" \
+  -H 'authorization: Bearer YOUR_APP_API_KEY'
 curl -sS -X POST http://127.0.0.1:8080/v1/mcp/tools/tavily/search \
+  -H 'authorization: Bearer YOUR_APP_API_KEY' \
   -H 'content-type: application/json' \
   -d '{"query":"Rust async best practices"}'
 ```
