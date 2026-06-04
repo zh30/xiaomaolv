@@ -34,6 +34,7 @@ fn test_config() -> AppConfig {
             locale: "en-US".to_string(),
             max_history: 16,
             concurrency_limit: 32,
+            api_key: None,
         },
         providers: std::iter::once((
             "openai".to_string(),
@@ -53,6 +54,7 @@ fn test_config() -> AppConfig {
                 enabled: true,
                 diag_bearer_token: None,
                 diag_rate_limit_per_minute: 120,
+                rate_limit_per_minute: 0,
             },
             telegram: Some(TelegramChannelConfig {
                 enabled: true,

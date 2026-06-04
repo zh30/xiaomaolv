@@ -24,6 +24,17 @@ impl AppConfig {
         Ok(parsed)
     }
 
+    /// Parse config from TOML and resolve env placeholders using provided overrides
+    /// instead of reading from process environment variables.
+    pub fn from_toml_with_env(
+        content: &str,
+        env_overrides: &HashMap<String, String>,
+    ) -> anyhow::Result<Self> {
+        let mut parsed: Self = toml::from_str(content).context("failed to parse config toml")?;
+        parsed.resolve_env_placeholders_with_overrides(env_overrides);
+        Ok(parsed)
+    }
+
     pub async fn from_path(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path_ref = path.as_ref();
         let content = tokio::fs::read_to_string(path_ref)
@@ -32,8 +43,25 @@ impl AppConfig {
         Self::from_toml(&content)
     }
 
+    /// Parse config from file and resolve env placeholders using provided overrides
+    /// instead of reading from process environment variables.
+    pub async fn from_path_with_env(
+        path: impl AsRef<Path>,
+        env_overrides: &HashMap<String, String>,
+    ) -> anyhow::Result<Self> {
+        let path_ref = path.as_ref();
+        let content = tokio::fs::read_to_string(path_ref)
+            .await
+            .with_context(|| format!("failed to read config file: {}", path_ref.display()))?;
+        Self::from_toml_with_env(&content, env_overrides)
+    }
+
     fn resolve_env_placeholders(&mut self) {
         self.app.locale = resolve_env_placeholder(&self.app.locale);
+
+        if let Some(api_key) = self.app.api_key.as_mut() {
+            *api_key = resolve_env_placeholder(api_key);
+        }
 
         if let Some(token) = self.channels.http.diag_bearer_token.as_mut() {
             *token = resolve_env_placeholder(token);
@@ -76,6 +104,70 @@ impl AppConfig {
             *token = resolve_env_placeholder(token);
         }
     }
+
+    /// Resolve env placeholders using provided overrides instead of `std::env::var`.
+    /// This avoids the data race from `std::env::set_var` in a multi-threaded async runtime.
+    fn resolve_env_placeholders_with_overrides(&mut self, env_overrides: &HashMap<String, String>) {
+        self.app.locale = resolve_env_placeholder_with_overrides(&self.app.locale, env_overrides);
+
+        if let Some(api_key) = self.app.api_key.as_mut() {
+            *api_key = resolve_env_placeholder_with_overrides(api_key, env_overrides);
+        }
+
+        if let Some(token) = self.channels.http.diag_bearer_token.as_mut() {
+            *token = resolve_env_placeholder_with_overrides(token, env_overrides);
+        }
+
+        for provider in self.providers.values_mut() {
+            if let Some(api_key) = provider.api_key.as_mut() {
+                *api_key = resolve_env_placeholder_with_overrides(api_key, env_overrides);
+            }
+            if let Some(base_url) = provider.base_url.as_mut() {
+                *base_url = resolve_env_placeholder_with_overrides(base_url, env_overrides);
+            }
+            if let Some(model) = provider.model.as_mut() {
+                *model = resolve_env_placeholder_with_overrides(model, env_overrides);
+            }
+            resolve_env_map_with_overrides(&mut provider.options, env_overrides);
+        }
+
+        if let Some(telegram) = self.channels.telegram.as_mut() {
+            telegram.bot_token =
+                resolve_env_placeholder_with_overrides(&telegram.bot_token, env_overrides);
+            if let Some(username) = telegram.bot_username.as_mut() {
+                *username = resolve_env_placeholder_with_overrides(username, env_overrides);
+            }
+            telegram.startup_online_text = resolve_env_placeholder_with_overrides(
+                &telegram.startup_online_text,
+                env_overrides,
+            );
+            telegram.group_trigger_mode =
+                resolve_env_placeholder_with_overrides(&telegram.group_trigger_mode, env_overrides);
+            telegram.scheduler_default_timezone = resolve_env_placeholder_with_overrides(
+                &telegram.scheduler_default_timezone,
+                env_overrides,
+            );
+            telegram
+                .admin_user_ids
+                .resolve_env_placeholders_with_overrides(env_overrides);
+        }
+
+        for channel in self.channels.plugins.values_mut() {
+            resolve_env_map_with_overrides(&mut channel.settings, env_overrides);
+        }
+
+        self.memory.zvec.endpoint =
+            resolve_env_placeholder_with_overrides(&self.memory.zvec.endpoint, env_overrides);
+        self.memory.zvec.collection =
+            resolve_env_placeholder_with_overrides(&self.memory.zvec.collection, env_overrides);
+        self.memory.zvec.upsert_path =
+            resolve_env_placeholder_with_overrides(&self.memory.zvec.upsert_path, env_overrides);
+        self.memory.zvec.query_path =
+            resolve_env_placeholder_with_overrides(&self.memory.zvec.query_path, env_overrides);
+        if let Some(token) = self.memory.zvec.auth_bearer_token.as_mut() {
+            *token = resolve_env_placeholder_with_overrides(token, env_overrides);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +180,8 @@ pub struct AppSettings {
     pub max_history: usize,
     #[serde(default = "default_concurrency")]
     pub concurrency_limit: usize,
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +213,8 @@ pub struct HttpChannelConfig {
     pub diag_bearer_token: Option<String>,
     #[serde(default = "default_http_diag_rate_limit_per_minute")]
     pub diag_rate_limit_per_minute: usize,
+    #[serde(default = "default_http_rate_limit_per_minute")]
+    pub rate_limit_per_minute: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,6 +290,12 @@ impl TelegramAdminUserIds {
     fn resolve_env_placeholders(&mut self) {
         if let Self::Csv(raw) = self {
             *raw = resolve_env_placeholder(raw);
+        }
+    }
+
+    fn resolve_env_placeholders_with_overrides(&mut self, env_overrides: &HashMap<String, String>) {
+        if let Self::Csv(raw) = self {
+            *raw = resolve_env_placeholder_with_overrides(raw, env_overrides);
         }
     }
 
@@ -349,12 +451,26 @@ pub struct AgentHarnessConfig {
     pub compaction_tail_count: usize,
     #[serde(default = "default_compaction_message_threshold")]
     pub compaction_message_threshold: usize,
+    #[serde(default = "default_compaction_age_max_days")]
+    pub compaction_age_max_days: usize,
+    #[serde(default = "default_compaction_budget_max_tokens")]
+    pub compaction_budget_max_tokens: usize,
     #[serde(default)]
     pub enable_verification: bool,
+    #[serde(default)]
+    pub verification_mode: ToolVerificationMode,
     #[serde(default = "default_verification_max_tool_duration_ms")]
     pub verification_max_tool_duration_ms: u64,
     #[serde(default)]
     pub verification_warn_ratio: f64,
+    #[serde(default)]
+    pub output_verification_mode: OutputVerificationMode,
+    #[serde(default)]
+    pub output_verification_llm_enabled: bool,
+    #[serde(default = "default_output_verification_max_prompt_chars")]
+    pub output_verification_max_prompt_chars: usize,
+    #[serde(default = "default_output_verification_max_result_chars")]
+    pub output_verification_max_result_chars: usize,
 }
 
 impl Default for AgentHarnessConfig {
@@ -366,11 +482,37 @@ impl Default for AgentHarnessConfig {
             compaction_head_count: default_compaction_head_count(),
             compaction_tail_count: default_compaction_tail_count(),
             compaction_message_threshold: default_compaction_message_threshold(),
+            compaction_age_max_days: default_compaction_age_max_days(),
+            compaction_budget_max_tokens: default_compaction_budget_max_tokens(),
             enable_verification: false,
+            verification_mode: ToolVerificationMode::default(),
             verification_max_tool_duration_ms: default_verification_max_tool_duration_ms(),
             verification_warn_ratio: 0.8,
+            output_verification_mode: OutputVerificationMode::default(),
+            output_verification_llm_enabled: false,
+            output_verification_max_prompt_chars: default_output_verification_max_prompt_chars(),
+            output_verification_max_result_chars: default_output_verification_max_result_chars(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolVerificationMode {
+    #[default]
+    Observe,
+    Retry,
+    Block,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputVerificationMode {
+    #[default]
+    Off,
+    Observe,
+    ReviseOnce,
+    Block,
 }
 
 impl Default for AgentConfig {
@@ -448,6 +590,10 @@ fn default_enabled() -> bool {
 
 fn default_http_diag_rate_limit_per_minute() -> usize {
     120
+}
+
+fn default_http_rate_limit_per_minute() -> usize {
+    0
 }
 
 fn default_disabled() -> bool {
@@ -702,8 +848,24 @@ fn default_compaction_message_threshold() -> usize {
     20
 }
 
+fn default_compaction_age_max_days() -> usize {
+    7
+}
+
+fn default_compaction_budget_max_tokens() -> usize {
+    16_000
+}
+
 fn default_verification_max_tool_duration_ms() -> u64 {
     5000
+}
+
+fn default_output_verification_max_prompt_chars() -> usize {
+    6000
+}
+
+fn default_output_verification_max_result_chars() -> usize {
+    2000
 }
 
 fn resolve_env_placeholder(value: &str) -> String {
@@ -728,9 +890,53 @@ fn resolve_env_placeholder(value: &str) -> String {
     value.to_string()
 }
 
+/// Resolve an env placeholder using provided overrides instead of `std::env::var`.
+/// Falls back to `std::env::var` when the key is not present in overrides.
+fn resolve_env_placeholder_with_overrides(
+    value: &str,
+    env_overrides: &HashMap<String, String>,
+) -> String {
+    if value.starts_with("${") && value.ends_with('}') {
+        let body = &value[2..value.len() - 1];
+        let (key, default_value) = if let Some((k, default)) = body.split_once(":-") {
+            (k, Some(default))
+        } else {
+            (body, None)
+        };
+
+        // Prefer overrides first
+        if let Some(env_value) = env_overrides.get(key)
+            && !env_value.is_empty()
+        {
+            return env_value.clone();
+        }
+
+        // Fallback to process env for keys not in overrides
+        if let Ok(env_value) = std::env::var(key)
+            && !env_value.is_empty()
+        {
+            return env_value;
+        }
+
+        if let Some(default) = default_value {
+            return default.to_string();
+        }
+    }
+    value.to_string()
+}
+
 fn resolve_env_map(map: &mut HashMap<String, String>) {
     for value in map.values_mut() {
         *value = resolve_env_placeholder(value);
+    }
+}
+
+fn resolve_env_map_with_overrides(
+    map: &mut HashMap<String, String>,
+    env_overrides: &HashMap<String, String>,
+) {
+    for value in map.values_mut() {
+        *value = resolve_env_placeholder_with_overrides(value, env_overrides);
     }
 }
 

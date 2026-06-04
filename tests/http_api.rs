@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum_test::TestServer;
 use xiaomaolv::config::{
@@ -6,6 +6,7 @@ use xiaomaolv::config::{
 };
 use xiaomaolv::domain::MessageRole;
 use xiaomaolv::http::build_router;
+use xiaomaolv::mcp::{BUILTIN_MCP_SERVER_NAME, BUILTIN_MCP_TOOL_CURRENT_TIME};
 use xiaomaolv::provider::{ChatProvider, CompletionRequest};
 
 struct FakeProvider;
@@ -21,6 +22,38 @@ impl ChatProvider for FakeProvider {
             .map(|m| m.content.as_str())
             .unwrap_or("");
         Ok(format!("ack:{user}"))
+    }
+}
+
+#[derive(Default)]
+struct ToolCallingProvider {
+    calls: Mutex<usize>,
+}
+
+#[async_trait::async_trait]
+impl ChatProvider for ToolCallingProvider {
+    fn model_name(&self) -> Option<&str> {
+        Some("tool-test-model")
+    }
+
+    async fn complete(&self, _req: CompletionRequest) -> anyhow::Result<String> {
+        let call_index = {
+            let mut guard = self.calls.lock().expect("provider call mutex");
+            let call_index = *guard;
+            *guard = (*guard).saturating_add(1);
+            call_index
+        };
+
+        if call_index == 0 {
+            return Ok(serde_json::json!({
+                "server": BUILTIN_MCP_SERVER_NAME,
+                "tool": BUILTIN_MCP_TOOL_CURRENT_TIME,
+                "arguments": {}
+            })
+            .to_string());
+        }
+
+        Ok("tool final answer".to_string())
     }
 }
 
@@ -196,6 +229,183 @@ async fn get_code_mode_metrics_returns_prometheus_text() {
 }
 
 #[tokio::test]
+async fn get_code_mode_metrics_includes_harness_metrics_after_tool_request() {
+    let mut cfg = test_config(Some("diag-token"), 120);
+    cfg.agent.harness.enable_trajectory = true;
+    cfg.agent.swarm.enabled = false;
+
+    let app = build_router(
+        cfg,
+        "sqlite::memory:",
+        Some(Arc::new(ToolCallingProvider::default())),
+    )
+    .await
+    .expect("router");
+    let server = TestServer::new(app).expect("test server");
+
+    let message = server
+        .post("/v1/messages")
+        .json(&serde_json::json!({
+            "session_id": "s-harness-metrics",
+            "user_id": "u-harness-metrics",
+            "text": "please call the time tool"
+        }))
+        .await;
+    message.assert_status_ok();
+
+    let response = server
+        .get("/v1/code-mode/metrics")
+        .add_header("authorization", "Bearer diag-token")
+        .await;
+    response.assert_status_ok();
+    let body = response.text();
+
+    assert!(
+        prometheus_line_has_value(
+            &body,
+            "xiaomaolv_trajectories_total",
+            &[("status", "final_answer")],
+            "1",
+        ),
+        "{body}"
+    );
+    assert!(
+        prometheus_line_has_value(
+            &body,
+            "xiaomaolv_tool_calls_total",
+            &[
+                ("server", BUILTIN_MCP_SERVER_NAME),
+                ("tool", BUILTIN_MCP_TOOL_CURRENT_TIME),
+                ("ok", "true")
+            ],
+            "1",
+        ),
+        "{body}"
+    );
+    assert!(
+        prometheus_line_has_value(
+            &body,
+            "xiaomaolv_trajectory_duration_seconds_count",
+            &[],
+            "1"
+        ),
+        "{body}"
+    );
+    assert!(
+        prometheus_line_has_value(&body, "xiaomaolv_avg_iterations_per_trajectory", &[], "2"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn get_harness_trajectories_requires_api_key() {
+    let mut cfg = test_config(None, 120);
+    cfg.app.api_key = Some("api-token".to_string());
+
+    let app = build_router(cfg, "sqlite::memory:", Some(Arc::new(FakeProvider)))
+        .await
+        .expect("router");
+    let server = TestServer::new(app).expect("test server");
+
+    let unauthorized = server.get("/v1/harness/trajectories").await;
+    unauthorized.assert_status_unauthorized();
+
+    let authorized = server
+        .get("/v1/harness/trajectories")
+        .add_header("authorization", "Bearer api-token")
+        .await;
+    authorized.assert_status_ok();
+}
+
+#[tokio::test]
+async fn get_harness_trajectories_is_rate_limited() {
+    let mut cfg = test_config(None, 120);
+    cfg.channels.http.rate_limit_per_minute = 1;
+
+    let app = build_router(cfg, "sqlite::memory:", Some(Arc::new(FakeProvider)))
+        .await
+        .expect("router");
+    let server = TestServer::new(app).expect("test server");
+
+    let first = server.get("/v1/harness/trajectories").await;
+    first.assert_status_ok();
+
+    let second = server.get("/v1/harness/trajectories").await;
+    second.assert_status_too_many_requests();
+}
+
+#[tokio::test]
+async fn get_harness_trajectory_detail_returns_tool_calls() {
+    let mut cfg = test_config(None, 120);
+    cfg.agent.harness.enable_trajectory = true;
+    cfg.agent.swarm.enabled = false;
+
+    let app = build_router(
+        cfg,
+        "sqlite::memory:",
+        Some(Arc::new(ToolCallingProvider::default())),
+    )
+    .await
+    .expect("router");
+    let server = TestServer::new(app).expect("test server");
+
+    let message = server
+        .post("/v1/messages")
+        .json(&serde_json::json!({
+            "session_id": "s-harness-detail",
+            "user_id": "u-harness-detail",
+            "text": "please call the time tool"
+        }))
+        .await;
+    message.assert_status_ok();
+
+    let list = server
+        .get("/v1/harness/trajectories?session_id=s-harness-detail&limit=9999&exit_reason=final_answer")
+        .await;
+    list.assert_status_ok();
+    let payload: serde_json::Value = list.json();
+    let trajectories = payload
+        .get("trajectories")
+        .and_then(|value| value.as_array())
+        .expect("trajectories array");
+    assert_eq!(trajectories.len(), 1);
+    let trajectory_id = trajectories[0]
+        .get("id")
+        .and_then(|value| value.as_str())
+        .expect("trajectory id");
+    assert_eq!(
+        trajectories[0]
+            .get("tool_calls")
+            .and_then(|value| value.as_array())
+            .and_then(|calls| calls.first())
+            .and_then(|call| call.get("call_index"))
+            .and_then(|value| value.as_u64()),
+        Some(0)
+    );
+
+    let detail = server
+        .get(&format!("/v1/harness/trajectories/{trajectory_id}"))
+        .await;
+    detail.assert_status_ok();
+    let payload: serde_json::Value = detail.json();
+    assert_eq!(
+        payload
+            .get("trajectory")
+            .and_then(|value| value.get("id"))
+            .and_then(|value| value.as_str()),
+        Some(trajectory_id)
+    );
+    assert_eq!(
+        payload
+            .get("trajectory")
+            .and_then(|value| value.get("tool_calls"))
+            .and_then(|value| value.as_array())
+            .map(Vec::len),
+        Some(1)
+    );
+}
+
+#[tokio::test]
 async fn get_code_mode_metrics_accepts_lowercase_bearer_scheme() {
     let cfg = test_config(Some("diag-token"), 120);
 
@@ -284,6 +494,7 @@ fn test_config(diag_bearer_token: Option<&str>, diag_rate_limit_per_minute: usiz
             locale: "en-US".to_string(),
             max_history: 16,
             concurrency_limit: 32,
+            api_key: None,
         },
         providers: std::iter::once((
             "openai".to_string(),
@@ -303,6 +514,7 @@ fn test_config(diag_bearer_token: Option<&str>, diag_rate_limit_per_minute: usiz
                 enabled: true,
                 diag_bearer_token: diag_bearer_token.map(|v| v.to_string()),
                 diag_rate_limit_per_minute,
+                rate_limit_per_minute: 0,
             },
             telegram: None,
             plugins: std::collections::HashMap::new(),
@@ -310,4 +522,20 @@ fn test_config(diag_bearer_token: Option<&str>, diag_rate_limit_per_minute: usiz
         memory: Default::default(),
         agent: Default::default(),
     }
+}
+
+fn prometheus_line_has_value(
+    body: &str,
+    metric: &str,
+    labels: &[(&str, &str)],
+    value: &str,
+) -> bool {
+    body.lines().any(|line| {
+        line.starts_with(metric)
+            && labels.iter().all(|(key, value)| {
+                let label = format!("{key}=\"{value}\"");
+                line.contains(&label)
+            })
+            && line.split_whitespace().last() == Some(value)
+    })
 }

@@ -1,9 +1,10 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use xiaomaolv::config::{AgentHarnessConfig, OutputVerificationMode};
 use xiaomaolv::domain::{IncomingMessage, MessageRole};
 use xiaomaolv::memory::SqliteMemoryStore;
 use xiaomaolv::provider::{ChatProvider, CompletionRequest};
-use xiaomaolv::service::MessageService;
+use xiaomaolv::service::{AgentSwarmSettings, MessageService};
 
 struct FakeProvider;
 
@@ -18,6 +19,28 @@ impl ChatProvider for FakeProvider {
             .map(|m| m.content.as_str())
             .unwrap_or("");
         Ok(format!("echo:{user}"))
+    }
+}
+
+#[derive(Default)]
+struct OutputRevisionProvider {
+    calls: Mutex<usize>,
+}
+
+#[async_trait::async_trait]
+impl ChatProvider for OutputRevisionProvider {
+    async fn complete(&self, _req: CompletionRequest) -> anyhow::Result<String> {
+        let call_index = {
+            let mut guard = self.calls.lock().expect("provider call mutex");
+            let call_index = *guard;
+            *guard = (*guard).saturating_add(1);
+            call_index
+        };
+        if call_index == 0 {
+            Ok(r#"{"server":"s","tool":"t","arguments":{}}"#.to_string())
+        } else {
+            Ok("clean final answer".to_string())
+        }
     }
 }
 
@@ -45,6 +68,85 @@ async fn service_generates_reply_and_persists_messages() {
     assert_eq!(history.len(), 2);
     assert_eq!(history[0].role, MessageRole::User);
     assert_eq!(history[1].role, MessageRole::Assistant);
+}
+
+#[tokio::test]
+async fn service_output_verification_revises_once_before_persisting() {
+    let provider = Arc::new(OutputRevisionProvider::default());
+    let store = SqliteMemoryStore::new("sqlite::memory:")
+        .await
+        .expect("store");
+    let service = MessageService::new(provider.clone(), store.clone(), 20)
+        .with_harness_config(&AgentHarnessConfig {
+            output_verification_mode: OutputVerificationMode::ReviseOnce,
+            output_verification_llm_enabled: true,
+            ..Default::default()
+        })
+        .with_agent_swarm(AgentSwarmSettings {
+            enabled: false,
+            ..Default::default()
+        });
+
+    let out = service
+        .handle(IncomingMessage {
+            channel: "http".to_string(),
+            session_id: "session-output-verify".to_string(),
+            user_id: "u1".to_string(),
+            text: "ping".to_string(),
+            reply_target: None,
+        })
+        .await
+        .expect("handle message");
+
+    assert_eq!(out.text, "clean final answer");
+    assert_eq!(*provider.calls.lock().expect("provider call mutex"), 2);
+
+    let history = store
+        .load_recent("session-output-verify", 10)
+        .await
+        .expect("history");
+    assert_eq!(history[1].content, "clean final answer");
+}
+
+#[tokio::test]
+async fn service_output_verification_without_llm_uses_deterministic_revision() {
+    let provider = Arc::new(OutputRevisionProvider::default());
+    let store = SqliteMemoryStore::new("sqlite::memory:")
+        .await
+        .expect("store");
+    let service = MessageService::new(provider.clone(), store.clone(), 20)
+        .with_harness_config(&AgentHarnessConfig {
+            output_verification_mode: OutputVerificationMode::ReviseOnce,
+            output_verification_llm_enabled: false,
+            ..Default::default()
+        })
+        .with_agent_swarm(AgentSwarmSettings {
+            enabled: false,
+            ..Default::default()
+        });
+
+    let out = service
+        .handle(IncomingMessage {
+            channel: "http".to_string(),
+            session_id: "session-output-verify-no-llm".to_string(),
+            user_id: "u1".to_string(),
+            text: "ping".to_string(),
+            reply_target: None,
+        })
+        .await
+        .expect("handle message");
+
+    assert_eq!(
+        out.text,
+        "I could not produce a reliable final answer from the available tool results."
+    );
+    assert_eq!(*provider.calls.lock().expect("provider call mutex"), 1);
+
+    let history = store
+        .load_recent("session-output-verify-no-llm", 10)
+        .await
+        .expect("history");
+    assert_eq!(history[1].content, out.text);
 }
 
 #[tokio::test]

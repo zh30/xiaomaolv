@@ -1,11 +1,16 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Instant;
+use tracing::warn;
 
+use crate::harness::observability::TrajectoryMetrics;
 use crate::memory::MemoryBackend;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallRecord {
+    #[serde(default)]
+    pub call_index: usize,
     pub server: String,
     pub tool: String,
     pub arguments: serde_json::Value,
@@ -27,10 +32,11 @@ pub struct TrajectoryRecord {
     pub final_answer: Option<String>,
     pub exit_reason: TrajectoryExitReason,
     pub model: String,
+    /// Provider completions currently return text only; keep this empty until usage metadata exists.
     pub total_tokens: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrajectoryExitReason {
     FinalAnswer,
     MaxIterations,
@@ -66,7 +72,20 @@ pub struct TrajectoryFilter {
     pub session_id: Option<String>,
     pub channel: Option<String>,
     pub user_id: Option<String>,
+    pub exit_reason: Option<TrajectoryExitReason>,
+    pub has_tool_errors: Option<bool>,
     pub limit: usize,
+}
+
+pub const DEFAULT_TRAJECTORY_QUERY_LIMIT: usize = 100;
+pub const MAX_TRAJECTORY_QUERY_LIMIT: usize = 500;
+
+pub fn clamp_trajectory_query_limit(limit: usize) -> usize {
+    if limit == 0 {
+        DEFAULT_TRAJECTORY_QUERY_LIMIT
+    } else {
+        limit.min(MAX_TRAJECTORY_QUERY_LIMIT)
+    }
 }
 
 #[derive(Clone)]
@@ -128,6 +147,133 @@ impl TrajectoryLogger {
         filter: TrajectoryFilter,
     ) -> anyhow::Result<Vec<TrajectoryRecord>> {
         self.memory.query_trajectories(filter).await
+    }
+}
+
+pub struct TrajectoryRun {
+    logger: Option<TrajectoryLogger>,
+    metrics: Option<TrajectoryMetrics>,
+    id: String,
+    started_at: Instant,
+    started: bool,
+    finished: bool,
+    tool_calls: usize,
+    max_iteration_seen: Option<usize>,
+}
+
+impl TrajectoryRun {
+    pub async fn start(
+        logger: Option<TrajectoryLogger>,
+        metrics: Option<TrajectoryMetrics>,
+        session_id: &str,
+        channel: &str,
+        user_id: &str,
+        model: &str,
+    ) -> Self {
+        let id = new_trajectory_id();
+        let mut started = false;
+
+        if let Some(logger) = &logger {
+            match logger
+                .start_trajectory(&id, session_id, channel, user_id, model)
+                .await
+            {
+                Ok(()) => started = true,
+                Err(err) => {
+                    warn!(
+                        trajectory_id = %id,
+                        error = %err,
+                        "failed to start trajectory"
+                    );
+                }
+            }
+        }
+
+        Self {
+            logger,
+            metrics,
+            id,
+            started_at: Instant::now(),
+            started,
+            finished: false,
+            tool_calls: 0,
+            max_iteration_seen: None,
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn observe_iteration(&mut self, iteration: usize) {
+        self.max_iteration_seen = Some(
+            self.max_iteration_seen
+                .map_or(iteration, |current| current.max(iteration)),
+        );
+    }
+
+    pub async fn log_tool_call(&mut self, mut record: ToolCallRecord) -> ToolCallRecord {
+        self.observe_iteration(record.iteration);
+        record.call_index = self.tool_calls;
+        self.tool_calls = self.tool_calls.saturating_add(1);
+        if let Some(metrics) = &self.metrics {
+            metrics.record_tool_call(record.duration_ms, &record.server, &record.tool, record.ok);
+        }
+        let logged_record = record.clone();
+
+        if !self.started {
+            return logged_record;
+        }
+
+        if let Some(logger) = &self.logger
+            && let Err(err) = logger.log_tool_call(&self.id, record).await
+        {
+            warn!(
+                trajectory_id = %self.id,
+                error = %err,
+                "failed to log trajectory tool call"
+            );
+        }
+        logged_record
+    }
+
+    pub async fn finish(
+        &mut self,
+        final_answer: Option<String>,
+        exit_reason: TrajectoryExitReason,
+    ) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+
+        if let Some(metrics) = &self.metrics {
+            let iterations = self
+                .max_iteration_seen
+                .map_or(0, |idx| idx.saturating_add(1));
+            metrics.record_trajectory(
+                self.started_at.elapsed().as_secs_f64(),
+                iterations,
+                self.tool_calls,
+                exit_reason.as_str(),
+            );
+        }
+
+        if !self.started {
+            return;
+        }
+
+        if let Some(logger) = &self.logger
+            && let Err(err) = logger
+                .finish_trajectory(&self.id, final_answer, exit_reason)
+                .await
+        {
+            warn!(
+                trajectory_id = %self.id,
+                error = %err,
+                "failed to finish trajectory"
+            );
+        }
     }
 }
 
@@ -200,6 +346,7 @@ mod tests {
     #[test]
     fn test_tool_call_record_serde() {
         let record = ToolCallRecord {
+            call_index: 0,
             server: "test-server".to_string(),
             tool: "test-tool".to_string(),
             arguments: serde_json::json!({"arg": "value"}),

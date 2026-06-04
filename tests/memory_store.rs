@@ -2,7 +2,8 @@ use chrono::{Datelike, Local, TimeZone};
 use tempfile::tempdir;
 use xiaomaolv::domain::{MessageRole, StoredMessage};
 use xiaomaolv::memory::{
-    MemoryBackend, MemoryChunkRecord, MemoryContextRequest, SqliteMemoryBackend, SqliteMemoryStore,
+    CompactionSummaryLoadRequest, CompactionSummaryUpsertRequest, MemoryBackend, MemoryChunkRecord,
+    MemoryContextRequest, SqliteMemoryBackend, SqliteMemoryStore,
 };
 
 #[tokio::test]
@@ -40,6 +41,55 @@ async fn memory_store_persists_and_loads_ordered_messages() {
     assert_eq!(history.len(), 2);
     assert_eq!(history[0].content, "hello");
     assert_eq!(history[1].content, "hi");
+}
+
+#[tokio::test]
+async fn memory_store_persists_and_reuses_compaction_summary_by_source_hash() {
+    let store = SqliteMemoryStore::new("sqlite::memory:")
+        .await
+        .expect("init store");
+
+    store
+        .upsert_compaction_summary(CompactionSummaryUpsertRequest {
+            session_id: "session-summary".to_string(),
+            strategy: "head_tail:2:8".to_string(),
+            source_hash: "source-a".to_string(),
+            source_message_ids: vec![1, 2, 3, 4],
+            source_first_message_id: Some(1),
+            source_last_message_id: Some(4),
+            source_message_count: 4,
+            summary: "cached summary".to_string(),
+            tokens_saved: 120,
+        })
+        .await
+        .expect("upsert summary");
+
+    let found = store
+        .load_compaction_summary(CompactionSummaryLoadRequest {
+            session_id: "session-summary".to_string(),
+            strategy: "head_tail:2:8".to_string(),
+            source_hash: "source-a".to_string(),
+        })
+        .await
+        .expect("load summary")
+        .expect("summary should exist");
+
+    assert_eq!(found.summary, "cached summary");
+    assert_eq!(found.source_message_ids, vec![1, 2, 3, 4]);
+    assert_eq!(found.source_first_message_id, Some(1));
+    assert_eq!(found.source_last_message_id, Some(4));
+    assert_eq!(found.tokens_saved, 120);
+
+    let changed_source = store
+        .load_compaction_summary(CompactionSummaryLoadRequest {
+            session_id: "session-summary".to_string(),
+            strategy: "head_tail:2:8".to_string(),
+            source_hash: "source-b".to_string(),
+        })
+        .await
+        .expect("load changed source");
+
+    assert!(changed_source.is_none());
 }
 
 #[tokio::test]

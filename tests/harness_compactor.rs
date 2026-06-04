@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use xiaomaolv::domain::{MessageRole, StoredMessage};
 use xiaomaolv::harness::compactor::{
-    CompactionRequest, CompactionResult, CompactionStrategy, Compactor,
+    CompactionMessageMetadata, CompactionRequest, CompactionResult, CompactionStrategy, Compactor,
 };
 use xiaomaolv::provider::{ChatProvider, CompletionRequest};
 
@@ -43,13 +43,13 @@ async fn test_compactor_disabled_returns_original() {
 
     let result = compactor
         .compact(
-            CompactionRequest {
+            CompactionRequest::new(
                 messages,
-                strategy: CompactionStrategy::HeadTail {
+                CompactionStrategy::HeadTail {
                     head_count: 2,
                     tail_count: 2,
                 },
-            },
+            ),
             Arc::new(MockChatProvider::new("summary".to_string())),
         )
         .await
@@ -67,13 +67,13 @@ async fn test_head_tail_compaction_short_messages_no_op() {
 
     let result = compactor
         .compact(
-            CompactionRequest {
+            CompactionRequest::new(
                 messages,
-                strategy: CompactionStrategy::HeadTail {
+                CompactionStrategy::HeadTail {
                     head_count: 2,
                     tail_count: 2,
                 },
-            },
+            ),
             Arc::new(MockChatProvider::new("summary".to_string())),
         )
         .await
@@ -92,13 +92,13 @@ async fn test_head_tail_compaction_calls_llm() {
     let mock_response = "This is a summarized conversation.".to_string();
     let result = compactor
         .compact(
-            CompactionRequest {
+            CompactionRequest::new(
                 messages,
-                strategy: CompactionStrategy::HeadTail {
+                CompactionStrategy::HeadTail {
                     head_count: 2,
                     tail_count: 2,
                 },
-            },
+            ),
             Arc::new(MockChatProvider::new(mock_response.clone())),
         )
         .await
@@ -120,13 +120,13 @@ async fn test_head_tail_compaction_preserves_head_and_tail() {
 
     let result = compactor
         .compact(
-            CompactionRequest {
+            CompactionRequest::new(
                 messages,
-                strategy: CompactionStrategy::HeadTail {
+                CompactionStrategy::HeadTail {
                     head_count: 2,
                     tail_count: 2,
                 },
-            },
+            ),
             Arc::new(MockChatProvider::new("summary".to_string())),
         )
         .await
@@ -146,18 +146,53 @@ async fn test_head_tail_compaction_preserves_head_and_tail() {
 }
 
 #[tokio::test]
+async fn test_head_tail_compaction_respects_min_recent_messages() {
+    let compactor = Compactor::new(true);
+    let messages = create_test_messages(20);
+    let mut request = CompactionRequest::new(
+        messages,
+        CompactionStrategy::HeadTail {
+            head_count: 1,
+            tail_count: 1,
+        },
+    );
+    request.min_recent_messages = 5;
+
+    let result = compactor
+        .compact(
+            request,
+            Arc::new(MockChatProvider::new("summary".to_string())),
+        )
+        .await
+        .unwrap();
+
+    let preserved_tail = result
+        .compacted_messages
+        .iter()
+        .rev()
+        .take(5)
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        preserved_tail,
+        vec![
+            "Message 19",
+            "Message 18",
+            "Message 17",
+            "Message 16",
+            "Message 15"
+        ]
+    );
+}
+
+#[tokio::test]
 async fn test_age_based_strategy_returns_unchanged() {
     let compactor = Compactor::new(true);
     let messages = create_test_messages(20);
 
-    // AgeBased requires timestamp info not available in StoredMessage,
-    // so it should return messages unchanged
     let result = compactor
         .compact(
-            CompactionRequest {
-                messages,
-                strategy: CompactionStrategy::AgeBased { max_age_days: 7 },
-            },
+            CompactionRequest::new(messages, CompactionStrategy::AgeBased { max_age_days: 7 }),
             Arc::new(MockChatProvider::new("summary".to_string())),
         )
         .await
@@ -169,25 +204,94 @@ async fn test_age_based_strategy_returns_unchanged() {
 }
 
 #[tokio::test]
-async fn test_budget_based_strategy_returns_unchanged() {
+async fn test_age_based_strategy_compacts_timestamped_old_prefix() {
     let compactor = Compactor::new(true);
-    let messages = create_test_messages(20);
+    let messages = create_test_messages(12);
+    let now = 1_700_000_000i64;
+    let mut request =
+        CompactionRequest::new(messages, CompactionStrategy::AgeBased { max_age_days: 7 });
+    request.now_unix = Some(now);
+    request.metadata = (0..12)
+        .map(|idx| CompactionMessageMetadata {
+            source_id: Some(idx),
+            created_at: Some(if idx < 8 {
+                now - 10 * 86_400
+            } else {
+                now - 86_400
+            }),
+        })
+        .collect();
 
-    // BudgetBased is handled by apply_context_budget, compactor should pass through
     let result = compactor
         .compact(
-            CompactionRequest {
-                messages,
-                strategy: CompactionStrategy::BudgetBased { max_tokens: 1000 },
-            },
-            Arc::new(MockChatProvider::new("summary".to_string())),
+            request,
+            Arc::new(MockChatProvider::new("old context summary".to_string())),
         )
         .await
         .unwrap();
 
-    // Should return unchanged since BudgetBased is not implemented in compactor
-    assert_eq!(result.compacted_messages.len(), 20);
-    assert_eq!(result.tokens_saved, 0);
+    assert!(result.compacted_messages.len() < 12);
+    assert!(
+        result.compacted_messages[0]
+            .content
+            .contains("Age compacted")
+    );
+    assert!(result.summary.contains("old context summary"));
+}
+
+#[tokio::test]
+async fn test_budget_based_strategy_reduces_tokens() {
+    let compactor = Compactor::new(true);
+    let messages = (0..20)
+        .map(|i| StoredMessage {
+            role: if i % 2 == 0 {
+                MessageRole::User
+            } else {
+                MessageRole::Assistant
+            },
+            content: format!("Message {i} {}", "long context ".repeat(40)),
+        })
+        .collect::<Vec<_>>();
+
+    let result = compactor
+        .compact(
+            CompactionRequest::new(
+                messages,
+                CompactionStrategy::BudgetBased { max_tokens: 200 },
+            ),
+            Arc::new(MockChatProvider::new("compact summary".to_string())),
+        )
+        .await
+        .unwrap();
+
+    assert!(result.compacted_messages.len() < 20);
+    assert!(result.tokens_saved > 0);
+    assert!(result.summary.contains("compact summary"));
+}
+
+#[tokio::test]
+async fn test_summary_guardrails_remove_raw_tool_json_markers() {
+    let compactor = Compactor::new(true);
+    let messages = create_test_messages(12);
+
+    let result = compactor
+        .compact(
+            CompactionRequest::new(
+                messages,
+                CompactionStrategy::HeadTail {
+                    head_count: 1,
+                    tail_count: 1,
+                },
+            ),
+            Arc::new(MockChatProvider::new(
+                "MCP_TOOL_RESULT_JSON should not leak".to_string(),
+            )),
+        )
+        .await
+        .unwrap();
+
+    assert!(!result.summary.contains("MCP_TOOL_RESULT_JSON"));
+    assert!(result.summary.contains("[tool-json]"));
 }
 
 #[test]
@@ -237,13 +341,13 @@ async fn test_compactor_with_empty_messages() {
 
     let result = compactor
         .compact(
-            CompactionRequest {
+            CompactionRequest::new(
                 messages,
-                strategy: CompactionStrategy::HeadTail {
+                CompactionStrategy::HeadTail {
                     head_count: 2,
                     tail_count: 2,
                 },
-            },
+            ),
             Arc::new(MockChatProvider::new("summary".to_string())),
         )
         .await
@@ -262,13 +366,13 @@ async fn test_compactor_at_threshold() {
 
     let result = compactor
         .compact(
-            CompactionRequest {
+            CompactionRequest::new(
                 messages,
-                strategy: CompactionStrategy::HeadTail {
+                CompactionStrategy::HeadTail {
                     head_count: 2,
                     tail_count: 2,
                 },
-            },
+            ),
             Arc::new(MockChatProvider::new("summary".to_string())),
         )
         .await

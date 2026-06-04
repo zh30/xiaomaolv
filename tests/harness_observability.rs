@@ -32,6 +32,7 @@ async fn test_trajectory_endpoint_returns_results() {
 
     // Insert a tool call
     let record = ToolCallRecord {
+        call_index: 0,
         server: "test-server".to_string(),
         tool: "test-tool".to_string(),
         arguments: serde_json::json!({"query": "test"}),
@@ -62,6 +63,8 @@ async fn test_trajectory_endpoint_returns_results() {
             session_id: Some(session_id.clone()),
             channel: Some(channel.clone()),
             user_id: Some(user_id.clone()),
+            exit_reason: None,
+            has_tool_errors: None,
             limit: 10,
         })
         .await
@@ -127,10 +130,23 @@ async fn test_trajectory_metrics_record() {
     let metrics = TrajectoryMetrics::new(&registry);
 
     // Record some trajectories
-    metrics.record_trajectory(1.0, 2, 3);
-    metrics.record_trajectory(2.0, 4, 6);
+    metrics.record_trajectory(1.0, 2, 3, "final_answer");
+    metrics.record_trajectory(2.0, 4, 6, "max_iterations");
 
-    assert_eq!(metrics.trajectories_total.get(), 2);
+    assert_eq!(
+        metrics
+            .trajectories_total
+            .with_label_values(&["final_answer"])
+            .get(),
+        1
+    );
+    assert_eq!(
+        metrics
+            .trajectories_total
+            .with_label_values(&["max_iterations"])
+            .get(),
+        1
+    );
     // Average iterations: (2 + 4) / 2 = 3.0
     assert_eq!(metrics.avg_iterations_per_trajectory.get(), 3.0);
 }
@@ -147,14 +163,14 @@ async fn test_trajectory_metrics_tool_calls() {
     assert_eq!(
         metrics
             .tool_calls_total
-            .with_label_values(&["server-a", "tool-x"])
+            .with_label_values(&["server-a", "tool-x", "true"])
             .get(),
         2
     );
     assert_eq!(
         metrics
             .tool_calls_total
-            .with_label_values(&["server-b", "tool-y"])
+            .with_label_values(&["server-b", "tool-y", "false"])
             .get(),
         1
     );

@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::fmt::Write as _;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -12,28 +14,38 @@ use tokio::time::timeout;
 use tracing::{info, warn};
 
 use crate::code_mode::{
-    AgentCodeModeSettings, CodeModeAuditRecord, CodeModeExecutionMode, CodeModeExecutor,
-    CodeModePlanner, DisabledCodeModePlanner, execute_plan_via_subprocess,
+    AgentCodeModeSettings, CodeModeAuditRecord, CodeModeCallResult, CodeModeExecutionMode,
+    CodeModeExecutor, CodeModePlanner, CodeModePolicy, DisabledCodeModePlanner,
+    execute_plan_via_subprocess,
 };
-use crate::config::AgentHarnessConfig;
+use crate::config::{AgentHarnessConfig, OutputVerificationMode, ToolVerificationMode};
 use crate::domain::{IncomingMessage, MessageRole, OutgoingMessage, StoredMessage};
-use crate::harness::compactor::{CompactionRequest, CompactionStrategy, Compactor};
+use crate::harness::compactor::{
+    CompactionMessageMetadata, CompactionRequest, CompactionStrategy, Compactor,
+};
 use crate::harness::observability::TrajectoryMetrics;
-use crate::harness::trajectory::{ToolCallRecord, TrajectoryLogger, new_trajectory_id};
-use crate::harness::verifier::{TimingVerifier, ToolCallVerifier};
+use crate::harness::trajectory::{
+    ToolCallRecord, TrajectoryExitReason, TrajectoryLogger, TrajectoryRun,
+};
+use crate::harness::verifier::{
+    CompositeVerifier, DeterministicOutputVerifier, OutputVerificationRequest,
+    OutputVerificationResult, ResultShapeVerifier, TimingVerifier, ToolCallVerifier,
+    ToolSchemaVerifier, VerificationIssue, VerificationResult,
+};
 use crate::mcp::{BUILTIN_MCP_SERVER_NAME, BUILTIN_MCP_TOOL_CURRENT_TIME, McpRuntime, McpToolInfo};
 use crate::memory::{
     AgentSwarmCleanupRequest, AgentSwarmNodeExitStatus, AgentSwarmNodeLoadRequest,
     AgentSwarmNodeRecord, AgentSwarmNodeState, AgentSwarmRunListRequest, AgentSwarmRunRecord,
     AgentSwarmRunStatus, AgentSwarmTreeRequest, ClaimDueTelegramSchedulerJobsRequest,
+    CompactionSummaryLoadRequest, CompactionSummaryUpsertRequest,
     CompleteTelegramSchedulerJobRunRequest, CreateAgentSwarmRunRequest,
     CreateTelegramSchedulerJobRequest, FailTelegramSchedulerJobRunRequest,
     FinishAgentSwarmRunRequest, GroupAliasLoadRequest, GroupAliasUpsertRequest,
     GroupUserProfileLoadRequest, GroupUserProfileRecord, GroupUserProfileUpsertRequest,
-    MemoryBackend, MemoryContextRequest, MemoryWriteRequest, SqliteMemoryBackend,
-    SqliteMemoryStore, TelegramSchedulerJobListRequest, TelegramSchedulerJobRecord,
-    TelegramSchedulerJobStatus, TelegramSchedulerPendingIntentRecord, TelegramSchedulerStats,
-    TelegramSchedulerStatsRequest, UpdateTelegramSchedulerJobStatusRequest,
+    MemoryBackend, MemoryContextRequest, MemoryWriteRequest, RecentMessageRecordsRequest,
+    SqliteMemoryBackend, SqliteMemoryStore, StoredMessageRecord, TelegramSchedulerJobListRequest,
+    TelegramSchedulerJobRecord, TelegramSchedulerJobStatus, TelegramSchedulerPendingIntentRecord,
+    TelegramSchedulerStats, TelegramSchedulerStatsRequest, UpdateTelegramSchedulerJobStatusRequest,
     UpsertAgentSwarmNodeRequest, UpsertTelegramSchedulerPendingIntentRequest,
 };
 use crate::provider::{ChatProvider, CompletionRequest, StreamSink};
@@ -216,6 +228,34 @@ pub struct MessageService {
     trajectory_logger: Option<TrajectoryLogger>,
     trajectory_metrics: Option<TrajectoryMetrics>,
     tool_verifier: Option<Arc<dyn ToolCallVerifier>>,
+    tool_schema_verifier: Option<ToolSchemaVerifier>,
+    tool_verification_mode: ToolVerificationMode,
+    output_verifier: Option<DeterministicOutputVerifier>,
+    output_verification_mode: OutputVerificationMode,
+    output_verification_llm_enabled: bool,
+    output_verification_max_prompt_chars: usize,
+    output_verification_max_result_chars: usize,
+}
+
+struct CompletionOutcome {
+    text: String,
+    output_verified: bool,
+}
+
+impl CompletionOutcome {
+    fn unverified(text: String) -> Self {
+        Self {
+            text,
+            output_verified: false,
+        }
+    }
+
+    fn verified(text: String) -> Self {
+        Self {
+            text,
+            output_verified: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,6 +396,13 @@ impl MessageService {
             trajectory_logger: None,
             trajectory_metrics: None,
             tool_verifier: None,
+            tool_schema_verifier: None,
+            tool_verification_mode: ToolVerificationMode::Observe,
+            output_verifier: None,
+            output_verification_mode: OutputVerificationMode::Off,
+            output_verification_llm_enabled: false,
+            output_verification_max_prompt_chars: 6000,
+            output_verification_max_result_chars: 2000,
         }
     }
 
@@ -437,8 +484,12 @@ impl MessageService {
                     head_count: config.compaction_head_count,
                     tail_count: config.compaction_tail_count,
                 },
-                "age_based" => CompactionStrategy::AgeBased { max_age_days: 7 },
-                "budget_based" => CompactionStrategy::BudgetBased { max_tokens: 16000 },
+                "age_based" => CompactionStrategy::AgeBased {
+                    max_age_days: config.compaction_age_max_days,
+                },
+                "budget_based" => CompactionStrategy::BudgetBased {
+                    max_tokens: config.compaction_budget_max_tokens,
+                },
                 _ => CompactionStrategy::HeadTail {
                     head_count: config.compaction_head_count,
                     tail_count: config.compaction_tail_count,
@@ -456,10 +507,24 @@ impl MessageService {
 
         // Set up tool verifier if enabled
         if config.enable_verification {
-            self.tool_verifier = Some(Arc::new(TimingVerifier::new(
-                config.verification_max_tool_duration_ms,
-                config.verification_warn_ratio,
-            )) as Arc<dyn ToolCallVerifier>);
+            self.tool_verification_mode = config.verification_mode;
+            self.tool_schema_verifier = Some(ToolSchemaVerifier::new());
+            self.tool_verifier = Some(Arc::new(
+                CompositeVerifier::new()
+                    .add(TimingVerifier::new(
+                        config.verification_max_tool_duration_ms,
+                        config.verification_warn_ratio,
+                    ))
+                    .add(ResultShapeVerifier::new()),
+            ) as Arc<dyn ToolCallVerifier>);
+        }
+
+        self.output_verification_mode = config.output_verification_mode;
+        self.output_verification_llm_enabled = config.output_verification_llm_enabled;
+        self.output_verification_max_prompt_chars = config.output_verification_max_prompt_chars;
+        self.output_verification_max_result_chars = config.output_verification_max_result_chars;
+        if !matches!(config.output_verification_mode, OutputVerificationMode::Off) {
+            self.output_verifier = Some(DeterministicOutputVerifier::new());
         }
 
         self
@@ -716,6 +781,95 @@ impl MessageService {
         out
     }
 
+    pub fn harness_metrics_prometheus(&self) -> Option<String> {
+        self.trajectory_metrics
+            .as_ref()
+            .map(TrajectoryMetrics::render_prometheus)
+    }
+
+    async fn verify_final_answer(
+        &self,
+        history: &[StoredMessage],
+        channel: &str,
+        final_answer: String,
+        tool_calls: &[ToolCallRecord],
+    ) -> anyhow::Result<String> {
+        let Some(verifier) = &self.output_verifier else {
+            return Ok(final_answer);
+        };
+        let request = OutputVerificationRequest {
+            final_answer: final_answer.clone(),
+            recent_history: history.to_vec(),
+            tool_calls: tool_calls.to_vec(),
+            channel: channel.to_string(),
+            required_format: None,
+        };
+        let verification = verifier.verify(&request);
+        if verification.passed {
+            return Ok(final_answer);
+        }
+
+        warn_output_verification_failure(&verification);
+        match self.output_verification_mode {
+            OutputVerificationMode::Off | OutputVerificationMode::Observe => Ok(final_answer),
+            OutputVerificationMode::Block => Ok(verification
+                .suggested_revision
+                .unwrap_or_else(|| "I could not produce a reliable final answer.".to_string())),
+            OutputVerificationMode::ReviseOnce => {
+                if !self.output_verification_llm_enabled {
+                    return Ok(verification.suggested_revision.unwrap_or_else(|| {
+                        "I could not produce a reliable final answer.".to_string()
+                    }));
+                }
+
+                let revision_prompt = output_revision_prompt(
+                    &verification,
+                    self.output_verification_max_prompt_chars,
+                );
+                let mut revision_history = history.to_vec();
+                revision_history.push(StoredMessage {
+                    role: MessageRole::Assistant,
+                    content: truncate_output_verification_text(
+                        &final_answer,
+                        self.output_verification_max_result_chars,
+                    ),
+                });
+                revision_history.push(StoredMessage {
+                    role: MessageRole::System,
+                    content: revision_prompt,
+                });
+                let revised = self
+                    .provider
+                    .complete(CompletionRequest {
+                        messages: revision_history,
+                        ..Default::default()
+                    })
+                    .await
+                    .context("provider completion failed during output verification revision")?;
+                let revised = truncate_output_verification_text(
+                    revised.trim(),
+                    self.output_verification_max_result_chars,
+                );
+                let revised_request = OutputVerificationRequest {
+                    final_answer: revised.clone(),
+                    recent_history: history.to_vec(),
+                    tool_calls: tool_calls.to_vec(),
+                    channel: channel.to_string(),
+                    required_format: None,
+                };
+                let revised_verification = verifier.verify(&revised_request);
+                if revised_verification.passed {
+                    Ok(revised)
+                } else {
+                    warn_output_verification_failure(&revised_verification);
+                    Ok(revised_verification.suggested_revision.unwrap_or_else(|| {
+                        "I could not produce a reliable final answer.".to_string()
+                    }))
+                }
+            }
+        }
+    }
+
     pub async fn handle(&self, incoming: IncomingMessage) -> anyhow::Result<OutgoingMessage> {
         self.memory
             .append(MemoryWriteRequest {
@@ -740,7 +894,7 @@ impl MessageService {
             });
         }
 
-        let history = self
+        let mut history = self
             .memory
             .load_context(MemoryContextRequest {
                 session_id: incoming.session_id.clone(),
@@ -753,20 +907,16 @@ impl MessageService {
             })
             .await
             .context("failed to load history")?;
-        let mut history = apply_context_budget(
-            history,
-            self.context_window_tokens,
-            self.context_reserved_tokens,
-            self.context_memory_budget_ratio,
-            self.context_min_recent_messages,
-        );
 
-        // Apply compaction if enabled and threshold is met
+        // Apply compaction before destructive budget trimming, then keep a final budget safety pass.
         if self.agent_compaction.enabled
             && history.len() >= self.agent_compaction.message_count_threshold
             && self.compactor.is_some()
         {
-            match self.apply_compaction(history.clone()).await {
+            match self
+                .apply_compaction(history.clone(), &incoming.session_id)
+                .await
+            {
                 Ok(compacted) => {
                     history = compacted;
                 }
@@ -775,6 +925,13 @@ impl MessageService {
                 }
             }
         }
+        let history = apply_context_budget(
+            history,
+            self.context_window_tokens,
+            self.context_reserved_tokens,
+            self.context_memory_budget_ratio,
+            self.context_min_recent_messages,
+        );
 
         let history = self.apply_skills_prompt(history, &incoming.text).await;
         let history = self
@@ -782,6 +939,9 @@ impl MessageService {
             .await;
 
         if let Some(swarm_text) = self.try_swarm_reply(&incoming, &history).await? {
+            let swarm_text = self
+                .verify_final_answer(&history, &incoming.channel, swarm_text, &[])
+                .await?;
             self.persist_assistant_reply(&incoming, &swarm_text).await?;
             return Ok(OutgoingMessage {
                 channel: incoming.channel,
@@ -791,7 +951,15 @@ impl MessageService {
             });
         }
 
-        let text = self.complete_with_optional_mcp(history, &incoming).await?;
+        let completion = self
+            .complete_with_optional_mcp(history.clone(), &incoming)
+            .await?;
+        let text = if completion.output_verified {
+            completion.text
+        } else {
+            self.verify_final_answer(&history, &incoming.channel, completion.text, &[])
+                .await?
+        };
 
         self.persist_assistant_reply(&incoming, &text).await?;
 
@@ -834,7 +1002,7 @@ impl MessageService {
             });
         }
 
-        let history = self
+        let mut history = self
             .memory
             .load_context(MemoryContextRequest {
                 session_id: incoming.session_id.clone(),
@@ -847,20 +1015,16 @@ impl MessageService {
             })
             .await
             .context("failed to load history")?;
-        let mut history = apply_context_budget(
-            history,
-            self.context_window_tokens,
-            self.context_reserved_tokens,
-            self.context_memory_budget_ratio,
-            self.context_min_recent_messages,
-        );
 
-        // Apply compaction if enabled and threshold is met
+        // Apply compaction before destructive budget trimming, then keep a final budget safety pass.
         if self.agent_compaction.enabled
             && history.len() >= self.agent_compaction.message_count_threshold
             && self.compactor.is_some()
         {
-            match self.apply_compaction(history.clone()).await {
+            match self
+                .apply_compaction(history.clone(), &incoming.session_id)
+                .await
+            {
                 Ok(compacted) => {
                     history = compacted;
                 }
@@ -869,6 +1033,13 @@ impl MessageService {
                 }
             }
         }
+        let history = apply_context_budget(
+            history,
+            self.context_window_tokens,
+            self.context_reserved_tokens,
+            self.context_memory_budget_ratio,
+            self.context_min_recent_messages,
+        );
 
         let history = self.apply_skills_prompt(history, &incoming.text).await;
         let history = self
@@ -1346,22 +1517,20 @@ impl MessageService {
         ]
         .join("\n");
 
-        let decision_call = self.provider.complete(CompletionRequest {
-            messages: vec![
-                StoredMessage {
-                    role: MessageRole::System,
-                    content: prompt,
-                },
-                StoredMessage {
-                    role: MessageRole::User,
-                    content: format!(
-                        "USER_TASK:\n{}\n\nRECENT_CONTEXT_JSON:\n{}",
-                        user_text.trim(),
-                        history_json
-                    ),
-                },
-            ],
-        });
+        let decision_call = self.provider.complete(CompletionRequest::json(vec![
+            StoredMessage {
+                role: MessageRole::System,
+                content: prompt,
+            },
+            StoredMessage {
+                role: MessageRole::User,
+                content: format!(
+                    "USER_TASK:\n{}\n\nRECENT_CONTEXT_JSON:\n{}",
+                    user_text.trim(),
+                    history_json
+                ),
+            },
+        ]));
         let call_result = timeout(
             Duration::from_millis(self.agent_swarm.max_node_timeout_ms.max(1)),
             decision_call,
@@ -1475,7 +1644,7 @@ impl MessageService {
                 shared.settings.max_depth,
             );
             match self
-                .swarm_complete_with_timeout(planner_messages, &shared)
+                .swarm_complete_with_timeout(planner_messages, &shared, true)
                 .await
             {
                 Ok(reply) => {
@@ -1549,7 +1718,7 @@ impl MessageService {
                 seed
             } else {
                 match self
-                    .swarm_complete_with_timeout(answer_messages, &shared)
+                    .swarm_complete_with_timeout(answer_messages, &shared, false)
                     .await
                 {
                     Ok(text) => text,
@@ -1726,7 +1895,7 @@ impl MessageService {
         let merged_messages =
             build_swarm_merge_messages(&history, &spec.task, &spec.role_name, &child_json);
         let merged_answer = match self
-            .swarm_complete_with_timeout(merged_messages, &shared)
+            .swarm_complete_with_timeout(merged_messages, &shared, false)
             .await
         {
             Ok(text) => text,
@@ -1786,6 +1955,7 @@ impl MessageService {
         &self,
         messages: Vec<StoredMessage>,
         shared: &SwarmExecutionShared,
+        json_mode: bool,
     ) -> Result<String, SwarmModelError> {
         let _permit = shared
             .semaphore
@@ -1793,7 +1963,12 @@ impl MessageService {
             .acquire_owned()
             .await
             .map_err(|err| SwarmModelError::Failure(anyhow::anyhow!(err.to_string())))?;
-        let call = self.provider.complete(CompletionRequest { messages });
+        let request = if json_mode {
+            CompletionRequest::json(messages)
+        } else {
+            CompletionRequest::from_messages(messages)
+        };
+        let call = self.provider.complete(request);
         match timeout(
             Duration::from_millis(shared.settings.max_node_timeout_ms.max(1)),
             call,
@@ -1851,21 +2026,20 @@ impl MessageService {
 
         let reply = self
             .provider
-            .complete(CompletionRequest {
-                messages: vec![
-                    StoredMessage {
-                        role: MessageRole::System,
-                        content: [
-                            "你是 Telegram 定时任务意图解析器。",
-                            "只输出 JSON，不要 Markdown，不要解释。",
-                            "JSON schema:",
-                            "{\"action\":\"create|update|delete|pause|resume|cancel|list|none\",\"confidence\":0..1,\"task_kind\":\"reminder|agent|null\",\"payload\":\"string|null\",\"schedule_kind\":\"once|cron|null\",\"run_at\":\"RFC3339或unix秒字符串|null\",\"cron_expr\":\"string|null\",\"timezone\":\"IANA时区或null\",\"job_id\":\"string|null\",\"job_operation\":\"delete|pause|resume|null\"}",
-                            "规则:",
-                            "1) 若不是定时任务意图，action=none, confidence<=0.4",
-                            "2) 若有明确时间并要求提醒，优先 action=create",
-                            "3) 对修改已存在草案可输出 action=update",
-                            "4) 若表达暂停/恢复/删除已存在任务，输出 action=pause|resume|delete，并尽量给出 job_id",
-                            "4) 只返回一个合法 JSON 对象",
+            .complete(CompletionRequest::json(vec![
+                StoredMessage {
+                    role: MessageRole::System,
+                    content: [
+                        "你是 Telegram 定时任务意图解析器。",
+                        "只输出 JSON，不要 Markdown，不要解释。",
+                        "JSON schema:",
+                        "{\"action\":\"create|update|delete|pause|resume|cancel|list|none\",\"confidence\":0..1,\"task_kind\":\"reminder|agent|null\",\"payload\":\"string|null\",\"schedule_kind\":\"once|cron|null\",\"run_at\":\"RFC3339或unix秒字符串|null\",\"cron_expr\":\"string|null\",\"timezone\":\"IANA时区或null\",\"job_id\":\"string|null\",\"job_operation\":\"delete|pause|resume|null\"}",
+                        "规则:",
+                        "1) 若不是定时任务意图，action=none, confidence<=0.4",
+                        "2) 若有明确时间并要求提醒，优先 action=create",
+                        "3) 对修改已存在草案可输出 action=update",
+                        "4) 若表达暂停/恢复/删除已存在任务，输出 action=pause|resume|delete，并尽量给出 job_id",
+                        "4) 只返回一个合法 JSON 对象",
                         ]
                         .join("\n"),
                     },
@@ -1873,8 +2047,7 @@ impl MessageService {
                         role: MessageRole::User,
                         content: input,
                     },
-                ],
-            })
+                ]))
             .await
             .context("failed to detect telegram scheduler intent")?;
 
@@ -1885,32 +2058,44 @@ impl MessageService {
         &self,
         history: Vec<StoredMessage>,
         incoming: &IncomingMessage,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<CompletionOutcome> {
         let Some(runtime) = self.snapshot_mcp_runtime().await else {
-            return self
+            let reply = self
                 .provider
-                .complete(CompletionRequest { messages: history })
+                .complete(CompletionRequest {
+                    messages: history,
+                    ..Default::default()
+                })
                 .await
-                .context("provider completion failed");
+                .context("provider completion failed")?;
+            return Ok(CompletionOutcome::unverified(reply));
         };
         let tools = match runtime.list_tools(None).await {
             Ok(tools) => tools,
             Err(err) => {
                 warn!(error = %err, "failed to list mcp tools, fallback to plain completion");
-                return self
+                let reply = self
                     .provider
-                    .complete(CompletionRequest { messages: history })
+                    .complete(CompletionRequest {
+                        messages: history,
+                        ..Default::default()
+                    })
                     .await
-                    .context("provider completion failed");
+                    .context("provider completion failed")?;
+                return Ok(CompletionOutcome::unverified(reply));
             }
         };
 
         if tools.is_empty() {
-            return self
+            let reply = self
                 .provider
-                .complete(CompletionRequest { messages: history })
+                .complete(CompletionRequest {
+                    messages: history,
+                    ..Default::default()
+                })
                 .await
-                .context("provider completion failed");
+                .context("provider completion failed")?;
+            return Ok(CompletionOutcome::unverified(reply));
         }
 
         if self.agent_code_mode.enabled
@@ -1918,10 +2103,10 @@ impl MessageService {
         {
             let force_shadow = matches!(attempt, CodeModeAttempt::Probe);
             match self
-                .complete_with_code_mode(history.clone(), &tools, &runtime, force_shadow)
+                .complete_with_code_mode(history.clone(), &tools, &runtime, force_shadow, incoming)
                 .await
             {
-                Ok(Some(reply)) => return Ok(reply),
+                Ok(Some(reply)) => return Ok(CompletionOutcome::verified(reply)),
                 Ok(None) => {}
                 Err(err) => {
                     warn!(error = %err, "code mode path failed, fallback to mcp json loop");
@@ -1931,6 +2116,7 @@ impl MessageService {
 
         self.complete_with_mcp_loop(history, tools, runtime, incoming)
             .await
+            .map(CompletionOutcome::verified)
     }
 
     async fn complete_with_optional_mcp_stream(
@@ -1942,7 +2128,13 @@ impl MessageService {
         let Some(runtime) = self.snapshot_mcp_runtime().await else {
             return self
                 .provider
-                .complete_stream(CompletionRequest { messages: history }, sink)
+                .complete_stream(
+                    CompletionRequest {
+                        messages: history,
+                        ..Default::default()
+                    },
+                    sink,
+                )
                 .await
                 .context("provider stream completion failed");
         };
@@ -1955,7 +2147,13 @@ impl MessageService {
                 );
                 return self
                     .provider
-                    .complete_stream(CompletionRequest { messages: history }, sink)
+                    .complete_stream(
+                        CompletionRequest {
+                            messages: history,
+                            ..Default::default()
+                        },
+                        sink,
+                    )
                     .await
                     .context("provider stream completion failed");
             }
@@ -1964,7 +2162,13 @@ impl MessageService {
         if tools.is_empty() {
             return self
                 .provider
-                .complete_stream(CompletionRequest { messages: history }, sink)
+                .complete_stream(
+                    CompletionRequest {
+                        messages: history,
+                        ..Default::default()
+                    },
+                    sink,
+                )
                 .await
                 .context("provider stream completion failed");
         }
@@ -1974,7 +2178,7 @@ impl MessageService {
         {
             let force_shadow = matches!(attempt, CodeModeAttempt::Probe);
             match self
-                .complete_with_code_mode(history.clone(), &tools, &runtime, force_shadow)
+                .complete_with_code_mode(history.clone(), &tools, &runtime, force_shadow, incoming)
                 .await
             {
                 Ok(Some(reply)) => {
@@ -2000,11 +2204,28 @@ impl MessageService {
         tools: &[McpToolInfo],
         runtime: &McpRuntime,
         force_shadow: bool,
+        incoming: &IncomingMessage,
     ) -> anyhow::Result<Option<String>> {
         let started_at = Instant::now();
         let planner = self.code_mode_planner.clone();
         let planner_name = planner.name();
-        let plan = planner.build_plan(&history, tools).await?;
+        let policy = CodeModePolicy::new(self.agent_code_mode.clone());
+        let code_mode_tools = tools
+            .iter()
+            .filter(|tool| policy.allows_tool(tool))
+            .cloned()
+            .collect::<Vec<_>>();
+        if code_mode_tools.is_empty() {
+            let audit = CodeModeAuditRecord::fallback(
+                planner_name,
+                "no code mode tools allowed by capability policy",
+            );
+            emit_code_mode_audit(&audit, self.agent_code_mode.normalized_timeout_warn_ratio());
+            self.record_code_mode_counters(&audit, force_shadow, CodeModeCircuitChange::None);
+            return Ok(None);
+        }
+
+        let plan = planner.build_plan(&history, &code_mode_tools).await?;
         let Some(plan) = plan else {
             let audit = CodeModeAuditRecord::fallback(planner_name, "planner returned no plan");
             emit_code_mode_audit(&audit, self.agent_code_mode.normalized_timeout_warn_ratio());
@@ -2016,10 +2237,10 @@ impl MessageService {
         let execution = match self.agent_code_mode.execution_mode {
             CodeModeExecutionMode::Local => {
                 let executor = CodeModeExecutor::new(self.agent_code_mode.clone());
-                executor.execute(runtime, &plan, tools).await
+                executor.execute(runtime, &plan, &code_mode_tools).await
             }
             CodeModeExecutionMode::Subprocess => {
-                execute_plan_via_subprocess(&plan, tools, &self.agent_code_mode).await
+                execute_plan_via_subprocess(&plan, &code_mode_tools, &self.agent_code_mode).await
             }
         };
         let execution = match execution {
@@ -2077,6 +2298,24 @@ impl MessageService {
             return Ok(None);
         }
 
+        let model = self.provider.model_name().unwrap_or("unknown").to_string();
+        let mut trajectory = TrajectoryRun::start(
+            self.trajectory_logger.clone(),
+            self.trajectory_metrics.clone(),
+            &incoming.session_id,
+            &incoming.channel,
+            &incoming.user_id,
+            &model,
+        )
+        .await;
+        let mut tool_calls = Vec::new();
+        for (iteration, call) in execution.calls.iter().enumerate() {
+            let record = trajectory
+                .log_tool_call(code_mode_tool_call_record(call, iteration))
+                .await;
+            tool_calls.push(record);
+        }
+
         let mut next_history = history;
         next_history.push(StoredMessage {
             role: MessageRole::System,
@@ -2087,13 +2326,38 @@ impl MessageService {
                 })
             ),
         });
-        let reply = self
+        let reply = match self
             .provider
             .complete(CompletionRequest {
-                messages: next_history,
+                messages: next_history.clone(),
+                ..Default::default()
             })
             .await
-            .context("provider completion failed after code mode execution")?;
+        {
+            Ok(reply) => reply,
+            Err(err) => {
+                trajectory
+                    .finish(None, TrajectoryExitReason::InternalError)
+                    .await;
+                return Err(err).context("provider completion failed after code mode execution");
+            }
+        };
+        let reply = match self
+            .verify_final_answer(&next_history, &incoming.channel, reply, &tool_calls)
+            .await
+        {
+            Ok(reply) => reply,
+            Err(err) => {
+                trajectory
+                    .finish(None, TrajectoryExitReason::InternalError)
+                    .await;
+                return Err(err).context("output verification failed after code mode execution");
+            }
+        };
+        trajectory.observe_iteration(0);
+        trajectory
+            .finish(Some(reply.clone()), TrajectoryExitReason::FinalAnswer)
+            .await;
         Ok(Some(reply))
     }
 
@@ -2105,54 +2369,189 @@ impl MessageService {
         incoming: &IncomingMessage,
     ) -> anyhow::Result<String> {
         let mut telemetry = McpLoopTelemetry::new(tools.len());
-        let trajectory_id = new_trajectory_id();
-        let model = "unknown".to_string();
-
-        if let Some(ref logger) = self.trajectory_logger
-            && let Err(e) = logger
-                .start_trajectory(
-                    &trajectory_id,
-                    &incoming.session_id,
-                    &incoming.channel,
-                    &incoming.user_id,
-                    &model,
-                )
-                .await
-        {
-            tracing::warn!(error = %e, "failed to start trajectory");
-        }
+        let mcp_prompt = build_mcp_system_prompt(&tools)?;
+        let model = self.provider.model_name().unwrap_or("unknown").to_string();
+        let mut trajectory = TrajectoryRun::start(
+            self.trajectory_logger.clone(),
+            self.trajectory_metrics.clone(),
+            &incoming.session_id,
+            &incoming.channel,
+            &incoming.user_id,
+            &model,
+        )
+        .await;
 
         history.push(StoredMessage {
             role: MessageRole::System,
-            content: build_mcp_system_prompt(&tools)?,
+            content: mcp_prompt,
         });
 
         let max_iterations = self.agent_mcp.max_iterations.max(1);
+        let mut verification_retry_used = false;
+        let mut tool_calls = Vec::new();
         for iteration in 0..max_iterations {
             telemetry.observe_prompt_chars(&history);
-            let reply = self
+            let reply = match self
                 .provider
                 .complete(CompletionRequest {
                     messages: history.clone(),
+                    ..Default::default()
                 })
                 .await
-                .context("provider completion failed")?;
-            telemetry.iterations += 1;
-
-            let Some(tool_call) = parse_mcp_tool_call(&reply) else {
-                telemetry.emit("final_answer");
-                // Log final answer trajectory
-                if let Some(ref logger) = self.trajectory_logger {
-                    let _ = logger
-                        .finish_trajectory(
-                            &trajectory_id,
-                            Some(reply.clone()),
-                            crate::harness::trajectory::TrajectoryExitReason::FinalAnswer,
-                        )
+            {
+                Ok(reply) => reply,
+                Err(err) => {
+                    trajectory
+                        .finish(None, TrajectoryExitReason::InternalError)
                         .await;
+                    return Err(err).context("provider completion failed");
                 }
-                return Ok(reply);
             };
+            telemetry.iterations += 1;
+            trajectory.observe_iteration(iteration);
+
+            let tool_call = match parse_mcp_tool_call_attempt(&reply) {
+                McpToolCallParse::Tool(tool_call) => tool_call,
+                McpToolCallParse::FinalAnswer => {
+                    let reply = match self
+                        .verify_final_answer(&history, &incoming.channel, reply, &tool_calls)
+                        .await
+                    {
+                        Ok(reply) => reply,
+                        Err(err) => {
+                            trajectory
+                                .finish(None, TrajectoryExitReason::InternalError)
+                                .await;
+                            return Err(err).context("output verification failed");
+                        }
+                    };
+                    telemetry.emit("final_answer");
+                    trajectory
+                        .finish(Some(reply.clone()), TrajectoryExitReason::FinalAnswer)
+                        .await;
+                    return Ok(reply);
+                }
+                McpToolCallParse::ParseError(verification) => {
+                    warn_verification_failure(&verification);
+                    if !verification_retry_used {
+                        verification_retry_used = true;
+                        history.push(StoredMessage {
+                            role: MessageRole::Assistant,
+                            content: reply,
+                        });
+                        history.push(verification_feedback_message(
+                            &verification,
+                            ToolVerificationMode::Retry,
+                        ));
+                        continue;
+                    }
+                    history.push(StoredMessage {
+                        role: MessageRole::Assistant,
+                        content: reply,
+                    });
+                    history.push(verification_feedback_message(
+                        &verification,
+                        ToolVerificationMode::Block,
+                    ));
+                    let final_reply = match self
+                        .provider
+                        .complete(CompletionRequest {
+                            messages: history.clone(),
+                            ..Default::default()
+                        })
+                        .await
+                    {
+                        Ok(reply) => reply,
+                        Err(err) => {
+                            trajectory
+                                .finish(None, TrajectoryExitReason::InternalError)
+                                .await;
+                            return Err(err)
+                                .context("provider completion failed after mcp parse error");
+                        }
+                    };
+                    let final_reply = match self
+                        .verify_final_answer(&history, &incoming.channel, final_reply, &tool_calls)
+                        .await
+                    {
+                        Ok(reply) => reply,
+                        Err(err) => {
+                            trajectory
+                                .finish(None, TrajectoryExitReason::InternalError)
+                                .await;
+                            return Err(err)
+                                .context("output verification failed after mcp parse error");
+                        }
+                    };
+                    telemetry.emit("tool_error");
+                    trajectory
+                        .finish(Some(final_reply.clone()), TrajectoryExitReason::ToolError)
+                        .await;
+                    return Ok(final_reply);
+                }
+            };
+
+            if let Err(verification) = validate_mcp_tool_call(&tools, &tool_call) {
+                warn_verification_failure(&verification);
+                let record = verification_failure_record(&tool_call, &verification, iteration);
+                let record = trajectory.log_tool_call(record).await;
+                tool_calls.push(record);
+                if !verification_retry_used {
+                    verification_retry_used = true;
+                    history.push(StoredMessage {
+                        role: MessageRole::Assistant,
+                        content: reply,
+                    });
+                    history.push(verification_feedback_message(
+                        &verification,
+                        ToolVerificationMode::Retry,
+                    ));
+                    continue;
+                }
+                history.push(StoredMessage {
+                    role: MessageRole::Assistant,
+                    content: reply,
+                });
+                history.push(verification_feedback_message(
+                    &verification,
+                    ToolVerificationMode::Block,
+                ));
+                let final_reply = match self
+                    .provider
+                    .complete(CompletionRequest {
+                        messages: history.clone(),
+                        ..Default::default()
+                    })
+                    .await
+                {
+                    Ok(reply) => reply,
+                    Err(err) => {
+                        trajectory
+                            .finish(None, TrajectoryExitReason::InternalError)
+                            .await;
+                        return Err(err)
+                            .context("provider completion failed after mcp tool validation error");
+                    }
+                };
+                let final_reply = match self
+                    .verify_final_answer(&history, &incoming.channel, final_reply, &tool_calls)
+                    .await
+                {
+                    Ok(reply) => reply,
+                    Err(err) => {
+                        trajectory
+                            .finish(None, TrajectoryExitReason::InternalError)
+                            .await;
+                        return Err(err)
+                            .context("output verification failed after mcp tool validation error");
+                    }
+                };
+                telemetry.emit("tool_error");
+                trajectory
+                    .finish(Some(final_reply.clone()), TrajectoryExitReason::ToolError)
+                    .await;
+                return Ok(final_reply);
+            }
 
             let tool_start = Instant::now();
             let tool_result = runtime
@@ -2173,7 +2572,8 @@ impl MessageService {
                     let args_clone = tool_call.arguments.clone();
 
                     // Create record for verification
-                    let record = ToolCallRecord {
+                    let mut record = ToolCallRecord {
+                        call_index: 0,
                         server: tool_call.server.clone(),
                         tool: tool_call.tool.clone(),
                         arguments: args_clone,
@@ -2183,26 +2583,88 @@ impl MessageService {
                         iteration,
                     };
 
-                    // Log tool call to trajectory
-                    if let Some(ref logger) = self.trajectory_logger {
-                        let _ = logger.log_tool_call(&trajectory_id, record.clone()).await;
+                    let verification = self.tool_verifier.as_ref().map(|v| v.verify(&record));
+                    if let Some(verification) = &verification
+                        && !verification.passed
+                    {
+                        warn_verification_failure(verification);
+                        annotate_record_with_verification_failure(&mut record, verification);
                     }
+                    let logged_record = trajectory.log_tool_call(record.clone()).await;
+                    tool_calls.push(logged_record);
 
-                    // Record tool call metrics
-                    if let Some(ref metrics) = self.trajectory_metrics {
-                        metrics.record_tool_call(
-                            tool_duration_ms,
-                            &tool_call.server,
-                            &tool_call.tool,
-                            true,
-                        );
-                    }
-
-                    // Verify tool call
-                    if let Some(ref verifier) = self.tool_verifier {
-                        let verification = verifier.verify(&record);
-                        if !verification.passed {
-                            warn!(?verification.issues, "Tool call verification failed");
+                    if let Some(verification) = verification
+                        && !verification.passed
+                    {
+                        match self.tool_verification_mode {
+                            ToolVerificationMode::Observe => {}
+                            ToolVerificationMode::Retry if !verification_retry_used => {
+                                verification_retry_used = true;
+                                history.push(StoredMessage {
+                                    role: MessageRole::Assistant,
+                                    content: reply,
+                                });
+                                history.push(verification_feedback_message(
+                                    &verification,
+                                    ToolVerificationMode::Retry,
+                                ));
+                                continue;
+                            }
+                            ToolVerificationMode::Retry | ToolVerificationMode::Block => {
+                                history.push(StoredMessage {
+                                    role: MessageRole::Assistant,
+                                    content: reply,
+                                });
+                                history.push(verification_feedback_message(
+                                    &verification,
+                                    ToolVerificationMode::Block,
+                                ));
+                                let final_reply = match self
+                                    .provider
+                                    .complete(CompletionRequest {
+                                        messages: history.clone(),
+                                        ..Default::default()
+                                    })
+                                    .await
+                                {
+                                    Ok(reply) => reply,
+                                    Err(err) => {
+                                        trajectory
+                                            .finish(None, TrajectoryExitReason::InternalError)
+                                            .await;
+                                        return Err(err).context(
+                                            "provider completion failed after tool verification block",
+                                        );
+                                    }
+                                };
+                                let final_reply = match self
+                                    .verify_final_answer(
+                                        &history,
+                                        &incoming.channel,
+                                        final_reply,
+                                        &tool_calls,
+                                    )
+                                    .await
+                                {
+                                    Ok(reply) => reply,
+                                    Err(err) => {
+                                        trajectory
+                                            .finish(None, TrajectoryExitReason::InternalError)
+                                            .await;
+                                        return Err(err).context(
+                                            "output verification failed after tool verification block",
+                                        );
+                                    }
+                                };
+                                telemetry.emit("tool_error");
+                                trajectory
+                                    .finish(
+                                        Some(final_reply.clone()),
+                                        TrajectoryExitReason::ToolError,
+                                    )
+                                    .await;
+                                return Ok(final_reply);
+                            }
                         }
                     }
 
@@ -2220,7 +2682,8 @@ impl MessageService {
                     let error_json = serde_json::json!({"error": err.to_string()});
 
                     // Create record for verification
-                    let record = ToolCallRecord {
+                    let mut record = ToolCallRecord {
+                        call_index: 0,
                         server: tool_call.server.clone(),
                         tool: tool_call.tool.clone(),
                         arguments: args_clone,
@@ -2230,26 +2693,88 @@ impl MessageService {
                         iteration,
                     };
 
-                    // Log tool call to trajectory
-                    if let Some(ref logger) = self.trajectory_logger {
-                        let _ = logger.log_tool_call(&trajectory_id, record.clone()).await;
+                    let verification = self.tool_verifier.as_ref().map(|v| v.verify(&record));
+                    if let Some(verification) = &verification
+                        && !verification.passed
+                    {
+                        warn_verification_failure(verification);
+                        annotate_record_with_verification_failure(&mut record, verification);
                     }
+                    let logged_record = trajectory.log_tool_call(record.clone()).await;
+                    tool_calls.push(logged_record);
 
-                    // Record tool call metrics
-                    if let Some(ref metrics) = self.trajectory_metrics {
-                        metrics.record_tool_call(
-                            tool_duration_ms,
-                            &tool_call.server,
-                            &tool_call.tool,
-                            false,
-                        );
-                    }
-
-                    // Verify tool call
-                    if let Some(ref verifier) = self.tool_verifier {
-                        let verification = verifier.verify(&record);
-                        if !verification.passed {
-                            warn!(?verification.issues, "Tool call verification failed");
+                    if let Some(verification) = verification
+                        && !verification.passed
+                    {
+                        match self.tool_verification_mode {
+                            ToolVerificationMode::Observe => {}
+                            ToolVerificationMode::Retry if !verification_retry_used => {
+                                verification_retry_used = true;
+                                history.push(StoredMessage {
+                                    role: MessageRole::Assistant,
+                                    content: reply,
+                                });
+                                history.push(verification_feedback_message(
+                                    &verification,
+                                    ToolVerificationMode::Retry,
+                                ));
+                                continue;
+                            }
+                            ToolVerificationMode::Retry | ToolVerificationMode::Block => {
+                                history.push(StoredMessage {
+                                    role: MessageRole::Assistant,
+                                    content: reply,
+                                });
+                                history.push(verification_feedback_message(
+                                    &verification,
+                                    ToolVerificationMode::Block,
+                                ));
+                                let final_reply = match self
+                                    .provider
+                                    .complete(CompletionRequest {
+                                        messages: history.clone(),
+                                        ..Default::default()
+                                    })
+                                    .await
+                                {
+                                    Ok(reply) => reply,
+                                    Err(err) => {
+                                        trajectory
+                                            .finish(None, TrajectoryExitReason::InternalError)
+                                            .await;
+                                        return Err(err).context(
+                                            "provider completion failed after tool verification block",
+                                        );
+                                    }
+                                };
+                                let final_reply = match self
+                                    .verify_final_answer(
+                                        &history,
+                                        &incoming.channel,
+                                        final_reply,
+                                        &tool_calls,
+                                    )
+                                    .await
+                                {
+                                    Ok(reply) => reply,
+                                    Err(err) => {
+                                        trajectory
+                                            .finish(None, TrajectoryExitReason::InternalError)
+                                            .await;
+                                        return Err(err).context(
+                                            "output verification failed after tool verification block",
+                                        );
+                                    }
+                                };
+                                telemetry.emit("tool_error");
+                                trajectory
+                                    .finish(
+                                        Some(final_reply.clone()),
+                                        TrajectoryExitReason::ToolError,
+                                    )
+                                    .await;
+                                return Ok(final_reply);
+                            }
                         }
                     }
 
@@ -2281,23 +2806,42 @@ impl MessageService {
             content: "MCP tool loop reached max iterations. Give a final answer based on available context."
                 .to_string(),
         });
-        let final_reply = self
+        let final_reply = match self
             .provider
-            .complete(CompletionRequest { messages: history })
+            .complete(CompletionRequest {
+                messages: history.clone(),
+                ..Default::default()
+            })
             .await
-            .context("provider completion failed")?;
+        {
+            Ok(reply) => reply,
+            Err(err) => {
+                trajectory
+                    .finish(None, TrajectoryExitReason::InternalError)
+                    .await;
+                return Err(err).context("provider completion failed");
+            }
+        };
+        let final_reply = match self
+            .verify_final_answer(&history, &incoming.channel, final_reply, &tool_calls)
+            .await
+        {
+            Ok(reply) => reply,
+            Err(err) => {
+                trajectory
+                    .finish(None, TrajectoryExitReason::InternalError)
+                    .await;
+                return Err(err).context("output verification failed after max iterations");
+            }
+        };
         telemetry.emit("max_iterations");
 
-        // Log max iterations trajectory
-        if let Some(ref logger) = self.trajectory_logger {
-            let _ = logger
-                .finish_trajectory(
-                    &trajectory_id,
-                    Some(final_reply.clone()),
-                    crate::harness::trajectory::TrajectoryExitReason::MaxIterations,
-                )
-                .await;
-        }
+        trajectory
+            .finish(
+                Some(final_reply.clone()),
+                TrajectoryExitReason::MaxIterations,
+            )
+            .await;
 
         Ok(final_reply)
     }
@@ -2311,43 +2855,50 @@ impl MessageService {
         incoming: &IncomingMessage,
     ) -> anyhow::Result<String> {
         let mut telemetry = McpLoopTelemetry::new(tools.len());
-        let trajectory_id = new_trajectory_id();
-        let model = "unknown".to_string();
-
-        if let Some(ref logger) = self.trajectory_logger
-            && let Err(e) = logger
-                .start_trajectory(
-                    &trajectory_id,
-                    &incoming.session_id,
-                    &incoming.channel,
-                    &incoming.user_id,
-                    &model,
-                )
-                .await
-        {
-            tracing::warn!(error = %e, "failed to start trajectory");
-        }
+        let mcp_prompt = build_mcp_system_prompt(&tools)?;
+        let model = self.provider.model_name().unwrap_or("unknown").to_string();
+        let mut trajectory = TrajectoryRun::start(
+            self.trajectory_logger.clone(),
+            self.trajectory_metrics.clone(),
+            &incoming.session_id,
+            &incoming.channel,
+            &incoming.user_id,
+            &model,
+        )
+        .await;
 
         history.push(StoredMessage {
             role: MessageRole::System,
-            content: build_mcp_system_prompt(&tools)?,
+            content: mcp_prompt,
         });
 
         let max_iterations = self.agent_mcp.max_iterations.max(1);
+        let mut verification_retry_used = false;
+        let mut tool_calls = Vec::new();
         for iteration in 0..max_iterations {
             telemetry.observe_prompt_chars(&history);
             let mut buffered_sink = BufferedStreamSink::default();
-            let reply = self
+            let reply = match self
                 .provider
                 .complete_stream(
                     CompletionRequest {
                         messages: history.clone(),
+                        ..Default::default()
                     },
                     &mut buffered_sink,
                 )
                 .await
-                .context("provider stream completion failed")?;
+            {
+                Ok(reply) => reply,
+                Err(err) => {
+                    trajectory
+                        .finish(None, TrajectoryExitReason::InternalError)
+                        .await;
+                    return Err(err).context("provider stream completion failed");
+                }
+            };
             telemetry.iterations += 1;
+            trajectory.observe_iteration(iteration);
 
             let streamed_reply = buffered_sink.rendered_text();
             let resolved_reply = if streamed_reply.trim().is_empty() {
@@ -2356,25 +2907,192 @@ impl MessageService {
                 streamed_reply.clone()
             };
 
-            let Some(tool_call) = parse_mcp_tool_call(&resolved_reply) else {
-                buffered_sink
-                    .replay_or_fallback(&resolved_reply, sink)
-                    .await?;
-                telemetry.emit("final_answer");
-
-                // Log final answer trajectory
-                if let Some(ref logger) = self.trajectory_logger {
-                    let _ = logger
-                        .finish_trajectory(
-                            &trajectory_id,
+            let tool_call = match parse_mcp_tool_call_attempt(&resolved_reply) {
+                McpToolCallParse::Tool(tool_call) => tool_call,
+                McpToolCallParse::FinalAnswer => {
+                    let resolved_reply = match self
+                        .verify_final_answer(
+                            &history,
+                            &incoming.channel,
+                            resolved_reply,
+                            &tool_calls,
+                        )
+                        .await
+                    {
+                        Ok(reply) => reply,
+                        Err(err) => {
+                            trajectory
+                                .finish(None, TrajectoryExitReason::InternalError)
+                                .await;
+                            return Err(err).context("output verification failed");
+                        }
+                    };
+                    telemetry.emit("final_answer");
+                    trajectory
+                        .finish(
                             Some(resolved_reply.clone()),
-                            crate::harness::trajectory::TrajectoryExitReason::FinalAnswer,
+                            TrajectoryExitReason::FinalAnswer,
                         )
                         .await;
+                    BufferedStreamSink::replay_text(&resolved_reply, sink).await?;
+                    return Ok(resolved_reply);
                 }
-
-                return Ok(resolved_reply);
+                McpToolCallParse::ParseError(verification) => {
+                    warn_verification_failure(&verification);
+                    if !verification_retry_used {
+                        verification_retry_used = true;
+                        history.push(StoredMessage {
+                            role: MessageRole::Assistant,
+                            content: resolved_reply,
+                        });
+                        history.push(verification_feedback_message(
+                            &verification,
+                            ToolVerificationMode::Retry,
+                        ));
+                        continue;
+                    }
+                    history.push(StoredMessage {
+                        role: MessageRole::Assistant,
+                        content: resolved_reply,
+                    });
+                    history.push(verification_feedback_message(
+                        &verification,
+                        ToolVerificationMode::Block,
+                    ));
+                    let mut final_sink = BufferedStreamSink::default();
+                    let final_reply = match self
+                        .provider
+                        .complete_stream(
+                            CompletionRequest {
+                                messages: history.clone(),
+                                ..Default::default()
+                            },
+                            &mut final_sink,
+                        )
+                        .await
+                    {
+                        Ok(reply) => reply,
+                        Err(err) => {
+                            trajectory
+                                .finish(None, TrajectoryExitReason::InternalError)
+                                .await;
+                            return Err(err).context(
+                                "provider stream completion failed after mcp parse error",
+                            );
+                        }
+                    };
+                    let streamed_reply = final_sink.rendered_text();
+                    let resolved_final = if streamed_reply.trim().is_empty() {
+                        final_reply
+                    } else {
+                        streamed_reply
+                    };
+                    let resolved_final = match self
+                        .verify_final_answer(
+                            &history,
+                            &incoming.channel,
+                            resolved_final,
+                            &tool_calls,
+                        )
+                        .await
+                    {
+                        Ok(reply) => reply,
+                        Err(err) => {
+                            trajectory
+                                .finish(None, TrajectoryExitReason::InternalError)
+                                .await;
+                            return Err(err)
+                                .context("output verification failed after mcp parse error");
+                        }
+                    };
+                    telemetry.emit("tool_error");
+                    trajectory
+                        .finish(
+                            Some(resolved_final.clone()),
+                            TrajectoryExitReason::ToolError,
+                        )
+                        .await;
+                    BufferedStreamSink::replay_text(&resolved_final, sink).await?;
+                    return Ok(resolved_final);
+                }
             };
+
+            if let Err(verification) = validate_mcp_tool_call(&tools, &tool_call) {
+                warn_verification_failure(&verification);
+                let record = verification_failure_record(&tool_call, &verification, iteration);
+                let record = trajectory.log_tool_call(record).await;
+                tool_calls.push(record);
+                if !verification_retry_used {
+                    verification_retry_used = true;
+                    history.push(StoredMessage {
+                        role: MessageRole::Assistant,
+                        content: resolved_reply,
+                    });
+                    history.push(verification_feedback_message(
+                        &verification,
+                        ToolVerificationMode::Retry,
+                    ));
+                    continue;
+                }
+                history.push(StoredMessage {
+                    role: MessageRole::Assistant,
+                    content: resolved_reply,
+                });
+                history.push(verification_feedback_message(
+                    &verification,
+                    ToolVerificationMode::Block,
+                ));
+                let mut final_sink = BufferedStreamSink::default();
+                let final_reply = match self
+                    .provider
+                    .complete_stream(
+                        CompletionRequest {
+                            messages: history.clone(),
+                            ..Default::default()
+                        },
+                        &mut final_sink,
+                    )
+                    .await
+                {
+                    Ok(reply) => reply,
+                    Err(err) => {
+                        trajectory
+                            .finish(None, TrajectoryExitReason::InternalError)
+                            .await;
+                        return Err(err).context(
+                            "provider stream completion failed after mcp tool validation error",
+                        );
+                    }
+                };
+                let streamed_reply = final_sink.rendered_text();
+                let resolved_final = if streamed_reply.trim().is_empty() {
+                    final_reply
+                } else {
+                    streamed_reply
+                };
+                let resolved_final = match self
+                    .verify_final_answer(&history, &incoming.channel, resolved_final, &tool_calls)
+                    .await
+                {
+                    Ok(reply) => reply,
+                    Err(err) => {
+                        trajectory
+                            .finish(None, TrajectoryExitReason::InternalError)
+                            .await;
+                        return Err(err)
+                            .context("output verification failed after mcp tool validation error");
+                    }
+                };
+                telemetry.emit("tool_error");
+                trajectory
+                    .finish(
+                        Some(resolved_final.clone()),
+                        TrajectoryExitReason::ToolError,
+                    )
+                    .await;
+                BufferedStreamSink::replay_text(&resolved_final, sink).await?;
+                return Ok(resolved_final);
+            }
 
             let tool_start = Instant::now();
             let tool_result = runtime
@@ -2395,7 +3113,8 @@ impl MessageService {
                     let args_clone = tool_call.arguments.clone();
 
                     // Create record for verification
-                    let record = ToolCallRecord {
+                    let mut record = ToolCallRecord {
+                        call_index: 0,
                         server: tool_call.server.clone(),
                         tool: tool_call.tool.clone(),
                         arguments: args_clone,
@@ -2405,26 +3124,99 @@ impl MessageService {
                         iteration,
                     };
 
-                    // Log tool call to trajectory
-                    if let Some(ref logger) = self.trajectory_logger {
-                        let _ = logger.log_tool_call(&trajectory_id, record.clone()).await;
+                    let verification = self.tool_verifier.as_ref().map(|v| v.verify(&record));
+                    if let Some(verification) = &verification
+                        && !verification.passed
+                    {
+                        warn_verification_failure(verification);
+                        annotate_record_with_verification_failure(&mut record, verification);
                     }
+                    let logged_record = trajectory.log_tool_call(record.clone()).await;
+                    tool_calls.push(logged_record);
 
-                    // Record tool call metrics
-                    if let Some(ref metrics) = self.trajectory_metrics {
-                        metrics.record_tool_call(
-                            tool_duration_ms,
-                            &tool_call.server,
-                            &tool_call.tool,
-                            true,
-                        );
-                    }
-
-                    // Verify tool call
-                    if let Some(ref verifier) = self.tool_verifier {
-                        let verification = verifier.verify(&record);
-                        if !verification.passed {
-                            warn!(?verification.issues, "Tool call verification failed");
+                    if let Some(verification) = verification
+                        && !verification.passed
+                    {
+                        match self.tool_verification_mode {
+                            ToolVerificationMode::Observe => {}
+                            ToolVerificationMode::Retry if !verification_retry_used => {
+                                verification_retry_used = true;
+                                history.push(StoredMessage {
+                                    role: MessageRole::Assistant,
+                                    content: resolved_reply,
+                                });
+                                history.push(verification_feedback_message(
+                                    &verification,
+                                    ToolVerificationMode::Retry,
+                                ));
+                                continue;
+                            }
+                            ToolVerificationMode::Retry | ToolVerificationMode::Block => {
+                                history.push(StoredMessage {
+                                    role: MessageRole::Assistant,
+                                    content: resolved_reply,
+                                });
+                                history.push(verification_feedback_message(
+                                    &verification,
+                                    ToolVerificationMode::Block,
+                                ));
+                                let mut final_sink = BufferedStreamSink::default();
+                                let final_reply = match self
+                                    .provider
+                                    .complete_stream(
+                                        CompletionRequest {
+                                            messages: history.clone(),
+                                            ..Default::default()
+                                        },
+                                        &mut final_sink,
+                                    )
+                                    .await
+                                {
+                                    Ok(reply) => reply,
+                                    Err(err) => {
+                                        trajectory
+                                            .finish(None, TrajectoryExitReason::InternalError)
+                                            .await;
+                                        return Err(err).context(
+                                            "provider stream completion failed after tool verification block",
+                                        );
+                                    }
+                                };
+                                let streamed_reply = final_sink.rendered_text();
+                                let resolved_final = if streamed_reply.trim().is_empty() {
+                                    final_reply
+                                } else {
+                                    streamed_reply
+                                };
+                                let resolved_final = match self
+                                    .verify_final_answer(
+                                        &history,
+                                        &incoming.channel,
+                                        resolved_final,
+                                        &tool_calls,
+                                    )
+                                    .await
+                                {
+                                    Ok(reply) => reply,
+                                    Err(err) => {
+                                        trajectory
+                                            .finish(None, TrajectoryExitReason::InternalError)
+                                            .await;
+                                        return Err(err).context(
+                                            "output verification failed after tool verification block",
+                                        );
+                                    }
+                                };
+                                telemetry.emit("tool_error");
+                                trajectory
+                                    .finish(
+                                        Some(resolved_final.clone()),
+                                        TrajectoryExitReason::ToolError,
+                                    )
+                                    .await;
+                                BufferedStreamSink::replay_text(&resolved_final, sink).await?;
+                                return Ok(resolved_final);
+                            }
                         }
                     }
 
@@ -2442,7 +3234,8 @@ impl MessageService {
                     let error_json = serde_json::json!({"error": err.to_string()});
 
                     // Create record for verification
-                    let record = ToolCallRecord {
+                    let mut record = ToolCallRecord {
+                        call_index: 0,
                         server: tool_call.server.clone(),
                         tool: tool_call.tool.clone(),
                         arguments: args_clone,
@@ -2452,26 +3245,99 @@ impl MessageService {
                         iteration,
                     };
 
-                    // Log tool call to trajectory
-                    if let Some(ref logger) = self.trajectory_logger {
-                        let _ = logger.log_tool_call(&trajectory_id, record.clone()).await;
+                    let verification = self.tool_verifier.as_ref().map(|v| v.verify(&record));
+                    if let Some(verification) = &verification
+                        && !verification.passed
+                    {
+                        warn_verification_failure(verification);
+                        annotate_record_with_verification_failure(&mut record, verification);
                     }
+                    let logged_record = trajectory.log_tool_call(record.clone()).await;
+                    tool_calls.push(logged_record);
 
-                    // Record tool call metrics
-                    if let Some(ref metrics) = self.trajectory_metrics {
-                        metrics.record_tool_call(
-                            tool_duration_ms,
-                            &tool_call.server,
-                            &tool_call.tool,
-                            false,
-                        );
-                    }
-
-                    // Verify tool call
-                    if let Some(ref verifier) = self.tool_verifier {
-                        let verification = verifier.verify(&record);
-                        if !verification.passed {
-                            warn!(?verification.issues, "Tool call verification failed");
+                    if let Some(verification) = verification
+                        && !verification.passed
+                    {
+                        match self.tool_verification_mode {
+                            ToolVerificationMode::Observe => {}
+                            ToolVerificationMode::Retry if !verification_retry_used => {
+                                verification_retry_used = true;
+                                history.push(StoredMessage {
+                                    role: MessageRole::Assistant,
+                                    content: resolved_reply,
+                                });
+                                history.push(verification_feedback_message(
+                                    &verification,
+                                    ToolVerificationMode::Retry,
+                                ));
+                                continue;
+                            }
+                            ToolVerificationMode::Retry | ToolVerificationMode::Block => {
+                                history.push(StoredMessage {
+                                    role: MessageRole::Assistant,
+                                    content: resolved_reply,
+                                });
+                                history.push(verification_feedback_message(
+                                    &verification,
+                                    ToolVerificationMode::Block,
+                                ));
+                                let mut final_sink = BufferedStreamSink::default();
+                                let final_reply = match self
+                                    .provider
+                                    .complete_stream(
+                                        CompletionRequest {
+                                            messages: history.clone(),
+                                            ..Default::default()
+                                        },
+                                        &mut final_sink,
+                                    )
+                                    .await
+                                {
+                                    Ok(reply) => reply,
+                                    Err(err) => {
+                                        trajectory
+                                            .finish(None, TrajectoryExitReason::InternalError)
+                                            .await;
+                                        return Err(err).context(
+                                            "provider stream completion failed after tool verification block",
+                                        );
+                                    }
+                                };
+                                let streamed_reply = final_sink.rendered_text();
+                                let resolved_final = if streamed_reply.trim().is_empty() {
+                                    final_reply
+                                } else {
+                                    streamed_reply
+                                };
+                                let resolved_final = match self
+                                    .verify_final_answer(
+                                        &history,
+                                        &incoming.channel,
+                                        resolved_final,
+                                        &tool_calls,
+                                    )
+                                    .await
+                                {
+                                    Ok(reply) => reply,
+                                    Err(err) => {
+                                        trajectory
+                                            .finish(None, TrajectoryExitReason::InternalError)
+                                            .await;
+                                        return Err(err).context(
+                                            "output verification failed after tool verification block",
+                                        );
+                                    }
+                                };
+                                telemetry.emit("tool_error");
+                                trajectory
+                                    .finish(
+                                        Some(resolved_final.clone()),
+                                        TrajectoryExitReason::ToolError,
+                                    )
+                                    .await;
+                                BufferedStreamSink::replay_text(&resolved_final, sink).await?;
+                                return Ok(resolved_final);
+                            }
                         }
                     }
 
@@ -2505,32 +3371,51 @@ impl MessageService {
                     .to_string(),
         });
         let mut buffered_sink = BufferedStreamSink::default();
-        let final_reply = self
+        let final_reply = match self
             .provider
-            .complete_stream(CompletionRequest { messages: history }, &mut buffered_sink)
+            .complete_stream(
+                CompletionRequest {
+                    messages: history.clone(),
+                    ..Default::default()
+                },
+                &mut buffered_sink,
+            )
             .await
-            .context("provider stream completion failed")?;
+        {
+            Ok(reply) => reply,
+            Err(err) => {
+                trajectory
+                    .finish(None, TrajectoryExitReason::InternalError)
+                    .await;
+                return Err(err).context("provider stream completion failed");
+            }
+        };
         let streamed_reply = buffered_sink.rendered_text();
         let resolved_reply = if streamed_reply.trim().is_empty() {
             final_reply
         } else {
             streamed_reply
         };
-        buffered_sink
-            .replay_or_fallback(&resolved_reply, sink)
-            .await?;
+        let resolved_reply = match self
+            .verify_final_answer(&history, &incoming.channel, resolved_reply, &tool_calls)
+            .await
+        {
+            Ok(reply) => reply,
+            Err(err) => {
+                trajectory
+                    .finish(None, TrajectoryExitReason::InternalError)
+                    .await;
+                return Err(err).context("output verification failed after max iterations");
+            }
+        };
         telemetry.emit("max_iterations");
-
-        // Log max iterations trajectory
-        if let Some(ref logger) = self.trajectory_logger {
-            let _ = logger
-                .finish_trajectory(
-                    &trajectory_id,
-                    Some(resolved_reply.clone()),
-                    crate::harness::trajectory::TrajectoryExitReason::MaxIterations,
-                )
-                .await;
-        }
+        trajectory
+            .finish(
+                Some(resolved_reply.clone()),
+                TrajectoryExitReason::MaxIterations,
+            )
+            .await;
+        BufferedStreamSink::replay_text(&resolved_reply, sink).await?;
 
         Ok(resolved_reply)
     }
@@ -2715,6 +3600,7 @@ impl MessageService {
     async fn apply_compaction(
         &self,
         history: Vec<StoredMessage>,
+        session_id: &str,
     ) -> anyhow::Result<Vec<StoredMessage>> {
         // Return early if compaction is not enabled or not needed
         if !self.agent_compaction.enabled {
@@ -2729,14 +3615,73 @@ impl MessageService {
             return Ok(history);
         };
 
+        let strategy = self.agent_compaction.strategy.clone();
+        let metadata = self
+            .load_compaction_metadata(session_id, &history)
+            .await
+            .unwrap_or_else(|err| {
+                warn!(error = %err, "failed to load compaction metadata");
+                vec![CompactionMessageMetadata::default(); history.len()]
+            });
+        let source_key = build_compaction_source_key(&history, &strategy, &metadata);
         let request = CompactionRequest {
             messages: history,
-            strategy: self.agent_compaction.strategy.clone(),
+            strategy: strategy.clone(),
+            metadata,
+            now_unix: Some(current_unix_timestamp_i64()),
+            min_recent_messages: self.context_min_recent_messages,
         };
 
-        let result = compactor.compact(request, self.provider.clone()).await?;
+        if let Some(cached) = self
+            .memory
+            .load_compaction_summary(CompactionSummaryLoadRequest {
+                session_id: session_id.to_string(),
+                strategy: source_key.strategy.clone(),
+                source_hash: source_key.source_hash.clone(),
+            })
+            .await
+            .unwrap_or_else(|err| {
+                warn!(error = %err, "failed to load cached compaction summary");
+                None
+            })
+        {
+            let result = compactor.compact_with_summary(request, cached.summary)?;
+            return Ok(result.compacted_messages);
+        }
 
+        let result = compactor.compact(request, self.provider.clone()).await?;
+        if !result.summary.trim().is_empty() && result.tokens_saved > 0 {
+            let req = CompactionSummaryUpsertRequest {
+                session_id: session_id.to_string(),
+                strategy: source_key.strategy,
+                source_hash: source_key.source_hash,
+                source_message_ids: source_key.source_message_ids,
+                source_first_message_id: source_key.source_first_message_id,
+                source_last_message_id: source_key.source_last_message_id,
+                source_message_count: source_key.source_message_count,
+                summary: result.summary.clone(),
+                tokens_saved: result.tokens_saved,
+            };
+            if let Err(err) = self.memory.upsert_compaction_summary(req).await {
+                warn!(error = %err, "failed to persist compaction summary");
+            }
+        }
         Ok(result.compacted_messages)
+    }
+
+    async fn load_compaction_metadata(
+        &self,
+        session_id: &str,
+        history: &[StoredMessage],
+    ) -> anyhow::Result<Vec<CompactionMessageMetadata>> {
+        let recent_records = self
+            .memory
+            .load_recent_records(RecentMessageRecordsRequest {
+                session_id: session_id.to_string(),
+                limit: self.max_recent_turns,
+            })
+            .await?;
+        Ok(align_compaction_metadata(history, recent_records))
     }
 
     async fn apply_skills_prompt(
@@ -2901,22 +3846,12 @@ impl BufferedStreamSink {
         self.deltas.concat()
     }
 
-    async fn replay_or_fallback(
-        &self,
-        fallback_text: &str,
-        sink: &mut dyn StreamSink,
-    ) -> anyhow::Result<()> {
-        let replay_text = if self.deltas.is_empty() {
-            fallback_text.to_string()
-        } else {
-            self.rendered_text()
-        };
-
-        if replay_text.is_empty() {
+    async fn replay_text(text: &str, sink: &mut dyn StreamSink) -> anyhow::Result<()> {
+        if text.is_empty() {
             return Ok(());
         }
 
-        let chunks = chunk_text_for_stream_replay(&replay_text, STREAM_REPLAY_CHUNK_CHARS);
+        let chunks = chunk_text_for_stream_replay(text, STREAM_REPLAY_CHUNK_CHARS);
         for (idx, chunk) in chunks.iter().enumerate() {
             sink.on_delta(chunk).await?;
             if idx + 1 < chunks.len() {
@@ -3065,10 +4000,92 @@ fn current_unix_timestamp_i64() -> i64 {
 }
 
 #[derive(Debug, Clone)]
+struct CompactionSourceKey {
+    strategy: String,
+    source_hash: String,
+    source_message_ids: Vec<i64>,
+    source_first_message_id: Option<i64>,
+    source_last_message_id: Option<i64>,
+    source_message_count: usize,
+}
+
+fn align_compaction_metadata(
+    history: &[StoredMessage],
+    mut recent_records: Vec<StoredMessageRecord>,
+) -> Vec<CompactionMessageMetadata> {
+    history
+        .iter()
+        .map(|message| {
+            let Some(idx) = recent_records.iter().position(|record| {
+                record.message.role == message.role && record.message.content == message.content
+            }) else {
+                return CompactionMessageMetadata::default();
+            };
+            let record = recent_records.remove(idx);
+            CompactionMessageMetadata {
+                source_id: Some(record.id),
+                created_at: Some(record.created_at),
+            }
+        })
+        .collect()
+}
+
+fn build_compaction_source_key(
+    history: &[StoredMessage],
+    strategy: &CompactionStrategy,
+    metadata: &[CompactionMessageMetadata],
+) -> CompactionSourceKey {
+    let strategy = compaction_strategy_name(strategy);
+    let mut hasher = DefaultHasher::new();
+    strategy.hash(&mut hasher);
+    history.len().hash(&mut hasher);
+    for message in history {
+        message.role.as_str().hash(&mut hasher);
+        message.content.hash(&mut hasher);
+    }
+    for meta in metadata {
+        meta.source_id.hash(&mut hasher);
+        meta.created_at.hash(&mut hasher);
+    }
+    let source_message_ids = metadata
+        .iter()
+        .filter_map(|meta| meta.source_id)
+        .collect::<Vec<_>>();
+    let source_first_message_id = source_message_ids.first().copied();
+    let source_last_message_id = source_message_ids.last().copied();
+
+    CompactionSourceKey {
+        strategy,
+        source_hash: format!("{:016x}", hasher.finish()),
+        source_message_ids,
+        source_first_message_id,
+        source_last_message_id,
+        source_message_count: history.len(),
+    }
+}
+
+fn compaction_strategy_name(strategy: &CompactionStrategy) -> String {
+    match strategy {
+        CompactionStrategy::HeadTail {
+            head_count,
+            tail_count,
+        } => format!("head_tail:{head_count}:{tail_count}"),
+        CompactionStrategy::AgeBased { max_age_days } => format!("age_based:{max_age_days}"),
+        CompactionStrategy::BudgetBased { max_tokens } => format!("budget_based:{max_tokens}"),
+    }
+}
+
+#[derive(Debug, Clone)]
 struct ParsedMcpToolCall {
     server: String,
     tool: String,
     arguments: Value,
+}
+
+enum McpToolCallParse {
+    Tool(ParsedMcpToolCall),
+    ParseError(VerificationResult),
+    FinalAnswer,
 }
 
 fn build_mcp_system_prompt(tools: &[McpToolInfo]) -> anyhow::Result<String> {
@@ -3414,10 +4431,45 @@ fn zodiac_for_year(year: i32) -> &'static str {
     SIGNS[idx]
 }
 
+#[cfg(test)]
 fn parse_mcp_tool_call(reply: &str) -> Option<ParsedMcpToolCall> {
-    let json_text = extract_json_payload(reply.trim())?;
-    let value: Value = serde_json::from_str(&json_text).ok()?;
-    parse_mcp_tool_call_value(&value)
+    match parse_mcp_tool_call_attempt(reply) {
+        McpToolCallParse::Tool(call) => Some(call),
+        McpToolCallParse::ParseError(_) | McpToolCallParse::FinalAnswer => None,
+    }
+}
+
+fn parse_mcp_tool_call_attempt(reply: &str) -> McpToolCallParse {
+    let Some(json_text) = extract_json_payload(reply.trim()) else {
+        return if looks_like_attempted_mcp_tool_call(reply) {
+            McpToolCallParse::ParseError(verification_failure_result(
+                "MALFORMED_TOOL_CALL_JSON",
+                "Tool call JSON could not be extracted",
+            ))
+        } else {
+            McpToolCallParse::FinalAnswer
+        };
+    };
+    let value: Value = match serde_json::from_str(&json_text) {
+        Ok(value) => value,
+        Err(err) if looks_like_attempted_mcp_tool_call(reply) => {
+            return McpToolCallParse::ParseError(verification_failure_result(
+                "MALFORMED_TOOL_CALL_JSON",
+                format!("Tool call JSON is malformed: {err}"),
+            ));
+        }
+        Err(_) => return McpToolCallParse::FinalAnswer,
+    };
+    match parse_mcp_tool_call_value(&value) {
+        Some(call) => McpToolCallParse::Tool(call),
+        None if looks_like_attempted_mcp_tool_call(reply) => {
+            McpToolCallParse::ParseError(verification_failure_result(
+                "INVALID_TOOL_CALL_SHAPE",
+                "Tool call JSON is missing server/tool/arguments shape",
+            ))
+        }
+        None => McpToolCallParse::FinalAnswer,
+    }
 }
 
 fn parse_scheduler_intent_json(reply: &str) -> Option<TelegramSchedulerIntent> {
@@ -3458,6 +4510,52 @@ fn parse_scheduler_intent_json(reply: &str) -> Option<TelegramSchedulerIntent> {
         .map(|v| v.trim().to_ascii_lowercase())
         .filter(|v| !v.is_empty());
     Some(parsed)
+}
+
+fn validate_mcp_tool_call<'a>(
+    tools: &'a [McpToolInfo],
+    tool_call: &ParsedMcpToolCall,
+) -> Result<&'a McpToolInfo, VerificationResult> {
+    let tool_info = tools
+        .iter()
+        .find(|tool| tool.server == tool_call.server && tool.name == tool_call.tool)
+        .ok_or_else(|| {
+            verification_failure_result(
+                "UNKNOWN_TOOL",
+                format!(
+                    "Requested MCP tool is not available: {}::{}",
+                    tool_call.server, tool_call.tool
+                ),
+            )
+        })?;
+    let schema_verifier = ToolSchemaVerifier::new();
+    let verification = schema_verifier.verify_arguments(tool_info, &tool_call.arguments);
+    if verification.passed {
+        Ok(tool_info)
+    } else {
+        Err(verification)
+    }
+}
+
+fn verification_failure_result(code: &str, message: impl Into<String>) -> VerificationResult {
+    VerificationResult {
+        passed: false,
+        confidence: 1.0,
+        issues: vec![VerificationIssue {
+            severity: crate::harness::verifier::IssueSeverity::Error,
+            code: code.to_string(),
+            message: message.into(),
+        }],
+        suggestion: None,
+    }
+}
+
+fn looks_like_attempted_mcp_tool_call(reply: &str) -> bool {
+    let lower = reply.to_ascii_lowercase();
+    lower.contains("tool_call")
+        || lower.contains("mcp_tool_call")
+        || (lower.contains("server") && lower.contains("tool"))
+        || (lower.contains("arguments") && lower.contains("tool"))
 }
 
 fn parse_flexible_json_value(reply: &str) -> Option<Value> {
@@ -3873,6 +4971,168 @@ fn truncate_message_to_token_budget(msg: &StoredMessage, max_tokens: usize) -> S
     }
 }
 
+fn code_mode_tool_call_record(call: &CodeModeCallResult, iteration: usize) -> ToolCallRecord {
+    let result = match (&call.result, &call.error) {
+        (Some(result), _) => result.clone(),
+        (None, Some(error)) => serde_json::json!({ "error": error }),
+        (None, None) => serde_json::json!({ "error": "code mode call returned no result" }),
+    };
+
+    ToolCallRecord {
+        call_index: 0,
+        server: call.server.clone(),
+        tool: call.tool.clone(),
+        arguments: serde_json::json!({}),
+        result,
+        ok: call.ok,
+        duration_ms: 0,
+        iteration,
+    }
+}
+
+fn verification_result_json(verification: &VerificationResult) -> Value {
+    serde_json::to_value(verification).unwrap_or_else(|_| {
+        serde_json::json!({
+            "passed": verification.passed,
+            "confidence": verification.confidence,
+            "issues": []
+        })
+    })
+}
+
+fn annotate_record_with_verification_failure(
+    record: &mut ToolCallRecord,
+    verification: &VerificationResult,
+) {
+    let original_result = record.result.clone();
+    record.ok = false;
+    record.result = serde_json::json!({
+        "verification_failed": true,
+        "verification": verification_result_json(verification),
+        "original_result": original_result
+    });
+}
+
+fn verification_failure_record(
+    tool_call: &ParsedMcpToolCall,
+    verification: &VerificationResult,
+    iteration: usize,
+) -> ToolCallRecord {
+    const UNKNOWN_TOOL_RECORD_SERVER: &str = "unknown";
+    const UNKNOWN_TOOL_RECORD_TOOL: &str = "invalid";
+
+    let unknown_tool = verification
+        .issues
+        .iter()
+        .any(|issue| issue.code == "UNKNOWN_TOOL");
+    let mut result = serde_json::json!({
+        "verification_failed": true,
+        "verification": verification_result_json(verification)
+    });
+    if unknown_tool && let Some(result) = result.as_object_mut() {
+        result.insert(
+            "requested_server".to_string(),
+            Value::String(tool_call.server.clone()),
+        );
+        result.insert(
+            "requested_tool".to_string(),
+            Value::String(tool_call.tool.clone()),
+        );
+    }
+
+    ToolCallRecord {
+        call_index: 0,
+        server: if unknown_tool {
+            UNKNOWN_TOOL_RECORD_SERVER.to_string()
+        } else {
+            tool_call.server.clone()
+        },
+        tool: if unknown_tool {
+            UNKNOWN_TOOL_RECORD_TOOL.to_string()
+        } else {
+            tool_call.tool.clone()
+        },
+        arguments: tool_call.arguments.clone(),
+        result,
+        ok: false,
+        duration_ms: 0,
+        iteration,
+    }
+}
+
+fn verification_feedback_message(
+    verification: &VerificationResult,
+    mode: ToolVerificationMode,
+) -> StoredMessage {
+    let instruction = match mode {
+        ToolVerificationMode::Retry => {
+            "The previous MCP tool call failed verification before its result was accepted. Retry once with corrected arguments or provide a final answer without using that failed result."
+        }
+        ToolVerificationMode::Block => {
+            "The previous MCP tool call failed verification. Do not call more tools. Provide a safe final answer that explains the tool failure briefly and avoids relying on the failed result."
+        }
+        ToolVerificationMode::Observe => {
+            "The previous MCP tool call had verification issues. Continue normally."
+        }
+    };
+
+    StoredMessage {
+        role: MessageRole::System,
+        content: format!(
+            "MCP_TOOL_VERIFICATION_FAILED_JSON:\n{}\n\n{}",
+            serde_json::to_string(&verification_result_json(verification))
+                .unwrap_or_else(|_| "{\"passed\":false,\"issues\":[]}".to_string()),
+            instruction
+        ),
+    }
+}
+
+fn warn_verification_failure(verification: &VerificationResult) {
+    let issues = verification
+        .issues
+        .iter()
+        .map(verification_issue_summary)
+        .collect::<Vec<_>>();
+    warn!(?issues, "Tool call verification failed");
+}
+
+fn warn_output_verification_failure(verification: &OutputVerificationResult) {
+    let issues = verification
+        .issues
+        .iter()
+        .map(verification_issue_summary)
+        .collect::<Vec<_>>();
+    warn!(?issues, "Output verification failed");
+}
+
+fn output_revision_prompt(verification: &OutputVerificationResult, max_chars: usize) -> String {
+    let payload = serde_json::to_string(verification)
+        .unwrap_or_else(|_| "{\"passed\":false,\"issues\":[]}".to_string());
+    let payload = truncate_output_verification_text(&payload, max_chars);
+    format!(
+        "OUTPUT_VERIFICATION_FAILED_JSON:\n{payload}\n\nRevise the previous assistant answer once. Return only the corrected final answer for the user. Do not expose tool-call JSON or verification internals."
+    )
+}
+
+fn truncate_output_verification_text(input: &str, max_chars: usize) -> String {
+    let max_chars = max_chars.max(1);
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    let mut out = input.chars().take(max_chars).collect::<String>();
+    out.push_str("...(truncated)");
+    out
+}
+
+fn verification_issue_summary(issue: &VerificationIssue) -> String {
+    format!(
+        "{}:{}:{}",
+        issue.severity.as_str(),
+        issue.code,
+        issue.message
+    )
+}
+
 fn truncate_json_value(value: &Value, max_chars: usize) -> Value {
     let encoded = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
     if encoded.chars().count() <= max_chars {
@@ -3886,20 +5146,22 @@ fn truncate_json_value(value: &Value, max_chars: usize) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentMcpSettings, BUILTIN_MCP_SERVER_NAME, BUILTIN_MCP_TOOL_CURRENT_TIME,
-        CodeModeCircuitChange, MessageService, apply_context_budget, build_mcp_system_prompt,
-        chunk_text_for_stream_replay, code_mode_timeout_ratio, extract_primary_user_text,
-        infer_timezone_from_time_query, is_explicit_current_time_query, looks_like_time_query,
-        next_code_mode_timeout_streak, parse_mcp_tool_call, parse_scheduler_intent_json,
-        render_fast_time_answer, should_open_code_mode_timeout_circuit,
-        should_probe_code_mode_timeout_circuit, should_warn_code_mode_timeouts,
-        truncate_json_value, weekday_to_chinese, zodiac_for_year,
+        AgentCompactionSettings, AgentMcpSettings, BUILTIN_MCP_SERVER_NAME,
+        BUILTIN_MCP_TOOL_CURRENT_TIME, CodeModeCircuitChange, MessageService, apply_context_budget,
+        build_mcp_system_prompt, chunk_text_for_stream_replay, code_mode_timeout_ratio,
+        extract_primary_user_text, infer_timezone_from_time_query, is_explicit_current_time_query,
+        looks_like_time_query, next_code_mode_timeout_streak, parse_mcp_tool_call,
+        parse_scheduler_intent_json, render_fast_time_answer,
+        should_open_code_mode_timeout_circuit, should_probe_code_mode_timeout_circuit,
+        should_warn_code_mode_timeouts, truncate_json_value, weekday_to_chinese, zodiac_for_year,
     };
     use crate::code_mode::{AgentCodeModeSettings, CodeModeAuditRecord};
     use crate::domain::{MessageRole, StoredMessage};
+    use crate::harness::compactor::CompactionStrategy;
     use crate::mcp::McpRuntime;
     use crate::memory::{MemoryBackend, SqliteMemoryBackend, SqliteMemoryStore};
     use crate::provider::{ChatProvider, CompletionRequest, StreamSink};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::sync::RwLock;
 
@@ -3908,6 +5170,25 @@ mod tests {
     #[async_trait::async_trait]
     impl ChatProvider for FakeProvider {
         async fn complete(&self, _req: CompletionRequest) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+    }
+
+    struct CountingSummaryProvider {
+        summary_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ChatProvider for CountingSummaryProvider {
+        async fn complete(&self, req: CompletionRequest) -> anyhow::Result<String> {
+            if req
+                .messages
+                .first()
+                .is_some_and(|message| message.content.starts_with("Summarize the following"))
+            {
+                self.summary_calls.fetch_add(1, Ordering::SeqCst);
+                return Ok("cached reusable summary".to_string());
+            }
             Ok("ok".to_string())
         }
     }
@@ -4200,6 +5481,76 @@ mod tests {
             !trimmed
                 .iter()
                 .any(|m| m.content.contains("score=0.120") && m.role == MessageRole::System)
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_reuses_persisted_summary_for_same_source_window() {
+        let store = SqliteMemoryStore::new("sqlite::memory:")
+            .await
+            .expect("init store");
+        for idx in 0..12 {
+            store
+                .append(
+                    "session-compact-cache",
+                    StoredMessage {
+                        role: if idx % 2 == 0 {
+                            MessageRole::User
+                        } else {
+                            MessageRole::Assistant
+                        },
+                        content: format!("Message {idx} {}", "long context ".repeat(24)),
+                    },
+                )
+                .await
+                .expect("append message");
+        }
+
+        let summary_calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(CountingSummaryProvider {
+            summary_calls: summary_calls.clone(),
+        });
+        let memory: Arc<dyn MemoryBackend> = Arc::new(SqliteMemoryBackend::new(store.clone()));
+        let service = MessageService::new_with_backend(
+            provider,
+            memory,
+            None,
+            AgentMcpSettings::default(),
+            12,
+            0,
+            0,
+        )
+        .with_context_budget(4000, 512, 35, 4)
+        .with_compaction(AgentCompactionSettings {
+            enabled: true,
+            strategy: CompactionStrategy::HeadTail {
+                head_count: 1,
+                tail_count: 1,
+            },
+            head_count: 1,
+            tail_count: 1,
+            message_count_threshold: 4,
+        });
+        let history = store
+            .load_recent("session-compact-cache", 12)
+            .await
+            .expect("load history");
+
+        let first = service
+            .apply_compaction(history.clone(), "session-compact-cache")
+            .await
+            .expect("first compaction");
+        let second = service
+            .apply_compaction(history, "session-compact-cache")
+            .await
+            .expect("second compaction");
+
+        assert_eq!(summary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(first, second);
+        assert!(
+            second
+                .iter()
+                .any(|message| message.content.contains("cached reusable summary"))
         );
     }
 

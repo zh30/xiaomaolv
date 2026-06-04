@@ -90,20 +90,32 @@ skills_match_min_score = 0.45
 skills_llm_rerank_enabled = false
 
 [agent.harness]
-# Enable trajectory logging for feedback loops (default: false)
-enable_trajectory = true
+# Default profile mirrors Rust defaults. Recommended for debugging/ops: set true.
+# Passive: records trajectories and metrics; does not change model output.
+enable_trajectory = false
 
-# Enable context compaction for long conversations (default: false)
+# Output-affecting: summarizes older context before the model sees it.
 enable_compaction = false
 compaction_strategy = "head_tail"  # head_tail | age_based | budget_based
 compaction_head_count = 10
 compaction_tail_count = 10
 compaction_message_threshold = 20
+compaction_age_max_days = 7
+compaction_budget_max_tokens = 16000
 
-# Enable tool call verification (default: false)
+# Output-affecting when mode is retry/block; observe mode only logs/annotates trajectories.
 enable_verification = false
+verification_mode = "observe"  # observe | retry | block
 verification_max_tool_duration_ms = 5000
 verification_warn_ratio = 0.8
+
+# Output-affecting unless mode is off/observe. revise_once performs one bounded rewrite.
+output_verification_mode = "off"  # off | observe | revise_once | block
+# When false, revise_once uses the deterministic safe revision; when true,
+# the provider gets one bounded rewrite prompt before deterministic fallback.
+output_verification_llm_enabled = false
+output_verification_max_prompt_chars = 6000
+output_verification_max_result_chars = 2000
 
 [agent.code_mode]
 enabled = false
@@ -119,6 +131,8 @@ timeout_auto_shadow_streak = 3
 max_result_chars = 12000
 execution_mode = "local" # local | subprocess
 subprocess_timeout_secs = 8
+# Code Mode allows only MCP tools whose server config declares matching
+# code_mode_capabilities. Tools with missing capability metadata are denied.
 allow_network = false
 allow_filesystem = false
 allow_env = false

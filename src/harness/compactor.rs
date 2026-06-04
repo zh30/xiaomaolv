@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::domain::{MessageRole, StoredMessage};
 use crate::provider::{ChatProvider, CompletionRequest};
@@ -17,10 +18,31 @@ pub enum CompactionStrategy {
     BudgetBased { max_tokens: usize },
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct CompactionMessageMetadata {
+    pub source_id: Option<i64>,
+    pub created_at: Option<i64>,
+}
+
 /// Request for compaction operation
 pub struct CompactionRequest {
     pub messages: Vec<StoredMessage>,
     pub strategy: CompactionStrategy,
+    pub metadata: Vec<CompactionMessageMetadata>,
+    pub now_unix: Option<i64>,
+    pub min_recent_messages: usize,
+}
+
+impl CompactionRequest {
+    pub fn new(messages: Vec<StoredMessage>, strategy: CompactionStrategy) -> Self {
+        Self {
+            messages,
+            strategy,
+            metadata: Vec::new(),
+            now_unix: None,
+            min_recent_messages: 0,
+        }
+    }
 }
 
 /// Result of compaction operation
@@ -64,28 +86,77 @@ impl Compactor {
                 head_count,
                 tail_count,
             } => {
-                self.compact_head_tail(request.messages, head_count, tail_count, model)
-                    .await
+                self.compact_head_tail(
+                    request.messages,
+                    head_count,
+                    tail_count.max(request.min_recent_messages),
+                    model,
+                )
+                .await
             }
-            CompactionStrategy::AgeBased { max_age_days: _ } => {
-                // Age-based compaction would require timestamp information in StoredMessage
-                // For now, fall back to returning messages as-is
-                Ok(CompactionResult {
-                    compacted_messages: request.messages,
-                    tokens_saved: 0,
-                    summary: String::new(),
-                })
+            CompactionStrategy::AgeBased { max_age_days } => {
+                self.compact_age_based(
+                    request.messages,
+                    request.metadata,
+                    max_age_days,
+                    request.now_unix.unwrap_or_else(unix_ts),
+                    request.min_recent_messages,
+                    model,
+                )
+                .await
             }
-            CompactionStrategy::BudgetBased { max_tokens: _ } => {
-                // Budget-based is handled by apply_context_budget in service.rs
-                // This strategy would need integration with the existing budget logic
-                Ok(CompactionResult {
-                    compacted_messages: request.messages,
-                    tokens_saved: 0,
-                    summary: String::new(),
-                })
+            CompactionStrategy::BudgetBased { max_tokens } => {
+                self.compact_budget_based(
+                    request.messages,
+                    max_tokens,
+                    request.min_recent_messages,
+                    model,
+                )
+                .await
             }
         }
+    }
+
+    pub fn compact_with_summary(
+        &self,
+        request: CompactionRequest,
+        summary: String,
+    ) -> anyhow::Result<CompactionResult> {
+        if !self.enabled {
+            return Ok(CompactionResult {
+                compacted_messages: request.messages,
+                tokens_saved: 0,
+                summary: String::new(),
+            });
+        }
+
+        let summary = sanitize_summary(summary);
+        Ok(match request.strategy {
+            CompactionStrategy::HeadTail {
+                head_count,
+                tail_count,
+            } => self.compact_head_tail_with_summary(
+                request.messages,
+                head_count,
+                tail_count.max(request.min_recent_messages),
+                summary,
+            ),
+            CompactionStrategy::AgeBased { max_age_days } => self.compact_age_based_with_summary(
+                request.messages,
+                request.metadata,
+                max_age_days,
+                request.now_unix.unwrap_or_else(unix_ts),
+                request.min_recent_messages,
+                summary,
+            ),
+            CompactionStrategy::BudgetBased { max_tokens } => self
+                .compact_budget_based_with_summary(
+                    request.messages,
+                    max_tokens,
+                    request.min_recent_messages,
+                    summary,
+                ),
+        })
     }
 
     /// Head-tail compaction: keep first N and last N messages, summarize the middle
@@ -104,19 +175,38 @@ impl Compactor {
             });
         }
 
-        let head = messages[..head_count].to_vec();
         let middle = messages[head_count..messages.len() - tail_count].to_vec();
-        let tail = messages[messages.len() - tail_count..].to_vec();
 
         let middle_summary = self.summarize(&middle, model).await?;
+        Ok(self.compact_head_tail_with_summary(messages, head_count, tail_count, middle_summary))
+    }
+
+    fn compact_head_tail_with_summary(
+        &self,
+        messages: Vec<StoredMessage>,
+        head_count: usize,
+        tail_count: usize,
+        summary: String,
+    ) -> CompactionResult {
+        if messages.len() <= head_count + tail_count {
+            return CompactionResult {
+                compacted_messages: messages,
+                tokens_saved: 0,
+                summary: String::new(),
+            };
+        }
+
+        let head = messages[..head_count].to_vec();
+        let middle_len = messages.len() - head_count - tail_count;
+        let tail = messages[messages.len() - tail_count..].to_vec();
+        let middle_summary = sanitize_summary(summary);
         let compacted: Vec<StoredMessage> = vec![
             head,
             vec![StoredMessage {
                 role: MessageRole::System,
                 content: format!(
                     "[Earlier {} messages summarized: {}]",
-                    middle.len(),
-                    middle_summary
+                    middle_len, middle_summary
                 ),
             }],
             tail,
@@ -125,22 +215,195 @@ impl Compactor {
         .flatten()
         .collect();
 
-        // Estimate tokens saved (rough approximation)
-        let original_tokens: usize = messages
-            .iter()
-            .map(|m| m.content.chars().count().saturating_add(4))
-            .sum();
-        let compacted_tokens: usize = compacted
-            .iter()
-            .map(|m| m.content.chars().count().saturating_add(4))
-            .sum();
+        let original_tokens = estimate_messages_tokens(&messages);
+        let compacted_tokens = estimate_messages_tokens(&compacted);
         let tokens_saved = original_tokens.saturating_sub(compacted_tokens);
 
-        Ok(CompactionResult {
+        CompactionResult {
             compacted_messages: compacted,
             tokens_saved,
             summary: middle_summary,
-        })
+        }
+    }
+
+    async fn compact_budget_based(
+        &self,
+        messages: Vec<StoredMessage>,
+        max_tokens: usize,
+        min_recent_messages: usize,
+        model: Arc<dyn ChatProvider>,
+    ) -> anyhow::Result<CompactionResult> {
+        let original_tokens = estimate_messages_tokens(&messages);
+        if original_tokens <= max_tokens || messages.len() <= 3 {
+            return Ok(CompactionResult {
+                compacted_messages: messages,
+                tokens_saved: 0,
+                summary: String::new(),
+            });
+        }
+
+        let tail_count = messages
+            .len()
+            .saturating_sub(1)
+            .min(6usize.max(min_recent_messages));
+        let head_count = 1usize;
+        if messages.len() <= head_count + tail_count {
+            return Ok(CompactionResult {
+                compacted_messages: messages,
+                tokens_saved: 0,
+                summary: String::new(),
+            });
+        }
+
+        let middle = messages[head_count..messages.len() - tail_count].to_vec();
+        let summary = sanitize_summary(self.summarize(&middle, model).await?);
+        Ok(self.compact_budget_based_with_summary(
+            messages,
+            max_tokens,
+            min_recent_messages,
+            summary,
+        ))
+    }
+
+    fn compact_budget_based_with_summary(
+        &self,
+        messages: Vec<StoredMessage>,
+        max_tokens: usize,
+        min_recent_messages: usize,
+        summary: String,
+    ) -> CompactionResult {
+        let original_tokens = estimate_messages_tokens(&messages);
+        if original_tokens <= max_tokens || messages.len() <= 3 {
+            return CompactionResult {
+                compacted_messages: messages,
+                tokens_saved: 0,
+                summary: String::new(),
+            };
+        }
+
+        let tail_count = messages
+            .len()
+            .saturating_sub(1)
+            .min(6usize.max(min_recent_messages));
+        let head_count = 1usize;
+        if messages.len() <= head_count + tail_count {
+            return CompactionResult {
+                compacted_messages: messages,
+                tokens_saved: 0,
+                summary: String::new(),
+            };
+        }
+
+        let head = messages[..head_count].to_vec();
+        let middle_len = messages.len() - head_count - tail_count;
+        let tail = messages[messages.len() - tail_count..].to_vec();
+        let summary = sanitize_summary(summary);
+        let compacted = vec![
+            head,
+            vec![StoredMessage {
+                role: MessageRole::System,
+                content: format!(
+                    "[Budget compacted {} earlier messages: {}]",
+                    middle_len, summary
+                ),
+            }],
+            tail,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        let compacted_tokens = estimate_messages_tokens(&compacted);
+
+        CompactionResult {
+            compacted_messages: compacted,
+            tokens_saved: original_tokens.saturating_sub(compacted_tokens),
+            summary,
+        }
+    }
+
+    async fn compact_age_based(
+        &self,
+        messages: Vec<StoredMessage>,
+        metadata: Vec<CompactionMessageMetadata>,
+        max_age_days: usize,
+        now_unix: i64,
+        min_recent_messages: usize,
+        model: Arc<dyn ChatProvider>,
+    ) -> anyhow::Result<CompactionResult> {
+        let compact_count = age_based_compact_count(
+            messages.len(),
+            &metadata,
+            max_age_days,
+            now_unix,
+            min_recent_messages,
+        );
+        if compact_count == 0 {
+            return Ok(CompactionResult {
+                compacted_messages: messages,
+                tokens_saved: 0,
+                summary: String::new(),
+            });
+        }
+
+        let stale = messages[..compact_count].to_vec();
+        let summary = sanitize_summary(self.summarize(&stale, model).await?);
+        Ok(self.compact_age_based_with_summary(
+            messages,
+            metadata,
+            max_age_days,
+            now_unix,
+            min_recent_messages,
+            summary,
+        ))
+    }
+
+    fn compact_age_based_with_summary(
+        &self,
+        messages: Vec<StoredMessage>,
+        metadata: Vec<CompactionMessageMetadata>,
+        max_age_days: usize,
+        now_unix: i64,
+        min_recent_messages: usize,
+        summary: String,
+    ) -> CompactionResult {
+        let compact_count = age_based_compact_count(
+            messages.len(),
+            &metadata,
+            max_age_days,
+            now_unix,
+            min_recent_messages,
+        );
+        if compact_count == 0 {
+            return CompactionResult {
+                compacted_messages: messages,
+                tokens_saved: 0,
+                summary: String::new(),
+            };
+        }
+
+        let original_tokens = estimate_messages_tokens(&messages);
+        let tail = messages[compact_count..].to_vec();
+        let summary = sanitize_summary(summary);
+        let compacted = vec![
+            vec![StoredMessage {
+                role: MessageRole::System,
+                content: format!(
+                    "[Age compacted {} messages older than {} days: {}]",
+                    compact_count, max_age_days, summary
+                ),
+            }],
+            tail,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        let compacted_tokens = estimate_messages_tokens(&compacted);
+
+        CompactionResult {
+            compacted_messages: compacted,
+            tokens_saved: original_tokens.saturating_sub(compacted_tokens),
+            summary,
+        }
     }
 
     /// Summarize a group of messages using the LLM
@@ -170,11 +433,75 @@ impl Compactor {
                     role: MessageRole::User,
                     content: summary_prompt,
                 }],
+                ..Default::default()
             })
             .await?;
 
         Ok(response)
     }
+}
+
+fn estimate_message_tokens(msg: &StoredMessage) -> usize {
+    ((msg.content.chars().count().saturating_add(3)) / 4)
+        .max(1)
+        .saturating_add(4)
+}
+
+fn estimate_messages_tokens(messages: &[StoredMessage]) -> usize {
+    messages.iter().map(estimate_message_tokens).sum()
+}
+
+fn age_based_compact_count(
+    message_count: usize,
+    metadata: &[CompactionMessageMetadata],
+    max_age_days: usize,
+    now_unix: i64,
+    min_recent_messages: usize,
+) -> usize {
+    let retained_tail = 6usize.max(min_recent_messages);
+    if message_count <= retained_tail || metadata.len() != message_count {
+        return 0;
+    }
+
+    let max_age_secs = (max_age_days as i64).saturating_mul(86_400);
+    let cutoff = now_unix.saturating_sub(max_age_secs);
+    let stale_prefix = metadata
+        .iter()
+        .take_while(|meta| {
+            meta.created_at
+                .is_some_and(|created_at| created_at < cutoff)
+        })
+        .count();
+    stale_prefix.min(message_count.saturating_sub(retained_tail))
+}
+
+fn sanitize_summary(summary: String) -> String {
+    let mut summary = summary.trim().to_string();
+    if summary.is_empty() {
+        summary = "Summary unavailable.".to_string();
+    }
+    for marker in [
+        "MCP_TOOL_RESULT_JSON",
+        "MCP_TOOL_VERIFICATION_FAILED_JSON",
+        "CODE_MODE_TOOL_RESULT_JSON",
+    ] {
+        summary = summary.replace(marker, "[tool-json]");
+    }
+    let max_chars = 4000usize;
+    if summary.chars().count() > max_chars {
+        let mut truncated = summary.chars().take(max_chars).collect::<String>();
+        truncated.push_str("...(truncated)");
+        truncated
+    } else {
+        summary
+    }
+}
+
+fn unix_ts() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -215,13 +542,13 @@ mod tests {
 
         let result = compactor
             .compact(
-                CompactionRequest {
+                CompactionRequest::new(
                     messages,
-                    strategy: CompactionStrategy::HeadTail {
+                    CompactionStrategy::HeadTail {
                         head_count: 2,
                         tail_count: 2,
                     },
-                },
+                ),
                 Arc::new(MockProvider),
             )
             .await

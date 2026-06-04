@@ -16,9 +16,31 @@ const RETRY_BACKOFF_BASE_MS: u64 = 100;
 const ERROR_BODY_MAX_CHARS: usize = 512;
 const COMPAT_MESSAGE_LIMIT: usize = 16;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CompletionRequest {
     pub messages: Vec<StoredMessage>,
+    pub response_format: Option<ResponseFormat>,
+}
+
+impl CompletionRequest {
+    pub fn from_messages(messages: Vec<StoredMessage>) -> Self {
+        Self {
+            messages,
+            response_format: None,
+        }
+    }
+
+    pub fn json(messages: Vec<StoredMessage>) -> Self {
+        Self {
+            messages,
+            response_format: Some(ResponseFormat::JsonObject),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ResponseFormat {
+    JsonObject,
 }
 
 #[async_trait]
@@ -28,6 +50,10 @@ pub trait StreamSink: Send {
 
 #[async_trait]
 pub trait ChatProvider: Send + Sync {
+    fn model_name(&self) -> Option<&str> {
+        None
+    }
+
     async fn complete(&self, req: CompletionRequest) -> anyhow::Result<String>;
 
     async fn complete_stream(
@@ -175,6 +201,23 @@ fn required_setting(
 struct OpenAiRequest {
     model: String,
     messages: Vec<StoredMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<ResponseFormatPayload>,
+}
+
+#[derive(Serialize)]
+struct ResponseFormatPayload {
+    r#type: String,
+}
+
+impl From<&ResponseFormat> for ResponseFormatPayload {
+    fn from(fmt: &ResponseFormat) -> Self {
+        match fmt {
+            ResponseFormat::JsonObject => Self {
+                r#type: "json_object".to_string(),
+            },
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -194,6 +237,10 @@ struct ChoiceMessage {
 
 #[async_trait]
 impl ChatProvider for OpenAiCompatibleProvider {
+    fn model_name(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
     async fn complete(&self, req: CompletionRequest) -> anyhow::Result<String> {
         self.complete_with_retry(req).await
     }
@@ -211,9 +258,14 @@ impl OpenAiCompatibleProvider {
     async fn complete_with_retry(&self, req: CompletionRequest) -> anyhow::Result<String> {
         let url = format!("{}/chat/completions", self.base_url);
         let normalized_messages = normalize_messages(req.messages);
+        let response_format = req
+            .response_format
+            .as_ref()
+            .map(ResponseFormatPayload::from);
         let payload = OpenAiRequest {
             model: self.model.clone(),
             messages: normalized_messages.clone(),
+            response_format,
         };
 
         let attempts = retry_attempts(self.max_retries);
@@ -240,6 +292,7 @@ impl OpenAiCompatibleProvider {
                                 &normalized_messages,
                                 status,
                                 &body,
+                                req.response_format.as_ref(),
                             )
                             .await
                             .unwrap_or_else(|err| {
@@ -287,22 +340,30 @@ impl OpenAiCompatibleProvider {
     ) -> anyhow::Result<String> {
         let url = format!("{}/chat/completions", self.base_url);
         let messages = normalize_messages(req.messages);
+        let response_format_payload = req
+            .response_format
+            .as_ref()
+            .map(ResponseFormatPayload::from);
         let attempts = retry_attempts(self.max_retries);
         let mut last_error = None;
 
         for attempt in 0..attempts {
             // Streamed long-form replies can exceed regular request timeout.
             let stream_timeout_secs = self.timeout_secs.saturating_mul(10).max(300);
+            let mut stream_body = serde_json::json!({
+                "model": self.model.clone(),
+                "messages": messages.clone(),
+                "stream": true
+            });
+            if let Some(ref fmt) = response_format_payload {
+                stream_body["response_format"] = serde_json::json!({ "type": fmt.r#type });
+            }
             let response = self
                 .client
                 .post(&url)
                 .timeout(Duration::from_secs(stream_timeout_secs))
                 .bearer_auth(&self.api_key)
-                .json(&serde_json::json!({
-                    "model": self.model.clone(),
-                    "messages": messages.clone(),
-                    "stream": true
-                }))
+                .json(&stream_body)
                 .send()
                 .await;
 
@@ -370,6 +431,7 @@ impl OpenAiCompatibleProvider {
         let fallback = self
             .complete_with_retry(CompletionRequest {
                 messages: messages.clone(),
+                response_format: req.response_format.clone(),
             })
             .await;
 
@@ -390,6 +452,7 @@ impl OpenAiCompatibleProvider {
         messages: &[StoredMessage],
         status: StatusCode,
         body: &str,
+        response_format: Option<&ResponseFormat>,
     ) -> anyhow::Result<Option<String>> {
         if !is_message_shape_error(status, body) {
             return Ok(None);
@@ -410,6 +473,7 @@ impl OpenAiCompatibleProvider {
         let payload = OpenAiRequest {
             model: self.model.clone(),
             messages: compat_messages,
+            response_format: response_format.map(ResponseFormatPayload::from),
         };
         let resp = self
             .client

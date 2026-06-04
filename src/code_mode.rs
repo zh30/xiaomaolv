@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -15,7 +14,7 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 use crate::domain::{MessageRole, StoredMessage};
-use crate::mcp::{McpConfigPaths, McpRegistry, McpRuntime, McpToolInfo};
+use crate::mcp::{McpConfigPaths, McpRegistry, McpRuntime, McpToolCapabilities, McpToolInfo};
 use crate::provider::{ChatProvider, CompletionRequest};
 
 const DEFAULT_PLANNER_MAX_TOOLS: usize = 48;
@@ -196,6 +195,8 @@ pub struct CodeModeSandboxRequest {
 pub struct CodeModeAllowedTool {
     pub server: String,
     pub tool: String,
+    #[serde(default)]
+    pub code_mode_capabilities: Option<McpToolCapabilities>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -370,6 +371,7 @@ impl CodeModePlanner for LlmCodeModePlanner {
                         content: user_prompt,
                     },
                 ],
+                ..Default::default()
             })
             .await
             .context("code mode planner completion failed")?;
@@ -410,7 +412,6 @@ impl CodeModePolicy {
             );
         }
 
-        let allowed = allowed_tool_set(tools);
         for call in &plan.calls {
             if call.server.trim().is_empty() || call.tool.trim().is_empty() {
                 bail!("code mode plan contains empty server/tool name");
@@ -423,9 +424,36 @@ impl CodeModePolicy {
                 );
             }
             let key = format!("{}::{}", call.server, call.tool);
-            if !allowed.contains(&key) {
+            let Some(tool) = tools
+                .iter()
+                .find(|tool| tool.server == call.server && tool.name == call.tool)
+            else {
                 bail!("code mode plan references unavailable tool: {key}");
-            }
+            };
+            self.validate_tool_capabilities(tool)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn allows_tool(&self, tool: &McpToolInfo) -> bool {
+        self.validate_tool_capabilities(tool).is_ok()
+    }
+
+    fn validate_tool_capabilities(&self, tool: &McpToolInfo) -> anyhow::Result<()> {
+        let key = format!("{}::{}", tool.server, tool.name);
+        let Some(capabilities) = &tool.code_mode_capabilities else {
+            bail!("code mode tool capability metadata missing for {key}");
+        };
+
+        if capabilities.network && !self.settings.allow_network {
+            bail!("code mode tool {key} requires network access but allow_network=false");
+        }
+        if capabilities.filesystem && !self.settings.allow_filesystem {
+            bail!("code mode tool {key} requires filesystem access but allow_filesystem=false");
+        }
+        if capabilities.env && !self.settings.allow_env {
+            bail!("code mode tool {key} requires environment access but allow_env=false");
         }
 
         Ok(())
@@ -607,11 +635,14 @@ pub async fn execute_plan_via_subprocess(
     let executable =
         std::env::current_exe().context("failed to resolve current executable for code mode")?;
     let auth_token = generate_subprocess_auth_token();
+    let manifest_policy = CodeModePolicy::new(settings.clone());
     let allowed_tools = tools
         .iter()
+        .filter(|tool| manifest_policy.allows_tool(tool))
         .map(|tool| CodeModeAllowedTool {
             server: tool.server.clone(),
             tool: tool.name.clone(),
+            code_mode_capabilities: tool.code_mode_capabilities.clone(),
         })
         .collect::<Vec<_>>();
     let payload = serde_json::to_vec(&CodeModeSandboxRequest {
@@ -809,15 +840,9 @@ fn materialize_policy_tools(allowed_tools: &[CodeModeAllowedTool]) -> Vec<McpToo
             name: tool.tool.clone(),
             description: None,
             input_schema: serde_json::json!({"type": "object"}),
+            code_mode_capabilities: tool.code_mode_capabilities.clone(),
         })
         .collect::<Vec<_>>()
-}
-
-fn allowed_tool_set(tools: &[McpToolInfo]) -> HashSet<String> {
-    tools
-        .iter()
-        .map(|t| format!("{}::{}", t.server, t.name))
-        .collect::<HashSet<_>>()
 }
 
 fn truncate_prompt_text(input: &str, max_chars: usize) -> String {
@@ -931,7 +956,7 @@ mod tests {
     };
     use crate::code_mode::CodeModePlanner;
     use crate::domain::{MessageRole, StoredMessage};
-    use crate::mcp::{McpRuntime, McpServerConfig, McpToolInfo, McpTransport};
+    use crate::mcp::{McpRuntime, McpServerConfig, McpToolCapabilities, McpToolInfo, McpTransport};
     use crate::provider::{ChatProvider, CompletionRequest};
     use axum::extract::State;
     use axum::http::{HeaderMap, StatusCode};
@@ -1032,6 +1057,102 @@ mod tests {
             .validate_plan(&plan, &[tool("s1", "t1")])
             .expect_err("unknown tool should fail");
         assert!(err.to_string().contains("unavailable tool"));
+    }
+
+    #[test]
+    fn policy_rejects_tool_without_capability_metadata() {
+        let policy = CodeModePolicy::new(AgentCodeModeSettings::default());
+        let plan = CodeModePlan {
+            calls: vec![CodeModeToolCall {
+                server: "s1".to_string(),
+                tool: "unknown_caps".to_string(),
+                arguments: serde_json::json!({}),
+            }],
+        };
+        let tools = vec![tool_with_capabilities("s1", "unknown_caps", None)];
+
+        let err = policy
+            .validate_plan(&plan, &tools)
+            .expect_err("missing capability metadata should fail closed");
+        assert!(err.to_string().contains("capability metadata missing"));
+    }
+
+    #[test]
+    fn policy_rejects_disallowed_capability_tools() {
+        let policy = CodeModePolicy::new(AgentCodeModeSettings::default());
+        for (tool_name, capabilities, expected) in [
+            (
+                "net",
+                McpToolCapabilities {
+                    network: true,
+                    filesystem: false,
+                    env: false,
+                },
+                "allow_network=false",
+            ),
+            (
+                "fs",
+                McpToolCapabilities {
+                    network: false,
+                    filesystem: true,
+                    env: false,
+                },
+                "allow_filesystem=false",
+            ),
+            (
+                "env",
+                McpToolCapabilities {
+                    network: false,
+                    filesystem: false,
+                    env: true,
+                },
+                "allow_env=false",
+            ),
+        ] {
+            let plan = CodeModePlan {
+                calls: vec![CodeModeToolCall {
+                    server: "s1".to_string(),
+                    tool: tool_name.to_string(),
+                    arguments: serde_json::json!({}),
+                }],
+            };
+            let tools = vec![tool_with_capabilities("s1", tool_name, Some(capabilities))];
+
+            let err = policy
+                .validate_plan(&plan, &tools)
+                .expect_err("disallowed capability should fail");
+            assert!(err.to_string().contains(expected));
+        }
+    }
+
+    #[test]
+    fn policy_accepts_capability_tools_when_explicitly_allowed() {
+        let policy = CodeModePolicy::new(AgentCodeModeSettings {
+            allow_network: true,
+            allow_filesystem: true,
+            allow_env: true,
+            ..AgentCodeModeSettings::default()
+        });
+        let plan = CodeModePlan {
+            calls: vec![CodeModeToolCall {
+                server: "s1".to_string(),
+                tool: "full_access".to_string(),
+                arguments: serde_json::json!({}),
+            }],
+        };
+        let tools = vec![tool_with_capabilities(
+            "s1",
+            "full_access",
+            Some(McpToolCapabilities {
+                network: true,
+                filesystem: true,
+                env: true,
+            }),
+        )];
+
+        policy
+            .validate_plan(&plan, &tools)
+            .expect("explicitly allowed capabilities should pass");
     }
 
     #[test]
@@ -1220,6 +1341,7 @@ mod tests {
                 url: Some(format!("http://{addr}/mcp")),
                 headers: HashMap::new(),
                 timeout_secs: 5,
+                code_mode_capabilities: None,
             },
         );
         let runtime = McpRuntime::new(servers);
@@ -1274,11 +1396,20 @@ mod tests {
     }
 
     fn tool(server: &str, name: &str) -> McpToolInfo {
+        tool_with_capabilities(server, name, Some(McpToolCapabilities::none()))
+    }
+
+    fn tool_with_capabilities(
+        server: &str,
+        name: &str,
+        code_mode_capabilities: Option<McpToolCapabilities>,
+    ) -> McpToolInfo {
         McpToolInfo {
             server: server.to_string(),
             name: name.to_string(),
             description: Some("demo".to_string()),
             input_schema: serde_json::json!({ "type": "object" }),
+            code_mode_capabilities,
         }
     }
 
