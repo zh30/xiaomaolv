@@ -105,6 +105,7 @@ Then send a message to your Telegram bot.
 
 After MVP is running, use these docs in order:
 
+- `docs/development.md`: unified development guide for local work, architecture boundaries, tests, and PR checklist
 - `docs/real-test-minimax-telegram.md`: real MiniMax + Telegram integration guide
 - `docs/zvec-sidecar.md`: zvec sidecar protocol, startup, compatibility details
 - `docs/mcp-integration.md`: MCP install model, CLI usage, HTTP tool-call API
