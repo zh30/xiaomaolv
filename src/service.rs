@@ -1,7 +1,5 @@
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
 use std::fmt::Write as _;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -9,6 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::sync::{RwLock, Semaphore};
 use tokio::time::timeout;
 use tracing::{info, warn};
@@ -4036,16 +4035,30 @@ fn build_compaction_source_key(
     metadata: &[CompactionMessageMetadata],
 ) -> CompactionSourceKey {
     let strategy = compaction_strategy_name(strategy);
-    let mut hasher = DefaultHasher::new();
-    strategy.hash(&mut hasher);
-    history.len().hash(&mut hasher);
+    let mut hasher = Sha256::new();
+    update_compaction_source_hash(&mut hasher, "strategy", &strategy);
+    update_compaction_source_hash(&mut hasher, "history_len", &history.len().to_string());
     for message in history {
-        message.role.as_str().hash(&mut hasher);
-        message.content.hash(&mut hasher);
+        update_compaction_source_hash(&mut hasher, "message.role", message.role.as_str());
+        update_compaction_source_hash(&mut hasher, "message.content", &message.content);
     }
     for meta in metadata {
-        meta.source_id.hash(&mut hasher);
-        meta.created_at.hash(&mut hasher);
+        update_compaction_source_hash(
+            &mut hasher,
+            "metadata.source_id",
+            &meta
+                .source_id
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        );
+        update_compaction_source_hash(
+            &mut hasher,
+            "metadata.created_at",
+            &meta
+                .created_at
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        );
     }
     let source_message_ids = metadata
         .iter()
@@ -4056,12 +4069,21 @@ fn build_compaction_source_key(
 
     CompactionSourceKey {
         strategy,
-        source_hash: format!("{:016x}", hasher.finish()),
+        source_hash: format!("{:x}", hasher.finalize()),
         source_message_ids,
         source_first_message_id,
         source_last_message_id,
         source_message_count: history.len(),
     }
+}
+
+fn update_compaction_source_hash(hasher: &mut Sha256, label: &str, value: &str) {
+    hasher.update(label.as_bytes());
+    hasher.update([0]);
+    hasher.update(value.len().to_string().as_bytes());
+    hasher.update([0]);
+    hasher.update(value.as_bytes());
+    hasher.update([0]);
 }
 
 fn compaction_strategy_name(strategy: &CompactionStrategy) -> String {
@@ -5148,16 +5170,16 @@ mod tests {
     use super::{
         AgentCompactionSettings, AgentMcpSettings, BUILTIN_MCP_SERVER_NAME,
         BUILTIN_MCP_TOOL_CURRENT_TIME, CodeModeCircuitChange, MessageService, apply_context_budget,
-        build_mcp_system_prompt, chunk_text_for_stream_replay, code_mode_timeout_ratio,
-        extract_primary_user_text, infer_timezone_from_time_query, is_explicit_current_time_query,
-        looks_like_time_query, next_code_mode_timeout_streak, parse_mcp_tool_call,
-        parse_scheduler_intent_json, render_fast_time_answer,
+        build_compaction_source_key, build_mcp_system_prompt, chunk_text_for_stream_replay,
+        code_mode_timeout_ratio, extract_primary_user_text, infer_timezone_from_time_query,
+        is_explicit_current_time_query, looks_like_time_query, next_code_mode_timeout_streak,
+        parse_mcp_tool_call, parse_scheduler_intent_json, render_fast_time_answer,
         should_open_code_mode_timeout_circuit, should_probe_code_mode_timeout_circuit,
         should_warn_code_mode_timeouts, truncate_json_value, weekday_to_chinese, zodiac_for_year,
     };
     use crate::code_mode::{AgentCodeModeSettings, CodeModeAuditRecord};
     use crate::domain::{MessageRole, StoredMessage};
-    use crate::harness::compactor::CompactionStrategy;
+    use crate::harness::compactor::{CompactionMessageMetadata, CompactionStrategy};
     use crate::mcp::McpRuntime;
     use crate::memory::{MemoryBackend, SqliteMemoryBackend, SqliteMemoryStore};
     use crate::provider::{ChatProvider, CompletionRequest, StreamSink};
@@ -5552,6 +5574,48 @@ mod tests {
                 .iter()
                 .any(|message| message.content.contains("cached reusable summary"))
         );
+    }
+
+    #[test]
+    fn compaction_source_key_uses_stable_sha256_digest() {
+        let history = vec![
+            StoredMessage {
+                role: MessageRole::User,
+                content: "first".to_string(),
+            },
+            StoredMessage {
+                role: MessageRole::Assistant,
+                content: "second".to_string(),
+            },
+        ];
+        let metadata = vec![
+            CompactionMessageMetadata {
+                source_id: Some(10),
+                created_at: Some(1000),
+            },
+            CompactionMessageMetadata {
+                source_id: Some(11),
+                created_at: Some(1001),
+            },
+        ];
+
+        let key = build_compaction_source_key(
+            &history,
+            &CompactionStrategy::HeadTail {
+                head_count: 1,
+                tail_count: 2,
+            },
+            &metadata,
+        );
+
+        assert_eq!(
+            key.source_hash,
+            "391ded3c62b5ac3c864f424fbf622c15bd2381556a366ef0e88e312731cccc3e"
+        );
+        assert_eq!(key.source_message_ids, vec![10, 11]);
+        assert_eq!(key.source_first_message_id, Some(10));
+        assert_eq!(key.source_last_message_id, Some(11));
+        assert_eq!(key.source_message_count, 2);
     }
 
     #[test]
