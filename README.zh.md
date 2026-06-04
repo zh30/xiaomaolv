@@ -235,9 +235,9 @@ curl -sS http://127.0.0.1:8080/v1/channels/telegram/mode
 核心接口：
 
 - `GET /health`
-- `GET /setup`（可视化配置页）
-- `GET /v1/config/ui/state`（读取配置页状态）
-- `POST /v1/config/ui/save`（保存配置并热重载生效）
+- `GET /setup`（可视化配置页；鉴权行为同 `/v1/messages`）
+- `GET /v1/config/ui/state`（读取配置页状态；鉴权行为同 `/v1/messages`）
+- `POST /v1/config/ui/save`（保存配置并热重载生效；鉴权行为同 `/v1/messages`）
 - `POST /v1/messages`（配置了 `[app].api_key` 时需 `Authorization: Bearer <app.api_key>`）
 - `GET /v1/code-mode/diag`（需 `Authorization: Bearer <channels.http.diag_bearer_token>`）
 - `GET /v1/code-mode/metrics`（Prometheus 文本格式，鉴权同上）
@@ -249,6 +249,7 @@ curl -sS http://127.0.0.1:8080/v1/channels/telegram/mode
 示例：
 
 如果未配置 `[app].api_key`，请省略 app API key header。
+Setup/config UI 端点仅限同源使用，不返回宽松 CORS header。
 
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/messages \

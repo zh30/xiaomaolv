@@ -652,20 +652,7 @@ impl AppState {
 }
 
 fn build_axum_router(state: AppState, http_enabled: bool) -> Router {
-    let mut router = Router::new()
-        .route("/health", get(health))
-        .route("/setup", get(get_setup_page))
-        .route("/v1/config/ui/state", get(get_config_ui_state))
-        .route("/v1/config/ui/save", post(post_config_ui_save));
-
-    if http_enabled {
-        router = router
-            .route("/v1/messages", post(post_message))
-            .route("/v1/code-mode/diag", get(get_code_mode_diag))
-            .route("/v1/code-mode/metrics", get(get_code_mode_metrics));
-    }
-
-    router
+    let mut api_router = Router::new()
         .route("/v1/mcp/servers", get(get_mcp_servers))
         .route("/v1/mcp/tools", get(get_mcp_tools))
         .route("/v1/mcp/tools/{server}/{tool}", post(post_mcp_tool_call))
@@ -677,15 +664,30 @@ fn build_axum_router(state: AppState, http_enabled: bool) -> Router {
             post(post_channel_inbound_with_secret),
         )
         .route("/v1/harness/trajectories", get(list_trajectories))
-        .route("/v1/harness/trajectories/{id}", get(get_trajectory))
+        .route("/v1/harness/trajectories/{id}", get(get_trajectory));
+
+    if http_enabled {
+        api_router = api_router
+            .route("/v1/messages", post(post_message))
+            .route("/v1/code-mode/diag", get(get_code_mode_diag))
+            .route("/v1/code-mode/metrics", get(get_code_mode_metrics));
+    }
+
+    Router::new()
+        .route("/health", get(health))
+        .route("/setup", get(get_setup_page))
+        .route("/v1/config/ui/state", get(get_config_ui_state))
+        .route("/v1/config/ui/save", post(post_config_ui_save))
+        .merge(
+            api_router.layer(
+                CorsLayer::new()
+                    .allow_origin(Any)
+                    .allow_methods(Any)
+                    .allow_headers(Any),
+            ),
+        )
         .with_state(state)
         .layer(TraceLayer::new_for_http())
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
 }
 
 async fn start_channel_workers(
@@ -1661,14 +1663,20 @@ async fn build_config_ui_state(
     })
 }
 
-async fn get_setup_page() -> Html<&'static str> {
-    Html(SETUP_PAGE_HTML)
+async fn get_setup_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Html<&'static str>, ApiError> {
+    verify_api_key(&state, &headers)?;
+    Ok(Html(SETUP_PAGE_HTML))
 }
 
 async fn get_config_ui_state(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<ConfigUiStateQuery>,
 ) -> Result<Json<ConfigUiStateResponse>, ApiError> {
+    verify_api_key(&state, &headers)?;
     let Some(manager) = state.config_ui.clone() else {
         return Err(ApiError::NotFound(
             "config ui is unavailable for this runtime".to_string(),
@@ -1693,8 +1701,10 @@ async fn get_config_ui_state(
 
 async fn post_config_ui_save(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<ConfigUiSaveRequest>,
 ) -> Result<Json<ConfigUiSaveResponse>, ApiError> {
+    verify_api_key(&state, &headers)?;
     let Some(manager) = state.config_ui.clone() else {
         return Err(ApiError::NotFound(
             "config ui is unavailable for this runtime".to_string(),
