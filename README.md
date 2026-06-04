@@ -249,9 +249,9 @@ Details: `docs/zvec-sidecar.md`
 Core endpoints:
 
 - `GET /health`
-- `GET /setup` (visual setup page)
-- `GET /v1/config/ui/state` (read setup page state)
-- `POST /v1/config/ui/save` (save and hot-reload config)
+- `GET /setup` (visual setup page; same app API key behavior as `/v1/messages`)
+- `GET /v1/config/ui/state` (read setup page state; same app API key behavior as `/v1/messages`)
+- `POST /v1/config/ui/save` (save and hot-reload config; same app API key behavior as `/v1/messages`)
 - `POST /v1/messages` (requires `Authorization: Bearer <app.api_key>` when `[app].api_key` is configured)
 - `GET /v1/code-mode/diag` (requires `Authorization: Bearer <channels.http.diag_bearer_token>`)
 - `GET /v1/code-mode/metrics` (Prometheus format, same bearer token as diag)
@@ -263,6 +263,7 @@ Core endpoints:
 Example:
 
 Omit the app API key header if `[app].api_key` is not configured.
+Setup/config UI endpoints are same-origin only and do not emit permissive CORS headers.
 
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/messages \

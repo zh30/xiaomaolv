@@ -106,6 +106,125 @@ bot_token = "${TELEGRAM_BOT_TOKEN}"
 }
 
 #[tokio::test]
+async fn setup_and_config_ui_do_not_emit_cors_headers() {
+    clear_setup_env();
+
+    let td = TempDir::new().expect("temp dir");
+    let config_path = td.path().join("xiaomaolv.toml");
+    let env_path = td.path().join(".env.realtest");
+
+    fs::write(
+        &config_path,
+        r#"
+[app]
+bind = "127.0.0.1:0"
+default_provider = "openai"
+
+[providers.openai]
+kind = "openai-compatible"
+base_url = "http://127.0.0.1:9999/v1"
+api_key = "${MINIMAX_API_KEY}"
+model = "${MINIMAX_MODEL:-MiniMax-M2.5-highspeed}"
+
+[channels.http]
+enabled = true
+
+[channels.telegram]
+enabled = false
+bot_token = "${TELEGRAM_BOT_TOKEN}"
+"#,
+    )
+    .expect("write config");
+
+    let app = build_router_with_config_paths(&config_path, &env_path, "sqlite::memory:", None)
+        .await
+        .expect("router");
+    let server = TestServer::new(app).expect("test server");
+
+    let setup = server
+        .get("/setup")
+        .add_header("origin", "https://example.invalid")
+        .await;
+    setup.assert_status_ok();
+    assert!(setup.headers().get("access-control-allow-origin").is_none());
+
+    let state = server
+        .get("/v1/config/ui/state")
+        .add_header("origin", "https://example.invalid")
+        .await;
+    state.assert_status_ok();
+    assert!(state.headers().get("access-control-allow-origin").is_none());
+}
+
+#[tokio::test]
+async fn setup_and_config_ui_require_app_api_key_when_configured() {
+    clear_setup_env();
+
+    let td = TempDir::new().expect("temp dir");
+    let config_path = td.path().join("xiaomaolv.toml");
+    let env_path = td.path().join(".env.realtest");
+
+    fs::write(
+        &config_path,
+        r#"
+[app]
+bind = "127.0.0.1:0"
+default_provider = "openai"
+api_key = "setup-api-token"
+
+[providers.openai]
+kind = "openai-compatible"
+base_url = "http://127.0.0.1:9999/v1"
+api_key = "${MINIMAX_API_KEY}"
+model = "${MINIMAX_MODEL:-MiniMax-M2.5-highspeed}"
+
+[channels.http]
+enabled = true
+
+[channels.telegram]
+enabled = false
+bot_token = "${TELEGRAM_BOT_TOKEN}"
+"#,
+    )
+    .expect("write config");
+
+    let app = build_router_with_config_paths(&config_path, &env_path, "sqlite::memory:", None)
+        .await
+        .expect("router");
+    let server = TestServer::new(app).expect("test server");
+
+    let setup = server.get("/setup").await;
+    setup.assert_status_unauthorized();
+
+    let state = server.get("/v1/config/ui/state").await;
+    state.assert_status_unauthorized();
+
+    let save = server
+        .post("/v1/config/ui/save")
+        .json(&serde_json::json!({
+            "values": {
+                "MINIMAX_API_KEY": "mm-test-key",
+                "TELEGRAM_BOT_TOKEN": "tg-test-token"
+            },
+            "mode": "required"
+        }))
+        .await;
+    save.assert_status_unauthorized();
+
+    let authorized_setup = server
+        .get("/setup")
+        .add_header("authorization", "Bearer setup-api-token")
+        .await;
+    authorized_setup.assert_status_ok();
+
+    let authorized_state = server
+        .get("/v1/config/ui/state")
+        .add_header("authorization", "Bearer setup-api-token")
+        .await;
+    authorized_state.assert_status_ok();
+}
+
+#[tokio::test]
 async fn save_config_persists_env_and_clears_first_time() {
     clear_setup_env();
 

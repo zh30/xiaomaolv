@@ -79,6 +79,35 @@ async fn post_messages_returns_assistant_reply() {
 }
 
 #[tokio::test]
+async fn post_messages_retains_runtime_api_cors_headers() {
+    let cfg = test_config(None, 120);
+
+    let app = build_router(cfg, "sqlite::memory:", Some(Arc::new(FakeProvider)))
+        .await
+        .expect("router");
+    let server = TestServer::new(app).expect("test server");
+
+    let response = server
+        .post("/v1/messages")
+        .add_header("origin", "https://example.invalid")
+        .json(&serde_json::json!({
+            "session_id": "s-http-cors",
+            "user_id": "u-http",
+            "text": "hello"
+        }))
+        .await;
+
+    response.assert_status_ok();
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|value| value.to_str().ok()),
+        Some("*")
+    );
+}
+
+#[tokio::test]
 async fn get_mcp_servers_returns_json_payload() {
     let cfg = test_config(None, 120);
 
