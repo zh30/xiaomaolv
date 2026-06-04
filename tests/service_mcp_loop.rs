@@ -2,9 +2,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use prometheus::Registry;
 use tokio::sync::RwLock;
 use xiaomaolv::config::{AgentHarnessConfig, OutputVerificationMode};
 use xiaomaolv::domain::IncomingMessage;
+use xiaomaolv::harness::observability::TrajectoryMetrics;
 use xiaomaolv::harness::trajectory::TrajectoryFilter;
 use xiaomaolv::mcp::McpRuntime;
 use xiaomaolv::memory::{MemoryBackend, SqliteMemoryBackend, SqliteMemoryStore};
@@ -148,6 +150,72 @@ async fn mcp_loop_rejects_unknown_tool_before_runtime_call() {
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
     assert!(requests[1].contains("UNKNOWN_TOOL"));
+}
+
+#[tokio::test]
+async fn unknown_tool_metrics_use_bounded_labels_and_preserve_request() {
+    let provider = Arc::new(SequenceProvider::new(vec![
+        r#"{"server":"missing-server","tool":"made_up_tool","arguments":{}}"#,
+        "bounded metrics final",
+    ]));
+    let registry = Registry::new();
+    let metrics = TrajectoryMetrics::new(&registry);
+    let service = service_with_harness(
+        provider,
+        AgentHarnessConfig {
+            enable_trajectory: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("service")
+    .with_trajectory_metrics(metrics.clone());
+
+    let out = service
+        .handle(incoming("mcp-unknown-metrics"))
+        .await
+        .expect("handle");
+    assert_eq!(out.text, "bounded metrics final");
+
+    let prometheus = metrics.render_prometheus();
+    assert!(
+        prometheus.contains(
+            r#"xiaomaolv_tool_calls_total{ok="false",server="unknown",tool="invalid"} 1"#
+        ),
+        "{prometheus}"
+    );
+    assert!(
+        !prometheus.contains(r#"server="missing-server""#),
+        "{prometheus}"
+    );
+    assert!(
+        !prometheus.contains(r#"tool="made_up_tool""#),
+        "{prometheus}"
+    );
+
+    let trajectories = service
+        .query_trajectories(TrajectoryFilter {
+            session_id: Some("mcp-unknown-metrics".to_string()),
+            channel: Some("test".to_string()),
+            user_id: Some("user-1".to_string()),
+            exit_reason: None,
+            has_tool_errors: None,
+            limit: 10,
+        })
+        .await
+        .expect("query trajectories");
+    assert_eq!(trajectories.len(), 1);
+    let call = &trajectories[0].tool_calls[0];
+    assert_eq!(call.server, "unknown");
+    assert_eq!(call.tool, "invalid");
+    assert_eq!(
+        call.result.get("requested_server").and_then(|v| v.as_str()),
+        Some("missing-server")
+    );
+    assert_eq!(
+        call.result.get("requested_tool").and_then(|v| v.as_str()),
+        Some("made_up_tool")
+    );
 }
 
 #[tokio::test]

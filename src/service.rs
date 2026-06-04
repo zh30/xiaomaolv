@@ -816,6 +816,12 @@ impl MessageService {
                 .suggested_revision
                 .unwrap_or_else(|| "I could not produce a reliable final answer.".to_string())),
             OutputVerificationMode::ReviseOnce => {
+                if !self.output_verification_llm_enabled {
+                    return Ok(verification.suggested_revision.unwrap_or_else(|| {
+                        "I could not produce a reliable final answer.".to_string()
+                    }));
+                }
+
                 let revision_prompt = output_revision_prompt(
                     &verification,
                     self.output_verification_max_prompt_chars,
@@ -5012,15 +5018,42 @@ fn verification_failure_record(
     verification: &VerificationResult,
     iteration: usize,
 ) -> ToolCallRecord {
+    const UNKNOWN_TOOL_RECORD_SERVER: &str = "unknown";
+    const UNKNOWN_TOOL_RECORD_TOOL: &str = "invalid";
+
+    let unknown_tool = verification
+        .issues
+        .iter()
+        .any(|issue| issue.code == "UNKNOWN_TOOL");
+    let mut result = serde_json::json!({
+        "verification_failed": true,
+        "verification": verification_result_json(verification)
+    });
+    if unknown_tool && let Some(result) = result.as_object_mut() {
+        result.insert(
+            "requested_server".to_string(),
+            Value::String(tool_call.server.clone()),
+        );
+        result.insert(
+            "requested_tool".to_string(),
+            Value::String(tool_call.tool.clone()),
+        );
+    }
+
     ToolCallRecord {
         call_index: 0,
-        server: tool_call.server.clone(),
-        tool: tool_call.tool.clone(),
+        server: if unknown_tool {
+            UNKNOWN_TOOL_RECORD_SERVER.to_string()
+        } else {
+            tool_call.server.clone()
+        },
+        tool: if unknown_tool {
+            UNKNOWN_TOOL_RECORD_TOOL.to_string()
+        } else {
+            tool_call.tool.clone()
+        },
         arguments: tool_call.arguments.clone(),
-        result: serde_json::json!({
-            "verification_failed": true,
-            "verification": verification_result_json(verification)
-        }),
+        result,
         ok: false,
         duration_ms: 0,
         iteration,

@@ -441,6 +441,8 @@ verification_mode = "observe" # observe | retry | block
 verification_max_tool_duration_ms = 5000
 verification_warn_ratio = 0.8
 output_verification_mode = "off" # off | observe | revise_once | block
+# When false, revise_once uses the deterministic safe revision; when true,
+# the provider gets one bounded rewrite prompt before deterministic fallback.
 output_verification_llm_enabled = false
 output_verification_max_prompt_chars = 6000
 output_verification_max_result_chars = 2000

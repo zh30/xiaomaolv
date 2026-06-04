@@ -111,6 +111,8 @@ verification_warn_ratio = 0.8
 
 # Output-affecting unless mode is off/observe. revise_once performs one bounded rewrite.
 output_verification_mode = "off"  # off | observe | revise_once | block
+# When false, revise_once uses the deterministic safe revision; when true,
+# the provider gets one bounded rewrite prompt before deterministic fallback.
 output_verification_llm_enabled = false
 output_verification_max_prompt_chars = 6000
 output_verification_max_result_chars = 2000
