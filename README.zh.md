@@ -98,6 +98,7 @@ curl -sS http://127.0.0.1:8080/v1/channels/telegram/mode
 
 如果你已经能跑通 MVP，下面这些文档按使用频率排列：
 
+- `docs/development.md`：统一开发指南，包含本地开发、架构边界、测试选择与 PR checklist
 - `docs/real-test-minimax-telegram.md`：真实 MiniMax + Telegram 联调指南
 - `docs/zvec-sidecar.md`：zvec sidecar 协议、启动方式与兼容行为
 - `docs/engineering-quality.md`：架构约束、质量门禁与性能基线
