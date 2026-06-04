@@ -168,6 +168,8 @@ default_provider = "openai"
 locale = "${XIAOMAOLV_LOCALE:-en-US}"
 max_history = 16
 concurrency_limit = 128
+# Optional: protects HTTP APIs and config state/save endpoints when set.
+api_key = "${XIAOMAOLV_APP_API_KEY:-}"
 
 [providers.openai]
 kind = "openai-compatible"

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock as StdRwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
@@ -102,7 +102,7 @@ pub struct AppState {
     pub code_mode_diag_bearer_token: Option<String>,
     code_mode_diag_rate_limiter: Arc<FixedWindowRateLimiter>,
     api_rate_limiter: Arc<FixedWindowRateLimiter>,
-    api_key: Option<String>,
+    api_key: Arc<StdRwLock<Option<String>>>,
 }
 
 struct WorkerSupervisor {
@@ -471,7 +471,9 @@ async fn build_state(
                 60,
                 config.channels.http.rate_limit_per_minute,
             )),
-            api_key: config.app.api_key.clone(),
+            api_key: Arc::new(StdRwLock::new(normalize_optional_secret(
+                config.app.api_key.clone(),
+            ))),
         };
 
     Ok((state, http_enabled))
@@ -620,6 +622,7 @@ impl AppState {
         env_overrides: &HashMap<String, String>,
     ) -> anyhow::Result<()> {
         let config = AppConfig::from_path_with_env(&manager.config_path, env_overrides).await?;
+        let api_key = normalize_optional_secret(config.app.api_key.clone());
         let runtime = build_runtime_handles(
             &config,
             &manager.database_url,
@@ -642,6 +645,13 @@ impl AppState {
             // Replace the inner McpRuntime - need to deref Arc to get RwLock
             let mut mcp_guard = (*self.mcp_runtime).write().await;
             *mcp_guard = new_mcp_runtime.read().await.clone();
+        }
+        {
+            let mut current_api_key = self
+                .api_key
+                .write()
+                .map_err(|_| anyhow::anyhow!("app api key lock poisoned"))?;
+            *current_api_key = api_key;
         }
 
         let mut supervisor = self.worker_supervisor.lock().await;
@@ -1080,6 +1090,14 @@ const CONFIG_UI_FIELDS: &[ConfigUiFieldSpec] = &[
         placeholder: "replace_with_your_telegram_bot_token",
     },
     ConfigUiFieldSpec {
+        key: "XIAOMAOLV_APP_API_KEY",
+        group_key: "system",
+        required: false,
+        sensitive: true,
+        default_value: "",
+        placeholder: "replace_with_app_api_key",
+    },
+    ConfigUiFieldSpec {
         key: "MINIMAX_MODEL",
         group_key: "model",
         required: false,
@@ -1232,11 +1250,11 @@ fn localized_group_name(group_key: &str, locale: &str) -> &'static str {
         ("scheduler", "es") => "5. Programación y permisos",
         ("scheduler", "ar") => "5. الجدولة والصلاحيات",
         ("scheduler", _) => "5. Scheduler & Access",
-        ("system", "zh") => "6. 系统语言",
-        ("system", "hi") => "6. सिस्टम भाषा",
-        ("system", "es") => "6. Idioma del sistema",
-        ("system", "ar") => "6. لغة النظام",
-        ("system", _) => "6. System Language",
+        ("system", "zh") => "6. 系统与访问",
+        ("system", "hi") => "6. सिस्टम और एक्सेस",
+        ("system", "es") => "6. Sistema y acceso",
+        ("system", "ar") => "6. النظام والوصول",
+        ("system", _) => "6. System & Access",
         ("diagnostics", "zh") => "7. 诊断与观测",
         ("diagnostics", "hi") => "7. डायग्नोस्टिक्स",
         ("diagnostics", "es") => "7. Diagnóstico",
@@ -1263,6 +1281,11 @@ fn localized_field_label(key: &str, locale: &str) -> &'static str {
         ("TELEGRAM_BOT_TOKEN", "es") => "Token del bot de Telegram",
         ("TELEGRAM_BOT_TOKEN", "ar") => "رمز Telegram Bot",
         ("TELEGRAM_BOT_TOKEN", _) => "Telegram Bot Token",
+        ("XIAOMAOLV_APP_API_KEY", "zh") => "应用 API 密钥",
+        ("XIAOMAOLV_APP_API_KEY", "hi") => "ऐप API कुंजी",
+        ("XIAOMAOLV_APP_API_KEY", "es") => "Clave API de la app",
+        ("XIAOMAOLV_APP_API_KEY", "ar") => "مفتاح API للتطبيق",
+        ("XIAOMAOLV_APP_API_KEY", _) => "App API Key",
         ("MINIMAX_MODEL", "zh") => "MiniMax 模型",
         ("MINIMAX_MODEL", "hi") => "MiniMax मॉडल",
         ("MINIMAX_MODEL", "es") => "Modelo MiniMax",
@@ -1329,6 +1352,17 @@ fn localized_field_description(key: &str, locale: &str) -> &'static str {
         ("TELEGRAM_BOT_TOKEN", "es") => "Token del bot de BotFather (obligatorio).",
         ("TELEGRAM_BOT_TOKEN", "ar") => "رمز Telegram BotFather (مطلوب).",
         ("TELEGRAM_BOT_TOKEN", _) => "Telegram bot token from BotFather (required).",
+        ("XIAOMAOLV_APP_API_KEY", "zh") => "可选；设置后保护 HTTP API 和配置状态/保存接口。",
+        ("XIAOMAOLV_APP_API_KEY", "hi") => {
+            "वैकल्पिक; सेट होने पर HTTP API और कॉन्फ़िग सेव/स्टेट सुरक्षित करता है।"
+        }
+        ("XIAOMAOLV_APP_API_KEY", "es") => {
+            "Opcional; protege las APIs HTTP y guardar/estado de configuración."
+        }
+        ("XIAOMAOLV_APP_API_KEY", "ar") => "اختياري؛ يحمي واجهات HTTP وحفظ/حالة الإعداد.",
+        ("XIAOMAOLV_APP_API_KEY", _) => {
+            "Optional; protects HTTP APIs and config state/save after it is set."
+        }
         ("MINIMAX_MODEL", "zh") => "模型名，默认 MiniMax-M2.5-highspeed。",
         ("MINIMAX_MODEL", "hi") => "मॉडल नाम, डिफ़ॉल्ट MiniMax-M2.5-highspeed.",
         ("MINIMAX_MODEL", "es") => "Nombre del modelo, por defecto MiniMax-M2.5-highspeed.",
@@ -1401,6 +1435,10 @@ fn localized_messages(locale: &str) -> HashMap<String, String> {
             ("save_required", "保存必填并生效"),
             ("save_all", "保存全部并生效"),
             ("reload", "刷新状态"),
+            ("auth_token_label", "应用 API 密钥"),
+            ("auth_token_placeholder", "输入当前应用 API 密钥"),
+            ("apply_auth", "使用密钥"),
+            ("auth_required", "请输入应用 API 密钥后继续。"),
             ("notice_first", "当前是首次配置，请先填写必填项。"),
             ("notice_ready", "当前配置已完成，可继续按分类调整。"),
             ("saved", "配置已保存并即时生效"),
@@ -1418,6 +1456,10 @@ fn localized_messages(locale: &str) -> HashMap<String, String> {
             ("save_required", "आवश्यक सेव करें"),
             ("save_all", "सब सेव करें"),
             ("reload", "स्थिति रीफ़्रेश करें"),
+            ("auth_token_label", "ऐप API कुंजी"),
+            ("auth_token_placeholder", "मौजूदा ऐप API कुंजी दर्ज करें"),
+            ("apply_auth", "कुंजी उपयोग करें"),
+            ("auth_required", "जारी रखने के लिए ऐप API कुंजी दर्ज करें।"),
             ("notice_first", "पहली बार सेटअप है, पहले आवश्यक फ़ील्ड भरें।"),
             ("notice_ready", "कॉन्फ़िग तैयार है, आगे समायोजित कर सकते हैं।"),
             ("saved", "कॉन्फ़िग सेव हुआ और तुरंत लागू हुआ"),
@@ -1435,6 +1477,13 @@ fn localized_messages(locale: &str) -> HashMap<String, String> {
             ("save_required", "Guardar obligatorios"),
             ("save_all", "Guardar todo"),
             ("reload", "Actualizar estado"),
+            ("auth_token_label", "Clave API de la app"),
+            ("auth_token_placeholder", "Introduce la clave API actual"),
+            ("apply_auth", "Usar clave"),
+            (
+                "auth_required",
+                "Introduce la clave API de la app para continuar.",
+            ),
             (
                 "notice_first",
                 "Primera configuración: completa primero los campos obligatorios.",
@@ -1458,6 +1507,10 @@ fn localized_messages(locale: &str) -> HashMap<String, String> {
             ("save_required", "حفظ الإلزامي"),
             ("save_all", "حفظ الكل"),
             ("reload", "تحديث الحالة"),
+            ("auth_token_label", "مفتاح API للتطبيق"),
+            ("auth_token_placeholder", "أدخل مفتاح API الحالي"),
+            ("apply_auth", "استخدام المفتاح"),
+            ("auth_required", "أدخل مفتاح API للتطبيق للمتابعة."),
             (
                 "notice_first",
                 "هذه أول مرة إعداد، أكمل الحقول الإلزامية أولاً.",
@@ -1481,6 +1534,10 @@ fn localized_messages(locale: &str) -> HashMap<String, String> {
             ("save_required", "Save Required Fields"),
             ("save_all", "Save All"),
             ("reload", "Refresh State"),
+            ("auth_token_label", "App API Key"),
+            ("auth_token_placeholder", "Enter current app API key"),
+            ("apply_auth", "Use Key"),
+            ("auth_required", "Enter the app API key to continue."),
             (
                 "notice_first",
                 "First-time setup detected. Fill required fields first.",
@@ -1664,10 +1721,9 @@ async fn build_config_ui_state(
 }
 
 async fn get_setup_page(
-    State(state): State<AppState>,
-    headers: HeaderMap,
+    State(_state): State<AppState>,
+    _headers: HeaderMap,
 ) -> Result<Html<&'static str>, ApiError> {
-    verify_api_key(&state, &headers)?;
     Ok(Html(SETUP_PAGE_HTML))
 }
 
@@ -1866,6 +1922,15 @@ const SETUP_PAGE_HTML: &str = r#"<!doctype html>
       display: none;
     }
     .notice.error { background: #fdebf0; color: var(--danger); }
+    .auth-box {
+      margin-top: 12px;
+      display: none;
+      gap: 8px;
+      align-items: end;
+      flex-wrap: wrap;
+    }
+    .auth-box .auth-input { flex: 1 1 260px; }
+    .auth-box label { display: block; font-weight: 600; margin-bottom: 4px; }
     .grid { margin-top: 14px; display: grid; gap: 12px; grid-template-columns: 1fr; }
     .panel {
       background: var(--paper);
@@ -1920,6 +1985,13 @@ const SETUP_PAGE_HTML: &str = r#"<!doctype html>
         </div>
       </div>
       <div id="notice" class="notice"></div>
+      <div id="auth-box" class="auth-box">
+        <div class="auth-input">
+          <label for="setup-auth-token" id="ui-auth-token-label">App API Key</label>
+          <input id="setup-auth-token" type="password" autocomplete="current-password" placeholder="Enter current app API key" />
+        </div>
+        <button class="btn-light" id="apply-auth-token">Use Key</button>
+      </div>
     </section>
     <section class="grid">
       <article class="panel" id="required-panel">
@@ -1942,6 +2014,7 @@ const SETUP_PAGE_HTML: &str = r#"<!doctype html>
 
   <script>
     let latest = null;
+    let authToken = sessionStorage.getItem("setup_app_api_key") || "";
 
     function escapeHtml(text) {
       return String(text || "")
@@ -1962,6 +2035,26 @@ const SETUP_PAGE_HTML: &str = r#"<!doctype html>
       el.style.display = "block";
       if (isError) el.classList.add("error");
       else el.classList.remove("error");
+    }
+
+    function authHeaders(extra = {}) {
+      const headers = { ...extra };
+      if (authToken) headers.authorization = `Bearer ${authToken}`;
+      return headers;
+    }
+
+    function rememberAuthToken(token) {
+      authToken = String(token || "").trim();
+      if (authToken) sessionStorage.setItem("setup_app_api_key", authToken);
+      else sessionStorage.removeItem("setup_app_api_key");
+    }
+
+    function showAuthBox(show) {
+      const box = document.getElementById("auth-box");
+      box.style.display = show ? "flex" : "none";
+      if (show && authToken) {
+        document.getElementById("setup-auth-token").value = authToken;
+      }
     }
 
     function groupedFields(fields) {
@@ -2003,10 +2096,14 @@ const SETUP_PAGE_HTML: &str = r#"<!doctype html>
       document.getElementById("save-all").textContent = m("save_all", "Save All");
       document.getElementById("reload-state").textContent = m("reload", "Refresh State");
       document.getElementById("ui-view-language").textContent = m("view_language", "View Language");
+      document.getElementById("ui-auth-token-label").textContent = m("auth_token_label", "App API Key");
+      document.getElementById("setup-auth-token").placeholder = m("auth_token_placeholder", "Enter current app API key");
+      document.getElementById("apply-auth-token").textContent = m("apply_auth", "Use Key");
     }
 
     function render(state) {
       latest = state;
+      showAuthBox(false);
       renderStaticTexts();
       renderLocaleSelector();
 
@@ -2039,7 +2136,14 @@ const SETUP_PAGE_HTML: &str = r#"<!doctype html>
 
     async function loadState(locale) {
       const query = locale ? `?locale=${encodeURIComponent(locale)}` : "";
-      const res = await fetch(`/v1/config/ui/state${query}`);
+      const res = await fetch(`/v1/config/ui/state${query}`, {
+        headers: authHeaders(),
+      });
+      if (res.status === 401) {
+        showAuthBox(true);
+        notice(m("auth_required", "Enter the app API key to continue."), true);
+        return;
+      }
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
       render(data);
@@ -2048,13 +2152,15 @@ const SETUP_PAGE_HTML: &str = r#"<!doctype html>
     async function save(mode) {
       try {
         const selectedLocale = document.getElementById("view-language").value || "";
+        const values = collectValues();
         const res = await fetch("/v1/config/ui/save", {
           method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ mode, values: collectValues() }),
+          headers: authHeaders({ "content-type": "application/json" }),
+          body: JSON.stringify({ mode, values }),
         });
         const body = await res.json();
         if (!res.ok) throw new Error(body.message || JSON.stringify(body));
+        if (values.XIAOMAOLV_APP_API_KEY) rememberAuthToken(values.XIAOMAOLV_APP_API_KEY);
         notice(body.message || m("saved", "Saved."));
         await loadState(selectedLocale);
       } catch (err) {
@@ -2075,6 +2181,11 @@ const SETUP_PAGE_HTML: &str = r#"<!doctype html>
 
     document.getElementById("save-required").addEventListener("click", () => save("required"));
     document.getElementById("save-all").addEventListener("click", () => save("full"));
+    document.getElementById("apply-auth-token").addEventListener("click", async () => {
+      rememberAuthToken(document.getElementById("setup-auth-token").value);
+      const locale = document.getElementById("view-language").value || "";
+      await loadState(locale);
+    });
     document.getElementById("reload-state").addEventListener("click", async () => {
       const locale = document.getElementById("view-language").value || "";
       await loadState(locale);
@@ -2422,13 +2533,26 @@ fn internal_err(message: &'static str) -> impl Fn(anyhow::Error) -> ApiError {
     move |err| ApiError::Internal(err.context(message))
 }
 
+fn normalize_optional_secret(value: Option<String>) -> Option<String> {
+    value.and_then(|raw| {
+        let trimmed = raw.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
+}
+
 fn verify_api_key(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
-    let Some(ref expected_key) = state.api_key else {
+    let expected_key = state
+        .api_key
+        .read()
+        .map_err(|_| ApiError::Internal(anyhow::anyhow!("app api key lock poisoned")))?
+        .clone();
+    let Some(expected_key) = expected_key else {
         return Ok(());
     };
-    if expected_key.is_empty() {
-        return Ok(());
-    }
     let provided = headers
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())

@@ -60,10 +60,11 @@ cp .env.realtest.example .env.realtest
 可选模型覆盖：
 
 - `MINIMAX_MODEL`（默认：`MiniMax-M2.5-highspeed`）
+- `XIAOMAOLV_APP_API_KEY`（设置后保护 HTTP API 和配置状态/保存接口）
 - `TELEGRAM_BOT_USERNAME`（不带 `@`，建议填写，用于群组@匹配）
 - `TELEGRAM_ADMIN_USER_IDS`（私聊访问 + `/mcp` + `/skills` 管理员用户 ID，逗号分隔，如 `123456789,987654321`）
 
-也可以先不填，直接启动后打开可视化配置页：`http://127.0.0.1:8080/setup`。
+也可以先不填，直接启动后打开可视化配置页：`http://127.0.0.1:8080/setup`。如果稍后设置了 `XIAOMAOLV_APP_API_KEY`，配置页会先提示输入该密钥，再加载或保存配置状态。
 
 ### 3) 一键启动 MVP
 
@@ -235,7 +236,7 @@ curl -sS http://127.0.0.1:8080/v1/channels/telegram/mode
 核心接口：
 
 - `GET /health`
-- `GET /setup`（可视化配置页；鉴权行为同 `/v1/messages`）
+- `GET /setup`（可视化配置页 shell；自身不暴露配置状态）
 - `GET /v1/config/ui/state`（读取配置页状态；鉴权行为同 `/v1/messages`）
 - `POST /v1/config/ui/save`（保存配置并热重载生效；鉴权行为同 `/v1/messages`）
 - `POST /v1/messages`（配置了 `[app].api_key` 时需 `Authorization: Bearer <app.api_key>`）
@@ -249,7 +250,7 @@ curl -sS http://127.0.0.1:8080/v1/channels/telegram/mode
 示例：
 
 如果未配置 `[app].api_key`，请省略 app API key header。
-Setup/config UI 端点仅限同源使用，不返回宽松 CORS header。
+Setup/config UI 的状态/保存接口仅限同源使用，不返回宽松 CORS header。静态 `/setup` shell 保持可打开，方便首次部署者在页面提示中输入当前 app API key。
 
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/messages \

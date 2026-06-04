@@ -11,6 +11,7 @@ fn clear_setup_env() {
         std::env::remove_var("TELEGRAM_BOT_TOKEN");
         std::env::remove_var("MINIMAX_MODEL");
         std::env::remove_var("XIAOMAOLV_LOCALE");
+        std::env::remove_var("XIAOMAOLV_APP_API_KEY");
     }
 }
 
@@ -106,6 +107,100 @@ bot_token = "${TELEGRAM_BOT_TOKEN}"
 }
 
 #[tokio::test]
+async fn save_config_can_bootstrap_app_api_key_without_lockout() {
+    clear_setup_env();
+
+    let td = TempDir::new().expect("temp dir");
+    let config_path = td.path().join("xiaomaolv.toml");
+    let env_path = td.path().join(".env.realtest");
+
+    fs::write(
+        &config_path,
+        r#"
+[app]
+bind = "127.0.0.1:0"
+default_provider = "openai"
+api_key = "${XIAOMAOLV_APP_API_KEY:-}"
+
+[providers.openai]
+kind = "openai-compatible"
+base_url = "http://127.0.0.1:9999/v1"
+api_key = "${MINIMAX_API_KEY}"
+model = "${MINIMAX_MODEL:-MiniMax-M2.5-highspeed}"
+
+[channels.http]
+enabled = true
+
+[channels.telegram]
+enabled = false
+bot_token = "${TELEGRAM_BOT_TOKEN}"
+"#,
+    )
+    .expect("write config");
+
+    let app = build_router_with_config_paths(&config_path, &env_path, "sqlite::memory:", None)
+        .await
+        .expect("router");
+    let server = TestServer::new(app).expect("test server");
+
+    let state = server.get("/v1/config/ui/state").await;
+    state.assert_status_ok();
+    let payload: serde_json::Value = state.json();
+    let fields = payload
+        .get("fields")
+        .and_then(|v| v.as_array())
+        .expect("fields array");
+    let app_api_key = fields
+        .iter()
+        .find(|field| field.get("key").and_then(|v| v.as_str()) == Some("XIAOMAOLV_APP_API_KEY"))
+        .expect("app api key field");
+    assert_eq!(
+        app_api_key.get("required").and_then(|v| v.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        app_api_key.get("sensitive").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+
+    let save = server
+        .post("/v1/config/ui/save")
+        .json(&serde_json::json!({
+            "values": {
+                "MINIMAX_API_KEY": "mm-test-key",
+                "TELEGRAM_BOT_TOKEN": "tg-test-token",
+                "XIAOMAOLV_APP_API_KEY": "app-api-secret"
+            },
+            "mode": "required"
+        }))
+        .await;
+    save.assert_status_ok();
+
+    let saved_env = fs::read_to_string(&env_path).expect("saved env exists");
+    assert!(saved_env.contains("XIAOMAOLV_APP_API_KEY=app-api-secret"));
+
+    let unauthenticated_state = server.get("/v1/config/ui/state").await;
+    unauthenticated_state.assert_status_unauthorized();
+
+    let authenticated_state = server
+        .get("/v1/config/ui/state")
+        .add_header("authorization", "Bearer app-api-secret")
+        .await;
+    authenticated_state.assert_status_ok();
+
+    let unauthenticated_api = server.get("/v1/mcp/servers").await;
+    unauthenticated_api.assert_status_unauthorized();
+
+    let authenticated_api = server
+        .get("/v1/mcp/servers")
+        .add_header("authorization", "Bearer app-api-secret")
+        .await;
+    authenticated_api.assert_status_ok();
+
+    clear_setup_env();
+}
+
+#[tokio::test]
 async fn setup_and_config_ui_do_not_emit_cors_headers() {
     clear_setup_env();
 
@@ -194,7 +289,8 @@ bot_token = "${TELEGRAM_BOT_TOKEN}"
     let server = TestServer::new(app).expect("test server");
 
     let setup = server.get("/setup").await;
-    setup.assert_status_unauthorized();
+    setup.assert_status_ok();
+    setup.assert_text_contains("Configuration Center");
 
     let state = server.get("/v1/config/ui/state").await;
     state.assert_status_unauthorized();

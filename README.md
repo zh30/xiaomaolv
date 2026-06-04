@@ -68,10 +68,11 @@ Edit `.env.realtest` and fill at least:
 Optional model override:
 
 - `MINIMAX_MODEL` (default: `MiniMax-M2.5-highspeed`)
+- `XIAOMAOLV_APP_API_KEY` (protects HTTP APIs and config state/save endpoints when set)
 - `TELEGRAM_BOT_USERNAME` (without `@`, recommended for group mention matching)
 - `TELEGRAM_ADMIN_USER_IDS` (comma-separated Telegram user IDs for private chat access and `/mcp` + `/skills`, e.g. `123456789,987654321`)
 
-You can also skip this step first and configure from the visual setup page after boot: `http://127.0.0.1:8080/setup`.
+You can also skip this step first and configure from the visual setup page after boot: `http://127.0.0.1:8080/setup`. If you later set `XIAOMAOLV_APP_API_KEY`, the setup page will prompt for that key before loading or saving config state.
 
 ### 3) Start MVP in one command
 
@@ -249,7 +250,7 @@ Details: `docs/zvec-sidecar.md`
 Core endpoints:
 
 - `GET /health`
-- `GET /setup` (visual setup page; same app API key behavior as `/v1/messages`)
+- `GET /setup` (visual setup page shell; does not expose config state by itself)
 - `GET /v1/config/ui/state` (read setup page state; same app API key behavior as `/v1/messages`)
 - `POST /v1/config/ui/save` (save and hot-reload config; same app API key behavior as `/v1/messages`)
 - `POST /v1/messages` (requires `Authorization: Bearer <app.api_key>` when `[app].api_key` is configured)
@@ -263,7 +264,7 @@ Core endpoints:
 Example:
 
 Omit the app API key header if `[app].api_key` is not configured.
-Setup/config UI endpoints are same-origin only and do not emit permissive CORS headers.
+Setup/config UI state/save endpoints are same-origin only and do not emit permissive CORS headers. The static `/setup` shell stays loadable so first-time operators can enter the current app API key in the page prompt.
 
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/messages \
