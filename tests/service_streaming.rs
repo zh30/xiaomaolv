@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
+use xiaomaolv::config::{AgentHarnessConfig, OutputVerificationMode};
 use xiaomaolv::domain::{IncomingMessage, MessageRole};
 use xiaomaolv::memory::SqliteMemoryStore;
 use xiaomaolv::provider::{ChatProvider, CompletionRequest, StreamSink};
-use xiaomaolv::service::MessageService;
+use xiaomaolv::service::{AgentSwarmSettings, MessageService};
 
 struct FakeStreamingProvider;
 
@@ -37,6 +38,15 @@ impl StreamSink for CollectSink {
     }
 }
 
+struct SwarmToolLeakProvider;
+
+#[async_trait::async_trait]
+impl ChatProvider for SwarmToolLeakProvider {
+    async fn complete(&self, _req: CompletionRequest) -> anyhow::Result<String> {
+        Ok(r#"{"server":"demo","tool":"search","arguments":{}}"#.to_string())
+    }
+}
+
 #[tokio::test]
 async fn service_streams_reply_and_persists_final_message() {
     let store = SqliteMemoryStore::new("sqlite::memory:")
@@ -67,4 +77,49 @@ async fn service_streams_reply_and_persists_final_message() {
     assert_eq!(history[0].role, MessageRole::User);
     assert_eq!(history[1].role, MessageRole::Assistant);
     assert_eq!(history[1].content, "hello world");
+}
+
+#[tokio::test]
+async fn service_streaming_verifies_swarm_reply_before_delivery() {
+    let store = SqliteMemoryStore::new("sqlite::memory:")
+        .await
+        .expect("store");
+    let service = MessageService::new(Arc::new(SwarmToolLeakProvider), store.clone(), 20)
+        .with_harness_config(&AgentHarnessConfig {
+            output_verification_mode: OutputVerificationMode::Block,
+            ..Default::default()
+        })
+        .with_agent_swarm(AgentSwarmSettings {
+            enabled: true,
+            auto_detect: false,
+            reply_summary_enabled: false,
+            ..Default::default()
+        });
+    let mut sink = CollectSink::default();
+
+    let out = service
+        .handle_stream(
+            IncomingMessage {
+                channel: "telegram".to_string(),
+                session_id: "tg:stream:swarm-verify".to_string(),
+                user_id: "u-stream".to_string(),
+                text: "please coordinate this".to_string(),
+                reply_target: None,
+            },
+            &mut sink,
+        )
+        .await
+        .expect("streamed message");
+
+    assert_eq!(
+        out.text,
+        "I could not produce a reliable final answer from the available tool results."
+    );
+    assert_eq!(sink.chunks, vec![out.text.clone()]);
+
+    let history = store
+        .load_recent("tg:stream:swarm-verify", 10)
+        .await
+        .expect("history");
+    assert_eq!(history[1].content, out.text);
 }

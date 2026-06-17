@@ -23,6 +23,7 @@ use crate::harness::compactor::{
     CompactionMessageMetadata, CompactionRequest, CompactionStrategy, Compactor,
 };
 use crate::harness::observability::TrajectoryMetrics;
+use crate::harness::output_exit::{OutputExit, OutputExitRequest};
 use crate::harness::tool_protocol::{
     ToolProposal, ToolProtocol, annotate_record_with_verification_failure,
     verification_failure_record, verification_feedback_message,
@@ -31,9 +32,8 @@ use crate::harness::trajectory::{
     ToolCallRecord, TrajectoryExitReason, TrajectoryLogger, TrajectoryRun,
 };
 use crate::harness::verifier::{
-    CompositeVerifier, DeterministicOutputVerifier, OutputVerificationRequest,
-    OutputVerificationResult, ResultShapeVerifier, TimingVerifier, ToolCallVerifier,
-    ToolSchemaVerifier, VerificationIssue, VerificationResult,
+    CompositeVerifier, DeterministicOutputVerifier, ResultShapeVerifier, TimingVerifier,
+    ToolCallVerifier, ToolSchemaVerifier, VerificationIssue, VerificationResult,
 };
 use crate::json_utils::extract_json_payload;
 use crate::mcp::{BUILTIN_MCP_SERVER_NAME, BUILTIN_MCP_TOOL_CURRENT_TIME, McpRuntime, McpToolInfo};
@@ -798,80 +798,24 @@ impl MessageService {
         final_answer: String,
         tool_calls: &[ToolCallRecord],
     ) -> anyhow::Result<String> {
-        let Some(verifier) = &self.output_verifier else {
-            return Ok(final_answer);
-        };
-        let request = OutputVerificationRequest {
-            final_answer: final_answer.clone(),
-            recent_history: history.to_vec(),
-            tool_calls: tool_calls.to_vec(),
-            channel: channel.to_string(),
-            required_format: None,
-        };
-        let verification = verifier.verify(&request);
-        if verification.passed {
-            return Ok(final_answer);
-        }
-
-        warn_output_verification_failure(&verification);
-        match self.output_verification_mode {
-            OutputVerificationMode::Off | OutputVerificationMode::Observe => Ok(final_answer),
-            OutputVerificationMode::Block => Ok(verification
-                .suggested_revision
-                .unwrap_or_else(|| "I could not produce a reliable final answer.".to_string())),
-            OutputVerificationMode::ReviseOnce => {
-                if !self.output_verification_llm_enabled {
-                    return Ok(verification.suggested_revision.unwrap_or_else(|| {
-                        "I could not produce a reliable final answer.".to_string()
-                    }));
-                }
-
-                let revision_prompt = output_revision_prompt(
-                    &verification,
-                    self.output_verification_max_prompt_chars,
-                );
-                let mut revision_history = history.to_vec();
-                revision_history.push(StoredMessage {
-                    role: MessageRole::Assistant,
-                    content: truncate_output_verification_text(
-                        &final_answer,
-                        self.output_verification_max_result_chars,
-                    ),
-                });
-                revision_history.push(StoredMessage {
-                    role: MessageRole::System,
-                    content: revision_prompt,
-                });
-                let revised = self
-                    .provider
-                    .complete(CompletionRequest {
-                        messages: revision_history,
-                        ..Default::default()
-                    })
-                    .await
-                    .context("provider completion failed during output verification revision")?;
-                let revised = truncate_output_verification_text(
-                    revised.trim(),
-                    self.output_verification_max_result_chars,
-                );
-                let revised_request = OutputVerificationRequest {
-                    final_answer: revised.clone(),
-                    recent_history: history.to_vec(),
-                    tool_calls: tool_calls.to_vec(),
-                    channel: channel.to_string(),
-                    required_format: None,
-                };
-                let revised_verification = verifier.verify(&revised_request);
-                if revised_verification.passed {
-                    Ok(revised)
-                } else {
-                    warn_output_verification_failure(&revised_verification);
-                    Ok(revised_verification.suggested_revision.unwrap_or_else(|| {
-                        "I could not produce a reliable final answer.".to_string()
-                    }))
-                }
-            }
-        }
+        let exit = OutputExit::new(
+            self.provider.clone(),
+            self.output_verifier.clone(),
+            self.output_verification_mode,
+            self.output_verification_llm_enabled,
+            self.output_verification_max_prompt_chars,
+            self.output_verification_max_result_chars,
+        );
+        let result = exit
+            .finalize(OutputExitRequest {
+                history,
+                channel,
+                final_answer,
+                tool_calls,
+                required_format: None,
+            })
+            .await?;
+        Ok(result.text)
     }
 
     pub async fn handle(&self, incoming: IncomingMessage) -> anyhow::Result<OutgoingMessage> {
@@ -1051,6 +995,9 @@ impl MessageService {
             .await;
 
         if let Some(swarm_text) = self.try_swarm_reply(&incoming, &history).await? {
+            let swarm_text = self
+                .verify_final_answer(&history, &incoming.channel, swarm_text, &[])
+                .await?;
             if !swarm_text.is_empty() {
                 sink.on_delta(&swarm_text).await?;
             }
@@ -4550,34 +4497,6 @@ fn warn_verification_failure(verification: &VerificationResult) {
         .map(verification_issue_summary)
         .collect::<Vec<_>>();
     warn!(?issues, "Tool call verification failed");
-}
-
-fn warn_output_verification_failure(verification: &OutputVerificationResult) {
-    let issues = verification
-        .issues
-        .iter()
-        .map(verification_issue_summary)
-        .collect::<Vec<_>>();
-    warn!(?issues, "Output verification failed");
-}
-
-fn output_revision_prompt(verification: &OutputVerificationResult, max_chars: usize) -> String {
-    let payload = serde_json::to_string(verification)
-        .unwrap_or_else(|_| "{\"passed\":false,\"issues\":[]}".to_string());
-    let payload = truncate_output_verification_text(&payload, max_chars);
-    format!(
-        "OUTPUT_VERIFICATION_FAILED_JSON:\n{payload}\n\nRevise the previous assistant answer once. Return only the corrected final answer for the user. Do not expose tool-call JSON or verification internals."
-    )
-}
-
-fn truncate_output_verification_text(input: &str, max_chars: usize) -> String {
-    let max_chars = max_chars.max(1);
-    if input.chars().count() <= max_chars {
-        return input.to_string();
-    }
-    let mut out = input.chars().take(max_chars).collect::<String>();
-    out.push_str("...(truncated)");
-    out
 }
 
 fn verification_issue_summary(issue: &VerificationIssue) -> String {
