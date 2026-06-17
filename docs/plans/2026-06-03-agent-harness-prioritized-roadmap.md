@@ -379,3 +379,14 @@ Use this checklist before marking any task complete:
 - [x] README/config/docs are updated if operator-facing behavior changed.
 - [x] Any new harness config has a default, example value, and config bootstrap test.
 - [x] Any new trajectory field is covered by storage and HTTP/query tests.
+
+## 2026-06-17 Follow-up
+
+The next optimization phase deepens the harness interfaces:
+
+- `HarnessStore` separates harness persistence from conversation memory.
+- `AgentRun` owns start/log/finish lifecycle semantics.
+- `ToolProtocol` owns MCP proposal parsing, validation, execution envelopes, and feedback.
+- `OutputExit` owns final answer verification and bounded revision/block behavior.
+- `ExecutionEnvironment` makes Code Mode isolation explicit.
+- `SkillRuntime::select` exposes selected skill metadata before prompt rendering.

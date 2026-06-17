@@ -2,14 +2,26 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use tempfile::tempdir;
 use tokio::sync::RwLock;
-use xiaomaolv::config::{AgentHarnessConfig, ToolVerificationMode};
+use xiaomaolv::config::{AgentHarnessConfig, OutputVerificationMode, ToolVerificationMode};
 use xiaomaolv::domain::{IncomingMessage, MessageRole, StoredMessage};
 use xiaomaolv::harness::trajectory::{TrajectoryExitReason, TrajectoryFilter, TrajectoryRecord};
+use xiaomaolv::harness::verifier::{DeterministicOutputVerifier, OutputVerificationRequest};
 use xiaomaolv::mcp::{BUILTIN_MCP_SERVER_NAME, BUILTIN_MCP_TOOL_CURRENT_TIME, McpRuntime};
 use xiaomaolv::memory::{MemoryBackend, SqliteMemoryBackend, SqliteMemoryStore};
 use xiaomaolv::provider::{ChatProvider, CompletionRequest};
-use xiaomaolv::service::{AgentMcpSettings, AgentSwarmSettings, MessageService};
+use xiaomaolv::service::{
+    AgentMcpSettings, AgentSkillsSettings, AgentSwarmSettings, MessageService,
+};
+use xiaomaolv::skills::{
+    SkillActivationMode, SkillConfigPaths, SkillRegistry, SkillRuntime, SkillScope,
+};
+
+const CASE_AGENT_RUN_FINAL_ANSWER: &str = "agent_run_final_answer";
+const CASE_TOOL_PROTOCOL_SCHEMA_RETRY: &str = "tool_protocol_schema_retry";
+const CASE_OUTPUT_EXIT_BLOCK_HIDDEN_TOOL_ERROR: &str = "output_exit_block_hidden_tool_error";
+const CASE_SKILL_SELECTION_VISIBLE: &str = "skill_selection_visible";
 
 #[derive(Default)]
 struct EvalProvider {
@@ -63,6 +75,19 @@ struct EvalFixture {
     provider: Arc<EvalProvider>,
 }
 
+struct ErrorProvider;
+
+#[async_trait]
+impl ChatProvider for ErrorProvider {
+    fn model_name(&self) -> Option<&str> {
+        Some("harness-eval-error-model")
+    }
+
+    async fn complete(&self, _req: CompletionRequest) -> anyhow::Result<String> {
+        anyhow::bail!("eval provider failure")
+    }
+}
+
 async fn fixture(
     replies: Vec<String>,
     harness: AgentHarnessConfig,
@@ -87,6 +112,48 @@ async fn fixture(
         ..Default::default()
     })
     .with_harness_config(&harness);
+    Ok(EvalFixture {
+        service,
+        store,
+        provider,
+    })
+}
+
+async fn fixture_with_skills(
+    replies: Vec<String>,
+    harness: AgentHarnessConfig,
+    mcp: AgentMcpSettings,
+    max_recent_turns: usize,
+    skills_runtime: SkillRuntime,
+) -> anyhow::Result<EvalFixture> {
+    let provider = Arc::new(EvalProvider::new(replies));
+    let store = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let backend: Arc<dyn MemoryBackend> = Arc::new(SqliteMemoryBackend::new(store.clone()));
+    let runtime = Arc::new(RwLock::new(McpRuntime::new(HashMap::new())));
+    let service = MessageService::new_with_backend(
+        provider.clone(),
+        backend,
+        Some(runtime),
+        mcp,
+        max_recent_turns,
+        0,
+        0,
+    )
+    .with_agent_swarm(AgentSwarmSettings {
+        enabled: false,
+        ..Default::default()
+    })
+    .with_harness_config(&harness)
+    .with_agent_skills(
+        Some(Arc::new(RwLock::new(skills_runtime))),
+        AgentSkillsSettings {
+            enabled: true,
+            max_selected: 3,
+            max_prompt_chars: 8000,
+            match_min_score: 0.45,
+            llm_rerank_enabled: false,
+        },
+    );
     Ok(EvalFixture {
         service,
         store,
@@ -143,6 +210,56 @@ async fn single_trajectory(
     Ok(trajectories.into_iter().next().expect("trajectory"))
 }
 
+async fn assert_eval_case(
+    fx: &EvalFixture,
+    session_id: &str,
+    expected_final: &str,
+    expected_exit: TrajectoryExitReason,
+    expected_tool_calls: usize,
+    expected_issue_marker: Option<&str>,
+) -> anyhow::Result<TrajectoryRecord> {
+    let out = fx.service.handle(incoming(session_id)).await?;
+    assert_eq!(out.text, expected_final, "{session_id} final answer");
+
+    let trajectory = single_trajectory(&fx.service, session_id).await?;
+    assert_eq!(trajectory.exit_reason, expected_exit, "{session_id} exit");
+    assert_eq!(
+        trajectory.tool_calls.len(),
+        expected_tool_calls,
+        "{session_id} tool calls"
+    );
+    if let Some(marker) = expected_issue_marker {
+        assert!(
+            trajectory
+                .tool_calls
+                .iter()
+                .any(|call| call.result.to_string().contains(marker)),
+            "{session_id} should expose {marker}"
+        );
+    }
+    Ok(trajectory)
+}
+
+fn test_skill_paths(tmp: &tempfile::TempDir) -> SkillConfigPaths {
+    SkillConfigPaths {
+        user_config: tmp.path().join("user-skills.toml"),
+        project_config: tmp.path().join("project-skills.toml"),
+        user_dir: tmp.path().join("user-skills"),
+        project_dir: tmp.path().join("project-skills"),
+    }
+}
+
+fn create_local_skill(tmp: &tempfile::TempDir, name: &str, desc: &str) -> std::path::PathBuf {
+    let dir = tmp.path().join(name);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: {desc}\ntags: [assistant]\n---\n\nBe concise."),
+    )
+    .expect("write");
+    dir
+}
+
 async fn seed_history(
     store: &SqliteMemoryStore,
     session_id: &str,
@@ -167,17 +284,178 @@ async fn seed_history(
 }
 
 #[tokio::test]
-async fn eval_mcp_tool_loop_scenarios_are_deterministic() {
+async fn eval_agent_run_final_answer_case_is_deterministic() {
+    let fx = fixture(
+        vec!["agent run final".to_string()],
+        AgentHarnessConfig {
+            enable_trajectory: true,
+            ..Default::default()
+        },
+        default_mcp(3),
+        20,
+    )
+    .await
+    .expect("fixture");
+
+    assert_eval_case(
+        &fx,
+        CASE_AGENT_RUN_FINAL_ANSWER,
+        "agent run final",
+        TrajectoryExitReason::FinalAnswer,
+        0,
+        None,
+    )
+    .await
+    .expect("agent run final answer case");
+}
+
+#[tokio::test]
+async fn eval_tool_protocol_schema_retry_case_is_deterministic() {
+    let fx = fixture(
+        vec![
+            r#"{"server":"xiaomaolv_builtin","tool":"get_current_time","arguments":{"timezone":123}}"#
+                .to_string(),
+            "schema retry final".to_string(),
+        ],
+        AgentHarnessConfig {
+            enable_trajectory: true,
+            ..Default::default()
+        },
+        default_mcp(3),
+        20,
+    )
+    .await
+    .expect("fixture");
+
+    assert_eval_case(
+        &fx,
+        CASE_TOOL_PROTOCOL_SCHEMA_RETRY,
+        "schema retry final",
+        TrajectoryExitReason::FinalAnswer,
+        1,
+        Some("ARGUMENT_TYPE_MISMATCH"),
+    )
+    .await
+    .expect("tool protocol schema retry case");
+
+    let request_text = fx
+        .provider
+        .requests()
+        .last()
+        .expect("retry request")
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(request_text.contains("MCP_TOOL_VERIFICATION_FAILED_JSON"));
+    assert!(request_text.contains("ARGUMENT_TYPE_MISMATCH"));
+}
+
+#[tokio::test]
+async fn eval_output_exit_block_hidden_tool_error_case_is_deterministic() {
+    let fx = fixture(
+        vec![
+            unknown_tool_call().to_string(),
+            unknown_tool_call().to_string(),
+            "confident hidden tool final".to_string(),
+        ],
+        AgentHarnessConfig {
+            enable_trajectory: true,
+            output_verification_mode: OutputVerificationMode::Block,
+            ..Default::default()
+        },
+        default_mcp(3),
+        20,
+    )
+    .await
+    .expect("fixture");
+
+    let trajectory = assert_eval_case(
+        &fx,
+        CASE_OUTPUT_EXIT_BLOCK_HIDDEN_TOOL_ERROR,
+        "I could not produce a reliable final answer from the available tool results.",
+        TrajectoryExitReason::ToolError,
+        2,
+        Some("UNKNOWN_TOOL"),
+    )
+    .await
+    .expect("output exit hidden tool error case");
+
+    let verification = DeterministicOutputVerifier::new().verify(&OutputVerificationRequest {
+        final_answer: "confident hidden tool final".to_string(),
+        recent_history: vec![StoredMessage {
+            role: MessageRole::User,
+            content: "run the harness eval".to_string(),
+        }],
+        tool_calls: trajectory.tool_calls.clone(),
+        channel: "eval".to_string(),
+        required_format: None,
+    });
+    assert!(
+        verification
+            .issues
+            .iter()
+            .any(|issue| issue.code == "HIDDEN_TOOL_ERROR")
+    );
+}
+
+#[tokio::test]
+async fn eval_skill_selection_visible_case_is_deterministic() {
+    let tmp = tempdir().expect("tmp");
+    let registry = SkillRegistry::new(test_skill_paths(&tmp)).expect("registry");
+    let skill_dir = create_local_skill(&tmp, "calendar-skill", "always visible skill selection");
+    registry
+        .install_local_skill(
+            SkillScope::User,
+            &skill_dir,
+            Some("calendar-skill"),
+            SkillActivationMode::Always,
+        )
+        .await
+        .expect("install");
+    let runtime = SkillRuntime::from_registry(&registry)
+        .await
+        .expect("runtime");
+    let fx = fixture_with_skills(
+        vec!["skill selection final".to_string()],
+        AgentHarnessConfig {
+            enable_trajectory: true,
+            ..Default::default()
+        },
+        default_mcp(3),
+        20,
+        runtime,
+    )
+    .await
+    .expect("fixture with skills");
+
+    assert_eval_case(
+        &fx,
+        CASE_SKILL_SELECTION_VISIBLE,
+        "skill selection final",
+        TrajectoryExitReason::FinalAnswer,
+        0,
+        None,
+    )
+    .await
+    .expect("skill selection visible case");
+
+    let request_text = fx
+        .provider
+        .requests()
+        .last()
+        .expect("request")
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(request_text.contains("SKILLS_CONTEXT"));
+    assert!(request_text.contains("calendar-skill"));
+}
+
+#[tokio::test]
+async fn eval_existing_mcp_loop_scenarios_remain_deterministic() {
     let cases = vec![
-        (
-            "eval-no-tool",
-            vec!["no tool final".to_string()],
-            3,
-            "no tool final",
-            TrajectoryExitReason::FinalAnswer,
-            0,
-            None,
-        ),
         (
             "eval-valid-tool",
             vec![time_tool_call(), "valid tool final".to_string()],
@@ -213,15 +491,6 @@ async fn eval_mcp_tool_loop_scenarios_are_deterministic() {
             2,
             Some("UNKNOWN_TOOL"),
         ),
-        (
-            "eval-max-iterations",
-            vec![time_tool_call()],
-            1,
-            "",
-            TrajectoryExitReason::MaxIterations,
-            1,
-            None,
-        ),
     ];
 
     for (session, replies, max_iterations, expected_final, expected_exit, tool_calls, issue) in
@@ -238,31 +507,17 @@ async fn eval_mcp_tool_loop_scenarios_are_deterministic() {
         )
         .await
         .expect("fixture");
+        assert_eval_case(
+            &fx,
+            session,
+            expected_final,
+            expected_exit,
+            tool_calls,
+            issue,
+        )
+        .await
+        .expect("existing case");
 
-        let out = fx.service.handle(incoming(session)).await.expect("handle");
-        if expected_final.is_empty() {
-            assert!(
-                !out.text.trim().is_empty(),
-                "{session} should produce fallback text"
-            );
-        } else {
-            assert_eq!(out.text, expected_final, "{session} final answer");
-        }
-
-        let trajectory = single_trajectory(&fx.service, session)
-            .await
-            .expect("trajectory");
-        assert_eq!(trajectory.exit_reason, expected_exit, "{session} exit");
-        assert_eq!(trajectory.tool_calls.len(), tool_calls, "{session} calls");
-        if let Some(issue) = issue {
-            assert!(
-                trajectory
-                    .tool_calls
-                    .iter()
-                    .any(|call| call.result.to_string().contains(issue)),
-                "{session} should expose {issue}"
-            );
-        }
         if session == "eval-malformed-tool" {
             let request_text = fx
                 .provider
@@ -276,6 +531,70 @@ async fn eval_mcp_tool_loop_scenarios_are_deterministic() {
             assert!(request_text.contains("MALFORMED_TOOL_CALL_JSON"));
         }
     }
+
+    let fx = fixture(
+        vec![time_tool_call()],
+        AgentHarnessConfig {
+            enable_trajectory: true,
+            ..Default::default()
+        },
+        default_mcp(1),
+        20,
+    )
+    .await
+    .expect("fixture");
+    let out = fx
+        .service
+        .handle(incoming("eval-max-iterations"))
+        .await
+        .expect("handle");
+    assert!(
+        !out.text.trim().is_empty(),
+        "eval-max-iterations should produce fallback text"
+    );
+    let trajectory = single_trajectory(&fx.service, "eval-max-iterations")
+        .await
+        .expect("trajectory");
+    assert_eq!(trajectory.exit_reason, TrajectoryExitReason::MaxIterations);
+    assert_eq!(trajectory.tool_calls.len(), 1);
+}
+
+#[tokio::test]
+async fn eval_agent_run_internal_error_case_is_recorded() {
+    let store = SqliteMemoryStore::new("sqlite::memory:")
+        .await
+        .expect("store");
+    let backend: Arc<dyn MemoryBackend> = Arc::new(SqliteMemoryBackend::new(store.clone()));
+    let runtime = Arc::new(RwLock::new(McpRuntime::new(HashMap::new())));
+    let service = MessageService::new_with_backend(
+        Arc::new(ErrorProvider),
+        backend,
+        Some(runtime),
+        default_mcp(3),
+        20,
+        0,
+        0,
+    )
+    .with_agent_swarm(AgentSwarmSettings {
+        enabled: false,
+        ..Default::default()
+    })
+    .with_harness_config(&AgentHarnessConfig {
+        enable_trajectory: true,
+        ..Default::default()
+    });
+
+    let err = service
+        .handle(incoming("eval-agent-run-internal-error"))
+        .await
+        .expect_err("internal error");
+    assert!(!err.to_string().trim().is_empty());
+
+    let trajectory = single_trajectory(&service, "eval-agent-run-internal-error")
+        .await
+        .expect("trajectory");
+    assert_eq!(trajectory.exit_reason, TrajectoryExitReason::InternalError);
+    assert_eq!(trajectory.tool_calls.len(), 0);
 }
 
 #[tokio::test]

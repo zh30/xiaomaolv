@@ -10,8 +10,10 @@ cargo test --test harness_eval -- --nocapture
 
 Covered scenarios:
 
-- MCP/tool loop: no tool needed, valid tool call, malformed tool JSON recovery, unavailable tool rejection, max iterations.
-- Context compaction: no compaction, head-tail compaction, budget-based compaction.
-- Verification: observe, retry once, block.
+- AgentRun lifecycle: final answer, tool error, max iterations, internal error.
+- ToolProtocol: valid tool call, malformed JSON recovery, unknown tool rejection, schema-invalid arguments.
+- Context compaction: no compaction, head-tail compaction, budget-based compaction, persisted summary reuse.
+- OutputExit: observe, revise once, block hidden tool errors, block unresolved tool-call JSON.
+- Skills runtime: selected skill IDs are observable before prompt rendering.
 
 Each scenario asserts the final answer, trajectory exit reason, tool-call count, and visible verification/error markers where applicable.

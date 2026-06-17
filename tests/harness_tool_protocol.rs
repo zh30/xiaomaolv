@@ -52,7 +52,7 @@ fn tool_protocol_rejects_schema_invalid_arguments() {
     };
     let result = protocol.validate_call(&call);
     assert!(result.is_err());
-    let verification = result.err().expect("verification");
+    let verification = result.expect_err("verification");
     assert!(
         verification
             .issues

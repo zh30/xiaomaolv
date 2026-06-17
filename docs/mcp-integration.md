@@ -153,6 +153,8 @@ When enabled, the service:
 4. injects tool results back into context
 5. stops when model returns final answer or max loop count is reached
 
+Implementation note: MCP orchestration is owned by the harness ToolProtocol module. The model still emits the same JSON shape, but parsing, tool existence checks, JSON Schema argument checks, result envelopes, retry/block feedback, and trajectory tool-call records are handled by ToolProtocol instead of ad hoc service code.
+
 Related config:
 
 ```toml

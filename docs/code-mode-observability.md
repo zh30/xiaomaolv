@@ -4,7 +4,7 @@ This guide covers Prometheus scraping and alerting for code mode safety/performa
 
 ## Code Mode Safety
 
-Code Mode execution environments are explicit about isolation. `local` runs in process. `subprocess` runs a child xiaomaolv process and rebuilds the MCP runtime with the filtered tool manifest, but it is not an OS security sandbox. Capability flags (`allow_network`, `allow_filesystem`, `allow_env`) filter tool access before execution; they do not confine arbitrary child process behavior outside the selected MCP tools.
+The `ExecutionEnvironment` used by Code Mode is explicit about isolation. `local` runs in process. `subprocess` runs a child xiaomaolv process and rebuilds the MCP runtime with the filtered tool manifest, but it is not an OS security sandbox. Capability flags (`allow_network`, `allow_filesystem`, `allow_env`) filter tool access before execution; they do not confine arbitrary child process behavior outside the selected MCP tools.
 
 ## Endpoints
 
