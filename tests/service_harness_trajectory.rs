@@ -1,11 +1,12 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 use xiaomaolv::code_mode::{
     AgentCodeModeSettings, CodeModePlan, CodeModePlanner, CodeModeToolCall,
 };
+use xiaomaolv::config::AgentHarnessConfig;
 use xiaomaolv::domain::{IncomingMessage, StoredMessage};
 use xiaomaolv::harness::trajectory::{TrajectoryExitReason, TrajectoryFilter, TrajectoryLogger};
 use xiaomaolv::mcp::{
@@ -38,6 +39,33 @@ impl ChatProvider for AnswerProvider {
 
     async fn complete(&self, _req: CompletionRequest) -> anyhow::Result<String> {
         Ok("code-mode-answer".to_string())
+    }
+}
+
+struct QueueProvider {
+    replies: Mutex<VecDeque<String>>,
+}
+
+impl QueueProvider {
+    fn new(replies: Vec<String>) -> Self {
+        Self {
+            replies: Mutex::new(replies.into()),
+        }
+    }
+}
+
+#[async_trait]
+impl ChatProvider for QueueProvider {
+    fn model_name(&self) -> Option<&str> {
+        Some("queue-model")
+    }
+
+    async fn complete(&self, _req: CompletionRequest) -> anyhow::Result<String> {
+        self.replies
+            .lock()
+            .expect("replies mutex")
+            .pop_front()
+            .ok_or_else(|| anyhow::anyhow!("missing queued reply"))
     }
 }
 
@@ -197,4 +225,60 @@ async fn code_mode_direct_success_records_finished_trajectory_and_tool_call() {
     assert!(call.ok);
     assert_eq!(call.duration_ms, 0);
     assert_eq!(call.iteration, 0);
+}
+
+#[tokio::test]
+async fn mcp_loop_agent_run_finishes_once_on_parse_error_recovery() {
+    let store = SqliteMemoryStore::new("sqlite::memory:")
+        .await
+        .expect("store");
+    let backend = Arc::new(SqliteMemoryBackend::new(store.clone()));
+    let provider = Arc::new(QueueProvider::new(vec![
+        "MCP_TOOL_CALL_JSON: {bad".to_string(),
+        "I cannot use that malformed tool call safely.".to_string(),
+    ]));
+    let runtime = Arc::new(RwLock::new(McpRuntime::default()));
+    let service = MessageService::new_with_backend(
+        provider,
+        backend,
+        Some(runtime),
+        AgentMcpSettings {
+            enabled: true,
+            max_iterations: 2,
+            max_tool_result_chars: 4000,
+        },
+        8,
+        0,
+        0,
+    )
+    .with_harness_config(&AgentHarnessConfig {
+        enable_trajectory: true,
+        ..AgentHarnessConfig::default()
+    });
+
+    let _ = service
+        .handle(IncomingMessage {
+            channel: "http".to_string(),
+            session_id: "session-parse".to_string(),
+            user_id: "user-parse".to_string(),
+            text: "use a tool".to_string(),
+            reply_target: None,
+        })
+        .await;
+
+    let records = store
+        .query_trajectories(TrajectoryFilter {
+            session_id: Some("session-parse".to_string()),
+            channel: Some("http".to_string()),
+            user_id: None,
+            exit_reason: None,
+            has_tool_errors: None,
+            limit: 10,
+        })
+        .await
+        .expect("query trajectories");
+    assert!(records.len() <= 1);
+    if let Some(record) = records.first() {
+        assert!(record.finished_at.is_some());
+    }
 }

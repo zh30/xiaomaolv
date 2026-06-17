@@ -26,13 +26,12 @@ use crate::harness::execution_environment::{
 };
 use crate::harness::observability::TrajectoryMetrics;
 use crate::harness::output_exit::{OutputExit, OutputExitRequest};
+use crate::harness::run::{AgentRun, AgentRunExit, AgentRunStart};
 use crate::harness::tool_protocol::{
     ToolProposal, ToolProtocol, annotate_record_with_verification_failure,
     verification_failure_record, verification_feedback_message,
 };
-use crate::harness::trajectory::{
-    ToolCallRecord, TrajectoryExitReason, TrajectoryLogger, TrajectoryRun,
-};
+use crate::harness::trajectory::{ToolCallRecord, TrajectoryLogger};
 use crate::harness::verifier::{
     CompositeVerifier, DeterministicOutputVerifier, ResultShapeVerifier, TimingVerifier,
     ToolCallVerifier, ToolSchemaVerifier, VerificationIssue, VerificationResult,
@@ -2252,19 +2251,19 @@ impl MessageService {
         }
 
         let model = self.provider.model_name().unwrap_or("unknown").to_string();
-        let mut trajectory = TrajectoryRun::start(
-            self.trajectory_logger.clone(),
-            self.trajectory_metrics.clone(),
-            &incoming.session_id,
-            &incoming.channel,
-            &incoming.user_id,
-            &model,
-        )
+        let mut run = AgentRun::start(AgentRunStart {
+            logger: self.trajectory_logger.clone(),
+            metrics: self.trajectory_metrics.clone(),
+            session_id: incoming.session_id.clone(),
+            channel: incoming.channel.clone(),
+            user_id: incoming.user_id.clone(),
+            model,
+        })
         .await;
         let mut tool_calls = Vec::new();
         for (iteration, call) in execution.calls.iter().enumerate() {
-            let record = trajectory
-                .log_tool_call(code_mode_tool_call_record(call, iteration))
+            let record = run
+                .record_tool_call(code_mode_tool_call_record(call, iteration))
                 .await;
             tool_calls.push(record);
         }
@@ -2289,9 +2288,7 @@ impl MessageService {
         {
             Ok(reply) => reply,
             Err(err) => {
-                trajectory
-                    .finish(None, TrajectoryExitReason::InternalError)
-                    .await;
+                run.finish(AgentRunExit::InternalError).await;
                 return Err(err).context("provider completion failed after code mode execution");
             }
         };
@@ -2301,16 +2298,12 @@ impl MessageService {
         {
             Ok(reply) => reply,
             Err(err) => {
-                trajectory
-                    .finish(None, TrajectoryExitReason::InternalError)
-                    .await;
+                run.finish(AgentRunExit::InternalError).await;
                 return Err(err).context("output verification failed after code mode execution");
             }
         };
-        trajectory.observe_iteration(0);
-        trajectory
-            .finish(Some(reply.clone()), TrajectoryExitReason::FinalAnswer)
-            .await;
+        run.observe_iteration(0);
+        run.finish(AgentRunExit::FinalAnswer(reply.clone())).await;
         Ok(Some(reply))
     }
 
@@ -2324,14 +2317,14 @@ impl MessageService {
         let mut telemetry = McpLoopTelemetry::new(tools.len());
         let mcp_prompt = build_mcp_system_prompt(&tools)?;
         let model = self.provider.model_name().unwrap_or("unknown").to_string();
-        let mut trajectory = TrajectoryRun::start(
-            self.trajectory_logger.clone(),
-            self.trajectory_metrics.clone(),
-            &incoming.session_id,
-            &incoming.channel,
-            &incoming.user_id,
-            &model,
-        )
+        let mut run = AgentRun::start(AgentRunStart {
+            logger: self.trajectory_logger.clone(),
+            metrics: self.trajectory_metrics.clone(),
+            session_id: incoming.session_id.clone(),
+            channel: incoming.channel.clone(),
+            user_id: incoming.user_id.clone(),
+            model,
+        })
         .await;
 
         history.push(StoredMessage {
@@ -2355,14 +2348,12 @@ impl MessageService {
             {
                 Ok(reply) => reply,
                 Err(err) => {
-                    trajectory
-                        .finish(None, TrajectoryExitReason::InternalError)
-                        .await;
+                    run.finish(AgentRunExit::InternalError).await;
                     return Err(err).context("provider completion failed");
                 }
             };
             telemetry.iterations += 1;
-            trajectory.observe_iteration(iteration);
+            run.observe_iteration(iteration);
 
             let tool_call = match protocol.parse_reply(&reply) {
                 ToolProposal::Tool(tool_call) => tool_call,
@@ -2373,16 +2364,12 @@ impl MessageService {
                     {
                         Ok(reply) => reply,
                         Err(err) => {
-                            trajectory
-                                .finish(None, TrajectoryExitReason::InternalError)
-                                .await;
+                            run.finish(AgentRunExit::InternalError).await;
                             return Err(err).context("output verification failed");
                         }
                     };
                     telemetry.emit("final_answer");
-                    trajectory
-                        .finish(Some(reply.clone()), TrajectoryExitReason::FinalAnswer)
-                        .await;
+                    run.finish(AgentRunExit::FinalAnswer(reply.clone())).await;
                     return Ok(reply);
                 }
                 ToolProposal::ParseError(verification) => {
@@ -2417,9 +2404,7 @@ impl MessageService {
                     {
                         Ok(reply) => reply,
                         Err(err) => {
-                            trajectory
-                                .finish(None, TrajectoryExitReason::InternalError)
-                                .await;
+                            run.finish(AgentRunExit::InternalError).await;
                             return Err(err)
                                 .context("provider completion failed after mcp parse error");
                         }
@@ -2430,16 +2415,13 @@ impl MessageService {
                     {
                         Ok(reply) => reply,
                         Err(err) => {
-                            trajectory
-                                .finish(None, TrajectoryExitReason::InternalError)
-                                .await;
+                            run.finish(AgentRunExit::InternalError).await;
                             return Err(err)
                                 .context("output verification failed after mcp parse error");
                         }
                     };
                     telemetry.emit("tool_error");
-                    trajectory
-                        .finish(Some(final_reply.clone()), TrajectoryExitReason::ToolError)
+                    run.finish(AgentRunExit::ToolError(final_reply.clone()))
                         .await;
                     return Ok(final_reply);
                 }
@@ -2448,7 +2430,7 @@ impl MessageService {
             if let Err(verification) = protocol.validate_call(&tool_call) {
                 warn_verification_failure(&verification);
                 let record = verification_failure_record(&tool_call, &verification, iteration);
-                let record = trajectory.log_tool_call(record).await;
+                let record = run.record_tool_call(record).await;
                 tool_calls.push(record);
                 if !verification_retry_used {
                     verification_retry_used = true;
@@ -2480,9 +2462,7 @@ impl MessageService {
                 {
                     Ok(reply) => reply,
                     Err(err) => {
-                        trajectory
-                            .finish(None, TrajectoryExitReason::InternalError)
-                            .await;
+                        run.finish(AgentRunExit::InternalError).await;
                         return Err(err)
                             .context("provider completion failed after mcp tool validation error");
                     }
@@ -2493,16 +2473,13 @@ impl MessageService {
                 {
                     Ok(reply) => reply,
                     Err(err) => {
-                        trajectory
-                            .finish(None, TrajectoryExitReason::InternalError)
-                            .await;
+                        run.finish(AgentRunExit::InternalError).await;
                         return Err(err)
                             .context("output verification failed after mcp tool validation error");
                     }
                 };
                 telemetry.emit("tool_error");
-                trajectory
-                    .finish(Some(final_reply.clone()), TrajectoryExitReason::ToolError)
+                run.finish(AgentRunExit::ToolError(final_reply.clone()))
                     .await;
                 return Ok(final_reply);
             }
@@ -2513,9 +2490,7 @@ impl MessageService {
             let envelope = match envelope {
                 Ok(envelope) => envelope,
                 Err(err) => {
-                    trajectory
-                        .finish(None, TrajectoryExitReason::InternalError)
-                        .await;
+                    run.finish(AgentRunExit::InternalError).await;
                     return Err(err).context("mcp tool execution envelope failed");
                 }
             };
@@ -2534,7 +2509,7 @@ impl MessageService {
                 warn_verification_failure(verification);
                 annotate_record_with_verification_failure(&mut record, verification);
             }
-            let logged_record = trajectory.log_tool_call(record.clone()).await;
+            let logged_record = run.record_tool_call(record.clone()).await;
             tool_calls.push(logged_record);
 
             if let Some(verification) = verification
@@ -2573,9 +2548,7 @@ impl MessageService {
                         {
                             Ok(reply) => reply,
                             Err(err) => {
-                                trajectory
-                                    .finish(None, TrajectoryExitReason::InternalError)
-                                    .await;
+                                run.finish(AgentRunExit::InternalError).await;
                                 return Err(err).context(
                                     "provider completion failed after tool verification block",
                                 );
@@ -2592,17 +2565,14 @@ impl MessageService {
                         {
                             Ok(reply) => reply,
                             Err(err) => {
-                                trajectory
-                                    .finish(None, TrajectoryExitReason::InternalError)
-                                    .await;
+                                run.finish(AgentRunExit::InternalError).await;
                                 return Err(err).context(
                                     "output verification failed after tool verification block",
                                 );
                             }
                         };
                         telemetry.emit("tool_error");
-                        trajectory
-                            .finish(Some(final_reply.clone()), TrajectoryExitReason::ToolError)
+                        run.finish(AgentRunExit::ToolError(final_reply.clone()))
                             .await;
                         return Ok(final_reply);
                     }
@@ -2638,9 +2608,7 @@ impl MessageService {
         {
             Ok(reply) => reply,
             Err(err) => {
-                trajectory
-                    .finish(None, TrajectoryExitReason::InternalError)
-                    .await;
+                run.finish(AgentRunExit::InternalError).await;
                 return Err(err).context("provider completion failed");
             }
         };
@@ -2650,19 +2618,13 @@ impl MessageService {
         {
             Ok(reply) => reply,
             Err(err) => {
-                trajectory
-                    .finish(None, TrajectoryExitReason::InternalError)
-                    .await;
+                run.finish(AgentRunExit::InternalError).await;
                 return Err(err).context("output verification failed after max iterations");
             }
         };
         telemetry.emit("max_iterations");
 
-        trajectory
-            .finish(
-                Some(final_reply.clone()),
-                TrajectoryExitReason::MaxIterations,
-            )
+        run.finish(AgentRunExit::MaxIterations(final_reply.clone()))
             .await;
 
         Ok(final_reply)
@@ -2679,14 +2641,14 @@ impl MessageService {
         let mut telemetry = McpLoopTelemetry::new(tools.len());
         let mcp_prompt = build_mcp_system_prompt(&tools)?;
         let model = self.provider.model_name().unwrap_or("unknown").to_string();
-        let mut trajectory = TrajectoryRun::start(
-            self.trajectory_logger.clone(),
-            self.trajectory_metrics.clone(),
-            &incoming.session_id,
-            &incoming.channel,
-            &incoming.user_id,
-            &model,
-        )
+        let mut run = AgentRun::start(AgentRunStart {
+            logger: self.trajectory_logger.clone(),
+            metrics: self.trajectory_metrics.clone(),
+            session_id: incoming.session_id.clone(),
+            channel: incoming.channel.clone(),
+            user_id: incoming.user_id.clone(),
+            model,
+        })
         .await;
 
         history.push(StoredMessage {
@@ -2714,14 +2676,12 @@ impl MessageService {
             {
                 Ok(reply) => reply,
                 Err(err) => {
-                    trajectory
-                        .finish(None, TrajectoryExitReason::InternalError)
-                        .await;
+                    run.finish(AgentRunExit::InternalError).await;
                     return Err(err).context("provider stream completion failed");
                 }
             };
             telemetry.iterations += 1;
-            trajectory.observe_iteration(iteration);
+            run.observe_iteration(iteration);
 
             let streamed_reply = buffered_sink.rendered_text();
             let resolved_reply = if streamed_reply.trim().is_empty() {
@@ -2744,18 +2704,12 @@ impl MessageService {
                     {
                         Ok(reply) => reply,
                         Err(err) => {
-                            trajectory
-                                .finish(None, TrajectoryExitReason::InternalError)
-                                .await;
+                            run.finish(AgentRunExit::InternalError).await;
                             return Err(err).context("output verification failed");
                         }
                     };
                     telemetry.emit("final_answer");
-                    trajectory
-                        .finish(
-                            Some(resolved_reply.clone()),
-                            TrajectoryExitReason::FinalAnswer,
-                        )
+                    run.finish(AgentRunExit::FinalAnswer(resolved_reply.clone()))
                         .await;
                     BufferedStreamSink::replay_text(&resolved_reply, sink).await?;
                     return Ok(resolved_reply);
@@ -2796,9 +2750,7 @@ impl MessageService {
                     {
                         Ok(reply) => reply,
                         Err(err) => {
-                            trajectory
-                                .finish(None, TrajectoryExitReason::InternalError)
-                                .await;
+                            run.finish(AgentRunExit::InternalError).await;
                             return Err(err).context(
                                 "provider stream completion failed after mcp parse error",
                             );
@@ -2821,19 +2773,13 @@ impl MessageService {
                     {
                         Ok(reply) => reply,
                         Err(err) => {
-                            trajectory
-                                .finish(None, TrajectoryExitReason::InternalError)
-                                .await;
+                            run.finish(AgentRunExit::InternalError).await;
                             return Err(err)
                                 .context("output verification failed after mcp parse error");
                         }
                     };
                     telemetry.emit("tool_error");
-                    trajectory
-                        .finish(
-                            Some(resolved_final.clone()),
-                            TrajectoryExitReason::ToolError,
-                        )
+                    run.finish(AgentRunExit::ToolError(resolved_final.clone()))
                         .await;
                     BufferedStreamSink::replay_text(&resolved_final, sink).await?;
                     return Ok(resolved_final);
@@ -2843,7 +2789,7 @@ impl MessageService {
             if let Err(verification) = protocol.validate_call(&tool_call) {
                 warn_verification_failure(&verification);
                 let record = verification_failure_record(&tool_call, &verification, iteration);
-                let record = trajectory.log_tool_call(record).await;
+                let record = run.record_tool_call(record).await;
                 tool_calls.push(record);
                 if !verification_retry_used {
                     verification_retry_used = true;
@@ -2879,9 +2825,7 @@ impl MessageService {
                 {
                     Ok(reply) => reply,
                     Err(err) => {
-                        trajectory
-                            .finish(None, TrajectoryExitReason::InternalError)
-                            .await;
+                        run.finish(AgentRunExit::InternalError).await;
                         return Err(err).context(
                             "provider stream completion failed after mcp tool validation error",
                         );
@@ -2899,19 +2843,13 @@ impl MessageService {
                 {
                     Ok(reply) => reply,
                     Err(err) => {
-                        trajectory
-                            .finish(None, TrajectoryExitReason::InternalError)
-                            .await;
+                        run.finish(AgentRunExit::InternalError).await;
                         return Err(err)
                             .context("output verification failed after mcp tool validation error");
                     }
                 };
                 telemetry.emit("tool_error");
-                trajectory
-                    .finish(
-                        Some(resolved_final.clone()),
-                        TrajectoryExitReason::ToolError,
-                    )
+                run.finish(AgentRunExit::ToolError(resolved_final.clone()))
                     .await;
                 BufferedStreamSink::replay_text(&resolved_final, sink).await?;
                 return Ok(resolved_final);
@@ -2923,9 +2861,7 @@ impl MessageService {
             let envelope = match envelope {
                 Ok(envelope) => envelope,
                 Err(err) => {
-                    trajectory
-                        .finish(None, TrajectoryExitReason::InternalError)
-                        .await;
+                    run.finish(AgentRunExit::InternalError).await;
                     return Err(err).context("mcp tool execution envelope failed");
                 }
             };
@@ -2944,7 +2880,7 @@ impl MessageService {
                 warn_verification_failure(verification);
                 annotate_record_with_verification_failure(&mut record, verification);
             }
-            let logged_record = trajectory.log_tool_call(record.clone()).await;
+            let logged_record = run.record_tool_call(record.clone()).await;
             tool_calls.push(logged_record);
 
             if let Some(verification) = verification
@@ -2987,9 +2923,7 @@ impl MessageService {
                         {
                             Ok(reply) => reply,
                             Err(err) => {
-                                trajectory
-                                    .finish(None, TrajectoryExitReason::InternalError)
-                                    .await;
+                                run.finish(AgentRunExit::InternalError).await;
                                 return Err(err).context(
                                     "provider stream completion failed after tool verification block",
                                 );
@@ -3012,20 +2946,14 @@ impl MessageService {
                         {
                             Ok(reply) => reply,
                             Err(err) => {
-                                trajectory
-                                    .finish(None, TrajectoryExitReason::InternalError)
-                                    .await;
+                                run.finish(AgentRunExit::InternalError).await;
                                 return Err(err).context(
                                     "output verification failed after tool verification block",
                                 );
                             }
                         };
                         telemetry.emit("tool_error");
-                        trajectory
-                            .finish(
-                                Some(resolved_final.clone()),
-                                TrajectoryExitReason::ToolError,
-                            )
+                        run.finish(AgentRunExit::ToolError(resolved_final.clone()))
                             .await;
                         BufferedStreamSink::replay_text(&resolved_final, sink).await?;
                         return Ok(resolved_final);
@@ -3067,9 +2995,7 @@ impl MessageService {
         {
             Ok(reply) => reply,
             Err(err) => {
-                trajectory
-                    .finish(None, TrajectoryExitReason::InternalError)
-                    .await;
+                run.finish(AgentRunExit::InternalError).await;
                 return Err(err).context("provider stream completion failed");
             }
         };
@@ -3085,18 +3011,12 @@ impl MessageService {
         {
             Ok(reply) => reply,
             Err(err) => {
-                trajectory
-                    .finish(None, TrajectoryExitReason::InternalError)
-                    .await;
+                run.finish(AgentRunExit::InternalError).await;
                 return Err(err).context("output verification failed after max iterations");
             }
         };
         telemetry.emit("max_iterations");
-        trajectory
-            .finish(
-                Some(resolved_reply.clone()),
-                TrajectoryExitReason::MaxIterations,
-            )
+        run.finish(AgentRunExit::MaxIterations(resolved_reply.clone()))
             .await;
         BufferedStreamSink::replay_text(&resolved_reply, sink).await?;
 
