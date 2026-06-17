@@ -8,6 +8,7 @@ use crate::harness::trajectory::ToolCallRecord;
 use crate::harness::verifier::{
     IssueSeverity, ToolSchemaVerifier, VerificationIssue, VerificationResult,
 };
+use crate::json_utils::extract_json_payload;
 use crate::mcp::{McpRuntime, McpToolInfo};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -203,79 +204,6 @@ fn parse_tool_call_value(value: &Value) -> Option<ParsedToolCall> {
     })
 }
 
-fn extract_json_payload(text: &str) -> Option<String> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if serde_json::from_str::<Value>(trimmed).is_ok() {
-        return Some(trimmed.to_string());
-    }
-    extract_first_json_value_segment(trimmed)
-}
-
-fn extract_first_json_value_segment(text: &str) -> Option<String> {
-    for (start, ch) in text.char_indices() {
-        if !matches!(ch, '{' | '[') {
-            continue;
-        }
-        let suffix = &text[start..];
-        let Some(end_offset) = find_json_segment_end(suffix) else {
-            continue;
-        };
-        let candidate = suffix[..end_offset].trim();
-        if serde_json::from_str::<Value>(candidate).is_ok() {
-            return Some(candidate.to_string());
-        }
-    }
-    None
-}
-
-fn find_json_segment_end(input: &str) -> Option<usize> {
-    let mut stack = Vec::new();
-    let mut in_string = false;
-    let mut escaped = false;
-
-    for (offset, ch) in input.char_indices() {
-        if in_string {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            match ch {
-                '\\' => escaped = true,
-                '"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-
-        match ch {
-            '"' => in_string = true,
-            '{' | '[' => stack.push(ch),
-            '}' => {
-                if stack.pop() != Some('{') {
-                    return None;
-                }
-                if stack.is_empty() {
-                    return Some(offset + ch.len_utf8());
-                }
-            }
-            ']' => {
-                if stack.pop() != Some('[') {
-                    return None;
-                }
-                if stack.is_empty() {
-                    return Some(offset + ch.len_utf8());
-                }
-            }
-            _ => {}
-        }
-    }
-
-    None
-}
-
 fn looks_like_attempted_mcp_tool_call(reply: &str) -> bool {
     let lower = reply.to_ascii_lowercase();
     lower.contains("tool_call")
@@ -402,4 +330,44 @@ pub(crate) fn truncate_json_value(value: &Value, max_chars: usize) -> Value {
     let mut out = encoded.chars().take(max_chars).collect::<String>();
     out.push_str("...(truncated)");
     serde_json::json!({ "truncated": out })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ParsedToolCall, verification_failure_record};
+    use crate::harness::verifier::{IssueSeverity, VerificationIssue, VerificationResult};
+
+    #[test]
+    fn verification_failure_record_marks_unknown_tools_and_preserves_requested_shape() {
+        let call = ParsedToolCall {
+            server: "demo".to_string(),
+            tool: "search".to_string(),
+            arguments: serde_json::json!({"q":"rust"}),
+        };
+        let verification = VerificationResult {
+            passed: false,
+            confidence: 1.0,
+            issues: vec![VerificationIssue {
+                severity: IssueSeverity::Error,
+                code: "UNKNOWN_TOOL".to_string(),
+                message: "Requested MCP tool is not available: demo::search".to_string(),
+            }],
+            suggestion: None,
+        };
+
+        let record = verification_failure_record(&call, &verification, 4);
+
+        assert_eq!(record.server, "unknown");
+        assert_eq!(record.tool, "invalid");
+        assert_eq!(record.arguments, serde_json::json!({"q":"rust"}));
+        assert!(!record.ok);
+        assert_eq!(record.iteration, 4);
+        assert_eq!(record.result["verification_failed"], true);
+        assert_eq!(
+            record.result["verification"]["issues"][0]["code"],
+            "UNKNOWN_TOOL"
+        );
+        assert_eq!(record.result["requested_server"], "demo");
+        assert_eq!(record.result["requested_tool"], "search");
+    }
 }

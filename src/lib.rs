@@ -4,6 +4,7 @@ pub mod config;
 pub mod domain;
 pub mod harness;
 pub mod http;
+pub(crate) mod json_utils;
 pub mod mcp;
 pub mod mcp_commands;
 pub mod memory;

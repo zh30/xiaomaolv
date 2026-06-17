@@ -1,8 +1,13 @@
 use std::collections::HashMap;
 
+use xiaomaolv::config::ToolVerificationMode;
+use xiaomaolv::domain::MessageRole;
 use xiaomaolv::harness::tool_protocol::{
     ParsedToolCall, ToolExecutionEnvelope, ToolProposal, ToolProtocol,
+    annotate_record_with_verification_failure, verification_feedback_message,
 };
+use xiaomaolv::harness::trajectory::ToolCallRecord;
+use xiaomaolv::harness::verifier::{IssueSeverity, VerificationIssue, VerificationResult};
 use xiaomaolv::mcp::{
     BUILTIN_MCP_SERVER_NAME, BUILTIN_MCP_TOOL_CURRENT_TIME, McpRuntime, McpToolInfo,
 };
@@ -138,4 +143,78 @@ async fn tool_protocol_wraps_runtime_failures_in_error_envelope() {
     assert!(!envelope.record.ok);
     assert_eq!(envelope.record.iteration, 1);
     assert!(envelope.record.result["error"].as_str().is_some());
+}
+
+fn demo_verification() -> VerificationResult {
+    VerificationResult {
+        passed: false,
+        confidence: 0.97,
+        issues: vec![VerificationIssue {
+            severity: IssueSeverity::Error,
+            code: "UNKNOWN_ARGUMENT".to_string(),
+            message: "Unexpected field: extra".to_string(),
+        }],
+        suggestion: Some("Remove the unsupported field.".to_string()),
+    }
+}
+
+#[test]
+fn verification_feedback_message_retry_instructs_single_retry() {
+    let verification = demo_verification();
+    let message = verification_feedback_message(&verification, ToolVerificationMode::Retry);
+
+    assert_eq!(message.role, MessageRole::System);
+    assert!(
+        message
+            .content
+            .contains("MCP_TOOL_VERIFICATION_FAILED_JSON:")
+    );
+    assert!(message.content.contains("\"code\":\"UNKNOWN_ARGUMENT\""));
+    assert!(
+        message
+            .content
+            .contains("Retry once with corrected arguments")
+    );
+}
+
+#[test]
+fn verification_feedback_message_block_and_observe_preserve_mode_specific_guidance() {
+    let verification = demo_verification();
+
+    let block = verification_feedback_message(&verification, ToolVerificationMode::Block);
+    assert!(block.content.contains("Do not call more tools"));
+    assert!(block.content.contains("Provide a safe final answer"));
+
+    let observe = verification_feedback_message(&verification, ToolVerificationMode::Observe);
+    assert!(observe.content.contains("Continue normally."));
+    assert!(!observe.content.contains("Do not call more tools"));
+}
+
+#[test]
+fn annotate_record_with_verification_failure_wraps_original_payload() {
+    let verification = demo_verification();
+    let mut record = ToolCallRecord {
+        call_index: 3,
+        server: "demo".to_string(),
+        tool: "search".to_string(),
+        arguments: serde_json::json!({"q":"rust"}),
+        result: serde_json::json!({"items":[1,2,3]}),
+        ok: true,
+        duration_ms: 41,
+        iteration: 2,
+    };
+
+    annotate_record_with_verification_failure(&mut record, &verification);
+
+    assert!(!record.ok);
+    assert_eq!(record.result["verification_failed"], true);
+    assert_eq!(record.result["verification"]["passed"], false);
+    assert_eq!(
+        record.result["verification"]["issues"][0]["code"],
+        "UNKNOWN_ARGUMENT"
+    );
+    assert_eq!(
+        record.result["original_result"],
+        serde_json::json!({"items":[1,2,3]})
+    );
 }
