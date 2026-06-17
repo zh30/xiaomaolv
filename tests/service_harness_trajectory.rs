@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -8,11 +9,15 @@ use xiaomaolv::code_mode::{
 };
 use xiaomaolv::config::AgentHarnessConfig;
 use xiaomaolv::domain::{IncomingMessage, StoredMessage};
-use xiaomaolv::harness::trajectory::{TrajectoryExitReason, TrajectoryFilter, TrajectoryLogger};
+use xiaomaolv::harness::trajectory::{
+    ToolCallRecord, TrajectoryExitReason, TrajectoryFilter, TrajectoryLogger, TrajectoryRecord,
+};
 use xiaomaolv::mcp::{
     BUILTIN_MCP_SERVER_NAME, BUILTIN_MCP_TOOL_CURRENT_TIME, McpRuntime, McpToolInfo,
 };
-use xiaomaolv::memory::{MemoryBackend, SqliteMemoryBackend, SqliteMemoryStore};
+use xiaomaolv::memory::{
+    MemoryBackend, MemoryContextRequest, MemoryWriteRequest, SqliteMemoryBackend, SqliteMemoryStore,
+};
 use xiaomaolv::provider::{ChatProvider, CompletionRequest};
 use xiaomaolv::service::{AgentMcpSettings, AgentSwarmSettings, MessageService};
 
@@ -89,6 +94,80 @@ impl CodeModePlanner for StaticPlanner {
                 arguments: serde_json::json!({}),
             }],
         }))
+    }
+}
+
+struct CountingMemoryBackend {
+    inner: Arc<SqliteMemoryBackend>,
+    finish_calls: Arc<AtomicUsize>,
+}
+
+impl CountingMemoryBackend {
+    fn new(inner: Arc<SqliteMemoryBackend>, finish_calls: Arc<AtomicUsize>) -> Self {
+        Self {
+            inner,
+            finish_calls,
+        }
+    }
+}
+
+#[async_trait]
+impl MemoryBackend for CountingMemoryBackend {
+    async fn append(&self, req: MemoryWriteRequest) -> anyhow::Result<()> {
+        self.inner.append(req).await
+    }
+
+    async fn load_context(&self, req: MemoryContextRequest) -> anyhow::Result<Vec<StoredMessage>> {
+        self.inner.load_context(req).await
+    }
+
+    async fn insert_trajectory_tool_call(
+        &self,
+        trajectory_id: &str,
+        record: ToolCallRecord,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .insert_trajectory_tool_call(trajectory_id, record)
+            .await
+    }
+
+    async fn start_trajectory(
+        &self,
+        trajectory_id: &str,
+        session_id: &str,
+        channel: &str,
+        user_id: &str,
+        model: &str,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .start_trajectory(trajectory_id, session_id, channel, user_id, model)
+            .await
+    }
+
+    async fn finish_trajectory(
+        &self,
+        trajectory_id: &str,
+        final_answer: Option<String>,
+        exit_reason: TrajectoryExitReason,
+    ) -> anyhow::Result<()> {
+        self.finish_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .finish_trajectory(trajectory_id, final_answer, exit_reason)
+            .await
+    }
+
+    async fn get_trajectory(
+        &self,
+        trajectory_id: &str,
+    ) -> anyhow::Result<Option<TrajectoryRecord>> {
+        self.inner.get_trajectory(trajectory_id).await
+    }
+
+    async fn query_trajectories(
+        &self,
+        filter: TrajectoryFilter,
+    ) -> anyhow::Result<Vec<TrajectoryRecord>> {
+        self.inner.query_trajectories(filter).await
     }
 }
 
@@ -232,7 +311,12 @@ async fn mcp_loop_agent_run_finishes_once_on_parse_error_recovery() {
     let store = SqliteMemoryStore::new("sqlite::memory:")
         .await
         .expect("store");
-    let backend = Arc::new(SqliteMemoryBackend::new(store.clone()));
+    let sqlite_backend = Arc::new(SqliteMemoryBackend::new(store.clone()));
+    let finish_calls = Arc::new(AtomicUsize::new(0));
+    let backend = Arc::new(CountingMemoryBackend::new(
+        sqlite_backend,
+        finish_calls.clone(),
+    ));
     let provider = Arc::new(QueueProvider::new(vec![
         "MCP_TOOL_CALL_JSON: {bad".to_string(),
         "I cannot use that malformed tool call safely.".to_string(),
@@ -240,7 +324,7 @@ async fn mcp_loop_agent_run_finishes_once_on_parse_error_recovery() {
     let runtime = Arc::new(RwLock::new(McpRuntime::default()));
     let service = MessageService::new_with_backend(
         provider,
-        backend,
+        backend.clone(),
         Some(runtime),
         AgentMcpSettings {
             enabled: true,
@@ -254,9 +338,10 @@ async fn mcp_loop_agent_run_finishes_once_on_parse_error_recovery() {
     .with_harness_config(&AgentHarnessConfig {
         enable_trajectory: true,
         ..AgentHarnessConfig::default()
-    });
+    })
+    .with_trajectory_logger(TrajectoryLogger::new(backend.clone(), true));
 
-    let _ = service
+    let response = service
         .handle(IncomingMessage {
             channel: "http".to_string(),
             session_id: "session-parse".to_string(),
@@ -264,21 +349,25 @@ async fn mcp_loop_agent_run_finishes_once_on_parse_error_recovery() {
             text: "use a tool".to_string(),
             reply_target: None,
         })
-        .await;
+        .await
+        .expect("parse recovery should still return a final response");
+    assert_eq!(
+        response.text,
+        "I cannot use that malformed tool call safely."
+    );
 
-    let records = store
+    let records = service
         .query_trajectories(TrajectoryFilter {
             session_id: Some("session-parse".to_string()),
             channel: Some("http".to_string()),
-            user_id: None,
+            user_id: Some("user-parse".to_string()),
             exit_reason: None,
             has_tool_errors: None,
             limit: 10,
         })
         .await
         .expect("query trajectories");
-    assert!(records.len() <= 1);
-    if let Some(record) = records.first() {
-        assert!(record.finished_at.is_some());
-    }
+    assert_eq!(records.len(), 1);
+    assert!(records[0].finished_at.is_some());
+    assert_eq!(finish_calls.load(Ordering::SeqCst), 1);
 }
