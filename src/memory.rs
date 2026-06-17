@@ -1460,18 +1460,10 @@ impl SqliteMemoryStore {
         sqlx::query(
             "INSERT INTO mcp_trajectory_tool_calls
              (trajectory_id, call_index, iteration, server, tool, arguments, result, ok, duration_ms)
-             VALUES (
-                ?1,
-                COALESCE(
-                    (SELECT MAX(call_index) + 1
-                     FROM mcp_trajectory_tool_calls
-                     WHERE trajectory_id = ?1),
-                    0
-                ),
-                ?2, ?3, ?4, ?5, ?6, ?7, ?8
-             )",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )
         .bind(trajectory_id)
+        .bind(record.call_index as i64)
         .bind(record.iteration as i64)
         .bind(&record.server)
         .bind(&record.tool)

@@ -98,7 +98,7 @@ async fn test_trajectory_captures_final_answer() {
     // Insert multiple tool calls
     for i in 0..3 {
         let record = ToolCallRecord {
-            call_index: 0,
+            call_index: i,
             server: "test-server".to_string(),
             tool: format!("tool-{}", i),
             arguments: serde_json::json!({"arg": i}),
@@ -318,12 +318,12 @@ async fn test_trajectory_preserves_repeated_same_tool_calls() {
         .await
         .expect("start trajectory");
 
-    for value in ["first", "second"] {
+    for (call_index, value) in ["first", "second"].into_iter().enumerate() {
         logger
             .log_tool_call(
                 &trajectory_id,
                 ToolCallRecord {
-                    call_index: 0,
+                    call_index,
                     server: "same-server".to_string(),
                     tool: "same-tool".to_string(),
                     arguments: serde_json::json!({"value": value}),
