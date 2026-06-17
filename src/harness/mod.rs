@@ -1,4 +1,5 @@
 pub mod compactor;
+pub mod execution_environment;
 pub mod observability;
 pub mod output_exit;
 pub mod run;

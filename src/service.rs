@@ -14,13 +14,15 @@ use tracing::{info, warn};
 
 use crate::code_mode::{
     AgentCodeModeSettings, CodeModeAuditRecord, CodeModeCallResult, CodeModeExecutionMode,
-    CodeModeExecutor, CodeModePlanner, CodeModePolicy, DisabledCodeModePlanner,
-    execute_plan_via_subprocess,
+    CodeModePlanner, CodeModePolicy, DisabledCodeModePlanner,
 };
 use crate::config::{AgentHarnessConfig, OutputVerificationMode, ToolVerificationMode};
 use crate::domain::{IncomingMessage, MessageRole, OutgoingMessage, StoredMessage};
 use crate::harness::compactor::{
     CompactionMessageMetadata, CompactionRequest, CompactionStrategy, Compactor,
+};
+use crate::harness::execution_environment::{
+    ExecutionEnvironment, LocalExecutionEnvironment, SubprocessExecutionEnvironment,
 };
 use crate::harness::observability::TrajectoryMetrics;
 use crate::harness::output_exit::{OutputExit, OutputExitRequest};
@@ -2185,15 +2187,15 @@ impl MessageService {
         };
 
         let planned_calls = plan.calls.len();
-        let execution = match self.agent_code_mode.execution_mode {
+        let environment: Box<dyn ExecutionEnvironment> = match self.agent_code_mode.execution_mode {
             CodeModeExecutionMode::Local => {
-                let executor = CodeModeExecutor::new(self.agent_code_mode.clone());
-                executor.execute(runtime, &plan, &code_mode_tools).await
+                Box::new(LocalExecutionEnvironment::new(self.agent_code_mode.clone()))
             }
-            CodeModeExecutionMode::Subprocess => {
-                execute_plan_via_subprocess(&plan, &code_mode_tools, &self.agent_code_mode).await
-            }
+            CodeModeExecutionMode::Subprocess => Box::new(SubprocessExecutionEnvironment::new(
+                self.agent_code_mode.clone(),
+            )),
         };
+        let execution = environment.execute(runtime, &plan, &code_mode_tools).await;
         let execution = match execution {
             Ok(report) => report,
             Err(err) => {
@@ -2201,7 +2203,7 @@ impl MessageService {
                     planner: planner_name.to_string(),
                     used: false,
                     fallback: true,
-                    reason: Some(err.to_string()),
+                    reason: Some(format!("{}; isolation={:?}", err, environment.isolation())),
                     planned_calls,
                     executed_calls: 0,
                     failed_calls: 0,
