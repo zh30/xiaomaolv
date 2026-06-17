@@ -7,7 +7,6 @@ use tokio::sync::RwLock;
 use xiaomaolv::config::{AgentHarnessConfig, OutputVerificationMode, ToolVerificationMode};
 use xiaomaolv::domain::{IncomingMessage, MessageRole, StoredMessage};
 use xiaomaolv::harness::trajectory::{TrajectoryExitReason, TrajectoryFilter, TrajectoryRecord};
-use xiaomaolv::harness::verifier::{DeterministicOutputVerifier, OutputVerificationRequest};
 use xiaomaolv::mcp::{BUILTIN_MCP_SERVER_NAME, BUILTIN_MCP_TOOL_CURRENT_TIME, McpRuntime};
 use xiaomaolv::memory::{MemoryBackend, SqliteMemoryBackend, SqliteMemoryStore};
 use xiaomaolv::provider::{ChatProvider, CompletionRequest};
@@ -358,10 +357,12 @@ async fn eval_output_exit_block_hidden_tool_error_case_is_deterministic() {
             unknown_tool_call().to_string(),
             unknown_tool_call().to_string(),
             "confident hidden tool final".to_string(),
+            unknown_tool_call().to_string(),
         ],
         AgentHarnessConfig {
             enable_trajectory: true,
-            output_verification_mode: OutputVerificationMode::Block,
+            output_verification_mode: OutputVerificationMode::ReviseOnce,
+            output_verification_llm_enabled: true,
             ..Default::default()
         },
         default_mcp(3),
@@ -370,7 +371,7 @@ async fn eval_output_exit_block_hidden_tool_error_case_is_deterministic() {
     .await
     .expect("fixture");
 
-    let trajectory = assert_eval_case(
+    assert_eval_case(
         &fx,
         CASE_OUTPUT_EXIT_BLOCK_HIDDEN_TOOL_ERROR,
         "I could not produce a reliable final answer from the available tool results.",
@@ -381,22 +382,20 @@ async fn eval_output_exit_block_hidden_tool_error_case_is_deterministic() {
     .await
     .expect("output exit hidden tool error case");
 
-    let verification = DeterministicOutputVerifier::new().verify(&OutputVerificationRequest {
-        final_answer: "confident hidden tool final".to_string(),
-        recent_history: vec![StoredMessage {
-            role: MessageRole::User,
-            content: "run the harness eval".to_string(),
-        }],
-        tool_calls: trajectory.tool_calls.clone(),
-        channel: "eval".to_string(),
-        required_format: None,
-    });
+    let request_text = fx
+        .provider
+        .requests()
+        .last()
+        .expect("revision request")
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        verification
-            .issues
-            .iter()
-            .any(|issue| issue.code == "HIDDEN_TOOL_ERROR")
+        request_text.contains("OUTPUT_VERIFICATION_FAILED_JSON"),
+        "service should emit output verification feedback on the harness path"
     );
+    assert!(request_text.contains("HIDDEN_TOOL_ERROR"));
 }
 
 #[tokio::test]
