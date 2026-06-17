@@ -3380,7 +3380,20 @@ impl MessageService {
             max_prompt_chars: self.agent_skills.max_prompt_chars,
             match_min_score: self.agent_skills.match_min_score,
         };
-        if let Some(prompt) = runtime.build_system_prompt(query_text, &settings) {
+        let selection = runtime.select(query_text, &settings);
+        if !selection.skills.is_empty() {
+            info!(
+                skills = ?selection
+                    .skills
+                    .iter()
+                    .map(|skill| skill.id.as_str())
+                    .collect::<Vec<_>>(),
+                "selected skills for agent run"
+            );
+        }
+        if let Some(prompt) =
+            SkillRuntime::render_system_prompt(&selection, settings.max_prompt_chars)
+        {
             history.push(StoredMessage {
                 role: MessageRole::System,
                 content: prompt,

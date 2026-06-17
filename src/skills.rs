@@ -1074,6 +1074,22 @@ pub struct SkillRuntimeSelectionSettings {
 }
 
 #[derive(Debug, Clone)]
+pub struct SelectedSkill {
+    pub id: String,
+    pub mode: SkillActivationMode,
+    pub score: f32,
+    pub name: String,
+    pub description: String,
+    pub tags: Vec<String>,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SkillSelection {
+    pub skills: Vec<SelectedSkill>,
+}
+
+#[derive(Debug, Clone)]
 struct SkillRuntimeEntry {
     id: String,
     enabled: bool,
@@ -1133,8 +1149,13 @@ impl SkillRuntime {
         query: &str,
         settings: &SkillRuntimeSelectionSettings,
     ) -> Option<String> {
+        let selection = self.select(query, settings);
+        Self::render_system_prompt(&selection, settings.max_prompt_chars)
+    }
+
+    pub fn select(&self, query: &str, settings: &SkillRuntimeSelectionSettings) -> SkillSelection {
         if self.skills.is_empty() {
-            return None;
+            return SkillSelection::default();
         }
         let query_tokens = tokenize_text(query);
         let mut candidates = self
@@ -1156,7 +1177,7 @@ impl SkillRuntime {
             .collect::<Vec<_>>();
 
         if candidates.is_empty() {
-            return None;
+            return SkillSelection::default();
         }
         candidates.sort_by(|a, b| {
             let a_always = a.0.mode == SkillActivationMode::Always;
@@ -1168,24 +1189,41 @@ impl SkillRuntime {
         });
 
         let max_selected = settings.max_selected.max(1);
-        let mut selected = candidates
+        let selected = candidates
             .into_iter()
             .take(max_selected)
+            .map(|(skill, score)| SelectedSkill {
+                id: skill.id.clone(),
+                mode: skill.mode,
+                score,
+                name: skill.name.clone(),
+                description: skill.description.clone(),
+                tags: skill.tags.clone(),
+                content: skill.content.clone(),
+            })
             .collect::<Vec<_>>();
-        if selected.is_empty() {
+
+        SkillSelection { skills: selected }
+    }
+
+    pub fn render_system_prompt(
+        selection: &SkillSelection,
+        max_prompt_chars: usize,
+    ) -> Option<String> {
+        if selection.skills.is_empty() {
             return None;
         }
 
         let mut out = String::from(
             "SKILLS_CONTEXT:\nFollow these installed skill instructions when they are relevant to the user request.\n",
         );
-        let mut budget = settings.max_prompt_chars.max(256);
+        let mut budget = max_prompt_chars.max(256);
         if out.chars().count() >= budget {
             return None;
         }
         budget -= out.chars().count();
 
-        for (idx, (skill, score)) in selected.drain(..).enumerate() {
+        for (idx, skill) in selection.skills.iter().enumerate() {
             if budget < 64 {
                 break;
             }
@@ -1195,7 +1233,7 @@ impl SkillRuntime {
                 n = idx + 1,
                 id = skill.id,
                 mode = skill.mode,
-                score = score,
+                score = skill.score,
                 name = skill.name,
                 description = skill.description,
                 tags = skill.tags.join(","),
