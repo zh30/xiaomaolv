@@ -109,6 +109,50 @@ async fn service_output_verification_revises_once_before_persisting() {
 }
 
 #[tokio::test]
+async fn service_output_verification_blocks_invalid_non_streaming_reply_before_persisting() {
+    let store = SqliteMemoryStore::new("sqlite::memory:")
+        .await
+        .expect("store");
+    let service = MessageService::new(Arc::new(FakeProvider), store.clone(), 20)
+        .with_harness_config(&AgentHarnessConfig {
+            output_verification_mode: OutputVerificationMode::Block,
+            output_verification_llm_enabled: false,
+            ..Default::default()
+        })
+        .with_agent_swarm(AgentSwarmSettings {
+            enabled: false,
+            ..Default::default()
+        });
+
+    let out = service
+        .handle(IncomingMessage {
+            channel: "http".to_string(),
+            session_id: "session-output-block".to_string(),
+            user_id: "u1".to_string(),
+            text: r#"{"server":"s","tool":"t","arguments":{}}"#.to_string(),
+            reply_target: None,
+        })
+        .await
+        .expect("handle message");
+
+    assert_eq!(
+        out.text,
+        "I could not produce a reliable final answer from the available tool results."
+    );
+
+    let history = store
+        .load_recent("session-output-block", 10)
+        .await
+        .expect("history");
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[1].content, out.text);
+    assert_ne!(
+        history[1].content,
+        r#"echo:{"server":"s","tool":"t","arguments":{}}"#
+    );
+}
+
+#[tokio::test]
 async fn service_output_verification_without_llm_uses_deterministic_revision() {
     let provider = Arc::new(OutputRevisionProvider::default());
     let store = SqliteMemoryStore::new("sqlite::memory:")

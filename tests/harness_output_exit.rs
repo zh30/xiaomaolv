@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use xiaomaolv::config::OutputVerificationMode;
@@ -28,6 +28,20 @@ impl ChatProvider for EchoProvider {
         let text = self.complete(req).await?;
         sink.on_delta(&text).await?;
         Ok(text)
+    }
+}
+
+#[derive(Default)]
+struct InvalidRevisionProvider {
+    calls: Mutex<usize>,
+}
+
+#[async_trait]
+impl ChatProvider for InvalidRevisionProvider {
+    async fn complete(&self, _req: CompletionRequest) -> anyhow::Result<String> {
+        let mut calls = self.calls.lock().expect("revision provider call mutex");
+        *calls = (*calls).saturating_add(1);
+        Ok(r#"{"server":"demo","tool":"search","arguments":{}}"#.to_string())
     }
 }
 
@@ -71,4 +85,43 @@ async fn output_exit_blocks_hidden_tool_error() {
     assert!(result.verified);
     assert!(result.blocked_or_revised);
     assert_eq!(result.issue_codes, vec!["HIDDEN_TOOL_ERROR".to_string()]);
+}
+
+#[tokio::test]
+async fn output_exit_revise_once_returns_fallback_after_failed_reverification() {
+    let provider = Arc::new(InvalidRevisionProvider::default());
+    let exit = OutputExit::new(
+        provider.clone(),
+        Some(xiaomaolv::harness::verifier::DeterministicOutputVerifier::new()),
+        OutputVerificationMode::ReviseOnce,
+        true,
+        6000,
+        2000,
+    );
+
+    let result = exit
+        .finalize(OutputExitRequest {
+            history: &[StoredMessage {
+                role: MessageRole::User,
+                content: "answer directly".to_string(),
+            }],
+            channel: "http",
+            final_answer: r#"{"server":"demo","tool":"search","arguments":{}}"#.to_string(),
+            tool_calls: &[],
+            required_format: None,
+        })
+        .await
+        .expect("finalize");
+
+    assert_eq!(
+        result.text,
+        "I could not produce a reliable final answer from the available tool results."
+    );
+    assert!(result.verified);
+    assert!(result.blocked_or_revised);
+    assert_eq!(result.issue_codes, vec!["UNRESOLVED_TOOL_CALL".to_string()]);
+    assert_eq!(
+        *provider.calls.lock().expect("revision provider call mutex"),
+        1
+    );
 }
