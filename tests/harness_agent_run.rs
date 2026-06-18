@@ -1,15 +1,16 @@
 use prometheus::Registry;
 use xiaomaolv::harness::observability::TrajectoryMetrics;
 use xiaomaolv::harness::run::{AgentRun, AgentRunExit, AgentRunStart};
+use xiaomaolv::harness::store::SqliteHarnessStore;
 use xiaomaolv::harness::trajectory::ToolCallRecord;
-use xiaomaolv::memory::{SqliteMemoryBackend, SqliteMemoryStore};
+use xiaomaolv::memory::SqliteMemoryStore;
 
 #[tokio::test]
 async fn agent_run_finishes_once_and_records_tool_call() {
     let store = SqliteMemoryStore::new("sqlite::memory:")
         .await
         .expect("store");
-    let backend = std::sync::Arc::new(SqliteMemoryBackend::new(store.clone()));
+    let backend = std::sync::Arc::new(SqliteHarnessStore::new(store.clone()));
     let logger = xiaomaolv::harness::trajectory::TrajectoryLogger::new(backend, true);
     let metrics = TrajectoryMetrics::new(&Registry::new());
 

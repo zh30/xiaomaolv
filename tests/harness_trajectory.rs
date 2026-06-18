@@ -1,15 +1,16 @@
+use xiaomaolv::harness::store::SqliteHarnessStore;
 use xiaomaolv::harness::trajectory::{
     MAX_TRAJECTORY_QUERY_LIMIT, ToolCallRecord, TrajectoryExitReason, TrajectoryFilter,
     TrajectoryLogger, new_trajectory_id,
 };
-use xiaomaolv::memory::{SqliteMemoryBackend, SqliteMemoryStore};
+use xiaomaolv::memory::SqliteMemoryStore;
 
 #[tokio::test]
 async fn test_trajectory_records_tool_calls() {
     let store = SqliteMemoryStore::new("sqlite::memory:")
         .await
         .expect("init store");
-    let backend = SqliteMemoryBackend::new(store.clone());
+    let backend = SqliteHarnessStore::new(store.clone());
     let logger = TrajectoryLogger::new(Arc::new(backend), true);
 
     let trajectory_id = new_trajectory_id();
@@ -75,7 +76,7 @@ async fn test_trajectory_captures_final_answer() {
     let store = SqliteMemoryStore::new("sqlite::memory:")
         .await
         .expect("init store");
-    let backend = SqliteMemoryBackend::new(store.clone());
+    let backend = SqliteHarnessStore::new(store.clone());
     let logger = TrajectoryLogger::new(Arc::new(backend), true);
 
     let trajectory_id = new_trajectory_id();
@@ -161,7 +162,7 @@ async fn test_trajectory_filter_by_session() {
     let store = SqliteMemoryStore::new("sqlite::memory:")
         .await
         .expect("init store");
-    let backend = SqliteMemoryBackend::new(store.clone());
+    let backend = SqliteHarnessStore::new(store.clone());
     let logger = TrajectoryLogger::new(Arc::new(backend), true);
 
     // Create trajectories for different sessions
@@ -303,7 +304,7 @@ async fn test_trajectory_preserves_repeated_same_tool_calls() {
     let store = SqliteMemoryStore::new("sqlite::memory:")
         .await
         .expect("init store");
-    let backend = SqliteMemoryBackend::new(store.clone());
+    let backend = SqliteHarnessStore::new(store.clone());
     let logger = TrajectoryLogger::new(Arc::new(backend), true);
 
     let trajectory_id = new_trajectory_id();
@@ -373,7 +374,7 @@ async fn test_trajectory_query_clamps_limit_and_filters_tool_errors() {
     let store = SqliteMemoryStore::new("sqlite::memory:")
         .await
         .expect("init store");
-    let backend = SqliteMemoryBackend::new(store.clone());
+    let backend = SqliteHarnessStore::new(store.clone());
     let logger = TrajectoryLogger::new(Arc::new(backend), true);
 
     for idx in 0..(MAX_TRAJECTORY_QUERY_LIMIT + 5) {
@@ -467,7 +468,7 @@ async fn test_trajectory_disabled_logger_does_nothing() {
     let store = SqliteMemoryStore::new("sqlite::memory:")
         .await
         .expect("init store");
-    let backend = SqliteMemoryBackend::new(store.clone());
+    let backend = SqliteHarnessStore::new(store.clone());
 
     // Create logger with disabled=true but it won't do anything
     let logger = TrajectoryLogger::new(Arc::new(backend), false);

@@ -25,6 +25,7 @@ use crate::code_mode::LlmCodeModePlanner;
 use crate::config::AppConfig;
 use crate::domain::IncomingMessage;
 use crate::harness::observability::TrajectoryMetrics;
+use crate::harness::store::SqliteHarnessStore;
 use crate::mcp::{McpConfigPaths, McpRegistry, McpRuntime};
 use crate::memory::{
     HybridRetrievalOptions, HybridSqliteZvecMemoryBackend, MemoryBackend, SqliteMemoryBackend,
@@ -542,6 +543,7 @@ async fn build_runtime_handles(
     let mcp_runtime = Arc::new(RwLock::new(load_mcp_runtime().await));
     let skills_runtime = Arc::new(RwLock::new(load_skill_runtime().await));
     let code_mode_planner = Arc::new(LlmCodeModePlanner::new(provider.clone()));
+    let harness_store = Arc::new(SqliteHarnessStore::new(memory_store.clone()));
     let trajectory_metrics =
         if config.agent.harness.enable_trajectory || config.agent.harness.enable_verification {
             let registry = Registry::new();
@@ -562,6 +564,7 @@ async fn build_runtime_handles(
         config.memory.max_semantic_memories,
         config.memory.semantic_lookback_days,
     )
+    .with_harness_store(harness_store)
     .with_context_budget(
         config.memory.context_window_tokens,
         config.memory.context_reserved_tokens,

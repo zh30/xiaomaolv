@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 use xiaomaolv::config::{AgentHarnessConfig, ToolVerificationMode};
 use xiaomaolv::domain::IncomingMessage;
+use xiaomaolv::harness::store::SqliteHarnessStore;
 use xiaomaolv::harness::trajectory::{TrajectoryExitReason, TrajectoryFilter};
 use xiaomaolv::mcp::{BUILTIN_MCP_SERVER_NAME, BUILTIN_MCP_TOOL_CURRENT_TIME, McpRuntime};
 use xiaomaolv::memory::{MemoryBackend, SqliteMemoryBackend, SqliteMemoryStore};
@@ -67,7 +68,8 @@ async fn service_with_verification(
     mode: ToolVerificationMode,
 ) -> anyhow::Result<MessageService> {
     let store = SqliteMemoryStore::new("sqlite::memory:").await?;
-    let backend: Arc<dyn MemoryBackend> = Arc::new(SqliteMemoryBackend::new(store));
+    let backend: Arc<dyn MemoryBackend> = Arc::new(SqliteMemoryBackend::new(store.clone()));
+    let harness_store = Arc::new(SqliteHarnessStore::new(store));
     let runtime = Arc::new(RwLock::new(McpRuntime::new(HashMap::new())));
 
     Ok(MessageService::new_with_backend(
@@ -87,6 +89,7 @@ async fn service_with_verification(
         enabled: false,
         ..Default::default()
     })
+    .with_harness_store(harness_store)
     .with_harness_config(&AgentHarnessConfig {
         enable_trajectory: true,
         enable_verification: true,

@@ -1,10 +1,12 @@
 use std::sync::Arc;
 
+use tokio::sync::RwLock;
 use xiaomaolv::config::{AgentHarnessConfig, OutputVerificationMode};
 use xiaomaolv::domain::{IncomingMessage, MessageRole};
-use xiaomaolv::memory::SqliteMemoryStore;
+use xiaomaolv::mcp::McpRuntime;
+use xiaomaolv::memory::{MemoryBackend, SqliteMemoryBackend, SqliteMemoryStore};
 use xiaomaolv::provider::{ChatProvider, CompletionRequest, StreamSink};
-use xiaomaolv::service::{AgentSwarmSettings, MessageService};
+use xiaomaolv::service::{AgentMcpSettings, AgentSwarmSettings, MessageService};
 
 struct FakeStreamingProvider;
 
@@ -63,6 +65,23 @@ impl ChatProvider for HiddenToolCallStreamingProvider {
         let text = r#"{"server":"demo","tool":"search","arguments":{}}"#;
         sink.on_delta(text).await?;
         Ok(text.to_string())
+    }
+}
+
+struct UnexpectedProvider;
+
+#[async_trait::async_trait]
+impl ChatProvider for UnexpectedProvider {
+    async fn complete(&self, _req: CompletionRequest) -> anyhow::Result<String> {
+        anyhow::bail!("provider should not be called")
+    }
+
+    async fn complete_stream(
+        &self,
+        _req: CompletionRequest,
+        _sink: &mut dyn StreamSink,
+    ) -> anyhow::Result<String> {
+        anyhow::bail!("provider should not be called")
     }
 }
 
@@ -182,4 +201,56 @@ async fn service_streaming_verifies_plain_reply_before_delivery_when_output_exit
     assert_eq!(history.len(), 2);
     assert_eq!(history[1].role, MessageRole::Assistant);
     assert_eq!(history[1].content, expected);
+}
+
+#[tokio::test]
+async fn service_streaming_verifies_time_fast_path_before_delivery_when_output_exit_enabled() {
+    let store = SqliteMemoryStore::new("sqlite::memory:")
+        .await
+        .expect("store");
+    let backend: Arc<dyn MemoryBackend> = Arc::new(SqliteMemoryBackend::new(store.clone()));
+    let runtime = Arc::new(RwLock::new(McpRuntime::default()));
+    let service = MessageService::new_with_backend(
+        Arc::new(UnexpectedProvider),
+        backend,
+        Some(runtime),
+        AgentMcpSettings {
+            enabled: true,
+            max_iterations: 1,
+            max_tool_result_chars: 4000,
+        },
+        20,
+        0,
+        0,
+    )
+    .with_harness_config(&AgentHarnessConfig {
+        output_verification_mode: OutputVerificationMode::Block,
+        ..Default::default()
+    });
+    let mut sink = CollectSink::default();
+
+    let out = service
+        .handle_stream(
+            IncomingMessage {
+                channel: "telegram".to_string(),
+                session_id: "tg:stream:time-fast-path-verify".to_string(),
+                user_id: "u-stream".to_string(),
+                text: "现在几点？".to_string(),
+                reply_target: None,
+            },
+            &mut sink,
+        )
+        .await
+        .expect("streamed message");
+
+    assert!(!out.text.trim().is_empty());
+    assert_eq!(sink.chunks, vec![out.text.clone()]);
+
+    let history = store
+        .load_recent("tg:stream:time-fast-path-verify", 10)
+        .await
+        .expect("history");
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[1].role, MessageRole::Assistant);
+    assert_eq!(history[1].content, out.text);
 }

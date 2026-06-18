@@ -1,5 +1,6 @@
 use prometheus::Registry;
 use xiaomaolv::harness::observability::TrajectoryMetrics;
+use xiaomaolv::harness::store::SqliteHarnessStore;
 use xiaomaolv::harness::trajectory::{
     ToolCallRecord, TrajectoryExitReason, TrajectoryFilter, TrajectoryLogger, new_trajectory_id,
 };
@@ -10,7 +11,7 @@ async fn test_trajectory_endpoint_returns_results() {
     let store = SqliteMemoryStore::new("sqlite::memory:")
         .await
         .expect("init store");
-    let backend = SqliteMemoryBackend::new(store.clone());
+    let backend = SqliteHarnessStore::new(store.clone());
     let logger = TrajectoryLogger::new(std::sync::Arc::new(backend), true);
 
     let trajectory_id = new_trajectory_id();

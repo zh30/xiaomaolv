@@ -9,6 +9,7 @@ use xiaomaolv::code_mode::{
 };
 use xiaomaolv::config::AgentHarnessConfig;
 use xiaomaolv::domain::{IncomingMessage, StoredMessage};
+use xiaomaolv::harness::store::{HarnessStore, SqliteHarnessStore};
 use xiaomaolv::harness::trajectory::{
     ToolCallRecord, TrajectoryExitReason, TrajectoryFilter, TrajectoryLogger, TrajectoryRecord,
 };
@@ -16,9 +17,11 @@ use xiaomaolv::mcp::{
     BUILTIN_MCP_SERVER_NAME, BUILTIN_MCP_TOOL_CURRENT_TIME, McpRuntime, McpToolInfo,
 };
 use xiaomaolv::memory::{
-    MemoryBackend, MemoryContextRequest, MemoryWriteRequest, SqliteMemoryBackend, SqliteMemoryStore,
+    CompactionSummaryLoadRequest, CompactionSummaryRecord, CompactionSummaryUpsertRequest,
+    MemoryBackend, MemoryContextRequest, MemoryWriteRequest, SqliteMemoryBackend,
+    SqliteMemoryStore,
 };
-use xiaomaolv::provider::{ChatProvider, CompletionRequest};
+use xiaomaolv::provider::{ChatProvider, CompletionRequest, StreamSink};
 use xiaomaolv::service::{AgentMcpSettings, AgentSwarmSettings, MessageService};
 
 struct FailingProvider;
@@ -171,17 +174,85 @@ impl MemoryBackend for CountingMemoryBackend {
     }
 }
 
+#[async_trait]
+impl HarnessStore for CountingMemoryBackend {
+    async fn start_trajectory(
+        &self,
+        trajectory_id: &str,
+        session_id: &str,
+        channel: &str,
+        user_id: &str,
+        model: &str,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .start_trajectory(trajectory_id, session_id, channel, user_id, model)
+            .await
+    }
+
+    async fn insert_trajectory_tool_call(
+        &self,
+        trajectory_id: &str,
+        record: ToolCallRecord,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .insert_trajectory_tool_call(trajectory_id, record)
+            .await
+    }
+
+    async fn finish_trajectory(
+        &self,
+        trajectory_id: &str,
+        final_answer: Option<String>,
+        exit_reason: TrajectoryExitReason,
+    ) -> anyhow::Result<()> {
+        self.finish_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .finish_trajectory(trajectory_id, final_answer, exit_reason)
+            .await
+    }
+
+    async fn get_trajectory(
+        &self,
+        trajectory_id: &str,
+    ) -> anyhow::Result<Option<TrajectoryRecord>> {
+        self.inner.get_trajectory(trajectory_id).await
+    }
+
+    async fn query_trajectories(
+        &self,
+        filter: TrajectoryFilter,
+    ) -> anyhow::Result<Vec<TrajectoryRecord>> {
+        self.inner.query_trajectories(filter).await
+    }
+
+    async fn load_compaction_summary(
+        &self,
+        req: CompactionSummaryLoadRequest,
+    ) -> anyhow::Result<Option<CompactionSummaryRecord>> {
+        self.inner.load_compaction_summary(req).await
+    }
+
+    async fn upsert_compaction_summary(
+        &self,
+        req: CompactionSummaryUpsertRequest,
+    ) -> anyhow::Result<()> {
+        self.inner.upsert_compaction_summary(req).await
+    }
+}
+
 async fn service_with_provider(
     provider: Arc<dyn ChatProvider>,
     agent_mcp: AgentMcpSettings,
 ) -> anyhow::Result<MessageService> {
     let store = SqliteMemoryStore::new("sqlite::memory:").await?;
-    let backend: Arc<dyn MemoryBackend> = Arc::new(SqliteMemoryBackend::new(store));
+    let backend: Arc<dyn MemoryBackend> = Arc::new(SqliteMemoryBackend::new(store.clone()));
+    let harness_store = Arc::new(SqliteHarnessStore::new(store));
     let runtime = Arc::new(RwLock::new(McpRuntime::new(HashMap::new())));
-    let logger = TrajectoryLogger::new(backend.clone(), true);
+    let logger = TrajectoryLogger::new(harness_store.clone(), true);
 
     Ok(
         MessageService::new_with_backend(provider, backend, Some(runtime), agent_mcp, 20, 0, 0)
+            .with_harness_store(harness_store)
             .with_trajectory_logger(logger)
             .with_agent_swarm(AgentSwarmSettings {
                 enabled: false,
@@ -197,6 +268,15 @@ fn incoming(session_id: &str) -> IncomingMessage {
         user_id: "user-1".to_string(),
         text: "please use the agent harness".to_string(),
         reply_target: None,
+    }
+}
+
+struct FailingSink;
+
+#[async_trait]
+impl StreamSink for FailingSink {
+    async fn on_delta(&mut self, _delta: &str) -> anyhow::Result<()> {
+        anyhow::bail!("sink delivery failed")
     }
 }
 
@@ -304,6 +384,53 @@ async fn code_mode_direct_success_records_finished_trajectory_and_tool_call() {
     assert!(call.ok);
     assert_eq!(call.duration_ms, 0);
     assert_eq!(call.iteration, 0);
+}
+
+#[tokio::test]
+async fn code_mode_stream_sink_failure_finishes_trajectory_as_internal_error() {
+    let service = service_with_provider(
+        Arc::new(AnswerProvider),
+        AgentMcpSettings {
+            enabled: true,
+            max_iterations: 1,
+            max_tool_result_chars: 4000,
+        },
+    )
+    .await
+    .expect("build service")
+    .with_agent_code_mode(AgentCodeModeSettings {
+        enabled: true,
+        shadow_mode: false,
+        ..Default::default()
+    })
+    .with_code_mode_planner(Arc::new(StaticPlanner));
+    let mut sink = FailingSink;
+
+    let err = service
+        .handle_stream(incoming("code-mode-stream-sink-failure"), &mut sink)
+        .await
+        .expect_err("sink should fail");
+    assert!(format!("{err:?}").contains("sink delivery failed"));
+
+    let trajectories = service
+        .query_trajectories(TrajectoryFilter {
+            session_id: Some("code-mode-stream-sink-failure".to_string()),
+            channel: Some("test".to_string()),
+            user_id: Some("user-1".to_string()),
+            exit_reason: None,
+            has_tool_errors: None,
+            limit: 10,
+        })
+        .await
+        .expect("query trajectories");
+
+    assert_eq!(trajectories.len(), 1);
+    assert!(matches!(
+        trajectories[0].exit_reason,
+        TrajectoryExitReason::InternalError
+    ));
+    assert_eq!(trajectories[0].final_answer, None);
+    assert_eq!(trajectories[0].tool_calls.len(), 1);
 }
 
 #[tokio::test]

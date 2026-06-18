@@ -27,6 +27,7 @@ use crate::harness::execution_environment::{
 use crate::harness::observability::TrajectoryMetrics;
 use crate::harness::output_exit::{OutputExit, OutputExitRequest};
 use crate::harness::run::{AgentRun, AgentRunExit, AgentRunStart};
+use crate::harness::store::{HarnessStore, SqliteHarnessStore};
 use crate::harness::tool_protocol::{
     ToolProposal, ToolProtocol, annotate_record_with_verification_failure,
     verification_failure_record, verification_feedback_message,
@@ -202,6 +203,7 @@ impl Default for AgentCompactionSettings {
 pub struct MessageService {
     provider: Arc<dyn ChatProvider>,
     memory: Arc<dyn MemoryBackend>,
+    harness_store: Option<Arc<dyn HarnessStore>>,
     mcp_runtime: Option<Arc<RwLock<McpRuntime>>>,
     code_mode_planner: Arc<dyn CodeModePlanner>,
     skills_runtime: Option<Arc<RwLock<SkillRuntime>>>,
@@ -259,6 +261,19 @@ impl CompletionOutcome {
         Self {
             text,
             output_verified: true,
+        }
+    }
+}
+
+enum CodeModeCompletion {
+    Finished(String),
+    PendingStream { text: String, run: AgentRun },
+}
+
+impl CodeModeCompletion {
+    fn into_text(self) -> String {
+        match self {
+            Self::Finished(text) | Self::PendingStream { text, .. } => text,
         }
     }
 }
@@ -347,15 +362,18 @@ impl MessageService {
         store: SqliteMemoryStore,
         max_history: usize,
     ) -> Self {
+        let memory: Arc<dyn MemoryBackend> = Arc::new(SqliteMemoryBackend::new(store.clone()));
+        let harness_store: Arc<dyn HarnessStore> = Arc::new(SqliteHarnessStore::new(store));
         Self::new_with_backend(
             provider,
-            Arc::new(SqliteMemoryBackend::new(store)),
+            memory,
             None,
             AgentMcpSettings::default(),
             max_history,
             0,
             0,
         )
+        .with_harness_store(harness_store)
     }
 
     pub fn new_with_backend(
@@ -370,6 +388,7 @@ impl MessageService {
         Self {
             provider,
             memory,
+            harness_store: None,
             mcp_runtime,
             code_mode_planner: Arc::new(DisabledCodeModePlanner),
             skills_runtime: None,
@@ -455,7 +474,13 @@ impl MessageService {
     }
 
     pub fn with_trajectory_logger(mut self, logger: TrajectoryLogger) -> Self {
+        self.harness_store = Some(logger.store());
         self.trajectory_logger = Some(logger);
+        self
+    }
+
+    pub fn with_harness_store(mut self, store: Arc<dyn HarnessStore>) -> Self {
+        self.harness_store = Some(store);
         self
     }
 
@@ -479,7 +504,11 @@ impl MessageService {
     pub fn with_harness_config(mut self, config: &AgentHarnessConfig) -> Self {
         // Set up trajectory logger if enabled
         if config.enable_trajectory {
-            self.trajectory_logger = Some(TrajectoryLogger::new(self.memory.clone(), true));
+            if let Some(store) = &self.harness_store {
+                self.trajectory_logger = Some(TrajectoryLogger::new(store.clone(), true));
+            } else {
+                warn!("trajectory logging requested but no harness store is configured");
+            }
         }
 
         // Set up compactor if enabled
@@ -834,6 +863,13 @@ impl MessageService {
             .context("failed to persist user message")?;
 
         if let Some(text) = self.try_answer_time_query_fast_path(&incoming.text).await {
+            let history = vec![StoredMessage {
+                role: MessageRole::User,
+                content: incoming.text.clone(),
+            }];
+            let text = self
+                .verify_final_answer(&history, &incoming.channel, text, &[])
+                .await?;
             self.persist_assistant_reply(&incoming, &text).await?;
             return Ok(OutgoingMessage {
                 channel: incoming.channel,
@@ -939,6 +975,13 @@ impl MessageService {
             .context("failed to persist user message")?;
 
         if let Some(text) = self.try_answer_time_query_fast_path(&incoming.text).await {
+            let history = vec![StoredMessage {
+                role: MessageRole::User,
+                content: incoming.text.clone(),
+            }];
+            let text = self
+                .verify_final_answer(&history, &incoming.channel, text, &[])
+                .await?;
             if !text.is_empty() {
                 sink.on_delta(&text).await?;
             }
@@ -1316,14 +1359,20 @@ impl MessageService {
         &self,
         trajectory_id: String,
     ) -> anyhow::Result<Option<crate::harness::trajectory::TrajectoryRecord>> {
-        self.memory.get_trajectory(&trajectory_id).await
+        let Some(store) = &self.harness_store else {
+            return Ok(None);
+        };
+        store.get_trajectory(&trajectory_id).await
     }
 
     pub async fn query_trajectories(
         &self,
         filter: crate::harness::trajectory::TrajectoryFilter,
     ) -> anyhow::Result<Vec<crate::harness::trajectory::TrajectoryRecord>> {
-        self.memory.query_trajectories(filter).await
+        let Some(store) = &self.harness_store else {
+            return Ok(Vec::new());
+        };
+        store.query_trajectories(filter).await
     }
 
     async fn try_swarm_reply(
@@ -2055,10 +2104,17 @@ impl MessageService {
         {
             let force_shadow = matches!(attempt, CodeModeAttempt::Probe);
             match self
-                .complete_with_code_mode(history.clone(), &tools, &runtime, force_shadow, incoming)
+                .complete_with_code_mode(
+                    history.clone(),
+                    &tools,
+                    &runtime,
+                    force_shadow,
+                    incoming,
+                    false,
+                )
                 .await
             {
-                Ok(Some(reply)) => return Ok(CompletionOutcome::verified(reply)),
+                Ok(Some(reply)) => return Ok(CompletionOutcome::verified(reply.into_text())),
                 Ok(None) => {}
                 Err(err) => {
                     warn!(error = %err, "code mode path failed, fallback to mcp json loop");
@@ -2106,12 +2162,27 @@ impl MessageService {
         {
             let force_shadow = matches!(attempt, CodeModeAttempt::Probe);
             match self
-                .complete_with_code_mode(history.clone(), &tools, &runtime, force_shadow, incoming)
+                .complete_with_code_mode(
+                    history.clone(),
+                    &tools,
+                    &runtime,
+                    force_shadow,
+                    incoming,
+                    true,
+                )
                 .await
             {
-                Ok(Some(reply)) => {
+                Ok(Some(CodeModeCompletion::PendingStream { text, mut run })) => {
+                    if let Err(err) = BufferedStreamSink::replay_text(&text, sink).await {
+                        run.finish(AgentRunExit::InternalError).await;
+                        return Err(err);
+                    }
+                    run.finish(AgentRunExit::FinalAnswer(text.clone())).await;
+                    return Ok(text);
+                }
+                Ok(Some(CodeModeCompletion::Finished(reply))) => {
                     if !reply.is_empty() {
-                        sink.on_delta(&reply).await?;
+                        BufferedStreamSink::replay_text(&reply, sink).await?;
                     }
                     return Ok(reply);
                 }
@@ -2174,7 +2245,8 @@ impl MessageService {
         runtime: &McpRuntime,
         force_shadow: bool,
         incoming: &IncomingMessage,
-    ) -> anyhow::Result<Option<String>> {
+        defer_success_finish: bool,
+    ) -> anyhow::Result<Option<CodeModeCompletion>> {
         let started_at = Instant::now();
         let planner = self.code_mode_planner.clone();
         let planner_name = planner.name();
@@ -2320,8 +2392,12 @@ impl MessageService {
             }
         };
         run.observe_iteration(0);
-        run.finish(AgentRunExit::FinalAnswer(reply.clone())).await;
-        Ok(Some(reply))
+        if defer_success_finish {
+            Ok(Some(CodeModeCompletion::PendingStream { text: reply, run }))
+        } else {
+            run.finish(AgentRunExit::FinalAnswer(reply.clone())).await;
+            Ok(Some(CodeModeCompletion::Finished(reply)))
+        }
     }
 
     async fn complete_with_mcp_loop(
@@ -2726,9 +2802,9 @@ impl MessageService {
                         }
                     };
                     telemetry.emit("final_answer");
+                    replay_text_or_finish_internal_error(&mut run, &resolved_reply, sink).await?;
                     run.finish(AgentRunExit::FinalAnswer(resolved_reply.clone()))
                         .await;
-                    BufferedStreamSink::replay_text(&resolved_reply, sink).await?;
                     return Ok(resolved_reply);
                 }
                 ToolProposal::ParseError(verification) => {
@@ -2796,9 +2872,9 @@ impl MessageService {
                         }
                     };
                     telemetry.emit("tool_error");
+                    replay_text_or_finish_internal_error(&mut run, &resolved_final, sink).await?;
                     run.finish(AgentRunExit::ToolError(resolved_final.clone()))
                         .await;
-                    BufferedStreamSink::replay_text(&resolved_final, sink).await?;
                     return Ok(resolved_final);
                 }
             };
@@ -2866,9 +2942,9 @@ impl MessageService {
                     }
                 };
                 telemetry.emit("tool_error");
+                replay_text_or_finish_internal_error(&mut run, &resolved_final, sink).await?;
                 run.finish(AgentRunExit::ToolError(resolved_final.clone()))
                     .await;
-                BufferedStreamSink::replay_text(&resolved_final, sink).await?;
                 return Ok(resolved_final);
             }
 
@@ -2970,9 +3046,10 @@ impl MessageService {
                             }
                         };
                         telemetry.emit("tool_error");
+                        replay_text_or_finish_internal_error(&mut run, &resolved_final, sink)
+                            .await?;
                         run.finish(AgentRunExit::ToolError(resolved_final.clone()))
                             .await;
-                        BufferedStreamSink::replay_text(&resolved_final, sink).await?;
                         return Ok(resolved_final);
                     }
                 }
@@ -3033,9 +3110,9 @@ impl MessageService {
             }
         };
         telemetry.emit("max_iterations");
+        replay_text_or_finish_internal_error(&mut run, &resolved_reply, sink).await?;
         run.finish(AgentRunExit::MaxIterations(resolved_reply.clone()))
             .await;
-        BufferedStreamSink::replay_text(&resolved_reply, sink).await?;
 
         Ok(resolved_reply)
     }
@@ -3505,6 +3582,18 @@ fn resolve_provider_stream_reply(
     } else {
         streamed_reply
     }
+}
+
+async fn replay_text_or_finish_internal_error(
+    run: &mut AgentRun,
+    text: &str,
+    sink: &mut dyn StreamSink,
+) -> anyhow::Result<()> {
+    if let Err(err) = BufferedStreamSink::replay_text(text, sink).await {
+        run.finish(AgentRunExit::InternalError).await;
+        return Err(err);
+    }
+    Ok(())
 }
 
 fn chunk_text_for_stream_replay(text: &str, max_chars: usize) -> Vec<String> {

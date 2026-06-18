@@ -6,6 +6,7 @@ use tempfile::tempdir;
 use tokio::sync::RwLock;
 use xiaomaolv::config::{AgentHarnessConfig, OutputVerificationMode, ToolVerificationMode};
 use xiaomaolv::domain::{IncomingMessage, MessageRole, StoredMessage};
+use xiaomaolv::harness::store::SqliteHarnessStore;
 use xiaomaolv::harness::trajectory::{TrajectoryExitReason, TrajectoryFilter, TrajectoryRecord};
 use xiaomaolv::mcp::{BUILTIN_MCP_SERVER_NAME, BUILTIN_MCP_TOOL_CURRENT_TIME, McpRuntime};
 use xiaomaolv::memory::{MemoryBackend, SqliteMemoryBackend, SqliteMemoryStore};
@@ -96,6 +97,7 @@ async fn fixture(
     let provider = Arc::new(EvalProvider::new(replies));
     let store = SqliteMemoryStore::new("sqlite::memory:").await?;
     let backend: Arc<dyn MemoryBackend> = Arc::new(SqliteMemoryBackend::new(store.clone()));
+    let harness_store = Arc::new(SqliteHarnessStore::new(store.clone()));
     let runtime = Arc::new(RwLock::new(McpRuntime::new(HashMap::new())));
     let service = MessageService::new_with_backend(
         provider.clone(),
@@ -110,6 +112,7 @@ async fn fixture(
         enabled: false,
         ..Default::default()
     })
+    .with_harness_store(harness_store)
     .with_harness_config(&harness);
     Ok(EvalFixture {
         service,
@@ -128,6 +131,7 @@ async fn fixture_with_skills(
     let provider = Arc::new(EvalProvider::new(replies));
     let store = SqliteMemoryStore::new("sqlite::memory:").await?;
     let backend: Arc<dyn MemoryBackend> = Arc::new(SqliteMemoryBackend::new(store.clone()));
+    let harness_store = Arc::new(SqliteHarnessStore::new(store.clone()));
     let runtime = Arc::new(RwLock::new(McpRuntime::new(HashMap::new())));
     let service = MessageService::new_with_backend(
         provider.clone(),
@@ -142,6 +146,7 @@ async fn fixture_with_skills(
         enabled: false,
         ..Default::default()
     })
+    .with_harness_store(harness_store)
     .with_harness_config(&harness)
     .with_agent_skills(
         Some(Arc::new(RwLock::new(skills_runtime))),
@@ -564,6 +569,7 @@ async fn eval_agent_run_internal_error_case_is_recorded() {
         .await
         .expect("store");
     let backend: Arc<dyn MemoryBackend> = Arc::new(SqliteMemoryBackend::new(store.clone()));
+    let harness_store = Arc::new(SqliteHarnessStore::new(store.clone()));
     let runtime = Arc::new(RwLock::new(McpRuntime::new(HashMap::new())));
     let service = MessageService::new_with_backend(
         Arc::new(ErrorProvider),
@@ -578,6 +584,7 @@ async fn eval_agent_run_internal_error_case_is_recorded() {
         enabled: false,
         ..Default::default()
     })
+    .with_harness_store(harness_store)
     .with_harness_config(&AgentHarnessConfig {
         enable_trajectory: true,
         ..Default::default()

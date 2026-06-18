@@ -7,7 +7,8 @@ use tokio::sync::RwLock;
 use xiaomaolv::config::{AgentHarnessConfig, OutputVerificationMode};
 use xiaomaolv::domain::IncomingMessage;
 use xiaomaolv::harness::observability::TrajectoryMetrics;
-use xiaomaolv::harness::trajectory::TrajectoryFilter;
+use xiaomaolv::harness::store::SqliteHarnessStore;
+use xiaomaolv::harness::trajectory::{TrajectoryExitReason, TrajectoryFilter};
 use xiaomaolv::mcp::McpRuntime;
 use xiaomaolv::memory::{MemoryBackend, SqliteMemoryBackend, SqliteMemoryStore};
 use xiaomaolv::provider::{ChatProvider, CompletionRequest, StreamSink};
@@ -64,7 +65,8 @@ async fn service_with_harness(
     harness: AgentHarnessConfig,
 ) -> anyhow::Result<MessageService> {
     let store = SqliteMemoryStore::new("sqlite::memory:").await?;
-    let backend: Arc<dyn MemoryBackend> = Arc::new(SqliteMemoryBackend::new(store));
+    let backend: Arc<dyn MemoryBackend> = Arc::new(SqliteMemoryBackend::new(store.clone()));
+    let harness_store = Arc::new(SqliteHarnessStore::new(store));
     let runtime = Arc::new(RwLock::new(McpRuntime::new(HashMap::new())));
     Ok(MessageService::new_with_backend(
         provider,
@@ -83,6 +85,7 @@ async fn service_with_harness(
         enabled: false,
         ..Default::default()
     })
+    .with_harness_store(harness_store)
     .with_harness_config(&harness))
 }
 
@@ -112,6 +115,15 @@ impl StreamSink for CollectSink {
     async fn on_delta(&mut self, delta: &str) -> anyhow::Result<()> {
         self.chunks.push(delta.to_string());
         Ok(())
+    }
+}
+
+struct FailingSink;
+
+#[async_trait]
+impl StreamSink for FailingSink {
+    async fn on_delta(&mut self, _delta: &str) -> anyhow::Result<()> {
+        anyhow::bail!("sink delivery failed")
     }
 }
 
@@ -322,4 +334,43 @@ async fn streaming_mcp_loop_rejects_unknown_tool_before_runtime_call() {
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
     assert!(requests[1].contains("UNKNOWN_TOOL"));
+}
+
+#[tokio::test]
+async fn streaming_mcp_loop_sink_failure_finishes_trajectory_as_internal_error() {
+    let provider = Arc::new(SequenceProvider::new(vec!["stream final before sink"]));
+    let service = service_with_harness(
+        provider,
+        AgentHarnessConfig {
+            enable_trajectory: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("service");
+    let mut sink = FailingSink;
+
+    let err = service
+        .handle_stream(incoming("mcp-stream-sink-failure"), &mut sink)
+        .await
+        .expect_err("sink should fail");
+    assert!(format!("{err:?}").contains("sink delivery failed"));
+
+    let trajectories = service
+        .query_trajectories(TrajectoryFilter {
+            session_id: Some("mcp-stream-sink-failure".to_string()),
+            channel: Some("test".to_string()),
+            user_id: Some("user-1".to_string()),
+            exit_reason: None,
+            has_tool_errors: None,
+            limit: 10,
+        })
+        .await
+        .expect("query trajectories");
+    assert_eq!(trajectories.len(), 1);
+    assert!(matches!(
+        trajectories[0].exit_reason,
+        TrajectoryExitReason::InternalError
+    ));
+    assert_eq!(trajectories[0].final_answer, None);
 }

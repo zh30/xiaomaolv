@@ -5,7 +5,7 @@ use std::time::Instant;
 use tracing::warn;
 
 use crate::harness::observability::TrajectoryMetrics;
-use crate::memory::MemoryBackend;
+use crate::harness::store::HarnessStore;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallRecord {
@@ -90,13 +90,17 @@ pub fn clamp_trajectory_query_limit(limit: usize) -> usize {
 
 #[derive(Clone)]
 pub struct TrajectoryLogger {
-    memory: Arc<dyn MemoryBackend>,
+    store: Arc<dyn HarnessStore>,
     enabled: bool,
 }
 
 impl TrajectoryLogger {
-    pub fn new(memory: Arc<dyn MemoryBackend>, enabled: bool) -> Self {
-        Self { memory, enabled }
+    pub fn new(store: Arc<dyn HarnessStore>, enabled: bool) -> Self {
+        Self { store, enabled }
+    }
+
+    pub fn store(&self) -> Arc<dyn HarnessStore> {
+        self.store.clone()
     }
 
     pub async fn start_trajectory(
@@ -110,7 +114,7 @@ impl TrajectoryLogger {
         if !self.enabled {
             return Ok(());
         }
-        self.memory
+        self.store
             .start_trajectory(trajectory_id, session_id, channel, user_id, model)
             .await
     }
@@ -123,7 +127,7 @@ impl TrajectoryLogger {
         if !self.enabled {
             return Ok(());
         }
-        self.memory
+        self.store
             .insert_trajectory_tool_call(trajectory_id, record)
             .await
     }
@@ -137,7 +141,7 @@ impl TrajectoryLogger {
         if !self.enabled {
             return Ok(());
         }
-        self.memory
+        self.store
             .finish_trajectory(trajectory_id, final_answer, exit_reason)
             .await
     }
@@ -146,7 +150,7 @@ impl TrajectoryLogger {
         &self,
         filter: TrajectoryFilter,
     ) -> anyhow::Result<Vec<TrajectoryRecord>> {
-        self.memory.query_trajectories(filter).await
+        self.store.query_trajectories(filter).await
     }
 }
 
