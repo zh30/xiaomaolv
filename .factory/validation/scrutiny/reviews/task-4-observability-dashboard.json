@@ -1,22 +1,16 @@
 {
   "featureId": "task-4-observability-dashboard",
-  "reviewedAt": "2026-03-24T12:00:00Z",
-  "commitId": "5c9ddca",
+  "reviewedAt": "2026-03-24T12:30:00Z",
+  "commitId": "5ba19e6",
   "transcriptSkeletonReviewed": false,
   "diffReviewed": true,
-  "status": "fail",
+  "status": "pass",
   "codeReview": {
-    "summary": "Implementation adds Prometheus metrics and HTTP endpoints for trajectory analysis. However, there is a critical bug in metric naming: some metrics use both a 'xiaomaolv_' prefix in the name AND a 'namespace(\"xiaomaolv\")' call, which results in double-prefixed names like 'xiaomaolv_xiaomaolv_tool_calls_total'. Tests do not validate actual metric names from the registry.",
+    "summary": "Fix adequately addresses the blocking issues from the prior review. Metric naming bug is fixed - 'tool_calls_total' and 'tool_call_duration_seconds' now correctly use namespace('xiaomaolv') without duplicate 'xiaomaolv_' prefix in the name, producing proper metric names 'xiaomaolv_tool_calls_total' and 'xiaomaolv_tool_call_duration_seconds'. TrajectoryMetrics is properly integrated into MessageService via builder pattern with with_trajectory_metrics(), and record_tool_call() is invoked in all 4 MCP tool execution paths. Non-blocking issues from prior review remain (unused underscore parameters, naming inconsistency across metrics).",
     "issues": [
       {
         "file": "src/harness/observability.rs",
-        "line": 36-43",
-        "severity": "blocking",
-        "description": "Metric naming bug: `tool_calls_total` uses both name 'xiaomaolv_tool_calls_total' AND namespace('xiaomaolv'). The prometheus crate namespace prepends 'xiaomaolv_' to the name, resulting in 'xiaomaolv_xiaomaolv_tool_calls_total'. Same issue at line 63 for 'tool_call_duration_seconds'. Should either remove 'xiaomaolv_' prefix from name when using namespace, or remove namespace when name already has prefix."
-      },
-      {
-        "file": "src/harness/observability.rs",
-        "line": 110",
+        "line": 110,
         "severity": "non_blocking",
         "description": "record_trajectory takes '_tool_calls: usize' parameter that is never used. The parameter is documented but not utilized - just prefixed with underscore."
       },
@@ -30,13 +24,7 @@
         "file": "src/harness/observability.rs",
         "line": 29-68",
         "severity": "non_blocking",
-        "description": "Inconsistent metric naming: some metrics (trajectories_total, avg_iterations_per_trajectory, trajectory_duration_seconds) use just 'xiaomaolv_' prefix without namespace, while others (tool_calls_total, tool_call_duration_seconds) use both prefix and namespace. This inconsistency makes metrics harder to discover and query in Prometheus."
-      },
-      {
-        "file": "tests/harness_observability.rs",
-        "line": 1-172",
-        "severity": "non_blocking",
-        "description": "Tests do not validate actual metric names registered in the Prometheus Registry. Tests only check counter values and gauge values, not the string metric names. The double-prefix bug would not be caught by these tests."
+        "description": "Inconsistent metric naming: some metrics (trajectories_total, avg_iterations_per_trajectory, trajectory_duration_seconds) use just 'xiaomaolv_' prefix without namespace, while others (tool_calls_total, tool_call_duration_seconds) use both prefix and namespace. This inconsistency makes metrics harder to discover and query in Prometheus. Note: The fix corrected the broken metrics but the remaining inconsistency persists."
       }
     ]
   },
@@ -48,8 +36,8 @@
     },
     {
       "area": "conventions",
-      "observation": "TrajectoryMetrics::new() registers metrics but the Registry is created locally in tests and not exposed via application state. There is no integration point where production code would create and store TrajectoryMetrics for actual use.",
-      "evidence": "src/harness/observability.rs creates metrics but they are not wired into Service or AppState"
+      "observation": "TrajectoryMetrics integration via with_trajectory_metrics() builder method has no corresponding config.toml section. Compare to agent.code_mode which has [agent.code_mode] in config.",
+      "evidence": "config/xiaomaolv.example.toml has [agent] and [agent.code_mode] sections but no TrajectoryMetrics configuration"
     },
     {
       "area": "skills",
@@ -63,5 +51,5 @@
     }
   ],
   "addressesFailureFrom": null,
-  "summary": "Code quality review failed due to blocking metric naming bug. The prometheus namespace and name prefix are being combined incorrectly, resulting in 'xiaomaolv_xiaomaolv_' double prefixes on tool_calls_total and tool_call_duration_seconds metrics. Additionally, the TrajectoryMetrics struct is defined but not wired into the application state, so it cannot actually collect metrics in production. The feature appears incomplete - HTTP endpoints exist but the metrics infrastructure is not integrated into the service that would call it."
+  "summary": "Fix review passed. Both blocking issues from the prior review have been adequately addressed: (1) metric naming bug is fixed - no more double 'xiaomaolv_xiaomaolv_' prefix, (2) TrajectoryMetrics is properly integrated into MessageService via builder pattern and invoked in all MCP tool execution paths. Non-blocking issues (unused parameters, naming inconsistency) remain unchanged and do not block approval."
 }

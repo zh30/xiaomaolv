@@ -1,0 +1,44 @@
+{
+  "featureId": "task-5-configuration-schema",
+  "reviewedAt": "2026-03-24T13:00:00Z",
+  "commitId": "cbd0601",
+  "transcriptSkeletonReviewed": false,
+  "diffReviewed": true,
+  "status": "pass",
+  "codeReview": {
+    "summary": "Fix correctly addresses the blocking issue from prior review. The compaction_strategy field is now properly wired from AgentHarnessConfig into AgentCompactionSettings. AgentHarnessConfig struct is properly defined with serde defaults, and with_harness_config() builder method correctly applies trajectory, compaction, and verification settings based on config. The compaction strategy enum mapping (head_tail, age_based, budget_based) is correctly implemented.",
+    "issues": [
+      {
+        "file": "src/service.rs",
+        "line": 440-443",
+        "severity": "non_blocking",
+        "description": "AgeBased strategy uses hardcoded max_age_days=7 and BudgetBased uses hardcoded max_tokens=16000. These values are not configurable via AgentHarnessConfig. This appears intentional since TOML config only exposes head_tail options, but could be confusing if users expect all strategies to be configurable."
+      },
+      {
+        "file": "src/service.rs",
+        "line": 161-167",
+        "severity": "non_blocking",
+        "description": "AgentCompactionSettings stores head_count and tail_count both in the CompactionStrategy::HeadTail variant AND as separate struct fields. This is redundant but not incorrect - the strategy is used by compact_conversation while separate fields could theoretically be used for other purposes. The design could be simplified by removing the redundant fields."
+      }
+    ]
+  },
+  "sharedStateObservations": [
+    {
+      "area": "conventions",
+      "observation": "The harness module (src/harness/) is not documented in CLAUDE.md or AGENTS.md module tables. The harness module contains compactor.rs, observability.rs, trajectory.rs, and verifier.rs - all related to agent harness functionality (compaction, verification, trajectory logging). The module tables only show service.rs, http.rs, provider.rs, channel.rs, memory.rs, scheduler.rs, mcp.rs, skills.rs, code_mode.rs, config.rs, skills_commands.rs, mcp_commands.rs.",
+      "evidence": "CLAUDE.md line 42-57: Core Modules table does not mention harness module. AGENTS.md also does not document the harness module."
+    },
+    {
+      "area": "conventions",
+      "observation": "The [agent.harness] config section is documented in config/xiaomaolv.example.toml but not in CLAUDE.md or AGENTS.md configuration section. Compare to [agent.code_mode] which is documented in both the example config and CLAUDE.md.",
+      "evidence": "config/xiaomaolv.example.toml has [agent.harness] section with comments, but CLAUDE.md configuration section (lines 71+) does not describe agent.harness options."
+    },
+    {
+      "area": "knowledge",
+      "observation": "The docs/plans/2026-03-24-agent-harness-optimization.md exists and appears to be the source plan for features 4 and 5, but it's not linked or referenced in AGENTS.md. Workers may not know where to find feature requirements.",
+      "evidence": "docs/plans/ directory exists but AGENTS.md has no reference to planning documents"
+    }
+  ],
+  "addressesFailureFrom": null,
+  "summary": "Task 5 (Configuration Schema) passes code review. The fix (cbd0601) correctly wires compaction_strategy from AgentHarnessConfig to AgentCompactionSettings. The AgentHarnessConfig struct is properly implemented with serde defaults, and with_harness_config() correctly applies harness settings. Non-blocking issues include hardcoded values for AgeBased/BudgetBased strategies and redundant head_count/tail_count fields in AgentCompactionSettings. Missing documentation for harness module and [agent.harness] config section in CLAUDE.md."
+}
