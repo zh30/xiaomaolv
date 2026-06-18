@@ -2079,16 +2079,8 @@ impl MessageService {
     ) -> anyhow::Result<String> {
         let Some(runtime) = self.snapshot_mcp_runtime().await else {
             return self
-                .provider
-                .complete_stream(
-                    CompletionRequest {
-                        messages: history,
-                        ..Default::default()
-                    },
-                    sink,
-                )
-                .await
-                .context("provider stream completion failed");
+                .complete_plain_provider_stream(history, sink, incoming)
+                .await;
         };
         let tools = match runtime.list_tools(None).await {
             Ok(tools) => tools,
@@ -2098,31 +2090,15 @@ impl MessageService {
                     "failed to list mcp tools, fallback to plain stream completion"
                 );
                 return self
-                    .provider
-                    .complete_stream(
-                        CompletionRequest {
-                            messages: history,
-                            ..Default::default()
-                        },
-                        sink,
-                    )
-                    .await
-                    .context("provider stream completion failed");
+                    .complete_plain_provider_stream(history, sink, incoming)
+                    .await;
             }
         };
 
         if tools.is_empty() {
             return self
-                .provider
-                .complete_stream(
-                    CompletionRequest {
-                        messages: history,
-                        ..Default::default()
-                    },
-                    sink,
-                )
-                .await
-                .context("provider stream completion failed");
+                .complete_plain_provider_stream(history, sink, incoming)
+                .await;
         }
 
         if self.agent_code_mode.enabled
@@ -2148,6 +2124,47 @@ impl MessageService {
 
         self.complete_with_mcp_loop_stream(history, tools, runtime, sink, incoming)
             .await
+    }
+
+    async fn complete_plain_provider_stream(
+        &self,
+        history: Vec<StoredMessage>,
+        sink: &mut dyn StreamSink,
+        incoming: &IncomingMessage,
+    ) -> anyhow::Result<String> {
+        if matches!(self.output_verification_mode, OutputVerificationMode::Off) {
+            return self
+                .provider
+                .complete_stream(
+                    CompletionRequest {
+                        messages: history,
+                        ..Default::default()
+                    },
+                    sink,
+                )
+                .await
+                .context("provider stream completion failed");
+        }
+
+        let mut buffered_sink = BufferedStreamSink::default();
+        let reply = self
+            .provider
+            .complete_stream(
+                CompletionRequest {
+                    messages: history.clone(),
+                    ..Default::default()
+                },
+                &mut buffered_sink,
+            )
+            .await
+            .context("provider stream completion failed")?;
+        let resolved_reply = resolve_provider_stream_reply(reply, &buffered_sink);
+        let resolved_reply = self
+            .verify_final_answer(&history, &incoming.channel, resolved_reply, &[])
+            .await
+            .context("output verification failed")?;
+        BufferedStreamSink::replay_text(&resolved_reply, sink).await?;
+        Ok(resolved_reply)
     }
 
     async fn complete_with_code_mode(
@@ -3475,6 +3492,18 @@ impl BufferedStreamSink {
             }
         }
         Ok(())
+    }
+}
+
+fn resolve_provider_stream_reply(
+    provider_reply: String,
+    buffered_sink: &BufferedStreamSink,
+) -> String {
+    let streamed_reply = buffered_sink.rendered_text();
+    if streamed_reply.trim().is_empty() {
+        provider_reply
+    } else {
+        streamed_reply
     }
 }
 

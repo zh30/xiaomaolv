@@ -47,6 +47,25 @@ impl ChatProvider for SwarmToolLeakProvider {
     }
 }
 
+struct HiddenToolCallStreamingProvider;
+
+#[async_trait::async_trait]
+impl ChatProvider for HiddenToolCallStreamingProvider {
+    async fn complete(&self, _req: CompletionRequest) -> anyhow::Result<String> {
+        Ok(r#"{"server":"demo","tool":"search","arguments":{}}"#.to_string())
+    }
+
+    async fn complete_stream(
+        &self,
+        _req: CompletionRequest,
+        sink: &mut dyn StreamSink,
+    ) -> anyhow::Result<String> {
+        let text = r#"{"server":"demo","tool":"search","arguments":{}}"#;
+        sink.on_delta(text).await?;
+        Ok(text.to_string())
+    }
+}
+
 #[tokio::test]
 async fn service_streams_reply_and_persists_final_message() {
     let store = SqliteMemoryStore::new("sqlite::memory:")
@@ -122,4 +141,45 @@ async fn service_streaming_verifies_swarm_reply_before_delivery() {
         .await
         .expect("history");
     assert_eq!(history[1].content, out.text);
+}
+
+#[tokio::test]
+async fn service_streaming_verifies_plain_reply_before_delivery_when_output_exit_enabled() {
+    let store = SqliteMemoryStore::new("sqlite::memory:")
+        .await
+        .expect("store");
+    let service = MessageService::new(Arc::new(HiddenToolCallStreamingProvider), store.clone(), 20)
+        .with_harness_config(&AgentHarnessConfig {
+            output_verification_mode: OutputVerificationMode::Block,
+            ..Default::default()
+        });
+    let mut sink = CollectSink::default();
+
+    let out = service
+        .handle_stream(
+            IncomingMessage {
+                channel: "telegram".to_string(),
+                session_id: "tg:stream:plain-output-verify".to_string(),
+                user_id: "u-stream".to_string(),
+                text: "stream please".to_string(),
+                reply_target: None,
+            },
+            &mut sink,
+        )
+        .await
+        .expect("streamed message");
+
+    let expected =
+        "I could not produce a reliable final answer from the available tool results.".to_string();
+    assert_eq!(out.text, expected);
+    assert_eq!(sink.chunks, vec![expected.clone()]);
+    assert!(!sink.chunks.iter().any(|chunk| chunk.contains("\"server\"")));
+
+    let history = store
+        .load_recent("tg:stream:plain-output-verify", 10)
+        .await
+        .expect("history");
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[1].role, MessageRole::Assistant);
+    assert_eq!(history[1].content, expected);
 }
