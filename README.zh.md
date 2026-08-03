@@ -1,6 +1,7 @@
 # xiaomaolv (小毛驴)
 
-一个 Rust 实现的高性能 AI 网关。目标是让你只配置 Provider 和消息通道，就能快速跑起来。
+一个 Rust 实现的高性能 AI 网关与可恢复 Agent Harness。目标是让你只配置 Provider 和
+消息通道就能快速运行，并在显式启用后用安全、可审计的闭环持续演进。
 
 ## 目录
 
@@ -11,6 +12,7 @@
 - [配置速览](#config-overview)
 - [可选：启用混合记忆（SQLite + zvec sidecar）](#hybrid-memory)
 - [HTTP API](#http-api)
+- [Loop Engineering Harness](#loop-engineering)
 - [Skills 集成](#skills-integration)
 - [插件扩展（Provider / Channel）](#plugin-system)
 - [本地开发](#local-dev)
@@ -27,7 +29,8 @@
 - Telegram 流式回复（通过 `editMessageText` 增量更新）
 - Telegram 回复统一使用 `MarkdownV2` 渲染（支持加粗/斜体/代码/链接/列表/引用）
 - Telegram 启动在线状态（通过 `setMyShortDescription`，可配置）
-- Telegram `/` 命令：`/start`、`/help`、`/whoami`、`/mcp ...`、`/skills ...`（私聊管理员控制）
+- Telegram `/` 命令：`/start`、`/help`、`/whoami`、`/mcp ...`、`/skills ...`、
+  `/goal ...`、`/resume ...`（私聊管理员控制）
 - Telegram 群组支持：
   - `strict` 模式：仅在 `@bot_username` 或 reply-to-bot 时回复
   - `smart` 模式：基于上下文规则的 `Respond/ObserveOnly/Ignore` 决策
@@ -37,6 +40,8 @@
 - 记忆系统：`sqlite-only`（默认）和 `hybrid-sqlite-zvec`（可选）
 - 插件式扩展 API（Provider/Channel/Memory）
 - 自进化 Harness：轨迹反馈、有界 Prompt 候选、确定性影子评测、人工晋升、热激活与回滚
+- Durable Loop Engineering：`/goal`、`/resume`、审批绑定的 Dynamic Workflow DAG、
+  租约/检查点恢复、只读 Self-test、Session Replay 与 Desktop-ready HTTP/SSE
 
 <a id="quick-start"></a>
 ## 快速开始（推荐：MiniMax + Telegram）
@@ -62,8 +67,10 @@ cp .env.realtest.example .env.realtest
 
 - `MINIMAX_MODEL`（默认：`MiniMax-M2.5-highspeed`）
 - `XIAOMAOLV_APP_API_KEY`（设置后保护 HTTP API 和配置状态/保存接口）
+- `XIAOMAOLV_HARNESS_INGEST_API_KEY`（可选，仅用于外部 Loop Engineering Signal 写入）
 - `TELEGRAM_BOT_USERNAME`（不带 `@`，建议填写，用于群组@匹配）
-- `TELEGRAM_ADMIN_USER_IDS`（私聊访问 + `/mcp` + `/skills` 管理员用户 ID，逗号分隔，如 `123456789,987654321`）
+- `TELEGRAM_ADMIN_USER_IDS`（私聊访问及 `/mcp`、`/skills`、`/goal`、`/resume`
+  管理员用户 ID，逗号分隔，如 `123456789,987654321`）
 
 也可以先不填，直接启动后打开可视化配置页：`http://127.0.0.1:8080/setup`。如果稍后设置了 `XIAOMAOLV_APP_API_KEY`，配置页会先提示输入该密钥，再加载或保存配置状态。
 
@@ -99,10 +106,16 @@ curl -sS http://127.0.0.1:8080/v1/channels/telegram/mode
 
 如果你已经能跑通 MVP，下面这些文档按使用频率排列：
 
+- `docs/README.md`：当前文档地图与历史计划边界
 - `docs/development.md`：统一开发指南，包含本地开发、架构边界、测试选择与 PR checklist
 - `docs/real-test-minimax-telegram.md`：真实 MiniMax + Telegram 联调指南
 - `docs/zvec-sidecar.md`：zvec sidecar 协议、启动方式与兼容行为
+- `docs/mcp-integration.md`：MCP 安装、CLI、Runtime API 与 Replay 边界
+- `docs/code-mode-observability.md`：Code Mode 指标、告警与 provider-frame 数据边界
+- `docs/agent-harness-eval.md`：Message Harness、Prompt Evolution 与 Loop Engineering 专项测试
 - `docs/self-evolving-harness.md`：安全自进化闭环、配置、API 与运维手册
+- `docs/loop-engineering-harness.md`：持久 Goal 执行、恢复、多源 Signal、自维护、
+  Session Replay 与 Desktop read model
 - `docs/engineering-quality.md`：架构约束、质量门禁与性能基线
 - `config/xiaomaolv.minimax-telegram.toml`：MVP 推荐配置（可直接拷贝改值）
 - `config/xiaomaolv.example.toml`：通用模板（适合自定义 Provider/Channel）
@@ -160,7 +173,8 @@ curl -sS http://127.0.0.1:8080/v1/channels/telegram/mode
   - `commands_enabled = true|false`（是否启用 `/` 命令处理）
   - `commands_auto_register = true|false`（启动时是否自动注册 Telegram 命令菜单）
   - `commands_private_only = true|false`（为 true 时 `/mcp` 与 `/skills` 仅允许私聊）
-  - `admin_user_ids = "${TELEGRAM_ADMIN_USER_IDS:-}"`（私聊访问 + `/mcp` + `/skills` 白名单，推荐在 `.env.realtest` 配置）
+  - `admin_user_ids = "${TELEGRAM_ADMIN_USER_IDS:-}"`（私聊访问及 `/mcp`、`/skills`、
+    `/goal`、`/resume` 白名单，推荐在 `.env.realtest` 配置）
 - 记忆模式：
   - `backend = "sqlite-only"`（默认）
   - `backend = "hybrid-sqlite-zvec"`（可选）
@@ -193,6 +207,8 @@ curl -sS http://127.0.0.1:8080/v1/channels/telegram/mode
   - `harness.enable_verification = false`；`harness.verification_mode = "observe"`（`observe` 为被动记录，`retry|block` 会影响工具流/最终回答）
   - `harness.output_verification_mode = "off"`（`off|observe|revise_once|block`；`revise_once` 会执行一次有界改写）
   - `harness.evolution.enabled = false`（默认关闭；自动循环只生成候选并做影子评测，不会自动审批或激活）
+  - `harness.loop_engine.enabled = false`（默认关闭；后台 worker 需另行设置
+    `worker_enabled = true`；operator 路由使用 `app.api_key`，外部 Signal 使用独立 ingest key）
   - `code_mode.enabled = false`（默认关闭）
   - `code_mode.shadow_mode = true`（灰度模式，仅审计不接管结果）
   - `code_mode.max_calls = 6`
@@ -250,7 +266,14 @@ curl -sS http://127.0.0.1:8080/v1/channels/telegram/mode
 - `GET /v1/channels/{channel}/diag`（鉴权行为同 `/v1/messages`）
 - `POST /v1/channels/{channel}/inbound`（鉴权行为同 `/v1/messages`）
 - `POST /v1/channels/{channel}/inbound/{secret}`（鉴权行为同 `/v1/messages`）
+- `GET /v1/harness/trajectories` 与 `GET /v1/harness/trajectories/{id}`（Message Harness
+  trajectory 列表/详情；鉴权行为同 `/v1/messages`）
 - `/v1/harness/evolution/*`（状态、反馈、评测集、候选、循环、审计、激活与回滚；始终要求配置 app API key）
+- `/v1/harness/goals/*`、`/v1/harness/signals/*`、`/v1/harness/self-tests/*`、
+  `/v1/harness/self-test-runs/*`、`/v1/harness/trajectories/*/frames`、
+  `/v1/harness/trajectories/*/replay/structural`、`/v1/harness/artifacts/*`
+  （Durable Loop Engineering 与 Desktop-ready read model；除 scoped
+  `POST /v1/harness/signals` 外，均始终要求配置 `app.api_key`）
 
 示例：
 
@@ -276,6 +299,34 @@ curl http://127.0.0.1:8080/v1/code-mode/metrics \
 两个端点都受 `channels.http.diag_rate_limit_per_minute` 限流保护。
 
 Prometheus 抓取与告警示例见：`docs/code-mode-observability.md`。
+
+<a id="loop-engineering"></a>
+## Loop Engineering Harness
+
+Loop Engineering 默认关闭，并在 SQLite 中持久化以下层级：
+
+```text
+Goal -> 不可变 Workflow revision -> WorkItem DAG -> Attempt -> Checkpoint
+```
+
+规划不会直接执行。Operator 必须批准精确的 Goal revision 与 `plan_hash` 后才会派发；
+该 hash 同时绑定 Workflow、effect manifest、验收条件与执行预算。任务 claim 使用租约和
+fencing token；`/resume` 会过期失效租约，并在不重放 effect 的前提下对账已提交结果。
+
+Telegram 操作仅允许私聊管理员：
+
+```text
+/goal <目标>
+/goal approve <goal-id> <revision> <plan-hash>
+/resume <goal-id>
+```
+
+Worker 只接受已注册的安全 handler。本版本不开放 `external_write`、任意代码修改、部署、
+凭据变更或自动 Prompt 激活。Operator 最多只能把多源 Signal 转成 `proposed` Goal；生产 `core`
+Self-test 套件只读；Structural Session Replay 不执行实时工具。HTTP collection/detail 与
+每个 Goal 单调递增的 SSE event stream 是当前 Desktop contract，本版本不包含 Desktop GUI。
+
+配置、完整端点、运维流程、边界与专项测试见：`docs/loop-engineering-harness.md`。
 
 <a id="skills-integration"></a>
 ## Skills 集成
@@ -382,4 +433,6 @@ MSG_C=32 MSG_N=2000 HEALTH_C=200 ./scripts/perf_smoke.sh
 
 - 不要提交任何真实密钥文件（如 `.env.realtest`）
 - 使用模板文件：`.env.realtest.example`
+- `app.api_key` 与 Harness scoped ingest key 必须分离，ingest key 不得用于 operator 控制面。
+- Loop Engineering 不授权未知外部写入或自主生产变更。
 - 如果密钥曾出现在本地仓库历史中，请先轮换密钥再开源

@@ -1,5 +1,9 @@
 # Agent Harness Development Optimization Implementation Plan
 
+> **Historical implementation plan (2026-06-17).** The first-class run/tool/output/store layers
+> are now part of the current Harness, which has since been extended by Prompt Evolution and Loop
+> Engineering. See `docs/README.md` for current contracts.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Turn xiaomaolv from a message pipeline with agent features into a real agent harness with a first-class run lifecycle, unified tool protocol, unified output exit, and separately testable harness state.

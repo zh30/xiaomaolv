@@ -33,7 +33,10 @@ Optional model override:
 - `TELEGRAM_BOT_USERNAME` (without `@`, recommended for group mention matching)
 - `TELEGRAM_STARTUP_ONLINE_TEXT` (optional, default: `online`)
 - `TELEGRAM_GROUP_TRIGGER_MODE` (optional, `strict|smart`, default: `smart`)
-- `TELEGRAM_ADMIN_USER_IDS` (optional, comma-separated Telegram user IDs for private chat access and `/mcp`)
+- `TELEGRAM_ADMIN_USER_IDS` (optional, comma-separated Telegram user IDs for private chat access
+  and `/mcp`, `/skills`, `/goal`, `/resume`)
+- `XIAOMAOLV_APP_API_KEY` (required for the optional Loop Engineering operator control plane)
+- `XIAOMAOLV_HARNESS_INGEST_API_KEY` (optional, scoped only to external Signal ingestion)
 
 ## 1.5 Fastest path (recommended)
 
@@ -186,6 +189,31 @@ It includes:
 - cached bot username used for mention matching
 - polling worker health (`last_poll_ok_at_unix`, `last_poll_error`, counters)
 - current `getMe` result (including `can_read_all_group_messages`)
+
+## 7. Optional Loop Engineering smoke test
+
+Loop Engineering is disabled in the default MVP template. To test it, set a non-empty
+`[app].api_key`, then enable `[agent.harness.loop_engine]`. Keep `worker_enabled = false` for a
+control-plane-only smoke test, or enable it to execute approved safe handlers. Restart the service
+after changing the file.
+
+In a private chat as a configured Telegram admin:
+
+```text
+/goal 分析当前系统的恢复能力并运行 core self-test
+```
+
+The reply includes `goal_id`, `revision`, and `plan_hash`. Review them before dispatch:
+
+```text
+/goal approve <goal-id> <revision> <plan-hash>
+/resume <goal-id>
+```
+
+`/goal` only plans. Approval binds the exact reviewed plan. `/resume` returns durable work,
+attempt, and checkpoint state and safely reconciles committed outcomes. This flow cannot perform
+unknown external writes, deploy code, change credentials, or activate Prompt Evolution. Full
+configuration and HTTP/SSE checks are in `docs/loop-engineering-harness.md`.
 
 ## Notes
 

@@ -1,5 +1,8 @@
 # Telegram Group Context Intelligence Implementation Plan
 
+> **Historical design record (2026-02-25).** Use README configuration and
+> `docs/real-test-minimax-telegram.md` for current Telegram behavior.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Make Telegram group behavior more human-like: the bot should speak when context strongly implies it is being addressed, and stay silent (but still observe) when it should not interrupt.

@@ -169,3 +169,9 @@ Operational notes:
 - streaming channels still work; when MCP loop path is active, final answer is emitted as one delta
 - if MCP discovery fails, service falls back to plain provider completion
 - to hard-disable tool orchestration, set `mcp_enabled = false`
+- with `agent.harness.enable_trajectory = true`, each main MCP provider completion (non-streaming
+  and streaming) records a bounded provider frame for Loop Engineering Session Replay
+- structural replay validates recorded frame order/hashes and executes zero live MCP calls; the
+  recorded ToolProtocol results remain evidence, not instructions to re-run tools
+
+See `docs/loop-engineering-harness.md` for frame limits, replay endpoints, and recovery boundaries.

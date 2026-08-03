@@ -1,5 +1,8 @@
 # xiaomaolv Rust Core Implementation Plan
 
+> **Historical design record (2026-02-23).** The core has since been implemented and extended.
+> Use `docs/README.md`, the current runbooks, and repository tests as the runtime contract.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Build a production-style, high-performance Rust implementation of xiaomaolv core capabilities where users only configure AI provider and message channel.

@@ -1,5 +1,9 @@
 # Agent Harness Optimization Implementation Plan
 
+> **Historical design record (2026-03-24).** The listed gaps have since evolved through Prompt
+> Evolution and Loop Engineering. Use `docs/agent-harness-eval.md` and the two current Harness
+> runbooks for present behavior.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Enhance xiaomaolv's Agent Harness capabilities: trajectory logging, context compaction, tool call verification, and observability for continuous improvement.

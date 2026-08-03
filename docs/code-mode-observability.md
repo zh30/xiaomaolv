@@ -86,3 +86,8 @@ groups:
 - Keep `diag_bearer_token` in secret storage, not in plaintext config.
 - If `xiaomaolv_code_mode_circuit_open` is persistently `1`, inspect tool latency first.
 - Tune `timeout_warn_ratio`, `timeout_auto_shadow_streak`, and `timeout_auto_shadow_probe_every` together.
+- `agent.harness.enable_trajectory = true` additionally records bounded provider frames for Code
+  Mode completions. This is separate from Prometheus diagnostics and may contain request/response
+  content, so protect the SQLite database as operational data.
+- Loop Engineering structural Session Replay reads those frames and executes zero live tools. It
+  does not reproduce the Code Mode subprocess or bypass capability filters.

@@ -3,6 +3,10 @@
 **Status:** Complete  
 **Date:** 2026-08-03
 
+> This is the completed Phase 1 design record. Loop Engineering extends its evidence and execution
+> scope; the Prompt Policy promotion safety invariants here remain active. Current operator docs:
+> `docs/self-evolving-harness.md` and `docs/loop-engineering-harness.md`.
+
 ## Goal
 
 Turn the existing execution harness into a closed, production-controlled improvement loop:

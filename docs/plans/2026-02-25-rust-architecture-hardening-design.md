@@ -1,5 +1,8 @@
 # Rust Architecture Hardening Implementation Plan
 
+> **Historical design record (2026-02-25).** Use `docs/development.md` and
+> `docs/engineering-quality.md` for current module boundaries and quality gates.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Raise code quality, maintainability, and runtime robustness without changing external behavior.

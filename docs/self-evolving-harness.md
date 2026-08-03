@@ -1,5 +1,9 @@
 # Self-Evolving Harness
 
+**Status:** implemented; remains the sole Prompt Policy promotion/activation/rollback authority.
+
+**Related Phase 2 runtime:** `docs/loop-engineering-harness.md`
+
 xiaomaolv can turn production trajectories and explicit human feedback into bounded
 system-prompt candidates, compare each candidate with the active policy in an isolated
 shadow suite, and then let an authenticated operator approve, activate, or roll it back.
@@ -25,6 +29,13 @@ trajectory failure or negative feedback
 Automatic work stops at `ready`. The model cannot approve a candidate, activate it, edit
 code, change tool permissions, change credentials, or deploy the service.
 
+Loop Engineering extends evidence intake and durable execution around this subsystem; it does
+not replace these promotion gates. An operator can convert multi-source Signals into proposed
+Goals, and an approved
+`evolution_evaluate` WorkItem can run the existing candidate evaluator under Goal budgets. The
+result is a compact immutable `evolution_evaluation` Artifact. Approval and activation still use
+the endpoints in this document.
+
 ## Safety Model
 
 - Disabled by default.
@@ -45,6 +56,8 @@ code, change tool permissions, change credentials, or deploy the service.
   snapshot and can legitimately produce a new candidate.
 - Proposal attempts, state transitions, evaluations, feedback, activations, and rollbacks are
   recorded in an append-only audit table.
+- Loop Engineering `prompt_policy_ref` artifacts contain only candidate/deployment references;
+  they cannot copy prompt text or become an alternate active-policy pointer.
 
 ## Configuration
 
@@ -157,6 +170,11 @@ curl -sS -X POST "$XIAOMAOLV_URL/v1/harness/evolution/feedback" \
 ```
 
 Scores must be in `[-1, 1]`. Feedback must reference an existing trajectory.
+
+For community, developer, user, replay, maintenance, or manually ingested evidence that is not
+attached to one Evolution trajectory, use the provenance-preserving Signal API described in
+`docs/loop-engineering-harness.md`. A scoped Signal client cannot call these Evolution endpoints,
+approve a Goal, or activate a candidate.
 
 ## 3. Propose and Evaluate
 
@@ -302,3 +320,7 @@ Phase one evaluates the replacement prompt against explicit deterministic cases 
 same provider. It does not replay MCP tools, channel delivery, or conversation memory during
 shadow evaluation. Use eval cases that represent the behavior you are willing to gate, inspect
 case-level results before approval, and keep rollback available during rollout.
+
+The Phase 2 Loop Engine adds structural provider-frame replay, but that replay is a separate,
+zero-live-tool integrity check. It is not a comparative Prompt Evolution evaluation and does not
+relax any approval or activation requirement above.

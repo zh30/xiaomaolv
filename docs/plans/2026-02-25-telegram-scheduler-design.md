@@ -1,5 +1,8 @@
 # Telegram 定时任务（自由设置）Implementation Plan
 
+> **历史设计记录（2026-02-25）。** 文中的任务拆解与“现状”均以当时为准；当前命令和配置以
+> README、`docs/development.md` 及测试为准。
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** 让 Telegram bot 支持“用户自然语言创建/修改/取消定时任务”，并由后台稳定执行（一次性与周期任务），同时保证权限、幂等、可观测与可回滚。

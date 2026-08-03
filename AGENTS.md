@@ -15,6 +15,12 @@ cargo test --all-targets
 # Run integration test
 cargo test --test <test_name> -- --nocapture
 
+# Loop Engineering focused regression tests
+cargo test --test harness_loop_engine -- --nocapture
+cargo test --test http_loop_engine_api -- --nocapture
+cargo test --test service_harness_trajectory -- --nocapture
+cargo test --test harness_evolution_engine -- --nocapture
+
 # Production build (thin LTO, opt-level 3, stripped)
 cargo build --release
 ```
@@ -33,6 +39,10 @@ Telegram/HTTP → Channel → Service → Memory → Provider (AI) → StreamSin
               MCP Runtime / Skills / Code Mode
                     ↓
      Trajectories/Feedback → Evolution Engine → Shadow Eval → Human Promotion
+
+HTTP/Telegram/Signals → LoopEngine → Workflow DAG → Leased Worker → Checkpoints/Artifacts
+                              ↓                         ↓
+                       Goal events/SSE           Self-test / Replay
 ```
 
 ### Key Traits
@@ -41,6 +51,8 @@ Telegram/HTTP → Channel → Service → Memory → Provider (AI) → StreamSin
 - `StreamSink::on_delta()` - streaming response handler (implemented by channel)
 - `ChannelFactory::create_channel()` - channel instance creation
 - `ProviderFactory` / `ChannelFactory` - plugin registration points
+- `LoopStore` - durable Goal/Workflow/Attempt/Checkpoint, Signal, Replay, Self-test, and Artifact persistence seam
+- `WorkHandler` - registered Dynamic Workflow execution boundary with an explicit effect class
 
 ### Message Processing Pipeline (service.rs)
 
@@ -83,9 +95,11 @@ When `agent.mcp_enabled = true`:
 
 ### Code Mode
 
-Safe-by-default sandbox with two execution modes:
+Safe-by-default execution layer with two modes:
 - `local`: direct Rust evaluation (limited to math, string, format ops)
 - `subprocess`: spawns subprocess with resource limits
+
+Capability metadata filters MCP access before execution. `subprocess` is not an OS-level sandbox.
 
 ### Self-Evolving Harness
 
@@ -96,6 +110,19 @@ Safe-by-default sandbox with two execution modes:
 - Human approval and activation are separate authenticated operations; rollback restores the prior deployment
 - SQLite stores candidates, eval snapshots, feedback, deployments, the active pointer, and immutable audit events
 - Full bounded evidence SHA-256 is globally unique to prevent stale or concurrent duplicate proposals
+
+### Loop Engineering Harness
+
+- `LoopEngine` owns the durable `Goal -> Workflow revision -> WorkItem DAG -> Attempt -> Checkpoint` lifecycle
+- Planning never dispatches work; approval binds the exact goal revision, plan hash, effect manifest, acceptance criteria, and execution budget
+- `LoopWorker` uses at-least-once claims, expiring leases, monotonically increasing fencing tokens, and prepared/committed/reconciled checkpoints
+- `/resume` expires stale leases and reconciles committed outcomes without replaying their effects
+- Registered handlers are `goal_planner`, `provider_analysis`, `self_test_suite`, `session_replay`, `manual_gate`, and `evolution_evaluate`; `external_write` handlers are rejected
+- Multi-source `EvolutionSignal` records preserve source/trust/deduplication metadata; only an operator route can convert them into `proposed` goals
+- Production `core` self-tests are read-only; repeated identical failure sets produce one deduplicated internal signal
+- Provider frames are recorded for main plain, Code Mode, and MCP completion paths when trajectory logging is enabled; structural replay executes zero live tools
+- HTTP collection/detail resources plus per-goal monotonic SSE are the Desktop boundary; no Desktop GUI is implemented
+- The evolution adapter may evaluate an existing prompt candidate, but approval, activation, and rollback remain exclusively in `EvolutionEngine`
 
 ### Plugin Architecture
 
@@ -117,4 +144,9 @@ TOML with env placeholders (`${VAR:-default}`). Key sections:
 - `[channels.http]` - HTTP channel for programmatic messaging
 - `[memory]` - backend selection and hybrid settings
 - `[agent]` - MCP, skills, code mode settings
+- `[agent.harness]` - trajectory, compaction, verification, evolution, and loop-engine settings
 - `[agent.harness.evolution]` - self-evolution cycle, evidence, eval gates, and human promotion policy
+- `[agent.harness.loop_engine]` - durable control plane, scoped signal ingestion, worker leases/concurrency, and maintenance interval
+
+Current operator documentation: `docs/loop-engineering-harness.md`. Historical documents under
+`docs/plans/` describe decisions at the time they were written and are not the runtime contract.

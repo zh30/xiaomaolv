@@ -94,12 +94,18 @@ skills_llm_rerank_enabled = false
 enable_trajectory = false
 
 [agent.harness.loop_engine]
+# Durable /goal, /resume, approved workflow DAGs, read-only self-test, structural replay,
+# immutable artifacts, and Desktop-ready HTTP/SSE. Disabled by default.
 enabled = false
+# Scoped only to POST /v1/harness/signals; never reuse app.api_key.
 ingest_api_key = "${XIAOMAOLV_HARNESS_INGEST_API_KEY:-}"
+# Registered safe handlers only; external_write is rejected.
 worker_enabled = false
+# Valid: poll 1..=60s, lease 1..=3600s, parallel 1..=16.
 worker_poll_interval_secs = 2
 worker_lease_secs = 30
 worker_max_parallel = 2
+# 0 disables periodic read-only maintenance; otherwise valid 10..=2592000s.
 self_test_interval_secs = 0
 
 [agent.harness.evolution]

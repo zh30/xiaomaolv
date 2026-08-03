@@ -1,6 +1,7 @@
 # xiaomaolv
 
-A high-performance Rust AI gateway. Configure your provider and channel, then run.
+A high-performance Rust AI gateway and recoverable agent harness. Configure your provider and
+channel, then opt into safety-gated, auditable evolution when needed.
 
 Chinese version: `README.zh.md`
 
@@ -13,6 +14,7 @@ Chinese version: `README.zh.md`
 - [Configuration Overview](#config-overview)
 - [Optional: Hybrid Memory (SQLite + zvec sidecar)](#hybrid-memory)
 - [HTTP API](#http-api)
+- [Loop Engineering Harness](#loop-engineering)
 - [MCP Integration](#mcp-integration)
 - [Skills Integration](#skills-integration)
 - [Plugin Extensions (Provider / Channel)](#plugin-system)
@@ -32,7 +34,8 @@ Chinese version: `README.zh.md`
 - Telegram streaming prefers `sendMessageDraft` when supported, with automatic fallback
 - Telegram typing heartbeat: immediate `sendChatAction("typing")`, then every 5 seconds until completion
 - Telegram startup online status (via `setMyShortDescription`, configurable)
-- Telegram slash commands: `/start`, `/help`, `/whoami`, `/mcp ...`, `/skills ...` (admin/private-chat control)
+- Telegram slash commands: `/start`, `/help`, `/whoami`, `/mcp ...`, `/skills ...`,
+  `/goal ...`, and `/resume ...` (admin/private-chat control)
 - Telegram group support:
   - `strict` mode: only replies on `@bot_username` or reply-to-bot
   - `smart` mode: contextual trigger with `Respond/ObserveOnly/Ignore`
@@ -73,8 +76,10 @@ Optional model override:
 
 - `MINIMAX_MODEL` (default: `MiniMax-M2.5-highspeed`)
 - `XIAOMAOLV_APP_API_KEY` (protects HTTP APIs and config state/save endpoints when set)
+- `XIAOMAOLV_HARNESS_INGEST_API_KEY` (optional, scoped only to external Loop Engineering signals)
 - `TELEGRAM_BOT_USERNAME` (without `@`, recommended for group mention matching)
-- `TELEGRAM_ADMIN_USER_IDS` (comma-separated Telegram user IDs for private chat access and `/mcp` + `/skills`, e.g. `123456789,987654321`)
+- `TELEGRAM_ADMIN_USER_IDS` (comma-separated Telegram user IDs for private chat access and
+  `/mcp`, `/skills`, `/goal`, and `/resume`, e.g. `123456789,987654321`)
 
 You can also skip this step first and configure from the visual setup page after boot: `http://127.0.0.1:8080/setup`. If you later set `XIAOMAOLV_APP_API_KEY`, the setup page will prompt for that key before loading or saving config state.
 
@@ -110,10 +115,13 @@ Then send a message to your Telegram bot.
 
 After MVP is running, use these docs in order:
 
+- `docs/README.md`: current-document map and historical-plan boundary
 - `docs/development.md`: unified development guide for local work, architecture boundaries, tests, and PR checklist
 - `docs/real-test-minimax-telegram.md`: real MiniMax + Telegram integration guide
 - `docs/zvec-sidecar.md`: zvec sidecar protocol, startup, compatibility details
 - `docs/mcp-integration.md`: MCP install model, CLI usage, HTTP tool-call API
+- `docs/code-mode-observability.md`: Code Mode metrics, alerts, and provider-frame data boundary
+- `docs/agent-harness-eval.md`: message harness, Prompt Evolution, and Loop Engineering test suites
 - `docs/self-evolving-harness.md`: safe evolution loop, configuration, API, and operator runbook
 - `docs/loop-engineering-harness.md`: durable goal execution, recovery, multi-source signals,
   self-maintenance, Session Replay, and Desktop read model
@@ -176,7 +184,8 @@ Key settings:
   - `commands_enabled = true|false` (enable slash command handling)
   - `commands_auto_register = true|false` (startup calls Telegram `setMyCommands`)
   - `commands_private_only = true|false` (`/mcp` + `/skills` only in private chat when true)
-  - `admin_user_ids = "${TELEGRAM_ADMIN_USER_IDS:-}"` (private chat allowlist + `/mcp` + `/skills` allowlist; recommended in `.env.realtest`)
+  - `admin_user_ids = "${TELEGRAM_ADMIN_USER_IDS:-}"` (private chat allowlist for `/mcp`,
+    `/skills`, `/goal`, and `/resume`; recommended in `.env.realtest`)
 - Memory mode:
   - `backend = "sqlite-only"` (default)
   - `backend = "hybrid-sqlite-zvec"` (optional)
@@ -270,10 +279,15 @@ Core endpoints:
 - `GET /v1/channels/{channel}/diag` (same app API key behavior as `/v1/messages`)
 - `POST /v1/channels/{channel}/inbound` (same app API key behavior as `/v1/messages`)
 - `POST /v1/channels/{channel}/inbound/{secret}` (same app API key behavior as `/v1/messages`)
+- `GET /v1/harness/trajectories` and `GET /v1/harness/trajectories/{id}` (message-harness
+  trajectory list/detail; same app API key behavior as `/v1/messages`)
 - `/v1/harness/evolution/*` (status, feedback, eval cases, candidates, cycle, audit,
   activation, and rollback; always requires a configured app API key)
-- `/v1/harness/goals`, `/signals`, `/self-tests`, `/trajectories/*/replay`, and `/artifacts`
-  (durable Loop Engineering and Desktop-ready read model; see the runbook)
+- `/v1/harness/goals/*`, `/v1/harness/signals/*`, `/v1/harness/self-tests/*`,
+  `/v1/harness/self-test-runs/*`, `/v1/harness/trajectories/*/frames`,
+  `/v1/harness/trajectories/*/replay/structural`, and `/v1/harness/artifacts/*`
+  (durable Loop Engineering and Desktop-ready read model; always requires a configured
+  `app.api_key`, except scoped `POST /v1/harness/signals` ingestion)
 
 Example:
 
@@ -299,6 +313,37 @@ for alerting and dashboards.
 Both endpoints are rate limited by `channels.http.diag_rate_limit_per_minute`.
 
 Prometheus scraping + alerting examples: `docs/code-mode-observability.md`.
+
+<a id="loop-engineering"></a>
+## Loop Engineering Harness
+
+Loop Engineering is opt-in and persists this hierarchy in SQLite:
+
+```text
+Goal -> immutable Workflow revision -> WorkItem DAG -> Attempt -> Checkpoint
+```
+
+Planning is non-executing. Dispatch starts only after an operator approves the exact goal
+revision and `plan_hash`, which binds the workflow, effect manifest, acceptance criteria, and
+execution budget. Claims use leases and fencing tokens; `/resume` expires stale leases and
+reconciles committed outcomes without replaying their effects.
+
+Telegram operations are private-chat/admin only:
+
+```text
+/goal <objective>
+/goal approve <goal-id> <revision> <plan-hash>
+/resume <goal-id>
+```
+
+The worker accepts only registered safe handlers. `external_write`, arbitrary code changes,
+deployments, credential changes, and automatic prompt activation are not enabled. Operators may
+convert multi-source signals only into `proposed` goals; the production `core` self-test suite is read-only;
+structural Session Replay performs zero live tool calls. The HTTP collections and per-goal
+monotonic SSE stream are the current Desktop contract—there is no Desktop GUI in this release.
+
+Configuration, endpoint reference, operator workflow, limits, and focused tests:
+`docs/loop-engineering-harness.md`.
 
 <a id="mcp-integration"></a>
 ## MCP Integration
@@ -595,4 +640,7 @@ MSG_C=32 MSG_N=2000 HEALTH_C=200 ./scripts/perf_smoke.sh
 
 - Never commit real secrets (for example `.env.realtest`)
 - Keep `.env.realtest.example` as your safe template
+- Keep `app.api_key` and the scoped Harness ingestion key distinct; the ingestion key must never
+  be reused for operator control-plane access.
+- Loop Engineering does not authorize unknown external writes or autonomous production changes.
 - If any key appeared in local git history, rotate it before publishing

@@ -1,5 +1,8 @@
 # Zvec + SQLite Agent Memory Design (Rust-first)
 
+> **Historical design record (2026-02-23).** Its “current baseline” describes the repository at
+> that date. Use `docs/zvec-sidecar.md` for the current hybrid-memory contract.
+
 Date: 2026-02-23
 
 ## 1. Goals

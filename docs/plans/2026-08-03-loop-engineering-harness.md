@@ -20,7 +20,7 @@ Evolve xiaomaolv from a prompt-improvement loop into a durable Harness engineeri
 The system may discover, normalize, plan, execute safe work, and test itself. Production
 activation remains a separate operator-authorized operation.
 
-## What Already Exists
+## Pre-Phase-2 Baseline (historical)
 
 | Existing component | Reuse | Missing boundary |
 |---|---|---|
@@ -64,21 +64,25 @@ available.
 
 ## Safety Invariants
 
-1. External and model-derived signals can create only `proposed` goals.
+1. Signals can be converted only into `proposed` Goals, and only through an operator route.
 2. `/goal` starts safe planning only. Effectful dispatch requires an operator approval bound to
-   an immutable goal revision, workflow hash, effect manifest, and execution budget.
+   an immutable goal revision, plan/workflow hash, effect manifest, acceptance criteria, and
+   execution budget.
 3. Work execution is at-least-once. No API claims universal exactly-once behavior.
 4. Every attempt owns a lease token and monotonically increasing fencing version.
 5. Provider and tool calls never occur inside a SQLite transaction.
-6. Pure/read work may retry automatically. Unknown external writes require confirmation.
-7. Checkpoints are immutable. Resume creates a new attempt; it never rewrites history.
-8. Replay uses captured prompts and recorded tool results; it never calls live tools.
-9. Self-test failures emit signals. They cannot approve or activate an artifact.
-10. Only registered, schema-versioned artifact drivers may validate, test, activate, or roll
-    back a capability.
+6. Registered work may retry only within its approved retry policy; production `external_write`
+   workflows and handlers are rejected.
+7. Prepared/committed outcomes are durable. Resume may mark a committed checkpoint reconciled and
+   creates a new Attempt for retried work; it never erases Attempt history.
+8. Structural Replay validates captured provider-frame order and hashes; it never calls live tools.
+9. Self-test failures emit deduplicated Signals. They cannot approve a Goal or activate Prompt
+   Policy.
+10. Only known Artifact kinds with bounded content may be published. Generic Artifact activation
+    is not implemented.
 11. Existing prompt candidate approval, stale-baseline protection, and rollback remain intact.
-12. Payloads, provider-call counts, response bytes, batches, retries, concurrency, and retention
-    are bounded. Token/currency budgets are not claimed until providers expose trusted usage.
+12. Payloads, provider-call counts, response bytes, retries, and worker concurrency are bounded.
+    Retention and token/currency budgets are not claimed.
 13. Production Self-tests are read-only. Mutation/crash suites run only against an ephemeral
     SQLite store with fake handlers and providers.
 14. Existing prompt candidates, deployments, active pointers, and runtime cache remain the sole
@@ -93,26 +97,25 @@ community / user / developer / trajectory / replay / self-test
                  append-only EvolutionSignal
                  provenance + trust + digest
                            |
-                    bounded triage
+                   operator review
                            |
                            v
-                    proposed HarnessGoal
+                       proposed Goal
                            |
-                safe GoalPlanner call
+             deterministic or supplied plan
                            |
                    review-ready revision
            workflow hash + effects + call budget
                            |
-              operator approve / revise / reject
+                    operator approve
                            |
                            v
-              versioned DynamicWorkflowSpec
-                           |
-                compile DAG into WorkItems
+                immutable WorkflowSpec
+                compiled WorkItem DAG
                            |
           +----------------+----------------+
           |                                 |
-     lease + Attempt                   manual gate
+     leased Attempt                    manual gate
           |
     prepared checkpoint
           |
@@ -120,12 +123,13 @@ community / user / developer / trajectory / replay / self-test
           |
     committed checkpoint
           |
-       self-test / shadow replay
+      verification / reconciliation
           |
           v
-    typed CapabilityArtifact candidate
-          |
-   existing human promotion + rollback
+      achieved Goal + typed Artifacts
+
+Prompt candidate evaluation is one bounded handler;
+promotion/activation/rollback remains in EvolutionEngine.
 ```
 
 Runtime ownership:
@@ -141,97 +145,81 @@ HTTP / Telegram commands
 
 WorkerSupervisor
   ├── LoopWorker        claim -> heartbeat -> execute -> commit
-  ├── MaintenanceWorker schedule bounded self-test suites
+  ├── maintenance timer run read-only core self-test
   └── EvolutionWorker   existing propose/evaluate-only cycle
 ```
 
 Configuration reload is cooperative: signal the old generation, stop new claims, await bounded
-handler cancellation/lease relinquish, and only then start replacement workers. If shutdown times
-out, leases expire naturally and the new generation still relies on fencing; it never assumes an
-aborted task did not produce a side effect.
+worker shutdown, and then start the replacement generation. If a claim outlives the process,
+leases expire naturally and the next worker still relies on fencing and checkpoint reconciliation.
 
 ## Durable Domain Model
 
 ### Goal
 
-`HarnessGoal` is the durable desired outcome, not an execution attempt.
+`GoalRecord` is the durable desired outcome, not an execution attempt.
 
 ```text
 id / revision
-title / objective / acceptance_criteria[]
-target_capability
-priority
+objective / status
 source_signal_ids[]
-created_by / approved_by?
-status
-created_at / updated_at
+created_by / created_at / updated_at
 ```
 
-Goal state machine:
+The enum preserves these states:
 
 ```text
-proposed -> planning -> review_ready -> approved -> active -> verifying -> achieved
-    |          |           |             |          |          |
- rejected    failed      revised       canceled   paused     active
-                          rejected                 blocked    failed
-                                                   failed
-
-paused / blocked / failed --resume--> active
-achieved / rejected / canceled are terminal
+proposed | planning | review_ready | approved | active | verifying | achieved
+rejected | canceled | paused | blocked | failed | replan
 ```
 
-Acceptance criteria are typed: `output_assertion`, `self_test_suite`, `artifact_ready`, or
-`manual`. `GoalVerifier` evaluates deterministic criteria and moves the goal through
-`verifying`; a manual criterion requires an explicit verify endpoint. A passing verifier may
-mark a goal `achieved`, while a failing verifier returns it to `active` or `failed` according to
-the approved retry policy.
+The delivered HTTP/worker path uses `proposed -> review_ready -> approved -> active -> verifying ->
+achieved`, with `failed` on exhausted work. The additional states are reserved in the domain; no
+pause/cancel/reject HTTP operations are exposed in this phase.
 
-An operator `/goal <objective>` creates a `proposed` goal and starts only the pure planning step.
-A goal derived from signals also starts as `proposed`. Approval occurs after the workflow,
-effects, acceptance criteria, and budget are visible. Replanning increments the goal revision
-and invalidates prior approval.
+Acceptance criteria are `self_test_suite`, `artifact_exists`, or `manual_approval`. Verification
+checks immutable Self-test/Artifact/manual evidence and marks a fully satisfied Goal `achieved`.
+Manual evidence requires the explicit verify endpoint.
+
+An operator `/goal <objective>` creates a `proposed` Goal and stores the deterministic recommended
+plan; no work executes. A Goal derived from a Signal also starts as `proposed`. Planning stores a
+new immutable Workflow revision and approval occurs only after its effects, criteria, and budget
+are visible. Approval checks both expected Goal revision and `plan_hash`.
 
 ### WorkItem
 
-`HarnessWorkItem` is one node in a persisted DAG.
+`WorkItemRecord` is one node in a persisted DAG.
 
 ```text
-id / goal_id / workflow_revision
-kind / payload_json / effect_class
-depends_on[] / priority / available_at
-status / max_attempts
-lease_token? / lease_until? / fencing_version
-created_at / updated_at
+id / goal_id / step_id / ordinal
+handler / input / effect / max_attempts
+dependency_ids[] / status
 ```
 
 ```text
-queued -> leased -> running -> succeeded
-   |        |          |        |
- canceled  expired     failed   skipped
-                       |   |
-                       |   +-> queued (retry policy)
-                       +-----> waiting_confirmation
+pending -> ready -> running -> succeeded
+                     |   |
+                     |   +-> ready (bounded retry)
+                     +-----> failed
+reserved: waiting_confirmation | canceled | blocked
 ```
 
 Dependencies must exist in the same goal and the graph must be acyclic. A work item becomes
-claimable only when every dependency succeeded or was explicitly skipped by the approved
-workflow policy. Dependency failure/cancellation propagates to downstream work as blocked or
-canceled. Exhausted attempts fail the WorkItem and derive the Goal state. Pausing prevents new
-claims and asks running handlers to cancel cooperatively; fencing still decides the authoritative
-result.
+claimable only when every dependency succeeded. Exhausted attempts fail the WorkItem; downstream
+pending nodes become blocked and the Goal becomes failed. Lease/fencing columns remain in SQLite
+and are returned through Attempt/Resume reports rather than duplicated in `WorkItemRecord`.
 
 ### Attempt and Checkpoint
 
-`HarnessAttempt` represents one worker claim. `HarnessCheckpoint` is immutable evidence about a
+`AttemptRecord` represents one worker claim. `CheckpointRecord` is durable evidence about a
 safe boundary inside that attempt.
 
 ```text
 Attempt: id / work_item_id / number / lease_token / fencing_version
-         status / started_at / finished_at / error_class?
+         worker_id / status / started_at / finished_at / error?
 
-Checkpoint: id / attempt_id / sequence / phase
-            idempotency_key? / input_digest / output_digest?
-            bounded_state_json / created_at
+Checkpoint: id / goal_id / work_item_id / attempt_id / phase
+            idempotency_key / bounded WorkOutcome? / created_at / updated_at
 ```
 
 Checkpoint phases share an operation ID and persist a bounded `WorkOutcome`:
@@ -239,46 +227,40 @@ Checkpoint phases share an operation ID and persist a bounded `WorkOutcome`:
 ```text
 prepared -> committed -> reconciled -> work succeeded
     |           |
-    |           +-- crash before work success -> recover committed outcome, do not execute again
+    |           +-- crash before finish -> recover outcome, do not execute again
     |
-process crash
-    |
-pure/read/idempotent write -> automatic retry
-external write, outcome unknown -> waiting_confirmation -> confirm | retry | skip | fail
+lease expiry -> abandon attempt -> bounded retry or fail
 ```
 
 `/resume <goal-id>` performs a transaction that validates the goal state, expires stale leases,
-requeues safe work, leaves uncertain external writes gated, advances the goal revision, and
-records an event. A subsequent worker claim creates a new Attempt.
+reconciles committed checkpoints, requeues retryable work, unlocks satisfied dependencies, and
+records an event. It does not change the approved Workflow or replay a committed handler effect. A
+subsequent claim creates a new Attempt with a higher fencing token.
 
 ## Execution Contract
 
 Every registered `WorkHandler` declares:
 
 ```text
-kind
-schema_version
-effect: pure | read | local_write | external_write
-validate(payload)
-idempotency_key(payload, goal, work_item)?
-execute(context, payload) -> WorkOutcome
+name()
+effect_class(): pure | read | local_write | external_write
+retryable(error)
+execute(context) -> WorkOutcome
 ```
 
 Rules:
 
-- `pure` and `read` handlers are automatically retryable.
-- `local_write` handlers must use the provided idempotency key or commit in the same SQLite
-  transaction as their durable result.
-- `external_write` handlers must provide an idempotency key and optional status lookup. Without
-  lookup support, a crash after `prepared` becomes `waiting_confirmation`.
+- The Workflow validator accepts only the six built-in names and rejects `external_write`.
+- The runtime registry also rejects any `external_write` handler and duplicate/empty names.
+- A handler's declared effect must exactly match the approved WorkItem effect before execution.
+- Retry is bounded by the approved step policy and the handler's `retryable` decision.
 - A stale fencing version cannot heartbeat, checkpoint, complete, or fail an attempt.
-- Unknown handler kinds and unsupported schema versions are rejected before dispatch.
-- A lease check immediately precedes handler execution and handlers receive a cancellation token,
-  but fencing cannot revoke an external request already accepted by another service. Therefore
-  Phase 2 registers no production `external_write` handler; the contract and crash behavior are
-  tested with fakes until a connector supplies enforced idempotency/status lookup.
+- A lease check and prepared checkpoint precede handler execution; committed outcomes are persisted
+  before an attempt is finalized.
+- Provider reservations persist call count, absolute deadline, and cumulative response bytes before
+  a call; provider I/O happens outside the SQLite transaction.
 
-Initial production handlers are useful but non-effectful: `goal_planner`, `provider_analysis`,
+Production handlers are bounded local/read operations: `goal_planner`, `provider_analysis`,
 `session_replay`, `self_test_suite`, `evolution_evaluate`, and `manual_gate`.
 
 ## Multi-source Evolution
@@ -289,151 +271,132 @@ All source adapters normalize into one append-only record:
 
 ```text
 id
-source_kind: trajectory | user_feedback | developer_feedback |
-             community | self_test | session_replay | manual
-external_id? / source_uri?
+kind: trajectory | user_feedback | developer_feedback |
+      community | self_test | session_replay | manual
+source / external_id?
 trust: internal | authenticated | external
-title / bounded_content / metadata_json
-content_sha256 / dedup_fingerprint
-status: pending | triaged | accepted | rejected
-observed_at / created_at
+content / content_hash / metadata
+status: observed | triaged | proposed | ignored
+created_at
 ```
 
-The unique dedup key is `(source_kind, dedup_fingerprint)`. Source adapters may store only
-bounded content and allowlisted metadata. Secrets, authorization headers, and raw credentials
-are rejected/redacted before persistence.
+Deduplication uses `(source, external_id)` when supplied and `(source, fingerprint)` for the full
+bounded request. Input limits are enforced before persistence: source 160 bytes, external ID 200
+bytes, content 16384 characters, and metadata 64 entries/8192 serialized bytes. Callers remain
+responsible for not submitting secrets or credentials as Signal content.
 
-External content is always data, never a system instruction. Triage receives it inside a quoted
-JSON envelope and produces strict, bounded JSON:
+External content is persisted as data and never injected as a system instruction by the Loop
+Engine. There is no autonomous LLM triage in this phase. An authenticated operator may convert one
+Signal into a `proposed` Goal with an explicit objective:
 
 ```json
 {
-  "title": "...",
-  "objective": "...",
-  "acceptance_criteria": ["..."],
-  "target_capability": "dynamic_workflow",
-  "priority": 50
+  "objective": "Investigate and safely improve recovery visibility"
 }
 ```
 
-Triage can create a `proposed` goal only. The signal-to-goal links remain queryable so a future
-operator can trace every claim back to its source.
-
-Existing negative trajectory feedback is adapted into `EvolutionSignal`; the existing feedback
-endpoint remains compatible.
+The new Goal records the source Signal ID for provenance. Signal ingestion cannot plan, approve,
+dispatch, resume, verify, publish Artifacts, or operate Prompt Evolution. Existing trajectory
+feedback remains available through the separate Prompt Evolution endpoint; automatic cross-store
+normalization is not claimed.
 
 ## Dynamic Workflow and Capability Artifacts
 
 ### Workflow
 
-`GoalPlanner` converts a goal revision into strict `DynamicWorkflowSpec` JSON using only the
-currently registered handler catalog. Invalid output fails planning without partial WorkItems.
-The resulting workflow, effect manifest, acceptance criteria, and call-count/response-byte budget
-are hashed together. Operator approval binds that hash; any change requires reapproval.
-
-`DynamicWorkflowSpec` is a versioned, declarative DAG. Phase 2 validates, stores, and compiles
-registered step kinds; it does not permit arbitrary shell or code payloads.
+`plan_goal_recommended` builds the default deterministic two-step plan (`provider_analysis` then
+`self_test_suite`). `POST /goals/{id}/plan` can supply another validated `WorkflowSpec`. Planning
+persists the full spec and compiles its steps/dependencies into WorkItems in one transaction; no
+provider or handler runs during planning.
 
 ```text
-version / name / description
 steps[]:
-  id / handler_kind / handler_schema_version
-  payload / depends_on[] / retry_policy
+  id / handler / effect / input / retry(max_attempts, backoff_secs)
+edges[]: from / to
+budget: max_provider_calls / deadline_secs / max_response_bytes
+acceptance_criteria[]
 ```
 
 Limits: 32 steps, 64 dependency edges, 32 KiB serialized manifest, acyclic graph, unique step
-IDs, registered handlers only.
+IDs, registered handlers only, and no `external_write`. The plan hash covers the Workflow plus
+acceptance criteria; approval separately persists hashes for the Workflow, effect manifest,
+criteria, and budget.
 
 ### Artifact registry
 
-`CapabilityArtifact` separates a candidate's generic lifecycle from a driver-specific manifest:
+`ArtifactRecord` is an immutable, typed output/reference:
 
 ```text
-id / kind / schema_version / manifest_json / content_sha256
-source_goal_id / status / created_at
+id / kind / name / version / content / content_hash
+source_goal_id? / parent_artifact_id? / created_by / created_at
 ```
 
-`ArtifactDriver` declares `validate`, `self_test`, `activate`, and `rollback`. Registered kinds in
-Phase 2:
+Kinds are `goal_template`, `dynamic_workflow`, `eval_suite`, `skill_manifest`, `replay_corpus`,
+`desktop_view`, `analysis_report`, `self_test_report`, `evolution_evaluation`, and
+`prompt_policy_ref`. Content is bounded to 32768 bytes and `(kind, name, version)` is unique.
 
-- `prompt_policy`: reference-only adapter over the existing prompt candidate/deployment engine;
-  it never duplicates prompt state, deployment history, or the active pointer.
-- `dynamic_workflow`: validates and stores the workflow manifest; activation requires human
-  approval.
-- `session_replay_suite`: immutable replay suite manifest.
-- `desktop_contract`: schema-only future integration contract; no GUI activation.
-
-An unknown kind or version cannot be activated. Background workers may produce and test
-artifacts but may not approve or activate them.
-
-Generic artifacts use immutable approval records plus per-kind deployment history and active
-pointers. The `prompt_policy` reference adapter delegates those operations to the existing
-evolution tables instead of writing generic deployment state, avoiding two active pointers.
+Artifacts do not have a generic activation pointer in this phase. `prompt_policy_ref` permits only
+an `evolution_candidate_id` and optional `deployment_id`; it cannot contain prompt text. Prompt
+approval, deployment history, active policy, and rollback remain exclusively in the existing
+Evolution tables/API.
 
 ## Session Replay
 
-Current trajectories gain bounded per-completion `TrajectoryFrame` records rather than a single
-snapshot. One request can contain several provider/tool iterations, so every frame records:
+When `agent.harness.enable_trajectory = true`, main plain, Code Mode, and MCP completion paths add
+one bounded `TrajectoryFrame` per provider call. One message may therefore produce several ordered
+frames. Each frame records:
 
 ```text
-schema_version / sequence / stage / iteration
-incoming message and bounded provider messages at that exact call
-provider/model and completion option fingerprint
-active policy/artifact IDs
-tool catalog digest / selected skills
-request digest / bounded response / response digest
-recorded tool proposal/result references
-replayability: exact | comparative | unavailable
+id / trajectory_id / call_index
+model / provider_fingerprint
+request_messages / request_was_json / request_hash
+response / response_hash
+capture: full | redacted | truncated
 ```
 
-Secrets and credentials are never included. Material redaction/truncation marks the frame
-`comparative` or `unavailable`; it is never called an exact capture. Historical trajectories
-without frames are reported as `unavailable`, not silently approximated. Exact replay caching
-requires the full request, provider configuration, model revision/seed when available, completion
-options, artifacts, and frame digest to match.
+Frames accept at most 256 messages/131072 serialized request bytes and 262144 response bytes.
+Runtime captures are conservatively `truncated` because the seed and full provider configuration
+are unavailable; operators must treat frame content as sensitive SQLite operational data.
 
-Replay modes:
+Delivered replay mode:
 
-1. `structural` — validate trace ordering, tool envelopes, exit reason, hashes, and assertions
-   without a provider call.
-2. `shadow` — call the provider for each captured frame, substitute recorded tool results, and
-   evaluate assertions. Provider output is comparative/non-deterministic unless an exact seeded
-   model revision is available. No live MCP/channel/memory writes.
+1. `structural` — validate contiguous call indexes plus request/response hashes entirely from
+   recorded frames. It reports `live_tools_executed = 0` and performs no provider/MCP/channel/memory
+   action.
 
-Each replay run stores the snapshot digest, artifact IDs, provider/model, result, bounded output,
-full output hash, and case-level issues. A replay failure emits a deduplicated `self_test` or
-`session_replay` signal.
+Each invocation persists a Replay run and case results. It fails clearly when a trajectory has no
+provider frames. `shadow_comparative` exists only as a reserved enum value: there is no endpoint or
+live-provider implementation, no recorded-tool substitution, and no automatic Replay-to-Signal
+emission in this release.
 
 ## Self-testing and Maintenance
 
-`SelfTestRegistry` holds versioned built-in suites. Mutation and crash suites always receive a
-fresh ephemeral SQLite database plus fake providers/handlers. Production maintenance registers
-read-only suites only. Phase 2 suites:
+The delivered production suite is `core`, a fixed set of read-only SQL integrity checks:
 
-- `loop_integrity`: invalid state transitions, orphan dependencies, expired leases, stale
-  fencing, and checkpoint sequence consistency.
-- `replay_integrity`: snapshot decoding, structural replay, shadow isolation, and assertion
-  scoring.
-- `evolution_integrity`: existing prompt baseline/candidate gates and active-policy consistency.
+- all 20 Loop Engineering tables exist,
+- schema migration version 1 is recorded,
+- every WorkItem references its Goal and immutable Workflow,
+- committed/reconciled checkpoints retain a WorkOutcome,
+- Signal events reference an immutable Signal,
+- Goal approvals still resolve to the reviewed Workflow hash.
 
-`SelfTestRunner` persists one immutable run and case results. It executes with:
+Each invocation persists a `SelfTestRun` plus case results. A failure emits an internal
+`self_test` Signal; the complete failed-case set is fingerprinted so repeated identical failures
+do not create a Signal storm. Passing does not approve a Goal, publish/activate Prompt Policy, or
+execute a provider/tool.
 
-- concurrency 1 by default;
-- bounded cases and provider calls per run;
-- a total runtime deadline;
-- dedup key `(suite_version, subject_digest)`;
-- no production activation permissions.
-
-Failed cases emit one deduplicated signal. Passing the suite does not mutate a goal or artifact.
-The maintenance timer is disabled by default and can also be triggered through the operator
-control plane.
+The operator endpoint can run `core` at any time. Periodic execution is enabled only when the Loop
+Engine is enabled and `self_test_interval_secs > 0`; it is independent of `worker_enabled`.
+Mutation/crash-window behavior is covered by integration tests with temporary SQLite and fake
+handlers/providers, not by production maintenance.
 
 ## Control Plane
 
 Operator endpoints use the existing app API key. The caller-supplied actor header remains an audit
-label, not identity proof; server-side actor identity is `operator:app-key`, while Telegram uses
-the verified admin user ID. Signal ingestion uses a separate scoped `harness_ingest_api_key` that
-cannot approve, dispatch, resume, verify, activate, or roll back anything.
+label, not identity proof; the fallback is `operator:http`, while Telegram records the verified
+admin user ID. Only `POST /v1/harness/signals` uses the separate scoped `ingest_api_key`; it cannot
+read Signals or create, plan, approve, dispatch, resume, verify, publish, activate, or roll back
+anything.
 
 ```text
 POST   /v1/harness/signals
@@ -498,162 +461,124 @@ harness_self_test_runs
 harness_self_test_case_results
 ```
 
-Foreign keys preserve provenance. State mutations and their corresponding append-only event are
-written in one transaction. Provider/tool calls happen after claim commit and before completion
-commit.
+Relevant foreign keys preserve Goal/Workflow/Signal/Artifact provenance. Core plan, approval,
+claim, checkpoint, and completion paths use short transactions; events are append-only. No
+provider or tool call occurs inside a SQLite transaction.
 
 Important indexes:
 
-- signals: `(kind, created_at, id)` and unique source fingerprint/external ID;
+- signals: `(kind, created_at, id)` and unique `(source, fingerprint)` / `(source, external_id)`;
 - goals: `(status, updated_at, id)`;
 - work: `(status, next_attempt_at, lease_until, created_at)`;
-- attempts: `(work_item_id, attempt_number)` unique;
-- checkpoints: `(attempt_id, sequence)` unique;
-- events: `(goal_id, created_at, id)`;
-- replay/self-test: subject/suite digest and creation time.
+- attempts: `(goal_id, started_at, id)` plus unique `(work_item_id, attempt_number)`;
+- checkpoints: `(goal_id, sequence)` plus unique `(work_item_id, idempotency_key)`;
+- events: `(goal_id, sequence)`;
+- replay: `(trajectory_id, created_at, id)`; Self-test: `(suite, started_at, id)`.
 
 ## Production Failure Modes
 
 | Failure | Handling | Test | User-visible result |
 |---|---|---|---|
-| Worker dies before executing | Lease expires; safe work is claimable | Store integration | Goal remains resumable |
-| Worker dies after external write | `prepared` remains without `committed` | Crash-window integration | `waiting_confirmation`, never silent replay |
-| Worker dies after committed checkpoint | Reconcile stored outcome, never call handler again | Crash-window integration | Work finishes from durable result |
-| Stale worker returns after lease takeover | Fencing CAS rejects checkpoint/completion | Concurrency integration | New attempt remains authoritative |
-| Duplicate community webhook | Unique source fingerprint returns existing signal | Store integration | Idempotent response |
-| Prompt injection in community text | Content stays JSON data; strict triage schema | Engine/eval | Proposed goal only |
-| Invalid/cyclic workflow | Validation fails before work insertion | Domain/store unit | Actionable 422 response |
-| Replay snapshot missing | Run marked `unavailable` | Replay unit/API | Explicit reason |
-| Replay tries a live tool | Replay runtime has no live MCP capability | Integration | Test fails closed |
-| Provider timeout in triage/replay | Attempt fails with retry policy and bounded error | Engine integration | Goal status and retry visible |
-| Self-test repeatedly fails | Digest dedup emits one signal per subject revision | Maintenance integration | No signal storm |
-| SQLite busy/locked | Short transactions, busy timeout, bounded retry | Store integration | Retryable failure, no partial state |
-| Payload growth | Hard size limits plus payload retention/pruning | Boundary tests | 422 before persistence |
-| Config reload overlaps worker generations | Cooperative stop/relinquish before replacement starts | Worker lifecycle integration | No double-claim window |
-
-No listed failure is allowed to be both silent and untested.
+| Worker dies with an uncommitted claim | Lease expires; `/resume` abandons/retries within attempt budget | Loop Engine integration | Goal and attempt history remain visible |
+| Worker dies after committed checkpoint | Reconcile stored outcome; do not call handler again | Loop Engine crash-window test | Work completes from durable result |
+| Stale worker returns after takeover | Lease token/fencing checks reject heartbeat/checkpoint/finish/fail | Loop Engine fencing test | New attempt stays authoritative |
+| External-write workflow/handler | Validator and registry reject it before dispatch | Workflow/registry tests | Bad request; no external effect |
+| Duplicate community webhook | Source external-ID/fingerprint returns existing Signal | Signal integration | `deduplicated = true` |
+| Untrusted Signal content | Scoped caller can only persist external/authenticated data | HTTP auth/scope test | Operator must explicitly propose a Goal |
+| Invalid/cyclic/oversized Workflow | Validation fails before WorkItem insertion | Loop Engine boundary tests | Bad request; no partial DAG |
+| Replay frames missing | Structural replay returns `trajectory has no provider frames` | Replay integration | Explicit bad request; no approximation |
+| Replay attempts live tools | Structural implementation has no tool/provider call path | Replay integration | `live_tools_executed = 0` |
+| Provider timeout/output overflow | Goal deadline and reserved response budget bound handler/eval | Evolution/worker tests | Attempt retry/failure remains visible |
+| Self-test repeatedly fails identically | Failure-set fingerprint deduplicates internal Signal | Self-test integration | No Signal storm |
+| SQLite busy/locked | WAL, five-second busy timeout, and short transactions | Existing store coverage | Error without provider I/O in transaction |
+| Payload growth | Pre-persistence size/count limits reject input | Boundary tests | Bad request; retention is not claimed |
+| Config reload overlaps generations | Old worker tasks receive shutdown; durable leases/fencing remain authoritative | Runtime behavior | No assumption of exactly-once execution |
 
 ## Performance and Retention
 
-- Claim at most 8 work items per transaction; provider and handler calls are outside the
-  transaction.
-- Loop worker concurrency defaults to 2; maintenance/replay provider concurrency defaults to 1.
+- Each claim transaction leases one dependency-ready WorkItem. A worker processes at most eight
+  WorkItems for one Goal per dispatch pass; provider and handler calls are outside transactions.
+- Loop worker concurrency defaults to 2. Periodic `core` maintenance and structural replay make
+  no provider calls; provider-backed handlers share the approved Goal budget and worker bound.
 - Lease heartbeat is at most one third of lease duration.
 - Signal content is capped at 16,384 characters, workflow/artifact manifests at 32 KiB,
-  provider-frame requests at 128 KiB, responses at 256 KiB, and API list limits at 500.
-- Replay and self-test results cache only by the complete immutable execution fingerprint.
-- Provider budgets are enforced as persisted maximum call counts, deadlines, and response bytes.
-  Token/currency accounting is informational only when usage metadata becomes available.
+  provider-frame requests at 128 KiB, and responses at 256 KiB. HTTP collection/event queries
+  default to 100 results; a defensive hard maximum is a deferred hardening item.
+- Every replay and self-test invocation persists an immutable run. Repeated identical Self-test
+  failure sets deduplicate the internal Signal by complete failure fingerprint.
+- Provider budgets enforce persisted maximum call counts, deadlines, and response bytes.
+  Token/currency accounting is not claimed because trusted provider usage is not captured here.
 - Retention/pruning is deliberately not automated in this phase; immutable evidence remains until
   a future reference-aware retention job is reviewed and enabled.
 - SQLite WAL and the existing five-second busy timeout remain. New write transactions must not
   span an await on a provider, MCP tool, channel, or filesystem operation.
 
-## Test Coverage Plan
+## Implemented Test Coverage
 
-```text
-CODE PATHS                                             USER FLOWS
-[+] loop domain                                       [+] /goal create -> dispatch
-  ├── [GAP][UNIT] every valid transition                ├── [GAP][E2E] authenticated direct goal
-  ├── [GAP][UNIT] every invalid transition              ├── [GAP][E2E] external signal -> proposed
-  ├── [GAP][UNIT] DAG validation/cycle                  └── [GAP][E2E] approve -> worker claim
-  └── [GAP][UNIT] payload/size/version bounds
+| Test file | Verified behavior |
+|---|---|
+| `tests/harness_loop_engine.rs` | Approved DAG dispatch, Goal verification, provider budgets, restart/resume, committed-checkpoint reconciliation, stale-worker fencing, approval hash binding, manual acceptance, Signal dedup/proposal, read-only Self-test/failure dedup, structural replay, Artifact/prompt references, and bounded evolution evaluation |
+| `tests/http_loop_engine_api.rs` | Operator authentication, scoped Signal ingestion/trust restriction, Goal plan/approve/resume lifecycle, collections, and event cursor |
+| `tests/service_harness_trajectory.rs` | Plain and streaming provider frames, Code Mode paths, MCP multi-call order/recovery, and terminal trajectory behavior |
+| `tests/harness_evolution_engine.rs` | Cumulative provider response budget, immutable scorecards, human gate, stale baselines, automatic-cycle stop-at-ready, concurrent evidence deduplication, and rollback |
+| `tests/config_bootstrap.rs` | Loop Engine defaults, explicit controls, environment placeholders, and template parsing |
 
-[+] SQLite store                                      [+] crash and recovery
-  ├── [GAP][INTEGRATION] signal dedup/provenance         ├── [GAP][E2E] expired lease -> new attempt
-  ├── [GAP][INTEGRATION] atomic state+event              ├── [GAP][E2E] stale worker rejected
-  ├── [GAP][INTEGRATION] dependency-aware claim          └── [GAP][E2E] unknown external write gated
-  ├── [GAP][INTEGRATION] lease heartbeat/fencing
-  ├── [GAP][INTEGRATION] committed-outcome reconciliation
-  └── [GAP][INTEGRATION] checkpoint sequence
+All tests use local SQLite and deterministic fake providers/tools. Structural replay asserts
+`live_tools_executed = 0`. The repository-level verification completed with formatting, strict
+Clippy, all targets, and a release build.
 
-[+] Signal triage                                     [+] operator recovery
-  ├── [GAP][UNIT] validation/redaction/digest            ├── [GAP][E2E] pause -> resume
-  ├── [GAP][INTEGRATION] strict JSON / provider error    ├── [GAP][E2E] confirm/skip external write
-  └── [GAP][EVAL] injection content stays untrusted      └── [GAP][E2E] cancel terminal behavior
+Intentionally uncovered because the feature is not shipped: external-write confirmation,
+pause/cancel HTTP operations, comparative live-provider replay, Desktop GUI behavior,
+vendor-specific community connectors, and automated retention/pruning.
 
-[+] Workflow/artifact registry                       [+] self-maintenance
-  ├── [GAP][UNIT] unknown kind/version rejected          ├── [GAP][E2E] run suite -> persisted result
-  ├── [GAP][UNIT] 32-step/64-edge/DAG limits             ├── [GAP][E2E] failure -> one signal
-  └── [GAP][INTEGRATION] operator activation gate        └── [GAP][E2E] pass -> no mutation
+Known delivered-path test gaps: the SSE streaming handler and disabled-mode `404` guard exist but
+do not yet have dedicated integration assertions.
 
-[+] Session Replay                                   [+] HTTP/Telegram control
-  ├── [GAP][UNIT] snapshot bounds/redaction              ├── [GAP][E2E] auth and actor gates
-  ├── [GAP][UNIT] structural replay                      ├── [GAP][E2E] 404/409/422 mapping
-  ├── [GAP][INTEGRATION] shadow provider                 ├── [GAP][E2E] duplicate submissions
-  ├── [GAP][INTEGRATION] recorded tool substitution      └── [GAP][INTEGRATION] command parsing/access
-  └── [GAP][E2E] live MCP cannot be reached
+## Implementation Record
 
-NEW-PATH COVERAGE BEFORE IMPLEMENTATION: 0 planned paths covered
-TARGET: every enumerated state edge, crash window, concurrency race, and user recovery flow
-```
+1. Added schema version 1, shared Harness IDs, explicit budgets, and cooperative worker reload.
+2. Added domain validation, immutable approval binding, DAG/work/attempt/checkpoint persistence,
+   lease heartbeat/fencing, and committed-outcome reconciliation.
+3. Added Artifact and multi-source Signal registries with bounded payloads and scoped ingestion.
+4. Added registered safe handlers and `LoopEngine` claim/dispatch/resume behavior.
+5. Added per-provider-completion frames and structural replay; comparative replay remains deferred.
+6. Added read-only Self-test persistence and deduplicated failure-to-Signal maintenance.
+7. Added HTTP/SSE and Telegram `/goal`/`/resume` control surfaces.
+8. Connected bounded `evolution_evaluate` to the existing Prompt Evolution engine without creating
+   an alternate approval/activation path.
+9. Added configuration templates, operator runbook, focused tests, and full repository gates.
 
-Required test files:
+## Implementation Dependency Record
 
-- `tests/harness_loop_domain.rs`
-- `tests/harness_loop_store.rs`
-- `tests/harness_loop_engine.rs`
-- `tests/harness_signal_triage.rs`
-- `tests/harness_workflow.rs`
-- `tests/harness_replay.rs`
-- `tests/harness_self_test.rs`
-- `tests/http_harness_control.rs`
-- `tests/telegram_goal_commands.rs`
-
-Prompt/LLM paths require deterministic fake-provider tests plus eval cases proving that external
-Signal content cannot become system instructions and that replay never executes live tools.
-
-## Implementation Sequence
-
-1. Add schema migration boundaries, shared Harness IDs, typed errors, budgets, and cooperative
-   worker shutdown semantics.
-2. Add domain types, complete state transitions, workflow/effect validation, verifier criteria,
-   and exhaustive unit tests.
-3. Add dedicated LoopStore, SQLite schema, short transactions, indexes, lease/fencing,
-   checkpoint reconciliation, and crash-window tests.
-4. Add artifact/workflow lifecycle and reference-only prompt adapter before replay/self-test
-   artifact types.
-5. Add Signal ingestion/dedup, scoped credentials, strict triage, GoalPlanner, immutable approval,
-   and tests.
-6. Add LoopEngine claim/heartbeat/execute/checkpoint/resume behavior with fake handlers, then
-   register the safe production handlers.
-7. Add per-completion trajectory frames and structural/comparative shadow Replay.
-8. Add isolated SelfTestRegistry/runner and failure-to-signal maintenance flow.
-9. Add operator HTTP control plane, event cursor, Telegram `/goal`/`/resume`, and recovery gates.
-10. Add bounded worker configuration, retention maintenance, metrics, docs, and migrations.
-11. Run formatting, strict Clippy, all targets, release build, and crash-window smoke tests.
-
-## Worktree Parallelization Strategy
-
-The implementation has independent work after the core domain is stable:
+The implementation used these dependency boundaries after the core domain stabilized:
 
 | Step | Modules | Depends on |
 |---|---|---|
-| Core domain/store | `harness/loop_engine`, SQLite schema | — |
-| Signal/triage | `harness/signals`, provider adapter | Core domain/store |
-| Replay | trajectory snapshot, `harness/replay` | Core domain/store |
-| Self-test | `harness/self_test` | Core domain/store, Replay |
-| Artifact registry | `harness/artifacts`, evolution adapter | Core domain/store |
+| Core domain/store | `harness/loop_engine/domain.rs`, `store.rs`, SQLite schema | — |
+| Signal ingestion/proposal | `harness/loop_engine/signals.rs` | Core domain/store |
+| Replay | trajectory frame capture, `harness/loop_engine/replay.rs` | Core domain/store |
+| Self-test | `harness/loop_engine/self_test.rs` | Core domain/store, Replay |
+| Artifact registry | `harness/loop_engine/artifacts.rs`, evolution adapter | Core domain/store |
 | Control plane | HTTP/Telegram | Engine, Signal, Replay, Self-test |
 
-Potential lanes after the core lands: Signal + Replay + Artifact Registry. Self-test follows
-Replay; Control Plane follows all engines. These lanes share `harness/mod.rs` and schema startup,
-so merges need coordination. This task will be implemented sequentially in the current workspace.
+Signal, Replay, and Artifact Registry were separable after the core; Self-test followed storage
+and Replay, and the Control Plane followed the engines. They share schema initialization and module
+exports, so the implementation was integrated sequentially in one workspace.
 
 ## Implementation Tasks
 
 - [x] **T1 (P1)** — Loop core — Build Goal, WorkItem, Attempt,
   Checkpoint, lease, fencing, events, and recovery.
 - [x] **T2 (P1)** — Signals — Add append-only multi-source
-  ingestion, provenance, trust, dedup, and proposed-goal triage.
+  ingestion, provenance, trust, dedup, and operator-created proposed Goals.
 - [x] **T3 (P1)** — Planner/verifier — Bind immutable workflow/effects/budgets to approval and
   close the Goal achievement loop.
 - [x] **T4 (P1)** — Replay — Capture per-completion frames and provide structural replay without
   live tools. Comparative provider replay remains an explicit future mode, not an exactness claim.
 - [x] **T5 (P1)** — Self-test — Persist bounded read-only suites/runs and emit
   deduplicated failure signals.
-- [x] **T6 (P2)** — Artifact registry — Add typed, versioned drivers
-  while preserving prompt activation safeguards.
+- [x] **T6 (P2)** — Artifact registry — Add immutable typed/versioned records
+  while preserving Prompt activation safeguards.
 - [x] **T7 (P1)** — Control plane — Add HTTP/SSE and Telegram goal/recovery
   flows with typed errors, scoped ingestion, operator gates, and event cursors.
 - [x] **T8 (P2)** — Operations — Add cooperative workers, persisted provider/deadline/response
@@ -673,6 +598,6 @@ so merges need coordination. This task will be implemented sequentially in the c
   scoped ingestion, isolated Self-tests, cooperative worker reload, and complete recovery APIs.
 - **CROSS-MODEL:** Both reviews agree on a dedicated durable loop, append-only signals,
   at-least-once recovery, typed drivers, and no live tools during replay.
-- **VERDICT:** ENG CLEARED — ready to implement the scoped Phase 2 core.
+- **VERDICT:** ENG CLEARED — the scoped Phase 2 core was then implemented and verified.
 
 NO UNRESOLVED DECISIONS

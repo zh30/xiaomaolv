@@ -124,12 +124,14 @@ output_verification_max_result_chars = 2000
 enabled = false
 # Separate, scoped key for POST /v1/harness/signals. Never reuse app.api_key.
 ingest_api_key = "${XIAOMAOLV_HARNESS_INGEST_API_KEY:-}"
-# Safe built-ins only: provider analysis, core self-test, structural replay, manual gate.
+# Safe registered handlers only: goal planning, provider analysis, core self-test, structural
+# replay, manual gate, and bounded evolution evaluation. external_write is rejected.
 worker_enabled = false
+# Valid: poll 1..=60s, lease 1..=3600s, parallel 1..=16.
 worker_poll_interval_secs = 2
 worker_lease_secs = 30
 worker_max_parallel = 2
-# 0 disables periodic read-only maintenance; 3600 is a practical starting interval.
+# 0 disables periodic read-only maintenance; otherwise valid 10..=2592000s.
 self_test_interval_secs = 0
 
 [agent.harness.evolution]

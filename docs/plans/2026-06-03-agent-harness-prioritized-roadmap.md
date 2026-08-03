@@ -1,5 +1,9 @@
 # Agent Harness Prioritized Roadmap
 
+> **Historical roadmap (2026-06-03), not the current backlog.** Use
+> `docs/agent-harness-eval.md`, `docs/self-evolving-harness.md`, and
+> `docs/loop-engineering-harness.md` for implemented behavior and remaining boundaries.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Turn the current agent harness from MVP scaffolding into a reliable, observable, and safer execution layer.
