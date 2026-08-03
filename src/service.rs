@@ -21,6 +21,7 @@ use crate::domain::{IncomingMessage, MessageRole, OutgoingMessage, StoredMessage
 use crate::harness::compactor::{
     CompactionMessageMetadata, CompactionRequest, CompactionStrategy, Compactor,
 };
+use crate::harness::evolution::{EvolutionPolicyRuntime, render_evolution_policy_message};
 use crate::harness::execution_environment::{
     ExecutionEnvironment, LocalExecutionEnvironment, SubprocessExecutionEnvironment,
 };
@@ -242,6 +243,7 @@ pub struct MessageService {
     output_verification_llm_enabled: bool,
     output_verification_max_prompt_chars: usize,
     output_verification_max_result_chars: usize,
+    evolution_policy_runtime: Option<EvolutionPolicyRuntime>,
 }
 
 struct CompletionOutcome {
@@ -427,6 +429,7 @@ impl MessageService {
             output_verification_llm_enabled: false,
             output_verification_max_prompt_chars: 6000,
             output_verification_max_result_chars: 2000,
+            evolution_policy_runtime: None,
         }
     }
 
@@ -481,6 +484,11 @@ impl MessageService {
 
     pub fn with_harness_store(mut self, store: Arc<dyn HarnessStore>) -> Self {
         self.harness_store = Some(store);
+        self
+    }
+
+    pub fn with_evolution_policy_runtime(mut self, runtime: EvolutionPolicyRuntime) -> Self {
+        self.evolution_policy_runtime = Some(runtime);
         self
     }
 
@@ -919,6 +927,7 @@ impl MessageService {
         );
 
         let history = self.apply_skills_prompt(history, &incoming.text).await;
+        let history = self.apply_evolution_policy(history).await;
         let history = self
             .append_builtin_time_context_if_needed(history, &incoming.text)
             .await;
@@ -1034,6 +1043,7 @@ impl MessageService {
         );
 
         let history = self.apply_skills_prompt(history, &incoming.text).await;
+        let history = self.apply_evolution_policy(history).await;
         let history = self
             .append_builtin_time_context_if_needed(history, &incoming.text)
             .await;
@@ -3413,6 +3423,24 @@ impl MessageService {
                 content: prompt,
             });
         }
+        history
+    }
+
+    async fn apply_evolution_policy(&self, mut history: Vec<StoredMessage>) -> Vec<StoredMessage> {
+        let Some(runtime) = &self.evolution_policy_runtime else {
+            return history;
+        };
+        let Some(active) = runtime.active().await else {
+            return history;
+        };
+        history.push(StoredMessage {
+            role: MessageRole::System,
+            content: render_evolution_policy_message(
+                &active.candidate_id,
+                &active.deployment_id,
+                &active.prompt_patch,
+            ),
+        });
         history
     }
 

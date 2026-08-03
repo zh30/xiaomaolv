@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, Mutex, RwLock as StdRwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 use axum::extract::{Path, Query, State};
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, RwLock, Semaphore, watch};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::channel::{
     ChannelContext, ChannelInbound, ChannelPlugin, ChannelPluginConfig, ChannelPluginError,
@@ -24,8 +24,16 @@ use crate::channel::{
 use crate::code_mode::LlmCodeModePlanner;
 use crate::config::AppConfig;
 use crate::domain::IncomingMessage;
+use crate::harness::evolution::{
+    ActiveEvolutionPolicy, EvolutionActor, EvolutionAuditEvent, EvolutionCandidateRecord,
+    EvolutionCycleResult, EvolutionCycleStatus, EvolutionDeploymentRecord, EvolutionEngine,
+    EvolutionEvalCase, EvolutionEvaluationRecord, EvolutionFeedbackDraft, EvolutionFeedbackRecord,
+    EvolutionGateConfig, EvolutionRollbackResult, evolution_cycle_skip_reason,
+};
 use crate::harness::observability::TrajectoryMetrics;
-use crate::harness::store::SqliteHarnessStore;
+use crate::harness::store::{
+    EvolutionStore, HarnessStore, SqliteEvolutionStore, SqliteHarnessStore,
+};
 use crate::mcp::{McpConfigPaths, McpRegistry, McpRuntime};
 use crate::memory::{
     HybridRetrievalOptions, HybridSqliteZvecMemoryBackend, MemoryBackend, SqliteMemoryBackend,
@@ -42,6 +50,7 @@ const CODE_MODE_DIAG_OVERFLOW_SOURCE_KEY: &str = "__overflow__";
 #[derive(Debug)]
 enum ApiError {
     BadRequest(String),
+    Conflict(String),
     Unauthorized(String),
     NotFound(String),
     RateLimited(String),
@@ -52,6 +61,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let (status, message) = match &self {
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
+            ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
             ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             ApiError::RateLimited(msg) => (StatusCode::TOO_MANY_REQUESTS, msg.clone()),
@@ -89,7 +99,15 @@ struct RuntimeHandles {
     service: Arc<MessageService>,
     channel_plugins: Arc<HashMap<String, Arc<dyn ChannelPlugin>>>,
     mcp_runtime: Arc<RwLock<McpRuntime>>,
+    evolution_engine: Option<Arc<EvolutionEngine>>,
+    evolution_auto_cycle: Option<EvolutionAutoCycleSettings>,
     locale: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EvolutionAutoCycleSettings {
+    interval_secs: u64,
+    initial_delay_secs: u64,
 }
 
 #[derive(Clone)]
@@ -543,7 +561,68 @@ async fn build_runtime_handles(
     let mcp_runtime = Arc::new(RwLock::new(load_mcp_runtime().await));
     let skills_runtime = Arc::new(RwLock::new(load_skill_runtime().await));
     let code_mode_planner = Arc::new(LlmCodeModePlanner::new(provider.clone()));
-    let harness_store = Arc::new(SqliteHarnessStore::new(memory_store.clone()));
+    let harness_store: Arc<dyn HarnessStore> =
+        Arc::new(SqliteHarnessStore::new(memory_store.clone()));
+    let evolution_config = &config.agent.harness.evolution;
+    if evolution_config.enabled {
+        if !(1..=100).contains(&evolution_config.max_source_trajectories) {
+            bail!("evolution max_source_trajectories must be between 1 and 100");
+        }
+        if !(512..=32_000).contains(&evolution_config.max_evidence_chars) {
+            bail!("evolution max_evidence_chars must be between 512 and 32000");
+        }
+    }
+    if evolution_config.auto_cycle_enabled {
+        if !evolution_config.enabled {
+            bail!("evolution auto cycle requires agent.harness.evolution.enabled=true");
+        }
+        if !config.agent.harness.enable_trajectory {
+            bail!("evolution auto cycle requires agent.harness.enable_trajectory=true");
+        }
+        if evolution_config.cycle_interval_secs < 60 {
+            bail!("evolution cycle_interval_secs must be at least 60 seconds");
+        }
+        if config
+            .app
+            .api_key
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            bail!("evolution auto cycle requires app.api_key for operator control");
+        }
+    }
+    let evolution_auto_cycle =
+        evolution_config
+            .auto_cycle_enabled
+            .then_some(EvolutionAutoCycleSettings {
+                interval_secs: evolution_config.cycle_interval_secs,
+                initial_delay_secs: evolution_config.cycle_initial_delay_secs,
+            });
+    let evolution_engine = if evolution_config.enabled {
+        let evolution_store: Arc<dyn EvolutionStore> =
+            Arc::new(SqliteEvolutionStore::new(memory_store.clone()));
+        let engine = EvolutionEngine::new(
+            evolution_store,
+            provider.clone(),
+            EvolutionGateConfig {
+                min_eval_cases: evolution_config.min_eval_cases,
+                min_candidate_score: evolution_config.min_candidate_score,
+                min_score_delta: evolution_config.min_score_delta,
+                max_regressions: evolution_config.max_regressions,
+                max_prompt_patch_chars: evolution_config.max_prompt_patch_chars,
+                require_human_approval: evolution_config.require_human_approval,
+            },
+        )
+        .await?
+        .with_harness_store(harness_store.clone())
+        .with_evidence_limits(
+            evolution_config.max_source_trajectories,
+            evolution_config.max_evidence_chars,
+        );
+        Some(Arc::new(engine))
+    } else {
+        None
+    };
     let trajectory_metrics =
         if config.agent.harness.enable_trajectory || config.agent.harness.enable_verification {
             let registry = Registry::new();
@@ -595,6 +674,9 @@ async fn build_runtime_handles(
         audit_retention_days: config.agent.swarm.audit_retention_days,
     })
     .with_harness_config(&config.agent.harness);
+    if let Some(engine) = &evolution_engine {
+        service = service.with_evolution_policy_runtime(engine.policy_runtime());
+    }
     if let Some(metrics) = trajectory_metrics {
         service = service.with_trajectory_metrics(metrics);
     }
@@ -605,6 +687,8 @@ async fn build_runtime_handles(
         service,
         channel_plugins: Arc::new(channel_plugins),
         mcp_runtime,
+        evolution_engine,
+        evolution_auto_cycle,
         locale: env_overrides
             .and_then(|m| m.get("XIAOMAOLV_LOCALE").cloned())
             .and_then(|value| normalize_supported_locale(&value))
@@ -677,7 +761,46 @@ fn build_axum_router(state: AppState, http_enabled: bool) -> Router {
             post(post_channel_inbound_with_secret),
         )
         .route("/v1/harness/trajectories", get(list_trajectories))
-        .route("/v1/harness/trajectories/{id}", get(get_trajectory));
+        .route("/v1/harness/trajectories/{id}", get(get_trajectory))
+        .route("/v1/harness/evolution/status", get(get_evolution_status))
+        .route(
+            "/v1/harness/evolution/candidates",
+            get(list_evolution_candidates).post(post_evolution_candidate),
+        )
+        .route(
+            "/v1/harness/evolution/candidates/{id}",
+            get(get_evolution_candidate),
+        )
+        .route(
+            "/v1/harness/evolution/candidates/{id}/evaluate",
+            post(post_evolution_evaluate),
+        )
+        .route(
+            "/v1/harness/evolution/candidates/{id}/abandon-evaluation",
+            post(post_evolution_abandon_evaluation),
+        )
+        .route(
+            "/v1/harness/evolution/candidates/{id}/approve",
+            post(post_evolution_approve),
+        )
+        .route(
+            "/v1/harness/evolution/candidates/{id}/activate",
+            post(post_evolution_activate),
+        )
+        .route(
+            "/v1/harness/evolution/eval-cases",
+            get(list_evolution_eval_cases).post(post_evolution_eval_case),
+        )
+        .route("/v1/harness/evolution/audit", get(list_evolution_audit))
+        .route(
+            "/v1/harness/evolution/feedback",
+            get(list_evolution_feedback).post(post_evolution_feedback),
+        )
+        .route("/v1/harness/evolution/cycle", post(post_evolution_cycle))
+        .route(
+            "/v1/harness/evolution/rollback",
+            post(post_evolution_rollback),
+        );
 
     if http_enabled {
         api_router = api_router
@@ -722,6 +845,49 @@ async fn start_channel_workers(
         if let Some(worker) = worker {
             workers.push(worker);
         }
+    }
+
+    if let (Some(engine), Some(settings)) = (
+        runtime.evolution_engine.clone(),
+        runtime.evolution_auto_cycle,
+    ) {
+        let mut shutdown = shutdown_rx.clone();
+        let task = tokio::spawn(async move {
+            let first_tick =
+                tokio::time::Instant::now() + Duration::from_secs(settings.initial_delay_secs);
+            let mut ticker =
+                tokio::time::interval_at(first_tick, Duration::from_secs(settings.interval_secs));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            break;
+                        }
+                    }
+                    _ = ticker.tick() => {
+                        match engine.run_cycle().await {
+                            Ok(cycle) => info!(
+                                candidate_id = %cycle.candidate.id,
+                                status = cycle.candidate.status.as_str(),
+                                "self-evolution cycle completed"
+                            ),
+                            Err(err) => {
+                                if let Some(reason) = evolution_cycle_skip_reason(&err) {
+                                    info!(reason, "self-evolution cycle skipped");
+                                } else {
+                                    warn!(error = %err, "self-evolution cycle failed");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        workers.push(ChannelWorker {
+            name: "self-evolution".to_string(),
+            task,
+        });
     }
 
     Ok(workers)
@@ -2497,6 +2663,384 @@ fn parse_trajectory_exit_reason(
     }
 }
 
+#[derive(Debug, Serialize)]
+struct EvolutionStatusResponse {
+    enabled: bool,
+    active_policy: Option<ActiveEvolutionPolicy>,
+    gate_config: Option<EvolutionGateConfig>,
+    cycle_status: Option<EvolutionCycleStatus>,
+}
+
+#[derive(Debug, Serialize)]
+struct EvolutionCandidateResponse {
+    candidate: EvolutionCandidateRecord,
+}
+
+#[derive(Debug, Serialize)]
+struct EvolutionCandidateDetailResponse {
+    candidate: EvolutionCandidateRecord,
+    latest_evaluation: Option<EvolutionEvaluationRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct EvolutionCandidateListResponse {
+    candidates: Vec<EvolutionCandidateRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct EvolutionEvaluationResponse {
+    evaluation: EvolutionEvaluationRecord,
+}
+
+#[derive(Debug, Serialize)]
+struct EvolutionDeploymentResponse {
+    deployment: EvolutionDeploymentRecord,
+}
+
+#[derive(Debug, Serialize)]
+struct EvolutionRollbackResponse {
+    rollback: EvolutionRollbackResult,
+}
+
+#[derive(Debug, Serialize)]
+struct EvolutionCycleResponse {
+    cycle: EvolutionCycleResult,
+}
+
+#[derive(Debug, Serialize)]
+struct EvolutionEvalCaseResponse {
+    eval_case: EvolutionEvalCase,
+}
+
+#[derive(Debug, Serialize)]
+struct EvolutionEvalCaseListResponse {
+    eval_cases: Vec<EvolutionEvalCase>,
+}
+
+#[derive(Debug, Serialize)]
+struct EvolutionAuditListResponse {
+    events: Vec<EvolutionAuditEvent>,
+}
+
+#[derive(Debug, Serialize)]
+struct EvolutionFeedbackResponse {
+    feedback: EvolutionFeedbackRecord,
+}
+
+#[derive(Debug, Serialize)]
+struct EvolutionFeedbackListResponse {
+    feedback: Vec<EvolutionFeedbackRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EvolutionListQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EvolutionEvalCaseQuery {
+    enabled_only: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EvolutionFeedbackQuery {
+    negative_only: Option<bool>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EvolutionCandidateCreateRequest {
+    prompt_patch: String,
+    rationale: String,
+    #[serde(default)]
+    source_trajectory_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EvolutionReasonRequest {
+    reason: String,
+}
+
+async fn get_evolution_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<EvolutionStatusResponse>, ApiError> {
+    guard_evolution_access(&state, &headers)?;
+    let engine = {
+        let runtime = state.runtime.read().await;
+        runtime.evolution_engine.clone()
+    };
+    let Some(engine) = engine else {
+        return Ok(Json(EvolutionStatusResponse {
+            enabled: false,
+            active_policy: None,
+            gate_config: None,
+            cycle_status: None,
+        }));
+    };
+    Ok(Json(EvolutionStatusResponse {
+        enabled: true,
+        active_policy: engine.active_policy().await,
+        gate_config: Some(engine.gate_config().clone()),
+        cycle_status: Some(engine.cycle_status().await),
+    }))
+}
+
+async fn list_evolution_candidates(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<EvolutionListQuery>,
+) -> Result<Json<EvolutionCandidateListResponse>, ApiError> {
+    guard_evolution_access(&state, &headers)?;
+    let engine = evolution_engine(&state).await?;
+    let candidates = engine
+        .list_candidates(query.limit.unwrap_or(100))
+        .await
+        .map_err(internal_err("failed to list evolution candidates"))?;
+    Ok(Json(EvolutionCandidateListResponse { candidates }))
+}
+
+async fn get_evolution_candidate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<EvolutionCandidateDetailResponse>, ApiError> {
+    guard_evolution_access(&state, &headers)?;
+    let engine = evolution_engine(&state).await?;
+    let candidate = engine
+        .get_candidate(&id)
+        .await
+        .map_err(internal_err("failed to get evolution candidate"))?
+        .ok_or_else(|| ApiError::NotFound(format!("evolution candidate '{id}' not found")))?;
+    let latest_evaluation = engine
+        .latest_evaluation(&id)
+        .await
+        .map_err(internal_err("failed to get evolution evaluation"))?;
+    Ok(Json(EvolutionCandidateDetailResponse {
+        candidate,
+        latest_evaluation,
+    }))
+}
+
+async fn post_evolution_candidate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<EvolutionCandidateCreateRequest>,
+) -> Result<Json<EvolutionCandidateResponse>, ApiError> {
+    guard_evolution_access(&state, &headers)?;
+    let actor = evolution_human_actor(&headers)?;
+    let engine = evolution_engine(&state).await?;
+    let candidate = engine
+        .create_candidate(
+            payload.prompt_patch,
+            payload.rationale,
+            payload.source_trajectory_ids,
+            &actor,
+        )
+        .await
+        .map_err(evolution_bad_request)?;
+    Ok(Json(EvolutionCandidateResponse { candidate }))
+}
+
+async fn post_evolution_evaluate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<EvolutionEvaluationResponse>, ApiError> {
+    guard_evolution_access(&state, &headers)?;
+    let engine = evolution_engine(&state).await?;
+    let evaluation = engine
+        .evaluate_candidate(&id)
+        .await
+        .map_err(internal_err("evolution evaluation failed"))?;
+    Ok(Json(EvolutionEvaluationResponse { evaluation }))
+}
+
+async fn post_evolution_approve(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(payload): Json<EvolutionReasonRequest>,
+) -> Result<Json<EvolutionCandidateResponse>, ApiError> {
+    guard_evolution_access(&state, &headers)?;
+    let actor = evolution_human_actor(&headers)?;
+    let engine = evolution_engine(&state).await?;
+    let candidate = engine
+        .approve_candidate(&id, &actor, &payload.reason)
+        .await
+        .map_err(evolution_bad_request)?;
+    Ok(Json(EvolutionCandidateResponse { candidate }))
+}
+
+async fn post_evolution_abandon_evaluation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(payload): Json<EvolutionReasonRequest>,
+) -> Result<Json<EvolutionCandidateResponse>, ApiError> {
+    guard_evolution_access(&state, &headers)?;
+    let actor = evolution_human_actor(&headers)?;
+    let engine = evolution_engine(&state).await?;
+    let candidate = engine
+        .abandon_evaluation(&id, &actor, &payload.reason)
+        .await
+        .map_err(evolution_bad_request)?;
+    Ok(Json(EvolutionCandidateResponse { candidate }))
+}
+
+async fn post_evolution_activate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(payload): Json<EvolutionReasonRequest>,
+) -> Result<Json<EvolutionDeploymentResponse>, ApiError> {
+    guard_evolution_access(&state, &headers)?;
+    let actor = evolution_human_actor(&headers)?;
+    let engine = evolution_engine(&state).await?;
+    let deployment = engine
+        .activate_candidate(&id, &actor, &payload.reason)
+        .await
+        .map_err(evolution_bad_request)?;
+    Ok(Json(EvolutionDeploymentResponse { deployment }))
+}
+
+async fn list_evolution_eval_cases(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<EvolutionEvalCaseQuery>,
+) -> Result<Json<EvolutionEvalCaseListResponse>, ApiError> {
+    guard_evolution_access(&state, &headers)?;
+    let engine = evolution_engine(&state).await?;
+    let eval_cases = engine
+        .list_eval_cases(query.enabled_only.unwrap_or(false))
+        .await
+        .map_err(internal_err("failed to list evolution eval cases"))?;
+    Ok(Json(EvolutionEvalCaseListResponse { eval_cases }))
+}
+
+async fn post_evolution_eval_case(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(eval_case): Json<EvolutionEvalCase>,
+) -> Result<Json<EvolutionEvalCaseResponse>, ApiError> {
+    guard_evolution_access(&state, &headers)?;
+    let actor = evolution_human_actor(&headers)?;
+    let engine = evolution_engine(&state).await?;
+    engine
+        .upsert_eval_case(eval_case.clone(), &actor)
+        .await
+        .map_err(evolution_bad_request)?;
+    Ok(Json(EvolutionEvalCaseResponse { eval_case }))
+}
+
+async fn list_evolution_audit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<EvolutionListQuery>,
+) -> Result<Json<EvolutionAuditListResponse>, ApiError> {
+    guard_evolution_access(&state, &headers)?;
+    let engine = evolution_engine(&state).await?;
+    let events = engine
+        .list_audit_events(query.limit.unwrap_or(100))
+        .await
+        .map_err(internal_err("failed to list evolution audit events"))?;
+    Ok(Json(EvolutionAuditListResponse { events }))
+}
+
+async fn post_evolution_feedback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(draft): Json<EvolutionFeedbackDraft>,
+) -> Result<Json<EvolutionFeedbackResponse>, ApiError> {
+    guard_evolution_access(&state, &headers)?;
+    let actor = evolution_human_actor(&headers)?;
+    let engine = evolution_engine(&state).await?;
+    let feedback = engine
+        .record_feedback(draft, &actor)
+        .await
+        .map_err(evolution_bad_request)?;
+    Ok(Json(EvolutionFeedbackResponse { feedback }))
+}
+
+async fn list_evolution_feedback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<EvolutionFeedbackQuery>,
+) -> Result<Json<EvolutionFeedbackListResponse>, ApiError> {
+    guard_evolution_access(&state, &headers)?;
+    let engine = evolution_engine(&state).await?;
+    let feedback = engine
+        .list_feedback(
+            query.negative_only.unwrap_or(false),
+            query.limit.unwrap_or(100),
+        )
+        .await
+        .map_err(internal_err("failed to list evolution feedback"))?;
+    Ok(Json(EvolutionFeedbackListResponse { feedback }))
+}
+
+async fn post_evolution_cycle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<EvolutionCycleResponse>, ApiError> {
+    guard_evolution_access(&state, &headers)?;
+    let engine = evolution_engine(&state).await?;
+    let cycle = engine.run_cycle().await.map_err(|err| {
+        if let Some(reason) = evolution_cycle_skip_reason(&err) {
+            ApiError::Conflict(reason.to_string())
+        } else {
+            internal_err("self-evolution cycle failed")(err)
+        }
+    })?;
+    Ok(Json(EvolutionCycleResponse { cycle }))
+}
+
+async fn post_evolution_rollback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<EvolutionReasonRequest>,
+) -> Result<Json<EvolutionRollbackResponse>, ApiError> {
+    guard_evolution_access(&state, &headers)?;
+    let actor = evolution_human_actor(&headers)?;
+    let engine = evolution_engine(&state).await?;
+    let rollback = engine
+        .rollback_active(&actor, &payload.reason)
+        .await
+        .map_err(evolution_bad_request)?;
+    Ok(Json(EvolutionRollbackResponse { rollback }))
+}
+
+async fn evolution_engine(state: &AppState) -> Result<Arc<EvolutionEngine>, ApiError> {
+    let runtime = state.runtime.read().await;
+    runtime
+        .evolution_engine
+        .clone()
+        .ok_or_else(|| ApiError::NotFound("self-evolution is disabled".to_string()))
+}
+
+fn evolution_human_actor(headers: &HeaderMap) -> Result<EvolutionActor, ApiError> {
+    let actor = headers
+        .get("x-evolution-actor")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("x-evolution-actor header is required".to_string()))?;
+    if actor.len() > 128
+        || !actor
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '@'))
+    {
+        return Err(ApiError::BadRequest(
+            "x-evolution-actor contains unsupported characters or is too long".to_string(),
+        ));
+    }
+    Ok(EvolutionActor::Human(actor.to_string()))
+}
+
+fn evolution_bad_request(err: anyhow::Error) -> ApiError {
+    ApiError::BadRequest(err.to_string())
+}
+
 async fn dispatch_channel_inbound(
     state: AppState,
     channel_name: String,
@@ -2576,6 +3120,21 @@ fn verify_api_key(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError>
             "invalid or missing API key".to_string(),
         )),
     }
+}
+
+fn guard_evolution_access(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let has_api_key = state
+        .api_key
+        .read()
+        .map_err(|_| ApiError::Internal(anyhow::anyhow!("app api key lock poisoned")))?
+        .is_some();
+    if !has_api_key {
+        return Err(ApiError::Unauthorized(
+            "self-evolution control plane requires app.api_key".to_string(),
+        ));
+    }
+    verify_api_key(state, headers)?;
+    check_rate_limit(state, headers)
 }
 
 fn check_rate_limit(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {

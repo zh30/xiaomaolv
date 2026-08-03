@@ -36,6 +36,7 @@
 - Telegram 回复会剥离 `<think>...</think>`，仅发送正文
 - 记忆系统：`sqlite-only`（默认）和 `hybrid-sqlite-zvec`（可选）
 - 插件式扩展 API（Provider/Channel/Memory）
+- 自进化 Harness：轨迹反馈、有界 Prompt 候选、确定性影子评测、人工晋升、热激活与回滚
 
 <a id="quick-start"></a>
 ## 快速开始（推荐：MiniMax + Telegram）
@@ -101,6 +102,7 @@ curl -sS http://127.0.0.1:8080/v1/channels/telegram/mode
 - `docs/development.md`：统一开发指南，包含本地开发、架构边界、测试选择与 PR checklist
 - `docs/real-test-minimax-telegram.md`：真实 MiniMax + Telegram 联调指南
 - `docs/zvec-sidecar.md`：zvec sidecar 协议、启动方式与兼容行为
+- `docs/self-evolving-harness.md`：安全自进化闭环、配置、API 与运维手册
 - `docs/engineering-quality.md`：架构约束、质量门禁与性能基线
 - `config/xiaomaolv.minimax-telegram.toml`：MVP 推荐配置（可直接拷贝改值）
 - `config/xiaomaolv.example.toml`：通用模板（适合自定义 Provider/Channel）
@@ -190,6 +192,7 @@ curl -sS http://127.0.0.1:8080/v1/channels/telegram/mode
   - `harness.compaction_budget_max_tokens = 16000`
   - `harness.enable_verification = false`；`harness.verification_mode = "observe"`（`observe` 为被动记录，`retry|block` 会影响工具流/最终回答）
   - `harness.output_verification_mode = "off"`（`off|observe|revise_once|block`；`revise_once` 会执行一次有界改写）
+  - `harness.evolution.enabled = false`（默认关闭；自动循环只生成候选并做影子评测，不会自动审批或激活）
   - `code_mode.enabled = false`（默认关闭）
   - `code_mode.shadow_mode = true`（灰度模式，仅审计不接管结果）
   - `code_mode.max_calls = 6`
@@ -247,6 +250,7 @@ curl -sS http://127.0.0.1:8080/v1/channels/telegram/mode
 - `GET /v1/channels/{channel}/diag`（鉴权行为同 `/v1/messages`）
 - `POST /v1/channels/{channel}/inbound`（鉴权行为同 `/v1/messages`）
 - `POST /v1/channels/{channel}/inbound/{secret}`（鉴权行为同 `/v1/messages`）
+- `/v1/harness/evolution/*`（状态、反馈、评测集、候选、循环、审计、激活与回滚；始终要求配置 app API key）
 
 示例：
 

@@ -471,6 +471,8 @@ pub struct AgentHarnessConfig {
     pub output_verification_max_prompt_chars: usize,
     #[serde(default = "default_output_verification_max_result_chars")]
     pub output_verification_max_result_chars: usize,
+    #[serde(default)]
+    pub evolution: AgentEvolutionConfig,
 }
 
 impl Default for AgentHarnessConfig {
@@ -492,6 +494,54 @@ impl Default for AgentHarnessConfig {
             output_verification_llm_enabled: false,
             output_verification_max_prompt_chars: default_output_verification_max_prompt_chars(),
             output_verification_max_result_chars: default_output_verification_max_result_chars(),
+            evolution: AgentEvolutionConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentEvolutionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub auto_cycle_enabled: bool,
+    #[serde(default = "default_evolution_cycle_interval_secs")]
+    pub cycle_interval_secs: u64,
+    #[serde(default = "default_evolution_cycle_initial_delay_secs")]
+    pub cycle_initial_delay_secs: u64,
+    #[serde(default = "default_evolution_max_source_trajectories")]
+    pub max_source_trajectories: usize,
+    #[serde(default = "default_evolution_max_evidence_chars")]
+    pub max_evidence_chars: usize,
+    #[serde(default = "default_evolution_min_eval_cases")]
+    pub min_eval_cases: usize,
+    #[serde(default = "default_evolution_min_candidate_score")]
+    pub min_candidate_score: f64,
+    #[serde(default = "default_evolution_min_score_delta")]
+    pub min_score_delta: f64,
+    #[serde(default)]
+    pub max_regressions: usize,
+    #[serde(default = "default_evolution_max_prompt_patch_chars")]
+    pub max_prompt_patch_chars: usize,
+    #[serde(default = "default_evolution_require_human_approval")]
+    pub require_human_approval: bool,
+}
+
+impl Default for AgentEvolutionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_cycle_enabled: false,
+            cycle_interval_secs: default_evolution_cycle_interval_secs(),
+            cycle_initial_delay_secs: default_evolution_cycle_initial_delay_secs(),
+            max_source_trajectories: default_evolution_max_source_trajectories(),
+            max_evidence_chars: default_evolution_max_evidence_chars(),
+            min_eval_cases: default_evolution_min_eval_cases(),
+            min_candidate_score: default_evolution_min_candidate_score(),
+            min_score_delta: default_evolution_min_score_delta(),
+            max_regressions: 0,
+            max_prompt_patch_chars: default_evolution_max_prompt_patch_chars(),
+            require_human_approval: default_evolution_require_human_approval(),
         }
     }
 }
@@ -830,6 +880,42 @@ fn default_agent_swarm_reply_summary_enabled() -> bool {
 
 fn default_agent_swarm_audit_retention_days() -> u32 {
     30
+}
+
+fn default_evolution_max_source_trajectories() -> usize {
+    20
+}
+
+fn default_evolution_cycle_interval_secs() -> u64 {
+    3_600
+}
+
+fn default_evolution_cycle_initial_delay_secs() -> u64 {
+    60
+}
+
+fn default_evolution_max_evidence_chars() -> usize {
+    8_000
+}
+
+fn default_evolution_min_eval_cases() -> usize {
+    3
+}
+
+fn default_evolution_min_candidate_score() -> f64 {
+    0.8
+}
+
+fn default_evolution_min_score_delta() -> f64 {
+    0.05
+}
+
+fn default_evolution_max_prompt_patch_chars() -> usize {
+    4_000
+}
+
+fn default_evolution_require_human_approval() -> bool {
+    true
 }
 
 fn default_compaction_strategy() -> String {

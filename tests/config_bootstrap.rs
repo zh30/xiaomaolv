@@ -81,6 +81,65 @@ enabled = true
     assert!(!cfg.agent.harness.output_verification_llm_enabled);
     assert_eq!(cfg.agent.harness.output_verification_max_prompt_chars, 6000);
     assert_eq!(cfg.agent.harness.output_verification_max_result_chars, 2000);
+    assert!(!cfg.agent.harness.evolution.enabled);
+    assert!(!cfg.agent.harness.evolution.auto_cycle_enabled);
+    assert_eq!(cfg.agent.harness.evolution.cycle_interval_secs, 3600);
+    assert_eq!(cfg.agent.harness.evolution.cycle_initial_delay_secs, 60);
+    assert_eq!(cfg.agent.harness.evolution.max_source_trajectories, 20);
+    assert_eq!(cfg.agent.harness.evolution.max_evidence_chars, 8000);
+    assert_eq!(cfg.agent.harness.evolution.min_eval_cases, 3);
+    assert_eq!(cfg.agent.harness.evolution.min_candidate_score, 0.8);
+    assert_eq!(cfg.agent.harness.evolution.min_score_delta, 0.05);
+    assert_eq!(cfg.agent.harness.evolution.max_regressions, 0);
+    assert_eq!(cfg.agent.harness.evolution.max_prompt_patch_chars, 4000);
+    assert!(cfg.agent.harness.evolution.require_human_approval);
+}
+
+#[test]
+fn config_bootstrap_parses_self_evolution_controls() {
+    let toml = r#"
+[app]
+bind = "127.0.0.1:8080"
+default_provider = "openai"
+
+[providers.openai]
+kind = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+api_key = "test-key"
+model = "gpt-4o-mini"
+
+[channels.http]
+enabled = true
+
+[agent.harness.evolution]
+enabled = true
+auto_cycle_enabled = true
+cycle_interval_secs = 7200
+cycle_initial_delay_secs = 120
+max_source_trajectories = 12
+max_evidence_chars = 5000
+min_eval_cases = 7
+min_candidate_score = 0.91
+min_score_delta = 0.08
+max_regressions = 1
+max_prompt_patch_chars = 2500
+require_human_approval = false
+"#;
+
+    let cfg = AppConfig::from_toml(toml).expect("config should parse");
+    let evolution = cfg.agent.harness.evolution;
+    assert!(evolution.enabled);
+    assert!(evolution.auto_cycle_enabled);
+    assert_eq!(evolution.cycle_interval_secs, 7200);
+    assert_eq!(evolution.cycle_initial_delay_secs, 120);
+    assert_eq!(evolution.max_source_trajectories, 12);
+    assert_eq!(evolution.max_evidence_chars, 5000);
+    assert_eq!(evolution.min_eval_cases, 7);
+    assert_eq!(evolution.min_candidate_score, 0.91);
+    assert_eq!(evolution.min_score_delta, 0.08);
+    assert_eq!(evolution.max_regressions, 1);
+    assert_eq!(evolution.max_prompt_patch_chars, 2500);
+    assert!(!evolution.require_human_approval);
 }
 
 #[test]

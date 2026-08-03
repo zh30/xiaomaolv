@@ -390,7 +390,13 @@ impl SqliteMemoryStore {
         .await
         .context("failed to initialize compaction summary session index")?;
 
+        initialize_evolution_schema(&pool).await?;
+
         Ok(Self { pool })
+    }
+
+    pub(crate) fn pool(&self) -> &SqlitePool {
+        &self.pool
     }
 
     pub async fn append(&self, session_id: &str, message: StoredMessage) -> anyhow::Result<()> {
@@ -1486,7 +1492,7 @@ impl SqliteMemoryStore {
         model: &str,
     ) -> anyhow::Result<()> {
         sqlx::query(
-            "INSERT OR IGNORE INTO mcp_trajectories
+            "INSERT INTO mcp_trajectories
              (id, session_id, channel, user_id, started_at, exit_reason, model)
              VALUES (?1, ?2, ?3, ?4, unixepoch(), 'final_answer', ?5)",
         )
@@ -1870,6 +1876,200 @@ async fn ensure_trajectory_tool_calls_schema(pool: &SqlitePool) -> anyhow::Resul
         .await
         .context("failed to commit trajectory tool call migration")?;
     Ok(())
+}
+
+async fn initialize_evolution_schema(pool: &SqlitePool) -> anyhow::Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS evolution_candidates (
+            id TEXT PRIMARY KEY,
+            parent_candidate_id TEXT REFERENCES evolution_candidates(id),
+            evidence_fingerprint TEXT,
+            prompt_patch TEXT NOT NULL,
+            rationale TEXT NOT NULL,
+            source_trajectory_ids_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );",
+    )
+    .execute(pool)
+    .await
+    .context("failed to initialize evolution_candidates table")?;
+
+    maybe_add_evolution_candidates_column(pool, "evidence_fingerprint TEXT")
+        .await
+        .context("failed to add evolution_candidates.evidence_fingerprint")?;
+
+    sqlx::query("DROP INDEX IF EXISTS idx_evolution_candidates_parent_evidence;")
+        .execute(pool)
+        .await
+        .context("failed to migrate evolution candidate evidence index")?;
+
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_evolution_candidates_evidence
+         ON evolution_candidates(evidence_fingerprint)
+         WHERE evidence_fingerprint IS NOT NULL;",
+    )
+    .execute(pool)
+    .await
+    .context("failed to initialize evolution candidate evidence index")?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_evolution_candidates_status_updated
+         ON evolution_candidates(status, updated_at DESC);",
+    )
+    .execute(pool)
+    .await
+    .context("failed to initialize evolution candidate status index")?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS evolution_eval_cases (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            input TEXT NOT NULL,
+            assertions_json TEXT NOT NULL,
+            weight REAL NOT NULL,
+            enabled INTEGER NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );",
+    )
+    .execute(pool)
+    .await
+    .context("failed to initialize evolution_eval_cases table")?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS evolution_evaluations (
+            id TEXT PRIMARY KEY,
+            candidate_id TEXT NOT NULL REFERENCES evolution_candidates(id),
+            baseline_candidate_id TEXT REFERENCES evolution_candidates(id),
+            scorecard_json TEXT NOT NULL,
+            decision_json TEXT NOT NULL,
+            gate_config_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );",
+    )
+    .execute(pool)
+    .await
+    .context("failed to initialize evolution_evaluations table")?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_evolution_evaluations_candidate_created
+         ON evolution_evaluations(candidate_id, created_at DESC, id DESC);",
+    )
+    .execute(pool)
+    .await
+    .context("failed to initialize evolution evaluation candidate index")?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS evolution_deployments (
+            id TEXT PRIMARY KEY,
+            candidate_id TEXT NOT NULL REFERENCES evolution_candidates(id),
+            previous_deployment_id TEXT REFERENCES evolution_deployments(id),
+            activated_by TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            activated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            rolled_back_at INTEGER,
+            rolled_back_by TEXT,
+            rollback_reason TEXT
+        );",
+    )
+    .execute(pool)
+    .await
+    .context("failed to initialize evolution_deployments table")?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS evolution_runtime_state (
+            singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+            active_deployment_id TEXT REFERENCES evolution_deployments(id),
+            updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );",
+    )
+    .execute(pool)
+    .await
+    .context("failed to initialize evolution_runtime_state table")?;
+
+    sqlx::query(
+        "INSERT OR IGNORE INTO evolution_runtime_state (singleton_id, active_deployment_id)
+         VALUES (1, NULL);",
+    )
+    .execute(pool)
+    .await
+    .context("failed to initialize evolution runtime singleton")?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS evolution_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trajectory_id TEXT NOT NULL REFERENCES mcp_trajectories(id),
+            score REAL NOT NULL,
+            tags_json TEXT NOT NULL,
+            comment TEXT,
+            actor TEXT NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );",
+    )
+    .execute(pool)
+    .await
+    .context("failed to initialize evolution_feedback table")?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_evolution_feedback_trajectory_created
+         ON evolution_feedback(trajectory_id, created_at DESC, id DESC);",
+    )
+    .execute(pool)
+    .await
+    .context("failed to initialize evolution feedback trajectory index")?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_evolution_feedback_score_created
+         ON evolution_feedback(score, created_at DESC, id DESC);",
+    )
+    .execute(pool)
+    .await
+    .context("failed to initialize evolution feedback score index")?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS evolution_audit_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            candidate_id TEXT REFERENCES evolution_candidates(id),
+            deployment_id TEXT REFERENCES evolution_deployments(id),
+            event_type TEXT NOT NULL,
+            actor TEXT NOT NULL,
+            details_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );",
+    )
+    .execute(pool)
+    .await
+    .context("failed to initialize evolution_audit_events table")?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_evolution_audit_created
+         ON evolution_audit_events(created_at DESC, id DESC);",
+    )
+    .execute(pool)
+    .await
+    .context("failed to initialize evolution audit index")?;
+
+    Ok(())
+}
+
+async fn maybe_add_evolution_candidates_column(
+    pool: &SqlitePool,
+    column_def: &str,
+) -> anyhow::Result<()> {
+    let sql = format!("ALTER TABLE evolution_candidates ADD COLUMN {column_def}");
+    match sqlx::query(&sql).execute(pool).await {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            let lower = err.to_string().to_ascii_lowercase();
+            if lower.contains("duplicate column name") {
+                Ok(())
+            } else {
+                Err(err).context("failed to alter evolution_candidates table")
+            }
+        }
+    }
 }
 
 fn is_in_memory_sqlite_url(database_url: &str) -> bool {

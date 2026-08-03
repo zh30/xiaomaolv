@@ -31,6 +31,8 @@ Telegram/HTTP → Channel → Service → Memory → Provider (AI) → StreamSin
               Scheduler (cron jobs)
                     ↓
               MCP Runtime / Skills / Code Mode
+                    ↓
+     Trajectories/Feedback → Evolution Engine → Shadow Eval → Human Promotion
 ```
 
 ### Key Traits
@@ -85,6 +87,16 @@ Safe-by-default sandbox with two execution modes:
 - `local`: direct Rust evaluation (limited to math, string, format ops)
 - `subprocess`: spawns subprocess with resource limits
 
+### Self-Evolving Harness
+
+- `EvolutionEngine` owns the discover/propose/evaluate/approve/activate/rollback state machine
+- Evolution is disabled by default and only evolves a bounded replacement system-prompt patch
+- Automatic cycles consume failed trajectories or negative feedback and stop at `ready`
+- Shadow evaluation calls the provider directly and cannot execute tools, write memory, or send messages
+- Human approval and activation are separate authenticated operations; rollback restores the prior deployment
+- SQLite stores candidates, eval snapshots, feedback, deployments, the active pointer, and immutable audit events
+- Full bounded evidence SHA-256 is globally unique to prevent stale or concurrent duplicate proposals
+
 ### Plugin Architecture
 
 **Provider** (`provider.rs` + `provider_plugin_api.rs`):
@@ -105,3 +117,4 @@ TOML with env placeholders (`${VAR:-default}`). Key sections:
 - `[channels.http]` - HTTP channel for programmatic messaging
 - `[memory]` - backend selection and hybrid settings
 - `[agent]` - MCP, skills, code mode settings
+- `[agent.harness.evolution]` - self-evolution cycle, evidence, eval gates, and human promotion policy

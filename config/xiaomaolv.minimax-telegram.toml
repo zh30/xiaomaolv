@@ -89,6 +89,24 @@ skills_max_prompt_chars = 8000
 skills_match_min_score = 0.45
 skills_llm_rerank_enabled = false
 
+[agent.harness]
+# Enable this before using automatic self-evolution cycles.
+enable_trajectory = false
+
+[agent.harness.evolution]
+enabled = false
+auto_cycle_enabled = false
+cycle_interval_secs = 3600
+cycle_initial_delay_secs = 60
+max_source_trajectories = 20
+max_evidence_chars = 8000
+min_eval_cases = 3
+min_candidate_score = 0.80
+min_score_delta = 0.05
+max_regressions = 0
+max_prompt_patch_chars = 4000
+require_human_approval = true
+
 [agent.code_mode]
 enabled = true
 shadow_mode = false

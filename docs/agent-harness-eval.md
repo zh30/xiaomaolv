@@ -15,5 +15,18 @@ Covered scenarios:
 - Context compaction: no compaction, head-tail compaction, budget-based compaction, persisted summary reuse.
 - OutputExit: observe, revise once, block hidden tool errors, block unresolved tool-call JSON.
 - Skills runtime: selected skill IDs are observable before prompt rendering.
+- Self-evolution: prompt validation and scoring gates, SQLite state and audit persistence,
+  feedback-driven proposal, concurrent evidence deduplication, human promotion, runtime
+  injection, automatic-cycle safety, and rollback.
 
 Each scenario asserts the final answer, trajectory exit reason, tool-call count, and visible verification/error markers where applicable.
+
+Run the self-evolution subset with:
+
+```bash
+cargo test --test harness_evolution \
+  --test harness_evolution_store \
+  --test harness_evolution_engine \
+  --test service_harness_evolution \
+  --test http_evolution_api
+```

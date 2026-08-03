@@ -44,6 +44,8 @@ Chinese version: `README.zh.md`
 - Plugin-style extension API for Provider/Channel/Memory
 - Agent MCP auto tool loop (configurable max iterations/result size)
 - Agent Skills runtime injection (configurable selection budget/match threshold)
+- Self-evolving harness: trajectory feedback, bounded prompt candidates, deterministic
+  shadow evaluation, authenticated human promotion, hot activation, and rollback
 
 <a id="quick-start"></a>
 ## Quick Start (Recommended: MiniMax + Telegram)
@@ -110,6 +112,7 @@ After MVP is running, use these docs in order:
 - `docs/real-test-minimax-telegram.md`: real MiniMax + Telegram integration guide
 - `docs/zvec-sidecar.md`: zvec sidecar protocol, startup, compatibility details
 - `docs/mcp-integration.md`: MCP install model, CLI usage, HTTP tool-call API
+- `docs/self-evolving-harness.md`: safe evolution loop, configuration, API, and operator runbook
 - `docs/engineering-quality.md`: architecture constraints, quality gates, and performance baselines
 - `config/xiaomaolv.minimax-telegram.toml`: recommended MVP config
 - `config/xiaomaolv.example.toml`: generic template for custom provider/channel setups
@@ -203,6 +206,7 @@ Key settings:
   - `harness.compaction_budget_max_tokens = 16000`
   - Tool verification is passive in `observe` mode and output-affecting in `retry|block`: `harness.enable_verification = false`, `harness.verification_mode = "observe"`.
   - Output verification is disabled by default: `harness.output_verification_mode = "off"` (`off|observe|revise_once|block`). `revise_once` performs one bounded rewrite.
+  - Self-evolution is disabled by default: `harness.evolution.enabled = false`. Automatic cycles only propose and shadow-evaluate; approval and activation remain separate authenticated human operations.
 - Agent Code Mode (safe-by-default scaffold):
   - `code_mode.enabled = false`
   - `code_mode.shadow_mode = true`
@@ -261,6 +265,8 @@ Core endpoints:
 - `GET /v1/channels/{channel}/diag` (same app API key behavior as `/v1/messages`)
 - `POST /v1/channels/{channel}/inbound` (same app API key behavior as `/v1/messages`)
 - `POST /v1/channels/{channel}/inbound/{secret}` (same app API key behavior as `/v1/messages`)
+- `/v1/harness/evolution/*` (status, feedback, eval cases, candidates, cycle, audit,
+  activation, and rollback; always requires a configured app API key)
 
 Example:
 
@@ -457,6 +463,22 @@ output_verification_mode = "off" # off | observe | revise_once | block
 output_verification_llm_enabled = false
 output_verification_max_prompt_chars = 6000
 output_verification_max_result_chars = 2000
+
+[agent.harness.evolution]
+# Disabled by default. auto_cycle_enabled additionally requires
+# harness.enable_trajectory=true and a non-empty app.api_key.
+enabled = false
+auto_cycle_enabled = false
+cycle_interval_secs = 3600
+cycle_initial_delay_secs = 60
+max_source_trajectories = 20
+max_evidence_chars = 8000
+min_eval_cases = 3
+min_candidate_score = 0.80
+min_score_delta = 0.05
+max_regressions = 0
+max_prompt_patch_chars = 4000
+require_human_approval = true
 
 [agent.code_mode]
 enabled = false

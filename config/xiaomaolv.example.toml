@@ -119,6 +119,23 @@ output_verification_llm_enabled = false
 output_verification_max_prompt_chars = 6000
 output_verification_max_result_chars = 2000
 
+[agent.harness.evolution]
+# Closed-loop improvement control plane. It is inert until explicitly enabled.
+enabled = false
+# Requires enable_trajectory=true and app.api_key. Background cycles can only
+# propose and shadow-evaluate; they never approve or activate a candidate.
+auto_cycle_enabled = false
+cycle_interval_secs = 3600
+cycle_initial_delay_secs = 60
+max_source_trajectories = 20
+max_evidence_chars = 8000
+min_eval_cases = 3 # enabled suite is capped at 50 cases
+min_candidate_score = 0.80
+min_score_delta = 0.05
+max_regressions = 0
+max_prompt_patch_chars = 4000
+require_human_approval = true
+
 [agent.code_mode]
 enabled = false
 shadow_mode = true

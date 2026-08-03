@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tracing::warn;
 
@@ -284,12 +285,14 @@ impl TrajectoryRun {
 /// Create a new trajectory ID
 pub fn new_trajectory_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let now_ms = SystemTime::now()
+    static TRAJECTORY_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let now_ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|v| v.as_millis())
+        .map(|value| value.as_nanos())
         .unwrap_or(0);
-    let rand: u16 = (now_ms % 65536) as u16;
-    format!("traj-{now_ms}-{rand}")
+    let sequence = TRAJECTORY_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("traj-{now_ns:x}-{sequence:x}")
 }
 
 #[cfg(test)]
@@ -337,14 +340,11 @@ mod tests {
 
     #[test]
     fn test_new_trajectory_id() {
-        let id1 = new_trajectory_id();
-        // Add small delay to ensure different timestamp
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        let id2 = new_trajectory_id();
-        assert!(id1.starts_with("traj-"));
-        assert!(id2.starts_with("traj-"));
-        // IDs should be unique-ish (different timestamps or rand)
-        assert_ne!(id1, id2);
+        let ids = (0..1_000)
+            .map(|_| new_trajectory_id())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), 1_000);
+        assert!(ids.iter().all(|id| id.starts_with("traj-")));
     }
 
     #[test]
