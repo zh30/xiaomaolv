@@ -12,6 +12,7 @@ use crate::harness::evolution::{
     EvolutionPromotionDecision, EvolutionRollbackResult, MAX_ENABLED_EVOLUTION_EVAL_CASES,
     PromptPatch,
 };
+use crate::harness::loop_engine::{LoopStore, SqliteLoopStore, TrajectoryFrameDraft};
 use crate::harness::trajectory::{
     ToolCallRecord, TrajectoryExitReason, TrajectoryFilter, TrajectoryRecord,
 };
@@ -61,6 +62,10 @@ pub trait HarnessStore: Send + Sync {
         &self,
         req: CompactionSummaryUpsertRequest,
     ) -> anyhow::Result<()>;
+
+    async fn record_provider_frame(&self, _draft: TrajectoryFrameDraft) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -136,6 +141,13 @@ impl HarnessStore for SqliteHarnessStore {
         req: CompactionSummaryUpsertRequest,
     ) -> anyhow::Result<()> {
         self.store.upsert_compaction_summary(req).await
+    }
+
+    async fn record_provider_frame(&self, draft: TrajectoryFrameDraft) -> anyhow::Result<()> {
+        let store = SqliteLoopStore::new(self.store.clone());
+        LoopStore::record_trajectory_frame(&store, draft, "trajectory:message-service")
+            .await
+            .map(|_| ())
     }
 }
 

@@ -1,3 +1,4 @@
+use crate::domain::StoredMessage;
 use crate::harness::observability::TrajectoryMetrics;
 use crate::harness::trajectory::{
     ToolCallRecord, TrajectoryExitReason, TrajectoryLogger, TrajectoryRun,
@@ -53,6 +54,17 @@ impl AgentRun {
 
     pub async fn record_tool_call(&mut self, record: ToolCallRecord) -> ToolCallRecord {
         self.trajectory.log_tool_call(record).await
+    }
+
+    pub async fn record_provider_call(
+        &mut self,
+        messages: &[StoredMessage],
+        request_was_json: bool,
+        response: &str,
+    ) {
+        self.trajectory
+            .log_provider_call(messages, request_was_json, response)
+            .await;
     }
 
     pub async fn finish(&mut self, exit: AgentRunExit) {

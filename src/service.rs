@@ -2071,42 +2071,18 @@ impl MessageService {
         incoming: &IncomingMessage,
     ) -> anyhow::Result<CompletionOutcome> {
         let Some(runtime) = self.snapshot_mcp_runtime().await else {
-            let reply = self
-                .provider
-                .complete(CompletionRequest {
-                    messages: history,
-                    ..Default::default()
-                })
-                .await
-                .context("provider completion failed")?;
-            return Ok(CompletionOutcome::unverified(reply));
+            return self.complete_plain_provider(history, incoming).await;
         };
         let tools = match runtime.list_tools(None).await {
             Ok(tools) => tools,
             Err(err) => {
                 warn!(error = %err, "failed to list mcp tools, fallback to plain completion");
-                let reply = self
-                    .provider
-                    .complete(CompletionRequest {
-                        messages: history,
-                        ..Default::default()
-                    })
-                    .await
-                    .context("provider completion failed")?;
-                return Ok(CompletionOutcome::unverified(reply));
+                return self.complete_plain_provider(history, incoming).await;
             }
         };
 
         if tools.is_empty() {
-            let reply = self
-                .provider
-                .complete(CompletionRequest {
-                    messages: history,
-                    ..Default::default()
-                })
-                .await
-                .context("provider completion failed")?;
-            return Ok(CompletionOutcome::unverified(reply));
+            return self.complete_plain_provider(history, incoming).await;
         }
 
         if self.agent_code_mode.enabled
@@ -2135,6 +2111,64 @@ impl MessageService {
         self.complete_with_mcp_loop(history, tools, runtime, incoming)
             .await
             .map(CompletionOutcome::verified)
+    }
+
+    async fn complete_plain_provider(
+        &self,
+        history: Vec<StoredMessage>,
+        incoming: &IncomingMessage,
+    ) -> anyhow::Result<CompletionOutcome> {
+        let model = self.provider.model_name().unwrap_or("unknown").to_string();
+        let mut run = AgentRun::start(AgentRunStart {
+            logger: self.trajectory_logger.clone(),
+            metrics: self.trajectory_metrics.clone(),
+            session_id: incoming.session_id.clone(),
+            channel: incoming.channel.clone(),
+            user_id: incoming.user_id.clone(),
+            model,
+        })
+        .await;
+        let request = CompletionRequest {
+            messages: history,
+            ..Default::default()
+        };
+        let reply = match self.complete_provider_for_run(&mut run, request).await {
+            Ok(reply) => reply,
+            Err(error) => {
+                run.finish(AgentRunExit::InternalError).await;
+                return Err(error).context("provider completion failed");
+            }
+        };
+        run.finish(AgentRunExit::FinalAnswer(reply.clone())).await;
+        Ok(CompletionOutcome::unverified(reply))
+    }
+
+    async fn complete_provider_for_run(
+        &self,
+        run: &mut AgentRun,
+        request: CompletionRequest,
+    ) -> anyhow::Result<String> {
+        let reply = self.provider.complete(request.clone()).await?;
+        run.record_provider_call(&request.messages, request.response_format.is_some(), &reply)
+            .await;
+        Ok(reply)
+    }
+
+    async fn complete_buffered_provider_for_run(
+        &self,
+        run: &mut AgentRun,
+        request: CompletionRequest,
+        sink: &mut BufferedStreamSink,
+    ) -> anyhow::Result<String> {
+        let provider_reply = self.provider.complete_stream(request.clone(), sink).await?;
+        let resolved_reply = resolve_provider_stream_reply(provider_reply, sink);
+        run.record_provider_call(
+            &request.messages,
+            request.response_format.is_some(),
+            &resolved_reply,
+        )
+        .await;
+        Ok(resolved_reply)
     }
 
     async fn complete_with_optional_mcp_stream(
@@ -2213,38 +2247,80 @@ impl MessageService {
         sink: &mut dyn StreamSink,
         incoming: &IncomingMessage,
     ) -> anyhow::Result<String> {
+        let model = self.provider.model_name().unwrap_or("unknown").to_string();
+        let mut run = AgentRun::start(AgentRunStart {
+            logger: self.trajectory_logger.clone(),
+            metrics: self.trajectory_metrics.clone(),
+            session_id: incoming.session_id.clone(),
+            channel: incoming.channel.clone(),
+            user_id: incoming.user_id.clone(),
+            model,
+        })
+        .await;
+        let request = CompletionRequest {
+            messages: history.clone(),
+            ..Default::default()
+        };
         if matches!(self.output_verification_mode, OutputVerificationMode::Off) {
-            return self
+            let mut recording_sink = RecordingStreamSink::new(sink);
+            let provider_reply = match self
                 .provider
-                .complete_stream(
-                    CompletionRequest {
-                        messages: history,
-                        ..Default::default()
-                    },
-                    sink,
-                )
+                .complete_stream(request.clone(), &mut recording_sink)
                 .await
-                .context("provider stream completion failed");
+            {
+                Ok(reply) => reply,
+                Err(error) => {
+                    run.finish(AgentRunExit::InternalError).await;
+                    return Err(error).context("provider stream completion failed");
+                }
+            };
+            let resolved_reply = recording_sink.resolved_text(provider_reply);
+            run.record_provider_call(
+                &request.messages,
+                request.response_format.is_some(),
+                &resolved_reply,
+            )
+            .await;
+            run.finish(AgentRunExit::FinalAnswer(resolved_reply.clone()))
+                .await;
+            return Ok(resolved_reply);
         }
 
         let mut buffered_sink = BufferedStreamSink::default();
-        let reply = self
+        let reply = match self
             .provider
-            .complete_stream(
-                CompletionRequest {
-                    messages: history.clone(),
-                    ..Default::default()
-                },
-                &mut buffered_sink,
-            )
+            .complete_stream(request.clone(), &mut buffered_sink)
             .await
-            .context("provider stream completion failed")?;
+        {
+            Ok(reply) => reply,
+            Err(error) => {
+                run.finish(AgentRunExit::InternalError).await;
+                return Err(error).context("provider stream completion failed");
+            }
+        };
         let resolved_reply = resolve_provider_stream_reply(reply, &buffered_sink);
-        let resolved_reply = self
+        run.record_provider_call(
+            &request.messages,
+            request.response_format.is_some(),
+            &resolved_reply,
+        )
+        .await;
+        let resolved_reply = match self
             .verify_final_answer(&history, &incoming.channel, resolved_reply, &[])
             .await
-            .context("output verification failed")?;
-        BufferedStreamSink::replay_text(&resolved_reply, sink).await?;
+        {
+            Ok(reply) => reply,
+            Err(error) => {
+                run.finish(AgentRunExit::InternalError).await;
+                return Err(error).context("output verification failed");
+            }
+        };
+        if let Err(error) = BufferedStreamSink::replay_text(&resolved_reply, sink).await {
+            run.finish(AgentRunExit::InternalError).await;
+            return Err(error);
+        }
+        run.finish(AgentRunExit::FinalAnswer(resolved_reply.clone()))
+            .await;
         Ok(resolved_reply)
     }
 
@@ -2378,11 +2454,13 @@ impl MessageService {
             ),
         });
         let reply = match self
-            .provider
-            .complete(CompletionRequest {
-                messages: next_history.clone(),
-                ..Default::default()
-            })
+            .complete_provider_for_run(
+                &mut run,
+                CompletionRequest {
+                    messages: next_history.clone(),
+                    ..Default::default()
+                },
+            )
             .await
         {
             Ok(reply) => reply,
@@ -2442,11 +2520,13 @@ impl MessageService {
         for iteration in 0..max_iterations {
             telemetry.observe_prompt_chars(&history);
             let reply = match self
-                .provider
-                .complete(CompletionRequest {
-                    messages: history.clone(),
-                    ..Default::default()
-                })
+                .complete_provider_for_run(
+                    &mut run,
+                    CompletionRequest {
+                        messages: history.clone(),
+                        ..Default::default()
+                    },
+                )
                 .await
             {
                 Ok(reply) => reply,
@@ -2498,11 +2578,13 @@ impl MessageService {
                         ToolVerificationMode::Block,
                     ));
                     let final_reply = match self
-                        .provider
-                        .complete(CompletionRequest {
-                            messages: history.clone(),
-                            ..Default::default()
-                        })
+                        .complete_provider_for_run(
+                            &mut run,
+                            CompletionRequest {
+                                messages: history.clone(),
+                                ..Default::default()
+                            },
+                        )
                         .await
                     {
                         Ok(reply) => reply,
@@ -2556,11 +2638,13 @@ impl MessageService {
                     ToolVerificationMode::Block,
                 ));
                 let final_reply = match self
-                    .provider
-                    .complete(CompletionRequest {
-                        messages: history.clone(),
-                        ..Default::default()
-                    })
+                    .complete_provider_for_run(
+                        &mut run,
+                        CompletionRequest {
+                            messages: history.clone(),
+                            ..Default::default()
+                        },
+                    )
                     .await
                 {
                     Ok(reply) => reply,
@@ -2642,11 +2726,13 @@ impl MessageService {
                             ToolVerificationMode::Block,
                         ));
                         let final_reply = match self
-                            .provider
-                            .complete(CompletionRequest {
-                                messages: history.clone(),
-                                ..Default::default()
-                            })
+                            .complete_provider_for_run(
+                                &mut run,
+                                CompletionRequest {
+                                    messages: history.clone(),
+                                    ..Default::default()
+                                },
+                            )
                             .await
                         {
                             Ok(reply) => reply,
@@ -2702,11 +2788,13 @@ impl MessageService {
                 .to_string(),
         });
         let final_reply = match self
-            .provider
-            .complete(CompletionRequest {
-                messages: history.clone(),
-                ..Default::default()
-            })
+            .complete_provider_for_run(
+                &mut run,
+                CompletionRequest {
+                    messages: history.clone(),
+                    ..Default::default()
+                },
+            )
             .await
         {
             Ok(reply) => reply,
@@ -2766,9 +2854,9 @@ impl MessageService {
         for iteration in 0..max_iterations {
             telemetry.observe_prompt_chars(&history);
             let mut buffered_sink = BufferedStreamSink::default();
-            let reply = match self
-                .provider
-                .complete_stream(
+            let resolved_reply = match self
+                .complete_buffered_provider_for_run(
+                    &mut run,
                     CompletionRequest {
                         messages: history.clone(),
                         ..Default::default()
@@ -2785,13 +2873,6 @@ impl MessageService {
             };
             telemetry.iterations += 1;
             run.observe_iteration(iteration);
-
-            let streamed_reply = buffered_sink.rendered_text();
-            let resolved_reply = if streamed_reply.trim().is_empty() {
-                reply
-            } else {
-                streamed_reply.clone()
-            };
 
             let tool_call = match protocol.parse_reply(&resolved_reply) {
                 ToolProposal::Tool(tool_call) => tool_call,
@@ -2840,9 +2921,9 @@ impl MessageService {
                         ToolVerificationMode::Block,
                     ));
                     let mut final_sink = BufferedStreamSink::default();
-                    let final_reply = match self
-                        .provider
-                        .complete_stream(
+                    let resolved_final = match self
+                        .complete_buffered_provider_for_run(
+                            &mut run,
                             CompletionRequest {
                                 messages: history.clone(),
                                 ..Default::default()
@@ -2858,12 +2939,6 @@ impl MessageService {
                                 "provider stream completion failed after mcp parse error",
                             );
                         }
-                    };
-                    let streamed_reply = final_sink.rendered_text();
-                    let resolved_final = if streamed_reply.trim().is_empty() {
-                        final_reply
-                    } else {
-                        streamed_reply
                     };
                     let resolved_final = match self
                         .verify_final_answer(
@@ -2915,9 +2990,9 @@ impl MessageService {
                     ToolVerificationMode::Block,
                 ));
                 let mut final_sink = BufferedStreamSink::default();
-                let final_reply = match self
-                    .provider
-                    .complete_stream(
+                let resolved_final = match self
+                    .complete_buffered_provider_for_run(
+                        &mut run,
                         CompletionRequest {
                             messages: history.clone(),
                             ..Default::default()
@@ -2933,12 +3008,6 @@ impl MessageService {
                             "provider stream completion failed after mcp tool validation error",
                         );
                     }
-                };
-                let streamed_reply = final_sink.rendered_text();
-                let resolved_final = if streamed_reply.trim().is_empty() {
-                    final_reply
-                } else {
-                    streamed_reply
                 };
                 let resolved_final = match self
                     .verify_final_answer(&history, &incoming.channel, resolved_final, &tool_calls)
@@ -3013,9 +3082,9 @@ impl MessageService {
                             ToolVerificationMode::Block,
                         ));
                         let mut final_sink = BufferedStreamSink::default();
-                        let final_reply = match self
-                            .provider
-                            .complete_stream(
+                        let resolved_final = match self
+                            .complete_buffered_provider_for_run(
+                                &mut run,
                                 CompletionRequest {
                                     messages: history.clone(),
                                     ..Default::default()
@@ -3031,12 +3100,6 @@ impl MessageService {
                                     "provider stream completion failed after tool verification block",
                                 );
                             }
-                        };
-                        let streamed_reply = final_sink.rendered_text();
-                        let resolved_final = if streamed_reply.trim().is_empty() {
-                            final_reply
-                        } else {
-                            streamed_reply
                         };
                         let resolved_final = match self
                             .verify_final_answer(
@@ -3086,9 +3149,9 @@ impl MessageService {
                     .to_string(),
         });
         let mut buffered_sink = BufferedStreamSink::default();
-        let final_reply = match self
-            .provider
-            .complete_stream(
+        let resolved_reply = match self
+            .complete_buffered_provider_for_run(
+                &mut run,
                 CompletionRequest {
                     messages: history.clone(),
                     ..Default::default()
@@ -3102,12 +3165,6 @@ impl MessageService {
                 run.finish(AgentRunExit::InternalError).await;
                 return Err(err).context("provider stream completion failed");
             }
-        };
-        let streamed_reply = buffered_sink.rendered_text();
-        let resolved_reply = if streamed_reply.trim().is_empty() {
-            final_reply
-        } else {
-            streamed_reply
         };
         let resolved_reply = match self
             .verify_final_answer(&history, &incoming.channel, resolved_reply, &tool_calls)
@@ -3566,6 +3623,11 @@ struct BufferedStreamSink {
     deltas: Vec<String>,
 }
 
+struct RecordingStreamSink<'a> {
+    inner: &'a mut dyn StreamSink,
+    deltas: Vec<String>,
+}
+
 const STREAM_REPLAY_CHUNK_CHARS: usize = 96;
 const STREAM_REPLAY_DELAY_MS: u64 = 220;
 
@@ -3576,6 +3638,34 @@ impl StreamSink for BufferedStreamSink {
             self.deltas.push(delta.to_string());
         }
         Ok(())
+    }
+}
+
+impl<'a> RecordingStreamSink<'a> {
+    fn new(inner: &'a mut dyn StreamSink) -> Self {
+        Self {
+            inner,
+            deltas: Vec::new(),
+        }
+    }
+
+    fn resolved_text(&self, provider_reply: String) -> String {
+        let streamed = self.deltas.concat();
+        if streamed.trim().is_empty() {
+            provider_reply
+        } else {
+            streamed
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl StreamSink for RecordingStreamSink<'_> {
+    async fn on_delta(&mut self, delta: &str) -> anyhow::Result<()> {
+        if !delta.is_empty() {
+            self.deltas.push(delta.to_string());
+        }
+        self.inner.on_delta(delta).await
     }
 }
 

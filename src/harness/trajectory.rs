@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tracing::warn;
 
+use crate::domain::StoredMessage;
+use crate::harness::loop_engine::{TrajectoryFrameCapture, TrajectoryFrameDraft};
 use crate::harness::observability::TrajectoryMetrics;
 use crate::harness::store::HarnessStore;
 
@@ -147,6 +149,13 @@ impl TrajectoryLogger {
             .await
     }
 
+    pub async fn log_provider_frame(&self, draft: TrajectoryFrameDraft) -> anyhow::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        self.store.record_provider_frame(draft).await
+    }
+
     pub async fn query_trajectories(
         &self,
         filter: TrajectoryFilter,
@@ -164,6 +173,8 @@ pub struct TrajectoryRun {
     finished: bool,
     tool_calls: usize,
     max_iteration_seen: Option<usize>,
+    provider_calls: u32,
+    model: String,
 }
 
 impl TrajectoryRun {
@@ -203,6 +214,8 @@ impl TrajectoryRun {
             finished: false,
             tool_calls: 0,
             max_iteration_seen: None,
+            provider_calls: 0,
+            model: model.to_string(),
         }
     }
 
@@ -240,6 +253,37 @@ impl TrajectoryRun {
             );
         }
         logged_record
+    }
+
+    pub async fn log_provider_call(
+        &mut self,
+        messages: &[StoredMessage],
+        request_was_json: bool,
+        response: &str,
+    ) {
+        let Some(logger) = &self.logger else {
+            return;
+        };
+        if !self.started {
+            return;
+        }
+        let call_index = self.provider_calls;
+        self.provider_calls = self.provider_calls.saturating_add(1);
+        let bounded_messages = bounded_replay_messages(messages, 128 * 1024);
+        let bounded_response = truncate_utf8(response, 256 * 1024);
+        let draft = TrajectoryFrameDraft {
+            trajectory_id: self.id.clone(),
+            call_index,
+            model: self.model.clone(),
+            provider_fingerprint: format!("model:{};seed:unknown;config:unavailable", self.model),
+            request_messages: bounded_messages,
+            request_was_json,
+            response: bounded_response,
+            capture: TrajectoryFrameCapture::Truncated,
+        };
+        if let Err(error) = logger.log_provider_frame(draft).await {
+            warn!(trajectory_id = %self.id, %error, "failed to record provider trajectory frame");
+        }
     }
 
     pub async fn finish(
@@ -293,6 +337,42 @@ pub fn new_trajectory_id() -> String {
         .unwrap_or(0);
     let sequence = TRAJECTORY_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("traj-{now_ns:x}-{sequence:x}")
+}
+
+fn bounded_replay_messages(messages: &[StoredMessage], max_bytes: usize) -> Vec<StoredMessage> {
+    let mut selected = Vec::new();
+    let mut used = 2_usize;
+    for message in messages.iter().rev() {
+        let remaining = max_bytes.saturating_sub(used);
+        if remaining < 64 {
+            break;
+        }
+        let content = truncate_utf8(&message.content, remaining.saturating_sub(48));
+        used = used.saturating_add(content.len()).saturating_add(48);
+        selected.push(StoredMessage {
+            role: message.role.clone(),
+            content,
+        });
+    }
+    selected.reverse();
+    if selected.is_empty() {
+        selected.push(StoredMessage {
+            role: crate::domain::MessageRole::System,
+            content: "[trajectory request omitted by capture budget]".to_string(),
+        });
+    }
+    selected
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut boundary = max_bytes;
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value[..boundary].to_string()
 }
 
 #[cfg(test)]

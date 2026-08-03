@@ -3,7 +3,7 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::sync::Arc;
 
-use anyhow::{Context, bail};
+use anyhow::{Context, bail, ensure};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -888,6 +888,44 @@ impl EvolutionEngine {
         &self,
         candidate_id: &str,
     ) -> anyhow::Result<EvolutionEvaluationRecord> {
+        self.evaluate_candidate_with_limit(candidate_id, usize::MAX, None)
+            .await
+            .map(|(evaluation, _)| evaluation)
+    }
+
+    pub async fn evaluate_candidate_bounded(
+        &self,
+        candidate_id: &str,
+        max_response_bytes: usize,
+    ) -> anyhow::Result<(EvolutionEvaluationRecord, usize)> {
+        ensure!(
+            max_response_bytes > 0,
+            "evolution response byte budget must be positive"
+        );
+        self.evaluate_candidate_with_limit(candidate_id, max_response_bytes, None)
+            .await
+    }
+
+    pub async fn evaluate_candidate_bounded_until(
+        &self,
+        candidate_id: &str,
+        max_response_bytes: usize,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<(EvolutionEvaluationRecord, usize)> {
+        ensure!(
+            max_response_bytes > 0,
+            "evolution response byte budget must be positive"
+        );
+        self.evaluate_candidate_with_limit(candidate_id, max_response_bytes, Some(deadline))
+            .await
+    }
+
+    async fn evaluate_candidate_with_limit(
+        &self,
+        candidate_id: &str,
+        max_response_bytes: usize,
+        deadline: Option<tokio::time::Instant>,
+    ) -> anyhow::Result<(EvolutionEvaluationRecord, usize)> {
         let _evaluation_guard = self.evaluation_lock.lock().await;
         let candidate = self
             .store
@@ -915,7 +953,9 @@ impl EvolutionEngine {
             )
             .await?;
 
-        let result = self.evaluate_candidate_inner(&candidate).await;
+        let result = self
+            .evaluate_candidate_inner(&candidate, max_response_bytes, deadline)
+            .await;
         match result {
             Ok(evaluation) => Ok(evaluation),
             Err(err) => {
@@ -940,11 +980,14 @@ impl EvolutionEngine {
     async fn evaluate_candidate_inner(
         &self,
         candidate: &EvolutionCandidateRecord,
-    ) -> anyhow::Result<EvolutionEvaluationRecord> {
+        max_response_bytes: usize,
+        deadline: Option<tokio::time::Instant>,
+    ) -> anyhow::Result<(EvolutionEvaluationRecord, usize)> {
         let cases = self.store.list_eval_cases(true).await?;
         let active = self.policy_runtime.active().await;
         let mut baseline_outputs = BTreeMap::new();
         let mut candidate_outputs = BTreeMap::new();
+        let mut response_bytes = 0_usize;
 
         for case in &cases {
             let baseline_policy = active.as_ref().map(|policy| {
@@ -955,20 +998,35 @@ impl EvolutionEngine {
                 )
             });
             let baseline = self
-                .shadow_complete(case, baseline_policy)
+                .shadow_complete_with_deadline(case, baseline_policy, deadline)
                 .await
                 .with_context(|| format!("baseline eval case '{}' failed", case.id))?;
+            response_bytes = response_bytes
+                .checked_add(baseline.len())
+                .context("evolution response byte count overflowed")?;
+            ensure!(
+                response_bytes <= max_response_bytes,
+                "evolution response byte budget exceeded"
+            );
             let candidate_output = self
-                .shadow_complete(
+                .shadow_complete_with_deadline(
                     case,
                     Some((
                         candidate.id.as_str(),
                         "shadow-evaluation",
                         &candidate.prompt_patch,
                     )),
+                    deadline,
                 )
                 .await
                 .with_context(|| format!("candidate eval case '{}' failed", case.id))?;
+            response_bytes = response_bytes
+                .checked_add(candidate_output.len())
+                .context("evolution response byte count overflowed")?;
+            ensure!(
+                response_bytes <= max_response_bytes,
+                "evolution response byte budget exceeded"
+            );
             baseline_outputs.insert(case.id.clone(), baseline);
             candidate_outputs.insert(case.id.clone(), candidate_output);
         }
@@ -1013,7 +1071,23 @@ impl EvolutionEngine {
                 details,
             )
             .await?;
-        Ok(evaluation)
+        Ok((evaluation, response_bytes))
+    }
+
+    async fn shadow_complete_with_deadline(
+        &self,
+        eval_case: &EvolutionEvalCase,
+        policy: Option<(&str, &str, &PromptPatch)>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> anyhow::Result<String> {
+        let completion = self.shadow_complete(eval_case, policy);
+        if let Some(deadline) = deadline {
+            tokio::time::timeout_at(deadline, completion)
+                .await
+                .context("evolution evaluation deadline exceeded")?
+        } else {
+            completion.await
+        }
     }
 
     async fn shadow_complete(

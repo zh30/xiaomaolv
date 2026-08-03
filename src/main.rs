@@ -238,6 +238,16 @@ skills_llm_rerank_enabled = false
 [agent.harness]
 enable_trajectory = false
 
+[agent.harness.loop_engine]
+# Durable /goal, /resume, Dynamic Workflow, self-test, replay, and Desktop-ready APIs.
+enabled = false
+ingest_api_key = "${XIAOMAOLV_HARNESS_INGEST_API_KEY:-}"
+worker_enabled = false
+worker_poll_interval_secs = 2
+worker_lease_secs = 30
+worker_max_parallel = 2
+self_test_interval_secs = 0
+
 [agent.harness.evolution]
 enabled = false
 auto_cycle_enabled = false

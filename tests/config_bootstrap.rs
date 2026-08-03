@@ -81,6 +81,13 @@ enabled = true
     assert!(!cfg.agent.harness.output_verification_llm_enabled);
     assert_eq!(cfg.agent.harness.output_verification_max_prompt_chars, 6000);
     assert_eq!(cfg.agent.harness.output_verification_max_result_chars, 2000);
+    assert!(!cfg.agent.harness.loop_engine.enabled);
+    assert!(cfg.agent.harness.loop_engine.ingest_api_key.is_none());
+    assert!(!cfg.agent.harness.loop_engine.worker_enabled);
+    assert_eq!(cfg.agent.harness.loop_engine.worker_poll_interval_secs, 2);
+    assert_eq!(cfg.agent.harness.loop_engine.worker_lease_secs, 30);
+    assert_eq!(cfg.agent.harness.loop_engine.worker_max_parallel, 2);
+    assert_eq!(cfg.agent.harness.loop_engine.self_test_interval_secs, 0);
     assert!(!cfg.agent.harness.evolution.enabled);
     assert!(!cfg.agent.harness.evolution.auto_cycle_enabled);
     assert_eq!(cfg.agent.harness.evolution.cycle_interval_secs, 3600);
@@ -93,6 +100,45 @@ enabled = true
     assert_eq!(cfg.agent.harness.evolution.max_regressions, 0);
     assert_eq!(cfg.agent.harness.evolution.max_prompt_patch_chars, 4000);
     assert!(cfg.agent.harness.evolution.require_human_approval);
+}
+
+#[test]
+fn config_bootstrap_parses_loop_engine_controls() {
+    let toml = r#"
+[app]
+bind = "127.0.0.1:8080"
+default_provider = "openai"
+
+[providers.openai]
+kind = "openai-compatible"
+api_key = "test-key"
+model = "gpt-4o-mini"
+
+[channels.http]
+enabled = true
+
+[agent.harness.loop_engine]
+enabled = true
+ingest_api_key = "ingest-test-key"
+worker_enabled = true
+worker_poll_interval_secs = 3
+worker_lease_secs = 45
+worker_max_parallel = 4
+self_test_interval_secs = 600
+"#;
+
+    let config = AppConfig::from_toml(toml).expect("loop engine config should parse");
+    let loop_engine = config.agent.harness.loop_engine;
+    assert!(loop_engine.enabled);
+    assert_eq!(
+        loop_engine.ingest_api_key.as_deref(),
+        Some("ingest-test-key")
+    );
+    assert!(loop_engine.worker_enabled);
+    assert_eq!(loop_engine.worker_poll_interval_secs, 3);
+    assert_eq!(loop_engine.worker_lease_secs, 45);
+    assert_eq!(loop_engine.worker_max_parallel, 4);
+    assert_eq!(loop_engine.self_test_interval_secs, 600);
 }
 
 #[test]

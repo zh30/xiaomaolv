@@ -12,6 +12,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::domain::{IncomingMessage, ReplyTarget};
+use crate::harness::loop_engine::LoopEngine;
 use crate::mcp_commands::{
     discover_mcp_registry, execute_mcp_command, mcp_help_text, parse_telegram_mcp_command,
 };
@@ -721,6 +722,7 @@ impl TelegramSender {
 pub struct ChannelContext {
     pub service: Arc<MessageService>,
     pub channel_name: String,
+    pub loop_engine: Option<Arc<LoopEngine>>,
 }
 
 #[derive(Clone)]
@@ -728,6 +730,7 @@ pub struct ChannelRuntimeContext {
     pub service: Arc<MessageService>,
     pub channel_name: String,
     pub shutdown: watch::Receiver<bool>,
+    pub loop_engine: Option<Arc<LoopEngine>>,
 }
 
 pub struct ChannelWorker {
@@ -1441,6 +1444,7 @@ impl ChannelPlugin for TelegramChannelPlugin {
 
         let channel_name = ctx.channel_name.clone();
         let service = ctx.service.clone();
+        let loop_engine = ctx.loop_engine.clone();
         let sender = self.sender.clone();
         let bot_token = self.bot_token.clone();
         let mut shutdown = ctx.shutdown.clone();
@@ -1544,6 +1548,7 @@ impl ChannelPlugin for TelegramChannelPlugin {
                                 ChannelContext {
                                     service: service.clone(),
                                     channel_name: channel_name.clone(),
+                                    loop_engine: loop_engine.clone(),
                                 },
                                 &sender,
                                 payload,

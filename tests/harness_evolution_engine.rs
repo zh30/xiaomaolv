@@ -156,6 +156,34 @@ async fn seed_failed_trajectory(
 }
 
 #[tokio::test]
+async fn bounded_evaluation_rejects_cumulative_provider_output_over_budget() {
+    let memory = SqliteMemoryStore::new("sqlite::memory:")
+        .await
+        .expect("memory store");
+    let store = Arc::new(SqliteEvolutionStore::new(memory));
+    seed_eval_cases(&store).await.expect("seed eval cases");
+    let provider = Arc::new(FakeEvolutionProvider::default());
+    let engine = EvolutionEngine::new(store, provider, gate_config())
+        .await
+        .expect("evolution engine");
+    let candidate = engine
+        .create_candidate(
+            "candidate wins",
+            "exercise bounded evaluation",
+            vec![],
+            &EvolutionActor::System("test".to_string()),
+        )
+        .await
+        .expect("candidate");
+
+    let error = engine
+        .evaluate_candidate_bounded(&candidate.id, 8)
+        .await
+        .expect_err("combined baseline/candidate output should exceed eight bytes");
+    assert!(error.to_string().contains("response byte budget"));
+}
+
+#[tokio::test]
 async fn engine_evaluates_approves_activates_and_rolls_back_with_human_gate() {
     let memory = SqliteMemoryStore::new("sqlite::memory:")
         .await

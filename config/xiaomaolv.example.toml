@@ -119,6 +119,19 @@ output_verification_llm_enabled = false
 output_verification_max_prompt_chars = 6000
 output_verification_max_result_chars = 2000
 
+[agent.harness.loop_engine]
+# Enables the durable operator control plane. app.api_key protects operator routes.
+enabled = false
+# Separate, scoped key for POST /v1/harness/signals. Never reuse app.api_key.
+ingest_api_key = "${XIAOMAOLV_HARNESS_INGEST_API_KEY:-}"
+# Safe built-ins only: provider analysis, core self-test, structural replay, manual gate.
+worker_enabled = false
+worker_poll_interval_secs = 2
+worker_lease_secs = 30
+worker_max_parallel = 2
+# 0 disables periodic read-only maintenance; 3600 is a practical starting interval.
+self_test_interval_secs = 0
+
 [agent.harness.evolution]
 # Closed-loop improvement control plane. It is inert until explicitly enabled.
 enabled = false

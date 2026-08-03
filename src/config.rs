@@ -62,6 +62,9 @@ impl AppConfig {
         if let Some(api_key) = self.app.api_key.as_mut() {
             *api_key = resolve_env_placeholder(api_key);
         }
+        if let Some(api_key) = self.agent.harness.loop_engine.ingest_api_key.as_mut() {
+            *api_key = resolve_env_placeholder(api_key);
+        }
 
         if let Some(token) = self.channels.http.diag_bearer_token.as_mut() {
             *token = resolve_env_placeholder(token);
@@ -111,6 +114,9 @@ impl AppConfig {
         self.app.locale = resolve_env_placeholder_with_overrides(&self.app.locale, env_overrides);
 
         if let Some(api_key) = self.app.api_key.as_mut() {
+            *api_key = resolve_env_placeholder_with_overrides(api_key, env_overrides);
+        }
+        if let Some(api_key) = self.agent.harness.loop_engine.ingest_api_key.as_mut() {
             *api_key = resolve_env_placeholder_with_overrides(api_key, env_overrides);
         }
 
@@ -473,6 +479,8 @@ pub struct AgentHarnessConfig {
     pub output_verification_max_result_chars: usize,
     #[serde(default)]
     pub evolution: AgentEvolutionConfig,
+    #[serde(default)]
+    pub loop_engine: AgentLoopEngineConfig,
 }
 
 impl Default for AgentHarnessConfig {
@@ -495,6 +503,39 @@ impl Default for AgentHarnessConfig {
             output_verification_max_prompt_chars: default_output_verification_max_prompt_chars(),
             output_verification_max_result_chars: default_output_verification_max_result_chars(),
             evolution: AgentEvolutionConfig::default(),
+            loop_engine: AgentLoopEngineConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentLoopEngineConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub ingest_api_key: Option<String>,
+    #[serde(default)]
+    pub worker_enabled: bool,
+    #[serde(default = "default_loop_worker_poll_interval_secs")]
+    pub worker_poll_interval_secs: u64,
+    #[serde(default = "default_loop_worker_lease_secs")]
+    pub worker_lease_secs: u32,
+    #[serde(default = "default_loop_worker_max_parallel")]
+    pub worker_max_parallel: usize,
+    #[serde(default)]
+    pub self_test_interval_secs: u64,
+}
+
+impl Default for AgentLoopEngineConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ingest_api_key: None,
+            worker_enabled: false,
+            worker_poll_interval_secs: default_loop_worker_poll_interval_secs(),
+            worker_lease_secs: default_loop_worker_lease_secs(),
+            worker_max_parallel: default_loop_worker_max_parallel(),
+            self_test_interval_secs: 0,
         }
     }
 }
@@ -844,6 +885,18 @@ fn default_agent_skills_match_min_score() -> f32 {
 
 fn default_agent_skills_llm_rerank_enabled() -> bool {
     false
+}
+
+fn default_loop_worker_poll_interval_secs() -> u64 {
+    2
+}
+
+fn default_loop_worker_lease_secs() -> u32 {
+    30
+}
+
+fn default_loop_worker_max_parallel() -> usize {
+    2
 }
 
 fn default_agent_swarm_enabled() -> bool {

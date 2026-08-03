@@ -1,4 +1,5 @@
 use super::*;
+use crate::harness::loop_engine::{ApproveGoalRequest, CreateGoalRequest};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum TelegramSlashCommand {
@@ -9,6 +10,8 @@ pub(super) enum TelegramSlashCommand {
     Skills { tail: String },
     Agents { tail: String },
     Task { tail: String },
+    Goal { tail: String },
+    Resume { tail: String },
     Unknown { name: String },
 }
 
@@ -280,6 +283,30 @@ pub(super) async fn maybe_handle_telegram_command(
                 sender,
                 message,
                 tail.as_str(),
+                is_private_chat,
+                command_settings,
+            )
+            .await?;
+            Ok(true)
+        }
+        TelegramSlashCommand::Goal { tail } => {
+            handle_telegram_goal_command(
+                ctx,
+                sender,
+                message,
+                &tail,
+                is_private_chat,
+                command_settings,
+            )
+            .await?;
+            Ok(true)
+        }
+        TelegramSlashCommand::Resume { tail } => {
+            handle_telegram_resume_command(
+                ctx,
+                sender,
+                message,
+                &tail,
                 is_private_chat,
                 command_settings,
             )
@@ -586,6 +613,263 @@ pub(super) async fn handle_telegram_task_command(
     }
 
     Ok(())
+}
+
+async fn handle_telegram_goal_command(
+    ctx: &ChannelContext,
+    sender: &TelegramSender,
+    message: &TelegramMessage,
+    tail: &str,
+    is_private_chat: bool,
+    command_settings: &TelegramCommandSettings,
+) -> anyhow::Result<()> {
+    if !ensure_harness_command_access(
+        ctx,
+        sender,
+        message,
+        is_private_chat,
+        command_settings,
+        "/goal",
+    )
+    .await?
+    {
+        return Ok(());
+    }
+    let engine = ctx.loop_engine.as_ref().expect("access checked engine");
+    let actor = format!(
+        "telegram:{}",
+        message
+            .from
+            .as_ref()
+            .map(|user| user.id)
+            .unwrap_or(message.chat.id)
+    );
+    let args = shlex::split(tail).ok_or_else(|| anyhow::anyhow!("命令参数错误: 引号未闭合"))?;
+    if args.first().is_some_and(|value| value == "approve") {
+        if args.len() != 4 {
+            send_telegram_command_reply(
+                sender,
+                message,
+                "用法: /goal approve <goal_id> <revision> <plan_hash>",
+            )
+            .await?;
+            return Ok(());
+        }
+        let revision = match args[2].parse::<u32>() {
+            Ok(value) => value,
+            Err(_) => {
+                send_telegram_command_reply(sender, message, "revision 必须是非负整数。").await?;
+                return Ok(());
+            }
+        };
+        match engine
+            .approve_goal(
+                &args[1],
+                ApproveGoalRequest {
+                    expected_goal_revision: revision,
+                    expected_plan_hash: args[3].clone(),
+                },
+                &actor,
+            )
+            .await
+        {
+            Ok(report) => {
+                send_telegram_command_reply(
+                    sender,
+                    message,
+                    &format!(
+                        "Goal 已批准并进入 durable dispatch。\ngoal_id={}\nstatus={}\nwork_items={}",
+                        report.goal.id,
+                        enum_label(&report.goal.status),
+                        report.work_items.len()
+                    ),
+                )
+                .await?;
+            }
+            Err(error) => {
+                send_telegram_command_reply(sender, message, &format!("Goal 批准失败: {error}"))
+                    .await?;
+            }
+        }
+        return Ok(());
+    }
+
+    let objective = tail.trim();
+    if objective.is_empty() {
+        send_telegram_command_reply(
+            sender,
+            message,
+            "用法:\n/goal <目标描述>\n/goal approve <goal_id> <revision> <plan_hash>",
+        )
+        .await?;
+        return Ok(());
+    }
+    let created = match engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: objective.to_string(),
+                source_signal_ids: Vec::new(),
+            },
+            &actor,
+        )
+        .await
+    {
+        Ok(goal) => goal,
+        Err(error) => {
+            send_telegram_command_reply(sender, message, &format!("Goal 创建失败: {error}"))
+                .await?;
+            return Ok(());
+        }
+    };
+    match engine.plan_goal_recommended(&created.id, &actor).await {
+        Ok(plan) => {
+            send_telegram_command_reply(
+                sender,
+                message,
+                &format!(
+                    "Goal 已生成安全计划，尚未执行。\ngoal_id={}\nstatus={}\nrevision={}\nplan_hash={}\n\n确认后执行:\n/goal approve {} {} {}",
+                    plan.goal.id,
+                    enum_label(&plan.goal.status),
+                    plan.goal.revision,
+                    plan.plan_hash,
+                    plan.goal.id,
+                    plan.goal.revision,
+                    plan.plan_hash,
+                ),
+            )
+            .await?;
+        }
+        Err(error) => {
+            send_telegram_command_reply(sender, message, &format!("Goal 规划失败: {error}"))
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_telegram_resume_command(
+    ctx: &ChannelContext,
+    sender: &TelegramSender,
+    message: &TelegramMessage,
+    tail: &str,
+    is_private_chat: bool,
+    command_settings: &TelegramCommandSettings,
+) -> anyhow::Result<()> {
+    if !ensure_harness_command_access(
+        ctx,
+        sender,
+        message,
+        is_private_chat,
+        command_settings,
+        "/resume",
+    )
+    .await?
+    {
+        return Ok(());
+    }
+    let goal_id = tail.trim();
+    if goal_id.is_empty() || goal_id.chars().any(char::is_whitespace) {
+        send_telegram_command_reply(sender, message, "用法: /resume <goal_id>").await?;
+        return Ok(());
+    }
+    let actor = format!(
+        "telegram:{}",
+        message
+            .from
+            .as_ref()
+            .map(|user| user.id)
+            .unwrap_or(message.chat.id)
+    );
+    let engine = ctx.loop_engine.as_ref().expect("access checked engine");
+    match engine.resume_goal(goal_id, &actor).await {
+        Ok(report) => {
+            let mut lines = vec![
+                format!("Goal: {}", report.goal.id),
+                format!("状态: {}", enum_label(&report.goal.status)),
+                format!("revision: {}", report.goal.revision),
+            ];
+            for item in report.work_items.iter().take(20) {
+                lines.push(format!(
+                    "- {} · {} · {}",
+                    item.step_id,
+                    enum_label(&item.status),
+                    item.handler
+                ));
+            }
+            if let Some(checkpoint) = report.latest_checkpoint {
+                lines.push(format!(
+                    "最近 checkpoint: {} · {}",
+                    checkpoint.id,
+                    enum_label(&checkpoint.phase)
+                ));
+            }
+            send_telegram_command_reply(sender, message, &lines.join("\n")).await?;
+        }
+        Err(error) => {
+            send_telegram_command_reply(sender, message, &format!("恢复 Goal 失败: {error}"))
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_harness_command_access(
+    ctx: &ChannelContext,
+    sender: &TelegramSender,
+    message: &TelegramMessage,
+    is_private_chat: bool,
+    command_settings: &TelegramCommandSettings,
+    command: &str,
+) -> anyhow::Result<bool> {
+    if !command_settings.enabled {
+        send_telegram_command_reply(sender, message, "命令功能未启用。").await?;
+        return Ok(false);
+    }
+    if !is_private_chat {
+        send_telegram_command_reply(sender, message, &format!("请私聊使用 {command} 命令。"))
+            .await?;
+        return Ok(false);
+    }
+    match evaluate_private_chat_access(
+        message.from.as_ref().map(|user| user.id),
+        &command_settings.admin_user_ids,
+    ) {
+        PrivateChatAccess::Allowed => {}
+        PrivateChatAccess::MissingAdminAllowlist => {
+            send_telegram_command_reply(
+                sender,
+                message,
+                &format!(
+                    "管理员白名单未配置，{command} 不可用。\n{}",
+                    telegram_whoami_hint(message)
+                ),
+            )
+            .await?;
+            return Ok(false);
+        }
+        PrivateChatAccess::Unauthorized => {
+            send_telegram_command_reply(
+                sender,
+                message,
+                &format!("无权限使用 {command}。\n{}", telegram_whoami_hint(message)),
+            )
+            .await?;
+            return Ok(false);
+        }
+    }
+    if ctx.loop_engine.is_none() {
+        send_telegram_command_reply(sender, message, "Loop Engine 未启用。请检查 harness 配置。")
+            .await?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn enum_label<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 pub(super) async fn handle_telegram_agents_command(
@@ -1538,6 +1822,8 @@ pub(super) fn parse_telegram_slash_command(
         "skills" | "skill" => Some(TelegramSlashCommand::Skills { tail }),
         "agents" | "agent" => Some(TelegramSlashCommand::Agents { tail }),
         "task" => Some(TelegramSlashCommand::Task { tail }),
+        "goal" => Some(TelegramSlashCommand::Goal { tail }),
+        "resume" => Some(TelegramSlashCommand::Resume { tail }),
         _ => Some(TelegramSlashCommand::Unknown { name: command }),
     }
 }
@@ -1560,6 +1846,8 @@ pub(super) fn telegram_help_text() -> String {
         "/skills - 管理 Skills（仅私聊管理员）",
         "/agents - 查看 Agent 审计（仅私聊管理员）",
         "/task - 管理定时任务（仅私聊管理员）",
+        "/goal - 创建、审阅或批准 durable Goal（仅私聊管理员）",
+        "/resume - 恢复并查看 Goal 状态（仅私聊管理员）",
     ]
     .join("\n")
 }
@@ -1686,6 +1974,8 @@ pub(super) fn telegram_registered_commands() -> Vec<(&'static str, &'static str)
         ("skills", "管理 Skills"),
         ("agents", "查看 Agent 审计"),
         ("task", "管理定时任务"),
+        ("goal", "创建与批准 durable Goal"),
+        ("resume", "恢复 Goal 状态"),
     ]
 }
 

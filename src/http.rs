@@ -10,6 +10,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures::StreamExt;
 use prometheus::Registry;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, RwLock, Semaphore, watch};
@@ -30,6 +31,7 @@ use crate::harness::evolution::{
     EvolutionEvalCase, EvolutionEvaluationRecord, EvolutionFeedbackDraft, EvolutionFeedbackRecord,
     EvolutionGateConfig, EvolutionRollbackResult, evolution_cycle_skip_reason,
 };
+use crate::harness::loop_engine::{LoopEngine, LoopWorker, SqliteLoopStore};
 use crate::harness::observability::TrajectoryMetrics;
 use crate::harness::store::{
     EvolutionStore, HarnessStore, SqliteEvolutionStore, SqliteHarnessStore,
@@ -44,6 +46,8 @@ use crate::service::{
     AgentMcpSettings, AgentSkillsSettings, AgentSwarmSettings, CodeModeDiagnostics, MessageService,
 };
 use crate::skills::{SkillConfigPaths, SkillRegistry, SkillRuntime};
+
+mod harness_control;
 
 const CODE_MODE_DIAG_OVERFLOW_SOURCE_KEY: &str = "__overflow__";
 
@@ -101,6 +105,12 @@ struct RuntimeHandles {
     mcp_runtime: Arc<RwLock<McpRuntime>>,
     evolution_engine: Option<Arc<EvolutionEngine>>,
     evolution_auto_cycle: Option<EvolutionAutoCycleSettings>,
+    loop_engine: Arc<LoopEngine>,
+    loop_engine_enabled: bool,
+    loop_ingest_api_key: Option<String>,
+    loop_worker: Option<Arc<LoopWorker>>,
+    loop_worker_settings: Option<LoopWorkerSettings>,
+    loop_self_test_interval_secs: u64,
     locale: String,
 }
 
@@ -108,6 +118,12 @@ struct RuntimeHandles {
 struct EvolutionAutoCycleSettings {
     interval_secs: u64,
     initial_delay_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LoopWorkerSettings {
+    poll_interval_secs: u64,
+    max_parallel: usize,
 }
 
 #[derive(Clone)]
@@ -139,16 +155,23 @@ impl WorkerSupervisor {
     }
 
     async fn replace(&mut self, shutdown_tx: watch::Sender<bool>, workers: Vec<ChannelWorker>) {
-        let previous_shutdown = std::mem::replace(&mut self.shutdown_tx, shutdown_tx);
-        let previous_workers = std::mem::replace(&mut self.workers, workers);
-        let _ = previous_shutdown.send(true);
-        stop_channel_workers(previous_workers).await;
+        self.stop_current().await;
+        self.install(shutdown_tx, workers);
     }
 
-    async fn shutdown(&mut self) {
+    async fn stop_current(&mut self) {
         let _ = self.shutdown_tx.send(true);
         let workers = std::mem::take(&mut self.workers);
         stop_channel_workers(workers).await;
+    }
+
+    fn install(&mut self, shutdown_tx: watch::Sender<bool>, workers: Vec<ChannelWorker>) {
+        self.shutdown_tx = shutdown_tx;
+        self.workers = workers;
+    }
+
+    async fn shutdown(&mut self) {
+        self.stop_current().await;
     }
 }
 
@@ -522,6 +545,29 @@ async fn build_runtime_handles(
     };
 
     let memory_store = SqliteMemoryStore::new(database_url).await?;
+    let loop_engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(
+        memory_store.clone(),
+    ))));
+    let loop_config = &config.agent.harness.loop_engine;
+    if loop_config.worker_enabled && !loop_config.enabled {
+        bail!("loop engine worker requires agent.harness.loop_engine.enabled=true");
+    }
+    if loop_config.worker_enabled {
+        if !(1..=60).contains(&loop_config.worker_poll_interval_secs) {
+            bail!("loop worker poll interval must be 1..=60 seconds");
+        }
+        if !(1..=3600).contains(&loop_config.worker_lease_secs) {
+            bail!("loop worker lease must be 1..=3600 seconds");
+        }
+        if !(1..=16).contains(&loop_config.worker_max_parallel) {
+            bail!("loop worker max_parallel must be 1..=16");
+        }
+    }
+    if loop_config.self_test_interval_secs > 0
+        && !(10..=2_592_000).contains(&loop_config.self_test_interval_secs)
+    {
+        bail!("loop self-test interval must be 10..=2592000 seconds or 0 to disable");
+    }
     let max_recent_turns = if config.memory.max_recent_turns == 0 {
         config.app.max_history
     } else {
@@ -623,6 +669,22 @@ async fn build_runtime_handles(
     } else {
         None
     };
+    let loop_worker = if loop_config.enabled && loop_config.worker_enabled {
+        Some(Arc::new(
+            LoopWorker::with_builtins(
+                loop_engine.clone(),
+                provider.clone(),
+                evolution_engine.clone(),
+            )
+            .with_runtime_options("loop-worker:runtime", loop_config.worker_lease_secs)?,
+        ))
+    } else {
+        None
+    };
+    let loop_worker_settings = loop_worker.as_ref().map(|_| LoopWorkerSettings {
+        poll_interval_secs: loop_config.worker_poll_interval_secs,
+        max_parallel: loop_config.worker_max_parallel,
+    });
     let trajectory_metrics =
         if config.agent.harness.enable_trajectory || config.agent.harness.enable_verification {
             let registry = Registry::new();
@@ -631,7 +693,7 @@ async fn build_runtime_handles(
             None
         };
     let mut service = MessageService::new_with_backend(
-        provider,
+        provider.clone(),
         memory_backend,
         Some(mcp_runtime.clone()),
         AgentMcpSettings {
@@ -689,6 +751,16 @@ async fn build_runtime_handles(
         mcp_runtime,
         evolution_engine,
         evolution_auto_cycle,
+        loop_engine,
+        loop_engine_enabled: loop_config.enabled,
+        loop_ingest_api_key: normalize_optional_secret(loop_config.ingest_api_key.clone()),
+        loop_worker,
+        loop_worker_settings,
+        loop_self_test_interval_secs: if loop_config.enabled {
+            loop_config.self_test_interval_secs
+        } else {
+            0
+        },
         locale: env_overrides
             .and_then(|m| m.get("XIAOMAOLV_LOCALE").cloned())
             .and_then(|value| normalize_supported_locale(&value))
@@ -723,8 +795,25 @@ impl AppState {
         // Extract mcp_runtime before moving runtime into RwLock
         let new_mcp_runtime = runtime.mcp_runtime.clone();
 
+        let previous_runtime = self.runtime.read().await.clone();
+        let mut supervisor = self.worker_supervisor.lock().await;
+        supervisor.stop_current().await;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let workers = start_channel_workers(&runtime, shutdown_rx).await?;
+        let workers = match start_channel_workers(&runtime, shutdown_rx).await {
+            Ok(workers) => workers,
+            Err(error) => {
+                let (rollback_tx, rollback_rx) = watch::channel(false);
+                match start_channel_workers(&previous_runtime, rollback_rx).await {
+                    Ok(previous_workers) => supervisor.install(rollback_tx, previous_workers),
+                    Err(rollback_error) => {
+                        return Err(error.context(format!(
+                            "new workers failed and previous workers could not restart: {rollback_error:#}"
+                        )));
+                    }
+                }
+                return Err(error.context("failed to start reloaded workers"));
+            }
+        };
 
         {
             let mut current_runtime = self.runtime.write().await;
@@ -741,8 +830,7 @@ impl AppState {
             *current_api_key = api_key;
         }
 
-        let mut supervisor = self.worker_supervisor.lock().await;
-        supervisor.replace(shutdown_tx, workers).await;
+        supervisor.install(shutdown_tx, workers);
 
         Ok(())
     }
@@ -800,7 +888,8 @@ fn build_axum_router(state: AppState, http_enabled: bool) -> Router {
         .route(
             "/v1/harness/evolution/rollback",
             post(post_evolution_rollback),
-        );
+        )
+        .merge(harness_control::router());
 
     if http_enabled {
         api_router = api_router
@@ -838,6 +927,9 @@ async fn start_channel_workers(
                 service: runtime.service.clone(),
                 channel_name: channel_name.clone(),
                 shutdown: shutdown_rx.clone(),
+                loop_engine: runtime
+                    .loop_engine_enabled
+                    .then(|| runtime.loop_engine.clone()),
             })
             .await
             .with_context(|| format!("failed to start channel worker for '{channel_name}'"))?;
@@ -890,13 +982,94 @@ async fn start_channel_workers(
         });
     }
 
+    if let (Some(worker), Some(settings)) =
+        (runtime.loop_worker.clone(), runtime.loop_worker_settings)
+    {
+        let mut shutdown = shutdown_rx.clone();
+        let task = tokio::spawn(async move {
+            let mut ticker =
+                tokio::time::interval(Duration::from_secs(settings.poll_interval_secs));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            break;
+                        }
+                    }
+                    _ = ticker.tick() => {
+                        match worker
+                            .dispatchable_goal_ids(settings.max_parallel.saturating_mul(8))
+                            .await
+                        {
+                            Ok(goal_ids) => {
+                                futures::stream::iter(goal_ids)
+                                    .for_each_concurrent(settings.max_parallel, |goal_id| {
+                                        let worker = worker.clone();
+                                        async move {
+                                            if let Err(error) = worker
+                                                .run_goal_until_idle(&goal_id, 8)
+                                                .await
+                                            {
+                                                warn!(%error, %goal_id, "loop worker goal dispatch failed");
+                                            }
+                                        }
+                                    })
+                                    .await;
+                            }
+                            Err(error) => warn!(%error, "loop worker failed to list dispatchable goals"),
+                        }
+                    }
+                }
+            }
+        });
+        workers.push(ChannelWorker {
+            name: "loop-engine".to_string(),
+            task,
+        });
+    }
+
+    if runtime.loop_self_test_interval_secs > 0 {
+        let engine = runtime.loop_engine.clone();
+        let interval_secs = runtime.loop_self_test_interval_secs;
+        let mut shutdown = shutdown_rx.clone();
+        let task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            break;
+                        }
+                    }
+                    _ = ticker.tick() => {
+                        match engine.run_self_tests("core", "self-test:maintenance").await {
+                            Ok(run) => info!(run_id = %run.id, status = ?run.status, "loop maintenance self-test completed"),
+                            Err(error) => warn!(%error, "loop maintenance self-test failed to run"),
+                        }
+                    }
+                }
+            }
+        });
+        workers.push(ChannelWorker {
+            name: "loop-self-test".to_string(),
+            task,
+        });
+    }
+
     Ok(workers)
 }
 
 async fn stop_channel_workers(workers: Vec<ChannelWorker>) {
-    for worker in workers {
-        worker.task.abort();
-        let _ = worker.task.await;
+    for mut worker in workers {
+        if tokio::time::timeout(Duration::from_secs(5), &mut worker.task)
+            .await
+            .is_err()
+        {
+            worker.task.abort();
+            let _ = worker.task.await;
+        }
     }
 }
 
@@ -3065,6 +3238,9 @@ async fn dispatch_channel_inbound(
             ChannelContext {
                 service: runtime_state.service.clone(),
                 channel_name,
+                loop_engine: runtime_state
+                    .loop_engine_enabled
+                    .then(|| runtime_state.loop_engine.clone()),
             },
             ChannelInbound {
                 payload,

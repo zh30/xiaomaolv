@@ -9,6 +9,7 @@ use xiaomaolv::code_mode::{
 };
 use xiaomaolv::config::AgentHarnessConfig;
 use xiaomaolv::domain::{IncomingMessage, StoredMessage};
+use xiaomaolv::harness::loop_engine::{LoopEngine, ReplayStatus, SqliteLoopStore};
 use xiaomaolv::harness::store::{HarnessStore, SqliteHarnessStore};
 use xiaomaolv::harness::trajectory::{
     ToolCallRecord, TrajectoryExitReason, TrajectoryFilter, TrajectoryLogger, TrajectoryRecord,
@@ -278,6 +279,192 @@ impl StreamSink for FailingSink {
     async fn on_delta(&mut self, _delta: &str) -> anyhow::Result<()> {
         anyhow::bail!("sink delivery failed")
     }
+}
+
+#[derive(Default)]
+struct CollectSink {
+    text: String,
+}
+
+#[async_trait]
+impl StreamSink for CollectSink {
+    async fn on_delta(&mut self, delta: &str) -> anyhow::Result<()> {
+        self.text.push_str(delta);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn plain_provider_completion_records_a_structurally_replayable_frame() {
+    let store = SqliteMemoryStore::new("sqlite::memory:")
+        .await
+        .expect("store");
+    let backend: Arc<dyn MemoryBackend> = Arc::new(SqliteMemoryBackend::new(store.clone()));
+    let harness_store = Arc::new(SqliteHarnessStore::new(store.clone()));
+    let service = MessageService::new_with_backend(
+        Arc::new(AnswerProvider),
+        backend,
+        None,
+        AgentMcpSettings::default(),
+        20,
+        0,
+        0,
+    )
+    .with_harness_store(harness_store.clone())
+    .with_trajectory_logger(TrajectoryLogger::new(harness_store, true))
+    .with_agent_swarm(AgentSwarmSettings {
+        enabled: false,
+        ..Default::default()
+    });
+
+    let output = service
+        .handle(incoming("plain-provider-replay"))
+        .await
+        .expect("plain provider completion");
+    assert_eq!(output.text, "code-mode-answer");
+
+    let trajectories = service
+        .query_trajectories(TrajectoryFilter {
+            session_id: Some("plain-provider-replay".to_string()),
+            channel: Some("test".to_string()),
+            user_id: Some("user-1".to_string()),
+            exit_reason: None,
+            has_tool_errors: None,
+            limit: 10,
+        })
+        .await
+        .expect("query trajectories");
+    assert_eq!(trajectories.len(), 1);
+
+    let engine = LoopEngine::new(Arc::new(SqliteLoopStore::new(store)));
+    let frames = engine
+        .list_trajectory_frames(&trajectories[0].id)
+        .await
+        .expect("list provider frames");
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].call_index, 0);
+    assert_eq!(frames[0].response, "code-mode-answer");
+    assert!(!frames[0].request_messages.is_empty());
+
+    let replay = engine
+        .run_structural_replay(&trajectories[0].id, "test:service-replay")
+        .await
+        .expect("structural replay");
+    assert_eq!(replay.status, ReplayStatus::Passed);
+    assert_eq!(replay.live_tools_executed, 0);
+}
+
+#[tokio::test]
+async fn plain_stream_completion_records_the_resolved_provider_frame() {
+    let store = SqliteMemoryStore::new("sqlite::memory:")
+        .await
+        .expect("store");
+    let backend: Arc<dyn MemoryBackend> = Arc::new(SqliteMemoryBackend::new(store.clone()));
+    let harness_store = Arc::new(SqliteHarnessStore::new(store.clone()));
+    let service = MessageService::new_with_backend(
+        Arc::new(AnswerProvider),
+        backend,
+        None,
+        AgentMcpSettings::default(),
+        20,
+        0,
+        0,
+    )
+    .with_harness_store(harness_store.clone())
+    .with_trajectory_logger(TrajectoryLogger::new(harness_store, true));
+    let mut sink = CollectSink::default();
+
+    let output = service
+        .handle_stream(incoming("plain-stream-replay"), &mut sink)
+        .await
+        .expect("plain stream completion");
+    assert_eq!(output.text, "code-mode-answer");
+    assert_eq!(sink.text, "code-mode-answer");
+
+    let trajectories = service
+        .query_trajectories(TrajectoryFilter {
+            session_id: Some("plain-stream-replay".to_string()),
+            channel: Some("test".to_string()),
+            user_id: Some("user-1".to_string()),
+            exit_reason: None,
+            has_tool_errors: None,
+            limit: 10,
+        })
+        .await
+        .expect("query trajectories");
+    assert_eq!(trajectories.len(), 1);
+
+    let engine = LoopEngine::new(Arc::new(SqliteLoopStore::new(store)));
+    let frames = engine
+        .list_trajectory_frames(&trajectories[0].id)
+        .await
+        .expect("list stream frames");
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].response, "code-mode-answer");
+}
+
+#[tokio::test]
+async fn mcp_stream_recovery_records_every_provider_completion_in_order() {
+    let store = SqliteMemoryStore::new("sqlite::memory:")
+        .await
+        .expect("store");
+    let backend: Arc<dyn MemoryBackend> = Arc::new(SqliteMemoryBackend::new(store.clone()));
+    let harness_store = Arc::new(SqliteHarnessStore::new(store.clone()));
+    let provider = Arc::new(QueueProvider::new(vec![
+        "MCP_TOOL_CALL_JSON: {bad".to_string(),
+        "Recovered final answer.".to_string(),
+    ]));
+    let runtime = Arc::new(RwLock::new(McpRuntime::default()));
+    let service = MessageService::new_with_backend(
+        provider,
+        backend,
+        Some(runtime),
+        AgentMcpSettings {
+            enabled: true,
+            max_iterations: 2,
+            max_tool_result_chars: 4000,
+        },
+        20,
+        0,
+        0,
+    )
+    .with_harness_store(harness_store.clone())
+    .with_trajectory_logger(TrajectoryLogger::new(harness_store, true))
+    .with_agent_swarm(AgentSwarmSettings {
+        enabled: false,
+        ..Default::default()
+    });
+    let mut sink = CollectSink::default();
+
+    let output = service
+        .handle_stream(incoming("mcp-stream-replay"), &mut sink)
+        .await
+        .expect("mcp stream recovery");
+    assert_eq!(output.text, "Recovered final answer.");
+
+    let trajectories = service
+        .query_trajectories(TrajectoryFilter {
+            session_id: Some("mcp-stream-replay".to_string()),
+            channel: Some("test".to_string()),
+            user_id: Some("user-1".to_string()),
+            exit_reason: None,
+            has_tool_errors: None,
+            limit: 10,
+        })
+        .await
+        .expect("query trajectories");
+    assert_eq!(trajectories.len(), 1);
+
+    let engine = LoopEngine::new(Arc::new(SqliteLoopStore::new(store)));
+    let frames = engine
+        .list_trajectory_frames(&trajectories[0].id)
+        .await
+        .expect("list mcp stream frames");
+    assert_eq!(frames.len(), 2, "captured frames: {frames:#?}");
+    assert_eq!(frames[0].call_index, 0);
+    assert_eq!(frames[0].response, "MCP_TOOL_CALL_JSON: {bad");
+    assert_eq!(frames[1].call_index, 1);
+    assert_eq!(frames[1].response, "Recovered final answer.");
 }
 
 #[tokio::test]

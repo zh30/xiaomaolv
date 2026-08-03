@@ -14,6 +14,7 @@ use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use tracing::warn;
 
 use crate::domain::{MessageRole, StoredMessage};
+use crate::harness::loop_engine::initialize_loop_engine_schema;
 
 #[derive(Clone)]
 pub struct SqliteMemoryStore {
@@ -391,6 +392,7 @@ impl SqliteMemoryStore {
         .context("failed to initialize compaction summary session index")?;
 
         initialize_evolution_schema(&pool).await?;
+        initialize_loop_engine_schema(&pool).await?;
 
         Ok(Self { pool })
     }
