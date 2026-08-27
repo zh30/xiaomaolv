@@ -7,7 +7,7 @@ Chinese version: `README.zh.md`
 
 ## Official links
 
-- Website: https://zhanghe.dev/products/xiaomaolv
+- Official website: https://zhanghe.dev/products/xiaomaolv
 
 The tested MiniMax + Telegram path is in [Quick Start](#quick-start).
 
