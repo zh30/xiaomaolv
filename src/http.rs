@@ -31,7 +31,9 @@ use crate::harness::evolution::{
     EvolutionEvalCase, EvolutionEvaluationRecord, EvolutionFeedbackDraft, EvolutionFeedbackRecord,
     EvolutionGateConfig, EvolutionRollbackResult, evolution_cycle_skip_reason,
 };
-use crate::harness::loop_engine::{LoopEngine, LoopWorker, SqliteLoopStore};
+use crate::harness::loop_engine::{
+    InternalApprovalPolicy, LoopEngine, LoopWorker, SqliteLoopStore,
+};
 use crate::harness::observability::TrajectoryMetrics;
 use crate::harness::store::{
     EvolutionStore, HarnessStore, SqliteEvolutionStore, SqliteHarnessStore,
@@ -545,9 +547,6 @@ async fn build_runtime_handles(
     };
 
     let memory_store = SqliteMemoryStore::new(database_url).await?;
-    let loop_engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(
-        memory_store.clone(),
-    ))));
     let loop_config = &config.agent.harness.loop_engine;
     if loop_config.worker_enabled && !loop_config.enabled {
         bail!("loop engine worker requires agent.harness.loop_engine.enabled=true");
@@ -568,6 +567,20 @@ async fn build_runtime_handles(
     {
         bail!("loop self-test interval must be 10..=2592000 seconds or 0 to disable");
     }
+    if !(1..=64).contains(&loop_config.internal_auto_approve_max_provider_calls) {
+        bail!("internal auto-approve provider-call ceiling must be 1..=64");
+    }
+    let internal_approval_policy = InternalApprovalPolicy {
+        max_effect: InternalApprovalPolicy::effect_class_from_name(
+            &loop_config.internal_auto_approve_max_effect,
+        )
+        .context("invalid agent.harness.loop_engine.internal_auto_approve_max_effect")?,
+        max_provider_calls: loop_config.internal_auto_approve_max_provider_calls,
+    };
+    let loop_engine = Arc::new(LoopEngine::new(Arc::new(
+        SqliteLoopStore::new(memory_store.clone())
+            .with_internal_approval_policy(internal_approval_policy),
+    )));
     let max_recent_turns = if config.memory.max_recent_turns == 0 {
         config.app.max_history
     } else {

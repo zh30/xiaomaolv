@@ -11,7 +11,7 @@ pub use artifacts::{ArtifactKind, ArtifactPublishResult, ArtifactRecord, Publish
 pub use domain::{
     AcceptanceCriterion, ApproveGoalRequest, AttemptRecord, AttemptStatus, CheckpointPhase,
     CheckpointRecord, CreateGoalRequest, EffectClass, ExecutionBudget, GoalRecord, GoalStatus,
-    GoalVerificationReport, LoopEventRecord, PlanGoalRequest, PlannedGoal,
+    GoalVerificationReport, InternalApprovalPolicy, LoopEventRecord, PlanGoalRequest, PlannedGoal,
     ProviderBudgetReservation, ResumeReport, RetryPolicy, WorkClaim, WorkItemRecord,
     WorkItemStatus, WorkOutcome, WorkflowEdge, WorkflowSpec, WorkflowStep,
 };

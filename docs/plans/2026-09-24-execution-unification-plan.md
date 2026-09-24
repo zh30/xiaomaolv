@@ -267,16 +267,20 @@ inside swarm logic, not inside a `WorkHandler`.
 the loop, which today does not exist.
 
 **Steps:**
-- [ ] Add `internal:auto` actor + policy: auto-approval binds only plans whose effect manifest
+- [x] Add `internal:auto` actor + policy: auto-approval binds only plans whose effect manifest
   is a subset of `{pure, read}`, whose budget is under configured caps, and whose actor is
   internal. External-write or over-budget plans still require the operator route.
-- [ ] Config: `[agent.harness.loop_engine] internal_auto_approve_max_effect = "read"`,
+  *Done: `InternalApprovalPolicy` enforced inside `approve_goal` when `actor ==
+  "internal:auto"`; subsystem actors (`internal:swarm`) approve only their own code-built
+  plan shapes and stay governed by domain validation.*
+- [x] Config: `[agent.harness.loop_engine] internal_auto_approve_max_effect = "read"`,
   `internal_auto_approve_max_provider_calls = 16` (defaults; hard ceiling enforced in domain
-  validation, not only config).
-- [ ] Audit: auto-approvals emit a `LoopEventRecord` with actor `internal:auto` and the bound
-  plan hash.
-- [ ] Tests: auto-approve accepts a read-only swarm plan; rejects `local_write`/`external_write`
+  validation, not only config). *Done; both parsed and range-checked at startup in `http.rs`.*
+- [x] Audit: auto-approvals emit a `LoopEventRecord` with actor `internal:auto` and the bound
+  plan hash. *Done: the existing approval event records the actor verbatim.*
+- [x] Tests: auto-approve accepts a read-only swarm plan; rejects `local_write`/`external_write`
   plans and over-budget plans; events recorded.
+  *Done: `internal_auto_approval_is_bounded_by_policy`.*
 
 ### T8 (P2) — Message-turn durability decision
 

@@ -1076,3 +1076,125 @@ async fn extend_workflow_enforces_internal_actor_manifest_and_budget() -> anyhow
     assert_eq!(child_claim.work_item.step_id, "run:2");
     Ok(())
 }
+
+/// The `internal:auto` actor auto-approves only plans whose effect manifest
+/// stays within the configured ceiling and whose provider-call budget is under
+/// the cap; other internal actors (e.g. `internal:swarm`) are unaffected.
+#[tokio::test]
+async fn internal_auto_approval_is_bounded_by_policy() -> anyhow::Result<()> {
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = LoopEngine::new(Arc::new(SqliteLoopStore::new(memory)));
+
+    async fn plan_and_try_approve(
+        engine: &LoopEngine,
+        objective: &str,
+        effect: EffectClass,
+        max_provider_calls: u32,
+        actor: &str,
+    ) -> anyhow::Result<()> {
+        let goal = engine
+            .create_goal(
+                CreateGoalRequest {
+                    objective: objective.to_string(),
+                    source_signal_ids: Vec::new(),
+                },
+                actor,
+            )
+            .await?;
+        let planned = engine
+            .plan_goal(
+                &goal.id,
+                PlanGoalRequest {
+                    workflow: WorkflowSpec {
+                        steps: vec![WorkflowStep {
+                            id: "step-1".to_string(),
+                            handler: "provider_analysis".to_string(),
+                            effect,
+                            input: serde_json::json!({}),
+                            retry: RetryPolicy {
+                                max_attempts: 1,
+                                backoff_secs: 0,
+                            },
+                        }],
+                        edges: Vec::new(),
+                        budget: ExecutionBudget {
+                            max_provider_calls,
+                            deadline_secs: 60,
+                            max_response_bytes: 65_536,
+                        },
+                    },
+                    acceptance_criteria: vec![AcceptanceCriterion::ArtifactExists {
+                        artifact_type: "analysis_report".to_string(),
+                    }],
+                },
+                actor,
+            )
+            .await?;
+        engine
+            .approve_goal(
+                &goal.id,
+                ApproveGoalRequest {
+                    expected_goal_revision: planned.goal.revision,
+                    expected_plan_hash: planned.plan_hash,
+                },
+                actor,
+            )
+            .await?;
+        Ok(())
+    }
+
+    // Read-effect plan within the default 16-call cap: approved.
+    plan_and_try_approve(
+        &engine,
+        "read-only internal plan",
+        EffectClass::Read,
+        4,
+        "internal:auto",
+    )
+    .await?;
+    // local_write exceeds the default "read" effect ceiling.
+    let write_plan = plan_and_try_approve(
+        &engine,
+        "write plan",
+        EffectClass::LocalWrite,
+        4,
+        "internal:auto",
+    )
+    .await;
+    assert!(write_plan.is_err());
+    // Over-cap provider budget is rejected even with an allowed effect.
+    let over_budget = plan_and_try_approve(
+        &engine,
+        "over budget",
+        EffectClass::Read,
+        64,
+        "internal:auto",
+    )
+    .await;
+    assert!(over_budget.is_err());
+    // A subsystem actor approves its own code-built plan without the generic
+    // auto-approval bounds (domain validation still applies).
+    plan_and_try_approve(
+        &engine,
+        "subsystem plan",
+        EffectClass::LocalWrite,
+        32,
+        "internal:swarm",
+    )
+    .await?;
+
+    // The auto-approved goal recorded an approval event attributed to
+    // internal:auto.
+    let goals = engine.list_goals(10).await?;
+    let auto_goal = goals
+        .iter()
+        .find(|goal| goal.objective == "read-only internal plan")
+        .expect("auto-approved goal");
+    let events = engine.list_goal_events(&auto_goal.id, 0, 50).await?;
+    assert!(
+        events
+            .iter()
+            .any(|event| event.actor == "internal:auto" && event.event_type.contains("approv"))
+    );
+    Ok(())
+}

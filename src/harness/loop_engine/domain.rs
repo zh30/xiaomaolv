@@ -216,6 +216,71 @@ pub(crate) const ALLOWED_WORKFLOW_HANDLERS: &[&str] = &[
 /// approved plan.
 pub(crate) const INTERNAL_ACTOR_PREFIX: &str = "internal:";
 
+/// Actor name for the generic internal auto-approval path. Unlike
+/// subsystem-scoped actors (`internal:swarm` approves only its own
+/// code-constructed plan shape), `internal:auto` may approve plans it did not
+/// author, so every approval is checked against `InternalApprovalPolicy`.
+pub(crate) const INTERNAL_AUTO_ACTOR: &str = "internal:auto";
+
+/// Bounds applied when the `internal:auto` actor approves a goal plan without
+/// an operator in the loop. Defaults are conservative; the hard ceilings in
+/// `WorkflowSpec::validate` still apply on top.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InternalApprovalPolicy {
+    /// Highest effect class an auto-approved plan may declare.
+    pub max_effect: EffectClass,
+    /// Provider-call budget ceiling for auto-approved plans.
+    pub max_provider_calls: u32,
+}
+
+impl Default for InternalApprovalPolicy {
+    fn default() -> Self {
+        Self {
+            max_effect: EffectClass::Read,
+            max_provider_calls: 16,
+        }
+    }
+}
+
+impl InternalApprovalPolicy {
+    /// Parses a policy effect ceiling from config (`"pure"`, `"read"`,
+    /// `"local_write"`, `"external_write"`). `external_write` is accepted but
+    /// ineffective because domain validation rejects such steps anyway.
+    pub fn effect_class_from_name(name: &str) -> anyhow::Result<EffectClass> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "pure" => Ok(EffectClass::Pure),
+            "read" => Ok(EffectClass::Read),
+            "local_write" => Ok(EffectClass::LocalWrite),
+            "external_write" => Ok(EffectClass::ExternalWrite),
+            other => bail!("unknown effect class ceiling: {other}"),
+        }
+    }
+
+    /// Ensures an `internal:auto` approval stays within the configured effect
+    /// and budget bounds. Called with the plan being approved.
+    pub(crate) fn check_plan(
+        &self,
+        workflow: &WorkflowSpec,
+        manifest: &[EffectClass],
+    ) -> anyhow::Result<()> {
+        for effect in manifest {
+            ensure!(
+                *effect <= self.max_effect,
+                "internal auto-approval rejected: plan effect '{}' exceeds ceiling '{}'",
+                effect.as_str(),
+                self.max_effect.as_str()
+            );
+        }
+        ensure!(
+            workflow.budget.max_provider_calls <= self.max_provider_calls,
+            "internal auto-approval rejected: provider call budget {} exceeds ceiling {}",
+            workflow.budget.max_provider_calls,
+            self.max_provider_calls
+        );
+        Ok(())
+    }
+}
+
 impl WorkflowSpec {
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         ensure!(

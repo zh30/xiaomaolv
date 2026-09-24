@@ -133,6 +133,12 @@ worker_lease_secs = 30
 worker_max_parallel = 2
 # 0 disables periodic read-only maintenance; otherwise valid 10..=2592000s.
 self_test_interval_secs = 0
+# Bounds for the generic `internal:auto` approval actor: plan effect manifest must stay
+# within this ceiling (pure|read|local_write|external_write) and within the provider-call cap.
+# Subsystem actors like internal:swarm approve only their own code-built plans and are
+# unaffected. Valid: provider calls 1..=64.
+internal_auto_approve_max_effect = "read"
+internal_auto_approve_max_provider_calls = 16
 
 [agent.harness.evolution]
 # Closed-loop improvement control plane. It is inert until explicitly enabled.

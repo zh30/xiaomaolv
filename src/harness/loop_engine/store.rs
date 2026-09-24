@@ -15,9 +15,10 @@ use super::artifacts::{
 use super::domain::{
     ALLOWED_WORKFLOW_HANDLERS, AcceptanceCriterion, ApproveGoalRequest, AttemptRecord,
     AttemptStatus, CheckpointPhase, CheckpointRecord, CreateGoalRequest, EffectClass, GoalRecord,
-    GoalStatus, GoalVerificationReport, INTERNAL_ACTOR_PREFIX, LoopEventRecord, PlanGoalRequest,
-    PlannedGoal, ProviderBudgetReservation, ResumeReport, WorkClaim, WorkItemRecord,
-    WorkItemStatus, WorkOutcome, WorkflowSpec, WorkflowStep, hash_serializable,
+    GoalStatus, GoalVerificationReport, INTERNAL_ACTOR_PREFIX, INTERNAL_AUTO_ACTOR,
+    InternalApprovalPolicy, LoopEventRecord, PlanGoalRequest, PlannedGoal,
+    ProviderBudgetReservation, ResumeReport, WorkClaim, WorkItemRecord, WorkItemStatus,
+    WorkOutcome, WorkflowSpec, WorkflowStep, hash_serializable,
 };
 use super::replay::{
     ReplayRun, TrajectoryFrame, TrajectoryFrameDraft, initialize_replay_schema, list_frames,
@@ -216,11 +217,21 @@ pub trait LoopStore: Send + Sync {
 #[derive(Clone)]
 pub struct SqliteLoopStore {
     store: SqliteMemoryStore,
+    internal_policy: InternalApprovalPolicy,
 }
 
 impl SqliteLoopStore {
     pub fn new(store: SqliteMemoryStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            internal_policy: InternalApprovalPolicy::default(),
+        }
+    }
+
+    /// Overrides the bounds applied to `internal:auto` plan approvals.
+    pub fn with_internal_approval_policy(mut self, policy: InternalApprovalPolicy) -> Self {
+        self.internal_policy = policy;
+        self
     }
 
     /// Shared claim path for `claim_goal_work` (ordinal order) and
@@ -981,6 +992,13 @@ impl LoopStore for SqliteLoopStore {
         let workflow: WorkflowSpec = serde_json::from_str(&workflow_json)?;
         let acceptance: Vec<AcceptanceCriterion> = serde_json::from_str(&acceptance_json)?;
         let effects: Vec<EffectClass> = serde_json::from_str(&effect_json)?;
+        // The generic internal auto-approval path is the only one that binds
+        // plans it did not author, so it is held to the configured policy.
+        // Subsystem actors (e.g. `internal:swarm`) approve their own
+        // code-constructed plans and stay governed by domain validation.
+        if actor == INTERNAL_AUTO_ACTOR {
+            self.internal_policy.check_plan(&workflow, &effects)?;
+        }
         let approval_id = new_loop_id("approval");
         sqlx::query(
             "INSERT INTO harness_goal_approvals
