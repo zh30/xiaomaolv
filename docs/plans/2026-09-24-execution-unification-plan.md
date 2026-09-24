@@ -1,0 +1,275 @@
+# Execution Unification Plan — Pipeline Decomposition, Swarm Convergence, Controlled Writes
+
+**Status:** In progress  
+**Date:** 2026-09-24  
+**Direction:** `docs/direction.md` (read first — this plan implements that north star)  
+**Supersedes:** Nothing. `2026-08-03-loop-engineering-harness.md` Phase 2 invariants remain active.
+
+## Goal
+
+Move xiaomaolv from "a chat gateway plus a separate durable harness" toward one durable, gated
+execution fabric:
+
+1. **Decompose `src/service.rs`** into a module tree with named pipeline stages (no behavior
+   change).
+2. **Project swarm runs into loop-engine terms** so multi-agent work becomes durable and
+   resumable instead of in-process only.
+3. **Enable `external_write` behind gates** (config flag, handler allowlist, approval,
+   idempotency, reconciliation) so the harness can act, not only observe.
+4. **Deepen the gates** (eval scorecards, signal-to-goal polish) — the differentiator.
+
+**Architecture note:** `src/service.rs` uses the Rust 2018 `foo.rs` + `foo/` layout already used
+by `src/channel.rs` + `src/channel/` and `src/http.rs` + `src/http/`. Submodules of
+`crate::service` are descendants of the module that defines `MessageService`, so they can hold
+`impl MessageService` blocks and access private fields/methods without widening visibility.
+Each decomposition task is therefore a pure code move plus a `pub use` where an external path
+must be preserved.
+
+## Current baseline (measured)
+
+`src/service.rs` = 5,575 lines total, ~4,680 non-test:
+
+| Region | Lines | Contents |
+|---|---|---|
+| settings + `MessageService` + swarm types | ~1-360 | `AgentSwarmSettings`, `SwarmExecutionShared`, etc. |
+| constructors / builders / diagnostics | ~361-830 | `new*`, `with_*`, metrics accessors |
+| `verify_final_answer`, `handle`, `handle_stream` | ~832-1080 | two near-identical ~110-line pipelines |
+| storage proxies (scheduler/swarm audit/trajectory) | ~1082-1390 | thin `self.memory.*` forwards |
+| swarm execution | ~1388-2016 | activation, recursive node executor, merge |
+| scheduler intent | ~2017-2066 | `detect_telegram_scheduler_intent` |
+| completion paths | ~2068-3190 | plain / code-mode / MCP loop, buffered + streaming |
+| helpers + free functions | ~3187-4687 | circuit breaker, compaction, time fast path, swarm prompts |
+| tests | ~4688-5575 | ~890 lines of unit tests |
+
+## NOT in scope
+
+- Any behavior change in Phases A. Message handling, swarm semantics, and prompts are frozen;
+  decomposition moves code, nothing else.
+- Executing swarm nodes through `LoopWorker` claims (Phase B keeps the in-process executor;
+  only the *record* becomes durable).
+- Exactly-once guarantees for external writes. The contract is at-least-once with approval,
+  idempotency keys, and reconcile-without-replay.
+- New channels, providers, memory backends, or multi-tenant anything.
+- Desktop UI (Phase E in the direction doc; the HTTP/SSE contract is already stable).
+
+## Priority overview
+
+| Priority | Task | Why first | Done when |
+|---|---|---|---|
+| P1 | T1 shared `prepare_turn` stage | Kills ~110 duplicated lines; creates the stage seam everything else hangs off | `handle`/`handle_stream` share one prelude; suite green |
+| P1 | T2 swarm -> `service/swarm.rs` | Largest self-contained block (~800 lines incl. helpers); frees the file | swarm code moved; `crate::service::*` paths unchanged; suite green |
+| P1 | T3 completion paths -> `service/completion*.rs` | ~1,120 lines of MCP loop / code mode / plain paths | completion code moved; suite green |
+| P1 | T4 delegates + streaming adapters -> submodules | ~400 lines of proxies and sink adapters | service.rs is orchestration only |
+| P1 | T5 tests -> `service/tests.rs` | Keeps the root file readable | `service.rs` <= ~1,500 lines |
+| P1 | T6 durable swarm projection | First real convergence: swarm runs survive crashes | run/node records land in loop-engine tables; resume reports swarm state |
+| P2 | T7 internal auto-approval policy | Required for any dynamic/non-interactive workflow growth | `internal:auto` actor bounded to effect <= `read` + budget cap; documented |
+| P2 | T8 message-turn durability decision | Decide whether trajectory frames suffice for chat turns | decision recorded; minimal impl if needed |
+| P2 | T9 `external_write` enablement | Converts harness from analyst to actor | config flag + allowlist + `channel_send` handler + idempotency + reconcile semantics; default off |
+| P2 | T10 eval scorecards -> evolution gate | Raises evolution ceiling | benchmark suite emits scorecards consumed by shadow eval |
+| P3 | T11 signal->goal polish | Dedup/review UX improvements | operator can review/convert signals end-to-end |
+| P3 | T12 Desktop control plane | Only worth it after Phase C | out of scope this plan; placeholder |
+
+## Implementation tasks
+
+### T1 (P1) — Extract the shared `prepare_turn` stage
+
+**Problem:** `handle` (859-966) and `handle_stream` (968-1080) duplicate ~110 lines:
+persist user message -> time-query fast path -> load context -> compaction -> budget ->
+skills -> evolution policy -> builtin time context -> swarm dispatch. They diverge only at the
+tail (buffered vs streamed completion) and in how early answers are emitted.
+
+**Files:**
+- Modify: `src/service.rs`
+
+**Steps:**
+- [x] Add `enum PreparedTurn { Immediate { text: String }, Ready { history: Vec<StoredMessage> } }`
+  near `CompletionOutcome`. `Immediate` carries an already-verified final answer (fast-path or
+  swarm); `Ready` carries the fully-prepared history.
+- [x] Add `async fn prepare_turn(&self, incoming: &IncomingMessage) -> anyhow::Result<PreparedTurn>`
+  performing: user-message persist -> fast-path check (verify, return `Immediate`) -> context
+  load -> compaction -> budget -> skills -> evolution -> time context -> swarm dispatch
+  (verify, return `Immediate`) -> `Ready`.
+- [x] Rewrite `handle` as `match self.prepare_turn(&incoming).await?` — `Immediate`: persist +
+  return; `Ready`: `complete_with_optional_mcp` -> conditional verify -> persist -> return.
+- [x] Rewrite `handle_stream` identically except `Immediate` emits via `sink.on_delta` (only when
+  non-empty) before persist, and `Ready` calls `complete_with_optional_mcp_stream`.
+- [x] Verify: `cargo test --test service_pipeline --test harness_eval` plus
+  `cargo test --lib service` (fast-path, swarm, streaming tests must pass unchanged).
+
+### T2 (P1) — Move swarm execution into `src/service/swarm.rs`
+
+**Problem:** ~800 lines of swarm code (types, audit proxies, recursive executor, prompt
+builders, heuristics) sit inside `service.rs`. It is the most self-contained subsystem and the
+Phase-B convergence target — it needs its own home before it grows a loop-engine projection.
+
+**Files:**
+- Create: `src/service/swarm.rs`
+- Modify: `src/service.rs` (`mod swarm;` + `pub use` for moved pub types + deletions)
+
+**Steps:**
+- [x] Move `AgentSwarmSettings` (keep `pub use swarm::AgentSwarmSettings` in `service.rs` so
+  `crate::service::AgentSwarmSettings` keeps working for `config.rs`, `channel.rs`, `http.rs`,
+  and the eight test files importing it).
+- [x] Move private swarm types: `SwarmExecutionShared`, `SwarmAgentSpec`, `SwarmNodeOutcome`,
+  `SwarmModelError`, `SwarmActivationDecision`, `SwarmNodePlanEnvelope`, `SwarmChildPlan`.
+- [x] Move methods into `impl MessageService` in the submodule: `try_swarm_reply` (as
+  `pub(super)`), `detect_swarm_activation`, `execute_swarm_node`, `swarm_complete_with_timeout`,
+  `build_swarm_summary_suffix`, `next_swarm_run_id`, and the four audit proxies
+  (`list_agent_swarm_runs`, `load_agent_swarm_tree`, `load_agent_swarm_node`,
+  `cleanup_agent_swarm_audit`).
+- [x] Move free helpers used only by swarm: `parse_flexible_json_value` (swarm-only — moved),
+  `sample_swarm_history`, `build_swarm_planner_messages`, `build_swarm_answer_messages`,
+  `build_swarm_merge_messages`, `default_swarm_nickname`, `truncate_swarm_text`,
+  `looks_like_swarm_task`.
+- [x] New file starts with `use super::*;` (deliberate: the move must not re-litigate import
+  lists; tightening imports is a separate cleanup).
+- [x] Verify: `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test --all-targets` — the agent-swarm tests (`tests/agent_swarm_store.rs`, swarm unit
+  tests) unchanged and green.
+
+### T3 (P1) — Move completion paths into `src/service/completion*.rs`
+
+**Problem:** `complete_with_optional_mcp`, `complete_plain_provider`, `complete_*_for_run`,
+`complete_with_code_mode`, `complete_with_mcp_loop`, `complete_with_mcp_loop_stream` (~2068-3190)
+plus their free helpers (`build_mcp_system_prompt`, `parse_mcp_tool_call`, stream replay
+chunker, code-mode audit/circuit functions) are ~1,500 lines of provider-call machinery.
+
+**Steps:**
+- [ ] Create `src/service/completion.rs` (or `completion/` if it exceeds ~900 lines — split as
+  `completion/mcp_loop.rs` + `completion/code_mode_path.rs`).
+- [ ] Move the completion methods into `impl MessageService` in the submodule(s) plus the free
+  helpers they own. Move `CompletionOutcome`, `CodeModeCompletion`, `CodeModeAttempt`,
+  `CodeModeCircuitChange`, `McpLoopObserver`, stream sink adapters (`IdentitySink`,
+  `BufferedStreamReplay`, `StreamReplayChunker`) if only completion code uses them.
+- [ ] Keep `code_mode_diagnostics`/`code_mode_metrics_prometheus` accessors in `service.rs`
+  (public API) or move with `pub use` — pick whichever keeps the diff smallest.
+- [ ] Verify: full `cargo test --all-targets` — MCP loop and code-mode tests must pass
+  unchanged.
+
+### T4 (P1) — Move delegates and streaming adapters into submodules
+
+**Steps:**
+- [ ] Create `src/service/delegates.rs`: the ~30 thin storage proxies (`observe`, scheduler job
+  CRUD/claim/complete/fail, pending-intent, swarm audit reads if not already in swarm.rs,
+  trajectory queries, group alias/profile proxies) and `detect_telegram_scheduler_intent` +
+  `parse_scheduler_intent_json`.
+- [ ] Create `src/service/streaming.rs`: `StreamSink` adapter structs, `replay_text`,
+  `resolve_provider_stream_reply`, `chunk_text_for_stream_replay` if not already moved in T3.
+- [ ] Verify: `cargo test --all-targets`.
+
+### T5 (P1) — Move tests into `src/service/tests.rs`
+
+**Steps:**
+- [ ] Move `#[cfg(test)] mod tests` (and `#[cfg(test)]` free helpers like `truncate_json_value`,
+  `parse_mcp_tool_call` if only tests use them) into `src/service/tests.rs` as
+  `use super::*;` + test fns.
+- [ ] Target: `service.rs` <= ~1,500 lines containing settings structs, `MessageService`,
+  builders, `handle`/`handle_stream` orchestration, `prepare_turn`, and stage helpers.
+- [ ] Verify: `cargo test --all-targets`, `cargo clippy --all-targets -- -D warnings`.
+
+### T6 (P1) — Durable swarm projection
+
+**Problem:** swarm runs execute in-process; a crash loses the tree. Loop engine already has the
+record model (Goal/WorkItem/Attempt/Checkpoint) and `Replan` for dynamic DAG growth.
+
+**Design sketch (validate in implementation):** when `try_swarm_reply` activates, create a Goal
+(`created_by = "internal:swarm"`, objective = root task) and immediately approve+activate it via
+the internal auto-approval seam (T7) — for T6 the projection may reuse an existing approval
+path internally. Each `execute_swarm_node` call maps to a WorkItem keyed by `agent_id`; node
+plan/answer/children persist as Attempt checkpoints. Recursive `delegate` plans append steps by
+committing a new workflow revision (the `Replan` path) rather than mutating the immutable
+revision. Swarm audit tables stay the Telegram-facing view; loop-engine tables become the
+durable system of record.
+
+**Steps:**
+- [ ] Write the design section into this doc before coding: projection mapping table
+  (run->Goal, node->WorkItem, node outcome->Attempt+Checkpoint) and how `run_id`/`agent_id`
+  correlate.
+- [ ] Add a `LoopStore`-backed projection inside `execute_swarm_node` (behind
+  `agent_swarm.enabled && loop_engine.enabled`); failures to project must not fail the reply
+  (warn + continue, matching existing audit best-effort semantics).
+- [ ] `/resume` and the goal-detail HTTP resource must show swarm goals with their node tree.
+- [ ] Tests: new `tests/harness_loop_engine.rs` cases — swarm run produces Goal + WorkItems +
+  committed checkpoints; simulated crash mid-run leaves resumable state.
+
+### T7 (P2) — Internal auto-approval policy
+
+**Problem:** T6's projection and any future dynamic workflow need approval without a human in
+the loop, which today does not exist.
+
+**Steps:**
+- [ ] Add `internal:auto` actor + policy: auto-approval binds only plans whose effect manifest
+  is a subset of `{pure, read}`, whose budget is under configured caps, and whose actor is
+  internal. External-write or over-budget plans still require the operator route.
+- [ ] Config: `[agent.harness.loop_engine] internal_auto_approve_max_effect = "read"`,
+  `internal_auto_approve_max_provider_calls = 16` (defaults; hard ceiling enforced in domain
+  validation, not only config).
+- [ ] Audit: auto-approvals emit a `LoopEventRecord` with actor `internal:auto` and the bound
+  plan hash.
+- [ ] Tests: auto-approve accepts a read-only swarm plan; rejects `local_write`/`external_write`
+  plans and over-budget plans; events recorded.
+
+### T8 (P2) — Message-turn durability decision
+
+- [ ] Evaluate whether per-completion trajectory frames already give chat turns enough durable
+  record, or whether `handle` should also emit a loop-engine Attempt. Record the decision in
+  `docs/direction.md`; implement only if the gap is real (e.g., mid-turn crash leaves memory
+  with a user message and no assistant reply — acceptable or not?).
+
+### T9 (P2) — Controlled `external_write`
+
+**Problem:** the harness can prove safety but cannot act. Enable writes through the gates.
+
+**Steps:**
+- [ ] Config: `[agent.harness.loop_engine] external_write_enabled = false` (default off) +
+  `external_write_handlers = ["channel_send"]` allowlist.
+- [ ] `WorkflowSpec::validate` gains a policy parameter (or validation moves to an engine-side
+  `validate_plan(spec, policy)`) so `external_write` steps are rejected unless the handler is in
+  the allowlist and the flag is on; keep the unconditional rejection as the default path.
+- [ ] `WorkHandlerRegistry::register` rejects `external_write` handlers not in the allowlist.
+- [ ] New handler `channel_send`: input `{channel, session_id, text}`; writes a `prepared`
+  checkpoint carrying an idempotency key derived from `(goal_id, step_id, attempt_number)`
+  *before* sending; sends through the registered channel; records evidence `{sent_at,
+  channel}`; on resume, `reconciled` marks committed sends without re-sending (document
+  at-least-once honestly).
+- [ ] Approval surface (HTTP detail + Telegram `/goal` review) renders the effect manifest so
+  an operator sees `external_write` before approving.
+- [ ] Tests: flag off -> rejection; flag on + allowlisted -> executes once; crash between
+  prepared and committed -> resume reconciles without a duplicate send (assert via fake channel
+  sink counting sends).
+
+### T10 (P2) — Eval scorecards feed the evolution gate
+
+- [ ] Extend `tests/harness_eval.rs` scenarios into a versioned benchmark producing a scorecard
+  artifact (tool-use success, compaction correctness, verification blocks, latency budget).
+- [ ] Wire scorecard artifacts into `EvolutionEngine` shadow eval as additional scored evidence.
+- [ ] Gate: a prompt candidate cannot reach `ready` if any benchmark scenario regresses.
+
+### T11 (P3) — Signal->goal polish
+
+- [ ] Dedup quality pass on `signals.rs` (near-duplicate detection, not just exact evidence
+  hash).
+- [ ] Operator review path: list pending signals, convert to proposed goal, reject with reason —
+  complete over HTTP + Telegram.
+
+### T12 (P3) — Desktop control plane (placeholder)
+
+- [ ] Deferred until Phase C lands. Consume existing collection/detail/SSE contract; no new
+  backend work expected.
+
+## Verification commands
+
+```bash
+cargo fmt --all
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
+cargo test --test harness_loop_engine -- --nocapture
+cargo test --test agent_swarm_store --test service_pipeline --test harness_eval -- --nocapture
+```
+
+## Progress log
+
+- 2026-09-24 — Plan created. **T1 done:** `PreparedTurn` + `prepare_turn` extracted;
+  `handle`/`handle_stream` are now thin tails (~110 duplicate lines removed). **T2 done:**
+  swarm subsystem moved to `src/service/swarm.rs` (917 lines); `service.rs` 5,575 -> 4,605.
+  `fmt`/`clippy -D warnings`/`cargo test --all-targets` all green, zero behavior change.
