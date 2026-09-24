@@ -553,6 +553,42 @@ fn test_config(diag_bearer_token: Option<&str>, diag_rate_limit_per_minute: usiz
     }
 }
 
+#[tokio::test]
+async fn get_console_serves_embedded_control_plane_page() {
+    let cfg = test_config(None, 120);
+
+    let app = build_router(cfg, "sqlite::memory:", Some(Arc::new(FakeProvider)))
+        .await
+        .expect("router");
+    let server = TestServer::new(app).expect("test server");
+
+    let response = server.get("/console").await;
+
+    response.assert_status_ok();
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/html; charset=utf-8")
+    );
+    let body = response.text();
+    assert!(body.contains("xiaomaolv console"));
+    // The page must wire up to the harness contract it renders.
+    for needle in [
+        "/v1/harness/goals",
+        "/v1/harness/signals",
+        "/v1/harness/artifacts",
+        "/v1/harness/trajectories",
+        "/v1/harness/self-tests/",
+        "/v1/harness/evolution/status",
+        "events/stream",
+        "x-harness-actor",
+    ] {
+        assert!(body.contains(needle), "console page missing {needle}");
+    }
+}
+
 fn prometheus_line_has_value(
     body: &str,
     metric: &str,

@@ -207,7 +207,13 @@ Supported signal kinds are `trajectory`, `user_feedback`, `developer_feedback`, 
 200 bytes, content to 16384 characters, and metadata to 64 entries/8192 serialized bytes.
 
 The HTTP resources plus monotonic goal-event cursor are the supported Desktop contract. Desktop
-business logic does not live in the server core.
+business logic does not live in the server core. `GET /console` serves an embedded single-file
+operator dashboard over this contract: it authenticates with the same `app.api_key` bearer plus
+`x-harness-actor` header, renders goals/signals/artifacts/trajectories/self-tests/evolution,
+drives the existing plan/approve/resume/verify/propose/ignore/evolution POST routes, and reads
+the goal SSE stream via a fetch reader (native `EventSource` cannot send the Authorization
+header). The page adds no backend semantics; a native Desktop shell can consume the same
+contract later.
 
 ## Self-test and Session Replay
 
@@ -245,7 +251,8 @@ SQLite schema version 1 stores the current Goal/work state plus append-only even
 checkpoint phases, signals, Self-test cases/runs, provider frames/replay runs, and Artifact events.
 The current release intentionally does not provide:
 
-- a Desktop GUI (the HTTP collection/detail resources and per-Goal SSE cursor are the contract),
+- a native Desktop GUI shell (the browser dashboard at `/console` is the reference client; the
+  HTTP collection/detail resources and per-Goal SSE cursor are the contract),
 - arbitrary code edits, commits, deployments, credentials/permission changes, or
   `external_write` handlers beyond the configured allowlist,
 - comparative live-provider replay or live MCP calls during structural replay,

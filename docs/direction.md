@@ -79,11 +79,17 @@ evolution shadow-evaluation gate. Polish the signal-to-goal pipeline (dedup qual
 review UX). The ceiling of the evolution engine is set by eval quality, not by proposal
 machinery.
 
-### Phase E — Desktop control plane (deferred)
+### Phase E — Desktop control plane
 
 The HTTP/SSE contract is already stable (collections, per-goal event cursors). A UI over a
-read-only engine is a dashboard; a UI over an acting engine is mission control. Build it after
-Phase C makes the engine worth watching.
+read-only engine is a dashboard; a UI over an acting engine is mission control.
+
+**2026-09-24 — first slice landed.** `GET /console` serves an embedded single-file operator
+dashboard over the existing contract: goals, signals, artifacts, trajectories, self-tests, and
+evolution panes; plan/approve/resume/verify/propose/ignore/evolution actions; and a fetch-based
+SSE reader for live goal events (native `EventSource` cannot send the bearer header). It adds
+zero backend semantics and no build toolchain — the page ships inside the binary. A native
+Desktop shell remains possible over the same contract but is no longer a blocker.
 
 ## Explicit non-goals
 

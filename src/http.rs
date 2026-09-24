@@ -50,6 +50,7 @@ use crate::service::{
 };
 use crate::skills::{SkillConfigPaths, SkillRegistry, SkillRuntime};
 
+mod console;
 mod harness_control;
 
 const CODE_MODE_DIAG_OVERFLOW_SOURCE_KEY: &str = "__overflow__";
@@ -951,6 +952,7 @@ fn build_axum_router(state: AppState, http_enabled: bool) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/setup", get(get_setup_page))
+        .route("/console", get(console::console_page))
         .route("/v1/config/ui/state", get(get_config_ui_state))
         .route("/v1/config/ui/save", post(post_config_ui_save))
         .merge(

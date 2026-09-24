@@ -355,10 +355,13 @@ the loop, which today does not exist.
   `POST /v1/harness/signals/{id}/ignore` (reason required; `proposed`/`ignored` are terminal
   in both directions), and Telegram `/signals` + `/signal <id> [ignore|goal]` surface.
 
-### T12 (P3) — Desktop control plane (placeholder)
+### T12 (P3) — Desktop control plane
 
-- [ ] Deferred until Phase C lands. Consume existing collection/detail/SSE contract; no new
-  backend work expected.
+- [x] First slice landed: `GET /console` serves an embedded single-file operator dashboard
+  (`src/http/console.html`, zero build toolchain) over the existing collection/detail/SSE
+  contract — goals, signals, artifacts, trajectories, self-tests, evolution; plan/approve/
+  resume/verify/propose/ignore/evolution actions; fetch-based SSE reader for the goal event
+  stream. No new backend semantics; native Desktop shell still deferred.
 
 ## Verification commands
 
@@ -402,3 +405,9 @@ cargo test --test agent_swarm_store --test service_pipeline --test harness_eval 
   near-duplicate layers; triage lifecycle closes (`observed`/`triaged` -> `proposed`|`ignored`,
   both terminal); operator review works end-to-end via `?status=` + `POST /ignore` on HTTP and
   `/signals` + `/signal <id> ignore|goal` on Telegram. 41 test binaries green.
+- 2026-09-24 — **T12 done:** `GET /console` serves an embedded single-file operator dashboard
+  (`src/http/console.html`, `include_str!`, zero build toolchain) over the existing
+  collection/detail/SSE contract: six panes (goals, signals, artifacts, trajectories,
+  self-tests, evolution), all plan/approve/resume/verify/propose/ignore/evolution actions,
+  and a fetch-based SSE reader for live goal events. Browser-verified end-to-end against a
+  live instance. `http_api` 17/17.

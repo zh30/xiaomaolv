@@ -122,7 +122,7 @@ Capability metadata filters MCP access before execution. `subprocess` is not an 
 - Multi-source `EvolutionSignal` records preserve source/trust/deduplication metadata; ingestion dedups on exact keys, normalized content, and token-set near-duplicates; only an operator route can convert `observed`/`triaged` signals into `proposed` goals or mark them `ignored` (HTTP + Telegram `/signals`)
 - Production `core` self-tests are read-only; repeated identical failure sets produce one deduplicated internal signal
 - Provider frames are recorded for main plain, Code Mode, and MCP completion paths when trajectory logging is enabled; structural replay executes zero live tools
-- HTTP collection/detail resources plus per-goal monotonic SSE are the Desktop boundary; no Desktop GUI is implemented
+- HTTP collection/detail resources plus per-goal monotonic SSE are the Desktop boundary; `GET /console` serves an embedded single-file operator dashboard over that contract (same bearer auth, no new backend semantics)
 - The evolution adapter may evaluate an existing prompt candidate, but approval, activation, and rollback remain exclusively in `EvolutionEngine`
 
 ### Plugin Architecture
