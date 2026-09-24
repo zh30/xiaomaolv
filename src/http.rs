@@ -735,7 +735,8 @@ async fn build_runtime_handles(
         reply_summary_enabled: config.agent.swarm.reply_summary_enabled,
         audit_retention_days: config.agent.swarm.audit_retention_days,
     })
-    .with_harness_config(&config.agent.harness);
+    .with_harness_config(&config.agent.harness)
+    .with_loop_engine(loop_config.enabled.then(|| loop_engine.clone()));
     if let Some(engine) = &evolution_engine {
         service = service.with_evolution_policy_runtime(engine.policy_runtime());
     }

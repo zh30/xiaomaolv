@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,11 +13,11 @@ use super::artifacts::{
     get_artifact, initialize_artifact_schema, list_artifacts, publish_artifact,
 };
 use super::domain::{
-    AcceptanceCriterion, ApproveGoalRequest, AttemptRecord, AttemptStatus, CheckpointPhase,
-    CheckpointRecord, CreateGoalRequest, EffectClass, GoalRecord, GoalStatus,
-    GoalVerificationReport, LoopEventRecord, PlanGoalRequest, PlannedGoal,
-    ProviderBudgetReservation, ResumeReport, WorkClaim, WorkItemRecord, WorkItemStatus,
-    WorkOutcome, WorkflowSpec, hash_serializable,
+    ALLOWED_WORKFLOW_HANDLERS, AcceptanceCriterion, ApproveGoalRequest, AttemptRecord,
+    AttemptStatus, CheckpointPhase, CheckpointRecord, CreateGoalRequest, EffectClass, GoalRecord,
+    GoalStatus, GoalVerificationReport, INTERNAL_ACTOR_PREFIX, LoopEventRecord, PlanGoalRequest,
+    PlannedGoal, ProviderBudgetReservation, ResumeReport, WorkClaim, WorkItemRecord,
+    WorkItemStatus, WorkOutcome, WorkflowSpec, WorkflowStep, hash_serializable,
 };
 use super::replay::{
     ReplayRun, TrajectoryFrame, TrajectoryFrameDraft, initialize_replay_schema, list_frames,
@@ -153,6 +153,30 @@ pub trait LoopStore: Send + Sync {
         actor: &str,
     ) -> anyhow::Result<Option<WorkClaim>>;
 
+    /// Targeted claim: like `claim_goal_work`, but selects the ready work item
+    /// whose `step_id` matches instead of the lowest-ordinal one. Used by
+    /// in-process subsystems (e.g. the agent swarm) that drive their own work
+    /// items and must bind the claim to a specific node.
+    async fn claim_work_item(
+        &self,
+        goal_id: &str,
+        step_id: &str,
+        worker_id: &str,
+        lease_secs: u32,
+        actor: &str,
+    ) -> anyhow::Result<Option<WorkClaim>>;
+
+    /// Append steps to an `approved`/`active` goal. Restricted to `internal:`
+    /// actors and bounded by the expansion marker declared in the approved
+    /// workflow (a step input carrying `"swarm_root": true` and `max_nodes`).
+    /// Appended steps start `ready`; no edges are created.
+    async fn extend_workflow(
+        &self,
+        goal_id: &str,
+        steps: Vec<WorkflowStep>,
+        actor: &str,
+    ) -> anyhow::Result<Vec<WorkItemRecord>>;
+
     async fn prepare_checkpoint(
         &self,
         claim: &WorkClaim,
@@ -197,6 +221,165 @@ pub struct SqliteLoopStore {
 impl SqliteLoopStore {
     pub fn new(store: SqliteMemoryStore) -> Self {
         Self { store }
+    }
+
+    /// Shared claim path for `claim_goal_work` (ordinal order) and
+    /// `claim_work_item` (targeted `step_id`). `step_id = None` picks the
+    /// lowest-ordinal ready item.
+    async fn claim_ready_work_item(
+        &self,
+        goal_id: &str,
+        step_id: Option<&str>,
+        worker_id: &str,
+        lease_secs: u32,
+        actor: &str,
+    ) -> anyhow::Result<Option<WorkClaim>> {
+        ensure_valid_id(goal_id, "goal id")?;
+        recover_goal_state(self.store.pool(), goal_id, actor).await?;
+        let now = unix_now();
+        let lease_until = now + i64::from(lease_secs);
+        let mut tx = self.store.pool().begin().await?;
+        let goal_status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM harness_goals WHERE id = ?1")
+                .bind(goal_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let goal_status = goal_status.context("goal not found")?;
+        ensure!(
+            matches!(goal_status.as_str(), "approved" | "active"),
+            "goal is not dispatchable"
+        );
+        let row = if let Some(step_id) = step_id {
+            sqlx::query(
+                "SELECT id, goal_id, workflow_id, status, step_id, handler, effect_class,
+                        input_json, max_attempts, ordinal, fencing_token
+                 FROM harness_work_items
+                 WHERE goal_id = ?1 AND step_id = ?2 AND status = 'ready'
+                   AND (next_attempt_at IS NULL OR next_attempt_at <= ?3)
+                   AND (SELECT COUNT(*) FROM harness_attempts a
+                        WHERE a.work_item_id = harness_work_items.id) < max_attempts
+                 LIMIT 1",
+            )
+            .bind(goal_id)
+            .bind(step_id)
+            .bind(now)
+            .fetch_optional(&mut *tx)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT id, goal_id, workflow_id, status, step_id, handler, effect_class,
+                        input_json, max_attempts, ordinal, fencing_token
+                 FROM harness_work_items
+                 WHERE goal_id = ?1 AND status = 'ready'
+                   AND (next_attempt_at IS NULL OR next_attempt_at <= ?2)
+                   AND (SELECT COUNT(*) FROM harness_attempts a
+                        WHERE a.work_item_id = harness_work_items.id) < max_attempts
+                 ORDER BY ordinal, id LIMIT 1",
+            )
+            .bind(goal_id)
+            .bind(now)
+            .fetch_optional(&mut *tx)
+            .await?
+        };
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let workflow_id: String = row.try_get("workflow_id")?;
+        let mut work_item = decode_work_item(row)?;
+        let workflow_json: String =
+            sqlx::query_scalar("SELECT workflow_json FROM harness_workflows WHERE id = ?1")
+                .bind(&workflow_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let budget = serde_json::from_str::<WorkflowSpec>(&workflow_json)
+            .context("invalid claimed workflow")?
+            .budget;
+        let lease_token = new_loop_id("lease");
+        let updated = sqlx::query(
+            "UPDATE harness_work_items
+             SET status = 'running', lease_token = ?1, lease_until = ?2,
+                 fencing_token = fencing_token + 1, updated_at = unixepoch()
+             WHERE id = ?3 AND status = 'ready'",
+        )
+        .bind(&lease_token)
+        .bind(lease_until)
+        .bind(&work_item.id)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let fencing_token: i64 =
+            sqlx::query_scalar("SELECT fencing_token FROM harness_work_items WHERE id = ?1")
+                .bind(&work_item.id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let attempt_number: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) + 1 FROM harness_attempts WHERE work_item_id = ?1")
+                .bind(&work_item.id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let attempt_id = new_loop_id("attempt");
+        sqlx::query(
+            "INSERT INTO harness_attempts
+             (id, goal_id, work_item_id, attempt_number, status, worker_id,
+              lease_token, fencing_token, started_at)
+             VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6, ?7, ?8)",
+        )
+        .bind(&attempt_id)
+        .bind(goal_id)
+        .bind(&work_item.id)
+        .bind(attempt_number)
+        .bind(worker_id)
+        .bind(&lease_token)
+        .bind(fencing_token)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE harness_goals SET status = 'active', updated_at = unixepoch()
+             WHERE id = ?1 AND status = 'approved'",
+        )
+        .bind(goal_id)
+        .execute(&mut *tx)
+        .await?;
+        insert_event(
+            &mut tx,
+            goal_id,
+            "work.claimed",
+            actor,
+            &serde_json::json!({
+                "work_item_id": &work_item.id,
+                "attempt_id": &attempt_id,
+                "worker_id": worker_id,
+                "fencing_token": fencing_token,
+            })
+            .to_string(),
+        )
+        .await?;
+        tx.commit().await?;
+        work_item.status = WorkItemStatus::Running;
+        let work_item_id = work_item.id.clone();
+        Ok(Some(WorkClaim {
+            work_item,
+            attempt: AttemptRecord {
+                id: attempt_id,
+                goal_id: goal_id.to_string(),
+                work_item_id,
+                attempt_number: u8::try_from(attempt_number).context("invalid attempt number")?,
+                status: AttemptStatus::Running,
+                worker_id: worker_id.to_string(),
+                lease_token,
+                fencing_token: u64::try_from(fencing_token).context("invalid fencing token")?,
+                started_at_unix: now,
+                finished_at_unix: None,
+                error: None,
+            },
+            lease_until_unix: lease_until,
+            budget,
+        }))
     }
 }
 
@@ -906,10 +1089,39 @@ impl LoopStore for SqliteLoopStore {
         lease_secs: u32,
         actor: &str,
     ) -> anyhow::Result<Option<WorkClaim>> {
+        self.claim_ready_work_item(goal_id, None, worker_id, lease_secs, actor)
+            .await
+    }
+
+    async fn claim_work_item(
+        &self,
+        goal_id: &str,
+        step_id: &str,
+        worker_id: &str,
+        lease_secs: u32,
+        actor: &str,
+    ) -> anyhow::Result<Option<WorkClaim>> {
+        ensure_valid_id(step_id, "step id")?;
+        self.claim_ready_work_item(goal_id, Some(step_id), worker_id, lease_secs, actor)
+            .await
+    }
+
+    async fn extend_workflow(
+        &self,
+        goal_id: &str,
+        steps: Vec<WorkflowStep>,
+        actor: &str,
+    ) -> anyhow::Result<Vec<WorkItemRecord>> {
         ensure_valid_id(goal_id, "goal id")?;
-        recover_goal_state(self.store.pool(), goal_id, actor).await?;
-        let now = unix_now();
-        let lease_until = now + i64::from(lease_secs);
+        ensure!(
+            actor.starts_with(INTERNAL_ACTOR_PREFIX),
+            "extend_workflow requires an internal actor"
+        );
+        ensure!(
+            !steps.is_empty() && steps.len() <= 32,
+            "extend_workflow requires 1..=32 steps"
+        );
+
         let mut tx = self.store.pool().begin().await?;
         let goal_status: Option<String> =
             sqlx::query_scalar("SELECT status FROM harness_goals WHERE id = ?1")
@@ -917,123 +1129,158 @@ impl LoopStore for SqliteLoopStore {
                 .fetch_optional(&mut *tx)
                 .await?;
         let goal_status = goal_status.context("goal not found")?;
+        // `verifying` is included because a swarm goal can reach "all current
+        // items succeeded" mid-run while more nodes are still being appended;
+        // the refresh below flips it back to `active` once new ready work
+        // exists.
         ensure!(
-            matches!(goal_status.as_str(), "approved" | "active"),
-            "goal is not dispatchable"
+            matches!(goal_status.as_str(), "approved" | "active" | "verifying"),
+            "goal is not extensible"
         );
-        let row = sqlx::query(
-            "SELECT id, goal_id, workflow_id, status, step_id, handler, effect_class,
-                    input_json, max_attempts, ordinal, fencing_token
-             FROM harness_work_items
-             WHERE goal_id = ?1 AND status = 'ready'
-               AND (next_attempt_at IS NULL OR next_attempt_at <= ?2)
-               AND (SELECT COUNT(*) FROM harness_attempts a
-                    WHERE a.work_item_id = harness_work_items.id) < max_attempts
-             ORDER BY ordinal, id LIMIT 1",
+        let workflow_row = sqlx::query(
+            "SELECT id, workflow_json, effect_manifest_json FROM harness_workflows
+             WHERE goal_id = ?1 ORDER BY goal_revision DESC LIMIT 1",
         )
         .bind(goal_id)
-        .bind(now)
         .fetch_optional(&mut *tx)
-        .await?;
-        let Some(row) = row else {
-            tx.commit().await?;
-            return Ok(None);
-        };
-        let workflow_id: String = row.try_get("workflow_id")?;
-        let mut work_item = decode_work_item(row)?;
-        let workflow_json: String =
-            sqlx::query_scalar("SELECT workflow_json FROM harness_workflows WHERE id = ?1")
-                .bind(&workflow_id)
+        .await?
+        .context("goal has no workflow to extend")?;
+        let workflow_id: String = workflow_row.try_get("id")?;
+        let workflow_json: String = workflow_row.try_get("workflow_json")?;
+        let manifest_json: String = workflow_row.try_get("effect_manifest_json")?;
+        let spec = serde_json::from_str::<WorkflowSpec>(&workflow_json)
+            .context("invalid approved workflow")?;
+        let manifest: BTreeSet<String> = serde_json::from_str::<Vec<String>>(&manifest_json)
+            .context("invalid effect manifest")?
+            .into_iter()
+            .collect();
+
+        // Dynamic extension is only authorized when the approved workflow
+        // declared an expansion marker: a root step input carrying
+        // `"swarm_root": true` and a `max_nodes` budget.
+        let root = spec
+            .steps
+            .iter()
+            .find(|step| {
+                step.input
+                    .get("swarm_root")
+                    .is_some_and(|value| value.as_bool() == Some(true))
+            })
+            .context("approved workflow does not authorize dynamic extension")?;
+        let max_nodes =
+            root.input
+                .get("max_nodes")
+                .and_then(serde_json::Value::as_u64)
+                .context("swarm root step is missing a max_nodes budget")? as usize;
+        let existing_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM harness_work_items WHERE goal_id = ?1")
+                .bind(goal_id)
                 .fetch_one(&mut *tx)
                 .await?;
-        let budget = serde_json::from_str::<WorkflowSpec>(&workflow_json)
-            .context("invalid claimed workflow")?
-            .budget;
-        let lease_token = new_loop_id("lease");
-        let updated = sqlx::query(
-            "UPDATE harness_work_items
-             SET status = 'running', lease_token = ?1, lease_until = ?2,
-                 fencing_token = fencing_token + 1, updated_at = unixepoch()
-             WHERE id = ?3 AND status = 'ready'",
+        let max_ordinal: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(ordinal), -1) FROM harness_work_items WHERE goal_id = ?1",
         )
-        .bind(&lease_token)
-        .bind(lease_until)
-        .bind(&work_item.id)
-        .execute(&mut *tx)
+        .bind(goal_id)
+        .fetch_one(&mut *tx)
         .await?;
-        if updated.rows_affected() != 1 {
-            tx.rollback().await?;
-            return Ok(None);
+        ensure!(
+            existing_count as usize + steps.len() <= max_nodes.min(32),
+            "workflow extension exceeds the approved expansion budget"
+        );
+
+        let existing_step_ids: BTreeSet<String> =
+            sqlx::query_scalar("SELECT step_id FROM harness_work_items WHERE goal_id = ?1")
+                .bind(goal_id)
+                .fetch_all(&mut *tx)
+                .await?
+                .into_iter()
+                .collect();
+        let mut step_ids = existing_step_ids;
+        for step in &steps {
+            ensure!(
+                !step.id.trim().is_empty() && step.id.len() <= 96,
+                "workflow step id must be 1..=96 bytes"
+            );
+            ensure!(
+                step_ids.insert(step.id.clone()),
+                "duplicate workflow step id"
+            );
+            ensure!(
+                ALLOWED_WORKFLOW_HANDLERS.contains(&step.handler.as_str()),
+                "unregistered workflow handler"
+            );
+            ensure!(
+                step.effect != EffectClass::ExternalWrite,
+                "external_write steps are rejected in this release"
+            );
+            ensure!(
+                manifest.contains(step.effect.as_str()),
+                "step effect is outside the approved effect manifest"
+            );
+            ensure!(
+                (1..=10).contains(&step.retry.max_attempts),
+                "max_attempts must be 1..=10"
+            );
+            ensure!(
+                step.retry.backoff_secs <= 3600,
+                "backoff cannot exceed 3600 seconds"
+            );
+            ensure!(
+                serde_json::to_vec(&step.input)?.len() <= 8192,
+                "step input cannot exceed 8192 bytes"
+            );
         }
-        let fencing_token: i64 =
-            sqlx::query_scalar("SELECT fencing_token FROM harness_work_items WHERE id = ?1")
-                .bind(&work_item.id)
-                .fetch_one(&mut *tx)
-                .await?;
-        let attempt_number: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) + 1 FROM harness_attempts WHERE work_item_id = ?1")
-                .bind(&work_item.id)
-                .fetch_one(&mut *tx)
-                .await?;
-        let attempt_id = new_loop_id("attempt");
-        sqlx::query(
-            "INSERT INTO harness_attempts
-             (id, goal_id, work_item_id, attempt_number, status, worker_id,
-              lease_token, fencing_token, started_at)
-             VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6, ?7, ?8)",
-        )
-        .bind(&attempt_id)
-        .bind(goal_id)
-        .bind(&work_item.id)
-        .bind(attempt_number)
-        .bind(worker_id)
-        .bind(&lease_token)
-        .bind(fencing_token)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE harness_goals SET status = 'active', updated_at = unixepoch()
-             WHERE id = ?1 AND status = 'approved'",
-        )
-        .bind(goal_id)
-        .execute(&mut *tx)
-        .await?;
+
+        let mut records = Vec::with_capacity(steps.len());
+        for (offset, step) in steps.iter().enumerate() {
+            let work_id = new_loop_id("work");
+            let ordinal = max_ordinal + 1 + offset as i64;
+            sqlx::query(
+                "INSERT INTO harness_work_items
+                 (id, goal_id, workflow_id, step_id, handler, effect_class, input_json,
+                  status, max_attempts, backoff_secs, ordinal)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ready', ?8, ?9, ?10)",
+            )
+            .bind(&work_id)
+            .bind(goal_id)
+            .bind(&workflow_id)
+            .bind(&step.id)
+            .bind(&step.handler)
+            .bind(step.effect.as_str())
+            .bind(serde_json::to_string(&step.input)?)
+            .bind(step.retry.max_attempts as i64)
+            .bind(step.retry.backoff_secs as i64)
+            .bind(ordinal)
+            .execute(&mut *tx)
+            .await?;
+            records.push(WorkItemRecord {
+                id: work_id,
+                goal_id: goal_id.to_string(),
+                status: WorkItemStatus::Ready,
+                step_id: step.id.clone(),
+                handler: step.handler.clone(),
+                effect: step.effect,
+                input: step.input.clone(),
+                max_attempts: step.retry.max_attempts,
+                ordinal: u32::try_from(ordinal).context("invalid work item ordinal")?,
+                dependency_ids: Vec::new(),
+            });
+        }
         insert_event(
             &mut tx,
             goal_id,
-            "work.claimed",
+            "workflow.extended",
             actor,
             &serde_json::json!({
-                "work_item_id": &work_item.id,
-                "attempt_id": &attempt_id,
-                "worker_id": worker_id,
-                "fencing_token": fencing_token,
+                "workflow_id": &workflow_id,
+                "step_ids": steps.iter().map(|step| step.id.as_str()).collect::<Vec<_>>(),
             })
             .to_string(),
         )
         .await?;
+        refresh_goal_status_tx(&mut tx, goal_id).await?;
         tx.commit().await?;
-        work_item.status = WorkItemStatus::Running;
-        let work_item_id = work_item.id.clone();
-        Ok(Some(WorkClaim {
-            work_item,
-            attempt: AttemptRecord {
-                id: attempt_id,
-                goal_id: goal_id.to_string(),
-                work_item_id,
-                attempt_number: u8::try_from(attempt_number).context("invalid attempt number")?,
-                status: AttemptStatus::Running,
-                worker_id: worker_id.to_string(),
-                lease_token,
-                fencing_token: u64::try_from(fencing_token).context("invalid fencing token")?,
-                started_at_unix: now,
-                finished_at_unix: None,
-                error: None,
-            },
-            lease_until_unix: lease_until,
-            budget,
-        }))
+        Ok(records)
     }
 
     async fn prepare_checkpoint(

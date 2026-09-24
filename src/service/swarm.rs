@@ -1,5 +1,19 @@
 use super::*;
 
+use crate::harness::loop_engine::{
+    AcceptanceCriterion, ApproveGoalRequest, ArtifactKind, CreateGoalRequest, EffectClass,
+    ExecutionBudget, PlanGoalRequest, PublishArtifactRequest, RetryPolicy, WorkClaim, WorkOutcome,
+    WorkflowSpec, WorkflowStep,
+};
+
+/// Actor used for Loop Engine records created by the swarm projection. The
+/// `internal:` prefix is required by `extend_workflow` and keeps these writes
+/// attributable to the subsystem rather than an operator.
+const SWARM_LOOP_ACTOR: &str = "internal:swarm";
+/// Loop Engine handler recorded for every projected swarm node. The real
+/// execution stays in-process; the handler name documents the work class.
+const SWARM_NODE_HANDLER: &str = "provider_analysis";
+
 #[derive(Debug, Clone)]
 pub struct AgentSwarmSettings {
     pub enabled: bool,
@@ -29,12 +43,32 @@ impl Default for AgentSwarmSettings {
     }
 }
 
+/// Best-effort durable projection of one swarm run into Loop Engine state.
+/// One per run, cloned into `SwarmExecutionShared`. Every projection failure
+/// is logged and downgraded to `None` so the reply path is never affected.
+#[derive(Clone)]
+struct SwarmLoopProjection {
+    engine: Arc<LoopEngine>,
+    goal_id: String,
+    worker_id: String,
+}
+
+impl std::fmt::Debug for SwarmLoopProjection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SwarmLoopProjection")
+            .field("goal_id", &self.goal_id)
+            .field("worker_id", &self.worker_id)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SwarmExecutionShared {
     run_id: String,
     channel: String,
     settings: AgentSwarmSettings,
     semaphore: Arc<Semaphore>,
+    loop_projection: Option<SwarmLoopProjection>,
     agent_counter: Arc<AtomicUsize>,
     success_count: Arc<AtomicUsize>,
     partial_count: Arc<AtomicUsize>,
@@ -55,6 +89,13 @@ struct SwarmAgentSpec {
     role_name: String,
     role_definition: String,
     nickname: Option<String>,
+}
+
+/// Per-node identity assigned at dispatch: `agent_id` is `{run_id}:{index}`.
+#[derive(Debug, Clone)]
+struct SwarmNodeIdentity {
+    agent_id: String,
+    index: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -185,6 +226,9 @@ impl MessageService {
             channel: incoming.channel.clone(),
             settings: self.agent_swarm.clone(),
             semaphore: Arc::new(Semaphore::new(self.agent_swarm.max_parallel.max(1))),
+            loop_projection: self
+                .start_swarm_loop_projection(&run_id, &incoming.text)
+                .await,
             agent_counter: Arc::new(AtomicUsize::new(0)),
             success_count: Arc::new(AtomicUsize::new(0)),
             partial_count: Arc::new(AtomicUsize::new(0)),
@@ -245,6 +289,9 @@ impl MessageService {
         {
             warn!(error = %err, run_id = %run_id, "failed to finalize swarm run audit");
         }
+
+        self.finish_swarm_loop_projection(&shared, reply_text.as_deref(), run_error.as_deref())
+            .await;
 
         if self.agent_swarm.audit_retention_days > 0 {
             let keep_secs = (self.agent_swarm.audit_retention_days as i64)
@@ -330,6 +377,10 @@ impl MessageService {
         }
     }
 
+    /// Executes one swarm node and mirrors its lifecycle into Loop Engine when
+    /// a projection is active: the node is appended (non-root) and claimed as
+    /// a work item, then its attempt is finished with a committed checkpoint
+    /// or failed non-retryably. Projection failures never change the outcome.
     async fn execute_swarm_node(
         &self,
         history: Vec<StoredMessage>,
@@ -339,7 +390,42 @@ impl MessageService {
         shared: SwarmExecutionShared,
     ) -> anyhow::Result<SwarmNodeOutcome> {
         let idx = shared.next_agent_index();
-        let agent_id = format!("{}:{idx}", shared.run_id);
+        let node = SwarmNodeIdentity {
+            agent_id: format!("{}:{idx}", shared.run_id),
+            index: idx,
+        };
+        let claim = self
+            .claim_swarm_loop_node(
+                &shared,
+                &spec,
+                depth,
+                parent_agent_id.as_deref(),
+                &node.agent_id,
+            )
+            .await;
+        let result = self
+            .execute_swarm_node_inner(history, spec, depth, parent_agent_id, shared.clone(), node)
+            .await;
+        if let Some(claim) = claim {
+            match &result {
+                Ok(outcome) => self.commit_swarm_loop_node(&shared, &claim, outcome).await,
+                Err(err) => self.fail_swarm_loop_node(&claim, &err.to_string()).await,
+            }
+        }
+        result
+    }
+
+    async fn execute_swarm_node_inner(
+        &self,
+        history: Vec<StoredMessage>,
+        spec: SwarmAgentSpec,
+        depth: usize,
+        parent_agent_id: Option<String>,
+        shared: SwarmExecutionShared,
+        node: SwarmNodeIdentity,
+    ) -> anyhow::Result<SwarmNodeOutcome> {
+        let agent_id = node.agent_id;
+        let idx = node.index;
         let nickname = spec
             .nickname
             .clone()
@@ -751,6 +837,282 @@ impl MessageService {
             Ok(Ok(text)) => Ok(text),
             Ok(Err(err)) => Err(SwarmModelError::Failure(err)),
             Err(_) => Err(SwarmModelError::Timeout),
+        }
+    }
+
+    /// Creates the durable Goal for this swarm run: a fixed internal plan with
+    /// a single `swarm_root` step declaring the expansion budget, immediately
+    /// approved. The approval binds a code-constructed plan (not model
+    /// output), which is the T6 temporary internal path; operator approval
+    /// flows stay untouched.
+    async fn start_swarm_loop_projection(
+        &self,
+        run_id: &str,
+        root_task: &str,
+    ) -> Option<SwarmLoopProjection> {
+        let engine = self.loop_engine.clone()?;
+        match self.create_swarm_goal(&engine, run_id, root_task).await {
+            Ok(goal_id) => Some(SwarmLoopProjection {
+                engine,
+                goal_id,
+                worker_id: format!("swarm:{run_id}"),
+            }),
+            Err(err) => {
+                warn!(error = %err, run_id = %run_id, "swarm loop projection disabled: goal setup failed");
+                None
+            }
+        }
+    }
+
+    async fn create_swarm_goal(
+        &self,
+        engine: &LoopEngine,
+        run_id: &str,
+        root_task: &str,
+    ) -> anyhow::Result<String> {
+        let goal = engine
+            .create_goal(
+                CreateGoalRequest {
+                    objective: format!(
+                        "agent swarm run {run_id}: {}",
+                        truncate_swarm_text(root_task, 480)
+                    ),
+                    source_signal_ids: Vec::new(),
+                },
+                SWARM_LOOP_ACTOR,
+            )
+            .await?;
+        let max_nodes = self.agent_swarm.max_agents.max(1) as u32;
+        let planned = engine
+            .plan_goal(
+                &goal.id,
+                PlanGoalRequest {
+                    workflow: WorkflowSpec {
+                        steps: vec![WorkflowStep {
+                            // The root node's agent_id is `{run_id}:1` because
+                            // `next_agent_index` returns 1 for the first node.
+                            id: format!("{run_id}:1"),
+                            handler: SWARM_NODE_HANDLER.to_string(),
+                            effect: EffectClass::LocalWrite,
+                            input: serde_json::json!({
+                                "swarm_root": true,
+                                "max_nodes": max_nodes,
+                                "swarm_run_id": run_id,
+                                "task": truncate_swarm_text(root_task, 1024),
+                                "role_name": "orchestrator",
+                            }),
+                            retry: RetryPolicy {
+                                max_attempts: 1,
+                                backoff_secs: 0,
+                            },
+                        }],
+                        edges: Vec::new(),
+                        budget: ExecutionBudget {
+                            max_provider_calls: (2 * max_nodes).min(64),
+                            deadline_secs: ((self.agent_swarm.max_run_timeout_ms / 1000) as u32)
+                                .saturating_add(60)
+                                .clamp(1, 86_400),
+                            max_response_bytes: 1_048_576,
+                        },
+                    },
+                    acceptance_criteria: vec![AcceptanceCriterion::ArtifactExists {
+                        artifact_type: "analysis_report".to_string(),
+                    }],
+                },
+                SWARM_LOOP_ACTOR,
+            )
+            .await?;
+        engine
+            .approve_goal(
+                &goal.id,
+                ApproveGoalRequest {
+                    expected_goal_revision: planned.goal.revision,
+                    expected_plan_hash: planned.plan_hash,
+                },
+                SWARM_LOOP_ACTOR,
+            )
+            .await?;
+        Ok(goal.id)
+    }
+
+    /// Appends the node as a work item (non-root only; the root step already
+    /// exists in the approved plan) and claims it under this run's worker id.
+    /// Returns `None` when projection is disabled or loses the claim race.
+    async fn claim_swarm_loop_node(
+        &self,
+        shared: &SwarmExecutionShared,
+        spec: &SwarmAgentSpec,
+        depth: usize,
+        parent_agent_id: Option<&str>,
+        agent_id: &str,
+    ) -> Option<WorkClaim> {
+        let projection = shared.loop_projection.as_ref()?;
+        if parent_agent_id.is_some() {
+            let step = WorkflowStep {
+                id: agent_id.to_string(),
+                handler: SWARM_NODE_HANDLER.to_string(),
+                effect: EffectClass::LocalWrite,
+                input: serde_json::json!({
+                    "swarm_run_id": shared.run_id,
+                    "parent_agent_id": parent_agent_id,
+                    "depth": depth,
+                    "task": truncate_swarm_text(&spec.task, 1024),
+                    "role_name": spec.role_name,
+                }),
+                retry: RetryPolicy {
+                    max_attempts: 1,
+                    backoff_secs: 0,
+                },
+            };
+            if let Err(err) = projection
+                .engine
+                .extend_workflow(&projection.goal_id, vec![step], SWARM_LOOP_ACTOR)
+                .await
+            {
+                warn!(error = %err, agent_id = %agent_id, "swarm node projection skipped: extension rejected");
+                return None;
+            }
+        }
+        let lease_secs = ((shared.settings.max_node_timeout_ms / 1000) as u32)
+            .saturating_add(30)
+            .clamp(1, 3600);
+        let claimed = match projection
+            .engine
+            .claim_work_item(
+                &projection.goal_id,
+                agent_id,
+                &projection.worker_id,
+                lease_secs,
+                SWARM_LOOP_ACTOR,
+            )
+            .await
+        {
+            Ok(claim) => claim,
+            Err(err) => {
+                warn!(error = %err, agent_id = %agent_id, "swarm node projection claim failed");
+                return None;
+            }
+        };
+        if claimed.is_none() {
+            // A generic LoopWorker may have won the ready item first; the
+            // in-process swarm still runs the node itself.
+            warn!(agent_id = %agent_id, "swarm node projection claim lost to another worker");
+        }
+        claimed
+    }
+
+    /// Commits the node outcome. The root node additionally publishes the
+    /// `analysis_report` artifact first so its committed outcome references it
+    /// and the `ArtifactExists` acceptance criterion can pass.
+    async fn commit_swarm_loop_node(
+        &self,
+        shared: &SwarmExecutionShared,
+        claim: &WorkClaim,
+        outcome: &SwarmNodeOutcome,
+    ) {
+        let Some(engine) = self.loop_engine.clone() else {
+            return;
+        };
+        if outcome.failed {
+            self.fail_swarm_loop_node(claim, outcome.status.as_str())
+                .await;
+            return;
+        }
+        let result = async {
+            let is_root = claim
+                .work_item
+                .input
+                .get("swarm_root")
+                .is_some_and(|value| value.as_bool() == Some(true));
+            let mut artifact_ids = Vec::new();
+            if is_root && !outcome.answer.trim().is_empty() {
+                let published = engine
+                    .publish_artifact(
+                        PublishArtifactRequest {
+                            kind: ArtifactKind::AnalysisReport,
+                            name: format!("swarm-{}", shared.run_id),
+                            version: "1".to_string(),
+                            content: serde_json::json!({
+                                "swarm_run_id": shared.run_id,
+                                "channel": shared.channel,
+                                "answer": truncate_swarm_text(&outcome.answer, 4096),
+                            }),
+                            source_goal_id: Some(claim.work_item.goal_id.clone()),
+                            parent_artifact_id: None,
+                        },
+                        SWARM_LOOP_ACTOR,
+                    )
+                    .await?;
+                artifact_ids.push(published.artifact.id);
+            }
+            let idempotency_key = format!("{}:{}:v1", claim.work_item.id, claim.attempt.id);
+            let checkpoint = engine
+                .prepare_checkpoint(claim, &idempotency_key, SWARM_LOOP_ACTOR)
+                .await?;
+            engine
+                .commit_checkpoint(
+                    claim,
+                    &checkpoint.id,
+                    WorkOutcome {
+                        summary: truncate_swarm_text(&outcome.answer, 1024),
+                        artifact_ids,
+                        evidence: serde_json::json!({
+                            "agent_id": outcome.agent_id,
+                            "nickname": outcome.nickname,
+                            "role_name": outcome.role_name,
+                            "status": outcome.status.as_str(),
+                            "partial": outcome.partial,
+                        }),
+                    },
+                    SWARM_LOOP_ACTOR,
+                )
+                .await?;
+            engine
+                .finish_attempt(claim, &checkpoint.id, SWARM_LOOP_ACTOR)
+                .await?;
+            anyhow::Ok(())
+        }
+        .await;
+        if let Err(err) = result {
+            warn!(error = %err, agent_id = %outcome.agent_id, "swarm node projection commit failed");
+        }
+    }
+
+    async fn fail_swarm_loop_node(&self, claim: &WorkClaim, error: &str) {
+        let Some(engine) = self.loop_engine.clone() else {
+            return;
+        };
+        if let Err(err) = engine
+            .fail_attempt(claim, error, false, SWARM_LOOP_ACTOR)
+            .await
+        {
+            warn!(error = %err, "swarm node projection fail_attempt failed");
+        }
+    }
+
+    /// Runs goal verification so `/resume` and goal detail show a closed loop.
+    /// The run-level result artifact was already published during the root
+    /// node's commit (acceptance criteria read committed outcomes).
+    async fn finish_swarm_loop_projection(
+        &self,
+        shared: &SwarmExecutionShared,
+        reply_text: Option<&str>,
+        run_error: Option<&str>,
+    ) {
+        let Some(projection) = shared.loop_projection.as_ref() else {
+            return;
+        };
+        if reply_text.is_none_or(|text| text.trim().is_empty())
+            && let Some(error) = run_error
+        {
+            warn!(run_id = %shared.run_id, error = %error, "swarm run failed; projected goal left unverified");
+        }
+        if let Err(err) = projection
+            .engine
+            .verify_goal(&projection.goal_id, SWARM_LOOP_ACTOR)
+            .await
+        {
+            warn!(error = %err, run_id = %shared.run_id, "swarm goal verification failed");
         }
     }
 

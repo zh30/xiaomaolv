@@ -1,9 +1,9 @@
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use tempfile::tempdir;
-use xiaomaolv::domain::{MessageRole, StoredMessage};
+use xiaomaolv::domain::{IncomingMessage, MessageRole, StoredMessage};
 use xiaomaolv::harness::evolution::{
     EvolutionActor, EvolutionCaseAssertions, EvolutionEngine, EvolutionEvalCase,
     EvolutionGateConfig,
@@ -18,6 +18,7 @@ use xiaomaolv::harness::loop_engine::{
 use xiaomaolv::harness::store::SqliteEvolutionStore;
 use xiaomaolv::memory::SqliteMemoryStore;
 use xiaomaolv::provider::{ChatProvider, CompletionRequest};
+use xiaomaolv::service::{AgentSwarmSettings, MessageService};
 
 struct WorkerProvider;
 
@@ -661,5 +662,417 @@ async fn manual_acceptance_requires_explicit_operator_evidence() -> anyhow::Resu
     let achieved = engine.verify_goal(&goal.id, "verifier:test").await?;
     assert!(achieved.achieved);
     assert_eq!(achieved.goal.status, GoalStatus::Achieved);
+    Ok(())
+}
+
+/// Provider that replays a fixed queue of responses for the deterministic
+/// swarm call order: activation classifier, root planner, each child's
+/// planner (children run sequentially), then the root merge call.
+#[derive(Default)]
+struct SwarmQueueProvider {
+    replies: Mutex<VecDeque<String>>,
+}
+
+#[async_trait]
+impl ChatProvider for SwarmQueueProvider {
+    fn model_name(&self) -> Option<&str> {
+        Some("swarm-projection-model")
+    }
+
+    async fn complete(&self, _req: CompletionRequest) -> anyhow::Result<String> {
+        Ok(self
+            .replies
+            .lock()
+            .expect("replies mutex")
+            .pop_front()
+            .unwrap_or_else(|| "swarm fallback".to_string()))
+    }
+}
+
+/// A full swarm run must leave a durable Goal -> WorkItem -> Attempt ->
+/// Checkpoint projection in Loop Engine state, and a verified goal once every
+/// node succeeds.
+#[tokio::test]
+async fn swarm_run_projects_a_durable_goal_tree_and_verifies_it() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("swarm.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(
+        memory.clone(),
+    ))));
+    let provider = Arc::new(SwarmQueueProvider {
+        replies: Mutex::new(VecDeque::from([
+            "{\"use_swarm\":true}".to_string(),
+            "{\"mode\":\"delegate\",\"children\":[{\"task\":\"outline frontend work\",\"role_name\":\"frontend\"},{\"task\":\"outline backend work\",\"role_name\":\"backend\"}]}".to_string(),
+            "{\"mode\":\"answer\",\"answer\":\"frontend plan\"}".to_string(),
+            "{\"mode\":\"answer\",\"answer\":\"backend plan\"}".to_string(),
+            "merged swarm answer".to_string(),
+        ])),
+    });
+    let service = MessageService::new(provider, memory, 8)
+        .with_agent_swarm(AgentSwarmSettings {
+            enabled: true,
+            auto_detect: true,
+            reply_summary_enabled: false,
+            ..Default::default()
+        })
+        .with_loop_engine(Some(engine.clone()));
+
+    let reply = service
+        .handle(IncomingMessage {
+            channel: "telegram".to_string(),
+            session_id: "tg:1".to_string(),
+            user_id: "42".to_string(),
+            text: "请拆分前后端任务并协作完成".to_string(),
+            reply_target: None,
+        })
+        .await?;
+    assert!(reply.text.contains("merged swarm answer"));
+
+    let goals = engine.list_goals(10).await?;
+    assert_eq!(goals.len(), 1);
+    let goal = &goals[0];
+    assert_eq!(goal.created_by, "internal:swarm");
+    assert_eq!(goal.status, GoalStatus::Achieved);
+
+    let resumed = engine.resume_goal(&goal.id, "operator:test").await?;
+    assert_eq!(resumed.work_items.len(), 3);
+    assert!(
+        resumed
+            .work_items
+            .iter()
+            .all(|item| item.status == WorkItemStatus::Succeeded)
+    );
+    let root_step = resumed
+        .work_items
+        .iter()
+        .find(|item| item.step_id.ends_with(":1"))
+        .expect("root step");
+    let run_id = root_step
+        .step_id
+        .rsplit_once(':')
+        .map(|(run_id, _)| run_id.to_string())
+        .expect("root step id carries the run id");
+    let step_ids: Vec<&str> = resumed
+        .work_items
+        .iter()
+        .map(|item| item.step_id.as_str())
+        .collect();
+    for idx in 1..=3 {
+        assert!(step_ids.contains(&format!("{run_id}:{idx}").as_str()));
+    }
+    let child = resumed
+        .work_items
+        .iter()
+        .find(|item| item.step_id.ends_with(":2"))
+        .expect("first child step");
+    assert_eq!(
+        child.input.get("parent_agent_id").and_then(|v| v.as_str()),
+        Some(format!("{run_id}:1").as_str())
+    );
+    assert_eq!(resumed.attempts.len(), 3);
+    assert!(
+        resumed
+            .attempts
+            .iter()
+            .all(|attempt| attempt.status
+                == xiaomaolv::harness::loop_engine::AttemptStatus::Succeeded)
+    );
+    let artifact = engine
+        .find_artifact(
+            ArtifactKind::AnalysisReport,
+            &format!("swarm-{run_id}"),
+            "1",
+        )
+        .await?
+        .expect("swarm result artifact");
+    assert_eq!(artifact.source_goal_id.as_deref(), Some(goal.id.as_str()));
+
+    let events = engine.list_goal_events(&goal.id, 0, 100).await?;
+    let event_types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert_eq!(
+        event_types
+            .iter()
+            .filter(|t| **t == "workflow.extended")
+            .count(),
+        2
+    );
+    assert_eq!(
+        event_types.iter().filter(|t| **t == "work.claimed").count(),
+        3
+    );
+    assert!(event_types.contains(&"goal.achieved"));
+    Ok(())
+}
+
+/// A mid-run crash (expired leases, no commits) must leave durable,
+/// inspectable state: the completed node stays `succeeded`, the interrupted
+/// node is reconciled, and the goal reflects the failure.
+#[tokio::test]
+async fn swarm_crash_leaves_resumable_durable_state() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("swarm-crash.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "agent swarm run run-crash: root task".to_string(),
+                source_signal_ids: Vec::new(),
+            },
+            "internal:swarm",
+        )
+        .await?;
+    let planned = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![WorkflowStep {
+                        id: "run-crash:1".to_string(),
+                        handler: "provider_analysis".to_string(),
+                        effect: EffectClass::LocalWrite,
+                        input: serde_json::json!({
+                            "swarm_root": true,
+                            "max_nodes": 4,
+                            "swarm_run_id": "run-crash",
+                        }),
+                        retry: RetryPolicy {
+                            max_attempts: 1,
+                            backoff_secs: 0,
+                        },
+                    }],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 8,
+                        deadline_secs: 120,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ArtifactExists {
+                    artifact_type: "analysis_report".to_string(),
+                }],
+            },
+            "internal:swarm",
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: planned.goal.revision,
+                expected_plan_hash: planned.plan_hash,
+            },
+            "internal:swarm",
+        )
+        .await?;
+
+    let root_claim = engine
+        .claim_work_item(
+            &goal.id,
+            "run-crash:1",
+            "swarm:run-crash",
+            30,
+            "internal:swarm",
+        )
+        .await?
+        .expect("root step should be claimable");
+    let root_checkpoint = engine
+        .prepare_checkpoint(&root_claim, "root:v1", "internal:swarm")
+        .await?;
+    engine
+        .commit_checkpoint(
+            &root_claim,
+            &root_checkpoint.id,
+            WorkOutcome {
+                summary: "root finished before crash".to_string(),
+                artifact_ids: Vec::new(),
+                evidence: serde_json::json!({"status": "success"}),
+            },
+            "internal:swarm",
+        )
+        .await?;
+    engine
+        .finish_attempt(&root_claim, &root_checkpoint.id, "internal:swarm")
+        .await?;
+
+    let appended = engine
+        .extend_workflow(
+            &goal.id,
+            vec![WorkflowStep {
+                id: "run-crash:2".to_string(),
+                handler: "provider_analysis".to_string(),
+                effect: EffectClass::LocalWrite,
+                input: serde_json::json!({
+                    "swarm_run_id": "run-crash",
+                    "parent_agent_id": "run-crash:1",
+                    "depth": 1,
+                }),
+                retry: RetryPolicy {
+                    max_attempts: 1,
+                    backoff_secs: 0,
+                },
+            }],
+            "internal:swarm",
+        )
+        .await?;
+    assert_eq!(appended.len(), 1);
+    // Claim the child with a 1s lease, then simulate a crash: no commit, no
+    // finish, process state dropped.
+    let _child_claim = engine
+        .claim_work_item(
+            &goal.id,
+            "run-crash:2",
+            "swarm:run-crash",
+            1,
+            "internal:swarm",
+        )
+        .await?
+        .expect("child step should be claimable");
+    drop(engine);
+
+    // Lease expiry is compared in whole seconds (`lease_until < unix_now`), so
+    // wait past the next second boundary plus the 1s lease.
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    let reopened_memory = SqliteMemoryStore::new(&database_url).await?;
+    let reopened = LoopEngine::new(Arc::new(SqliteLoopStore::new(reopened_memory)));
+    let resumed = reopened.resume_goal(&goal.id, "operator:test").await?;
+    let by_step: BTreeMap<&str, &xiaomaolv::harness::loop_engine::WorkItemRecord> = resumed
+        .work_items
+        .iter()
+        .map(|item| (item.step_id.as_str(), item))
+        .collect();
+    assert_eq!(by_step["run-crash:1"].status, WorkItemStatus::Succeeded);
+    // max_attempts = 1 means the crashed attempt exhausts the node's retry
+    // budget: the interruption is durably recorded as a failed node.
+    assert_eq!(by_step["run-crash:2"].status, WorkItemStatus::Failed);
+    assert_eq!(resumed.goal.status, GoalStatus::Failed);
+    Ok(())
+}
+
+/// `extend_workflow` must enforce the internal-actor requirement, the approved
+/// effect manifest, and the declared expansion budget.
+#[tokio::test]
+async fn extend_workflow_enforces_internal_actor_manifest_and_budget() -> anyhow::Result<()> {
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = LoopEngine::new(Arc::new(SqliteLoopStore::new(memory)));
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Bounded dynamic expansion".to_string(),
+                source_signal_ids: Vec::new(),
+            },
+            "internal:swarm",
+        )
+        .await?;
+    let planned = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![WorkflowStep {
+                        id: "run:1".to_string(),
+                        handler: "provider_analysis".to_string(),
+                        effect: EffectClass::LocalWrite,
+                        input: serde_json::json!({"swarm_root": true, "max_nodes": 2}),
+                        retry: RetryPolicy {
+                            max_attempts: 1,
+                            backoff_secs: 0,
+                        },
+                    }],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 4,
+                        deadline_secs: 60,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ArtifactExists {
+                    artifact_type: "analysis_report".to_string(),
+                }],
+            },
+            "internal:swarm",
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: planned.goal.revision,
+                expected_plan_hash: planned.plan_hash,
+            },
+            "internal:swarm",
+        )
+        .await?;
+
+    let child_step = |id: &str, effect: EffectClass| WorkflowStep {
+        id: id.to_string(),
+        handler: "provider_analysis".to_string(),
+        effect,
+        input: serde_json::json!({"swarm_run_id": "run"}),
+        retry: RetryPolicy {
+            max_attempts: 1,
+            backoff_secs: 0,
+        },
+    };
+
+    // Non-internal actors cannot extend.
+    let operator_attempt = engine
+        .extend_workflow(
+            &goal.id,
+            vec![child_step("run:2", EffectClass::LocalWrite)],
+            "operator:test",
+        )
+        .await;
+    assert!(operator_attempt.is_err());
+    // Effects outside the approved manifest (plan declared only local_write).
+    let wrong_effect = engine
+        .extend_workflow(
+            &goal.id,
+            vec![child_step("run:2", EffectClass::Read)],
+            "internal:swarm",
+        )
+        .await;
+    assert!(wrong_effect.is_err());
+    // Unregistered handler.
+    let mut bad_handler = child_step("run:2", EffectClass::LocalWrite);
+    bad_handler.handler = "unknown_handler".to_string();
+    assert!(
+        engine
+            .extend_workflow(&goal.id, vec![bad_handler], "internal:swarm")
+            .await
+            .is_err()
+    );
+    // Within budget: max_nodes=2 and one item already exists.
+    engine
+        .extend_workflow(
+            &goal.id,
+            vec![child_step("run:2", EffectClass::LocalWrite)],
+            "internal:swarm",
+        )
+        .await?;
+    // Exceeding the expansion budget is rejected.
+    assert!(
+        engine
+            .extend_workflow(
+                &goal.id,
+                vec![child_step("run:3", EffectClass::LocalWrite)],
+                "internal:swarm"
+            )
+            .await
+            .is_err()
+    );
+
+    // Targeted claim selects the requested step, not the lowest ordinal.
+    engine
+        .claim_work_item(&goal.id, "run:1", "swarm:run", 30, "internal:swarm")
+        .await?
+        .expect("root claimable");
+    let child_claim = engine
+        .claim_work_item(&goal.id, "run:2", "swarm:run", 30, "internal:swarm")
+        .await?
+        .expect("targeted child claimable");
+    assert_eq!(child_claim.work_item.step_id, "run:2");
     Ok(())
 }

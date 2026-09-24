@@ -186,16 +186,80 @@ committing a new workflow revision (the `Replan` path) rather than mutating the 
 revision. Swarm audit tables stay the Telegram-facing view; loop-engine tables become the
 durable system of record.
 
+**Design (validated against the code, 2026-09-24):**
+
+*Mapping table*
+
+| Swarm concept | Loop Engine record |
+|---|---|
+| run (`run_id`) | `GoalRecord` — `objective` = root task, `created_by` = `internal:swarm`; `run_id` carried in every step's `input.swarm_run_id` |
+| node (`agent_id` = `{run_id}:{idx}`) | `WorkItemRecord` — `step_id` = `agent_id`, `handler` = `provider_analysis`, `effect` = `local_write` (writes swarm audit + memory locally) |
+| parent→child delegation | `input.parent_agent_id` on the child step (see edge note below) |
+| node execution | `AttemptRecord` claimed by `worker_id = "swarm:{run_id}"` via a targeted claim |
+| node result | `CheckpointRecord` prepared→committed; `WorkOutcome.summary` = answer excerpt, `evidence` = `{exit_status, depth, role_name, child_agent_ids}` |
+| node failure/timeout | `fail_attempt(retryable = false)` — swarm keeps its own timeout semantics, no engine retry |
+| merged reply | `publish_artifact` (`analysis_report`, name `swarm-{run_id}`) during the root node's commit so its `artifact_ids` satisfy the `ArtifactExists` criterion → `verify_goal` → `achieved`; a run with no answer publishes nothing and the goal stays non-terminal |
+
+*Edge note:* the sketch's parent→child `WorkflowEdge` mapping was rejected during
+implementation review. Edges gate `ready` promotion — a child item would stay `pending` until
+the parent's attempt finishes, but swarm children execute *inside* the parent's in-process
+await, so edge-gated children could never be claimed. Parent linkage is recorded in
+`input.parent_agent_id` instead; appended steps start `ready`.
+
+*New primitives required (validated gaps):*
+
+1. `LoopStore::extend_workflow(goal_id, steps, actor)` — append steps to an `approved`/`active`
+   goal. Guards: `actor` must start with `internal:`; the approved workflow must contain a step
+   whose input carries `"swarm_root": true` plus `"max_nodes": N` (the approval-bound expansion
+   budget); total items ≤ `min(32, max_nodes)`; handlers must be registered; appended effect
+   classes ⊆ the approved effect manifest. Emits a `workflow.extended` `LoopEventRecord`; the
+   goal revision is unchanged — appends are execution records under the approved plan's
+   declared expansion budget, not a new plan. (`GoalStatus::Replan` exists but has no writer;
+   this method is the T6-sized subset of that path.)
+2. `LoopStore::claim_work_item(goal_id, step_id, worker_id, lease_secs, actor)` — targeted
+   claim: same lease/fencing/attempt mechanics as `claim_goal_work`, but selects the work item
+   with the given `step_id` instead of the lowest-ordinal ready item. `claim_goal_work` cannot
+   be reused: parallel siblings make its ordinal order unpredictable.
+3. `MessageService::with_loop_engine(Option<Arc<LoopEngine>>)` — wired in `http.rs` where the
+   engine is already built before the service.
+
+*Concurrency semantics:* the swarm appends a child's step and immediately claims it — the
+ready-but-unclaimed window is microseconds, while the generic `LoopWorker` polls on a seconds
+scale. If the worker wins a race anyway it executes `provider_analysis` on the node's input,
+which produces a generic answer (degraded but consistent: the durable record still shows the
+node ran); the swarm then sees `claim_work_item → None`, logs a warning, and still completes
+the node in-process for the parent merge. Accepted limitation for T6: an operator-facing
+`internal:` dispatch exclusion is deferred to T7 if hijacks prove noisy.
+
+*Crash semantics:* a process death mid-run leaves leased `running` attempts that expire and get
+reconciled by `recover_goal_state` on the next resume/claim. The swarm audit tables remain the
+Telegram-facing view; the goal record shows exactly which nodes finished. Operator `/resume`
+(`run_goal_until_idle` bypasses `list_dispatchable_goal_ids`) can drive leftover items to
+completion with generic handlers — degraded but durable. In-request swarm resumption is out of
+scope for T6.
+
+*Budget honesty:* the projected spec's `ExecutionBudget` mirrors swarm limits
+(`max_provider_calls = min(2 × max_agents, 64)`, `deadline_secs = max_run_timeout + margin`);
+per-call `reserve_provider_call` enforcement stays out of T6 because node provider calls happen
+inside swarm logic, not inside a `WorkHandler`.
+
 **Steps:**
-- [ ] Write the design section into this doc before coding: projection mapping table
+- [x] Write the design section into this doc before coding: projection mapping table
   (run->Goal, node->WorkItem, node outcome->Attempt+Checkpoint) and how `run_id`/`agent_id`
   correlate.
-- [ ] Add a `LoopStore`-backed projection inside `execute_swarm_node` (behind
+- [x] Add a `LoopStore`-backed projection inside `execute_swarm_node` (behind
   `agent_swarm.enabled && loop_engine.enabled`); failures to project must not fail the reply
-  (warn + continue, matching existing audit best-effort semantics).
-- [ ] `/resume` and the goal-detail HTTP resource must show swarm goals with their node tree.
-- [ ] Tests: new `tests/harness_loop_engine.rs` cases — swarm run produces Goal + WorkItems +
+  (warn + continue, matching existing audit best-effort semantics). *Done: `extend_workflow`,
+  `claim_work_item`, and `with_loop_engine` added; `execute_swarm_node` wraps the inner body
+  with claim → inner → commit/fail.*
+- [x] `/resume` and the goal-detail HTTP resource must show swarm goals with their node tree.
+  *Done automatically: projected goals are ordinary `harness_goals` rows; `resume_goal` and
+  the goal-detail/SSE endpoints read them without further work.*
+- [x] Tests: new `tests/harness_loop_engine.rs` cases — swarm run produces Goal + WorkItems +
   committed checkpoints; simulated crash mid-run leaves resumable state.
+  *Done: `swarm_run_projects_a_durable_goal_tree_and_verifies_it`,
+  `swarm_crash_leaves_resumable_durable_state`, and
+  `extend_workflow_enforces_internal_actor_manifest_and_budget`.*
 
 ### T7 (P2) — Internal auto-approval policy
 

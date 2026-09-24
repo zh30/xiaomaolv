@@ -5,8 +5,8 @@ use anyhow::Context;
 use super::domain::{
     AcceptanceCriterion, ApproveGoalRequest, CheckpointRecord, CreateGoalRequest, EffectClass,
     ExecutionBudget, GoalRecord, GoalVerificationReport, LoopEventRecord, PlanGoalRequest,
-    PlannedGoal, ProviderBudgetReservation, ResumeReport, RetryPolicy, WorkClaim, WorkOutcome,
-    WorkflowEdge, WorkflowSpec, WorkflowStep, hash_serializable, validate_actor,
+    PlannedGoal, ProviderBudgetReservation, ResumeReport, RetryPolicy, WorkClaim, WorkItemRecord,
+    WorkOutcome, WorkflowEdge, WorkflowSpec, WorkflowStep, hash_serializable, validate_actor,
 };
 use super::store::LoopStore;
 use super::{
@@ -263,6 +263,42 @@ impl LoopEngine {
         self.store
             .claim_goal_work(goal_id, worker_id, lease_secs, actor)
             .await
+    }
+
+    /// Targeted claim for in-process subsystems (e.g. the agent swarm) that
+    /// bind claims to a specific `step_id` rather than the lowest-ordinal
+    /// ready item.
+    pub async fn claim_work_item(
+        &self,
+        goal_id: &str,
+        step_id: &str,
+        worker_id: &str,
+        lease_secs: u32,
+        actor: &str,
+    ) -> anyhow::Result<Option<WorkClaim>> {
+        validate_actor(worker_id)?;
+        validate_actor(actor)?;
+        anyhow::ensure!(
+            (1..=3600).contains(&lease_secs),
+            "lease must be 1..=3600 seconds"
+        );
+        self.store
+            .claim_work_item(goal_id, step_id, worker_id, lease_secs, actor)
+            .await
+    }
+
+    /// Append steps to an `approved`/`active` goal. Restricted to `internal:`
+    /// actors; the approved workflow must declare an expansion marker
+    /// (`swarm_root` + `max_nodes`) and appended steps stay within its effect
+    /// manifest.
+    pub async fn extend_workflow(
+        &self,
+        goal_id: &str,
+        steps: Vec<WorkflowStep>,
+        actor: &str,
+    ) -> anyhow::Result<Vec<WorkItemRecord>> {
+        validate_actor(actor)?;
+        self.store.extend_workflow(goal_id, steps, actor).await
     }
 
     pub async fn publish_artifact(

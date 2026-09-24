@@ -201,6 +201,21 @@ pub struct WorkflowSpec {
     pub budget: ExecutionBudget,
 }
 
+pub(crate) const ALLOWED_WORKFLOW_HANDLERS: &[&str] = &[
+    "goal_planner",
+    "provider_analysis",
+    "session_replay",
+    "self_test_suite",
+    "evolution_evaluate",
+    "manual_gate",
+];
+
+/// Actor prefix reserved for subsystem-driven (non-operator) loop-engine
+/// operations such as the swarm projection. Internal actors may append steps
+/// to an approved goal via `extend_workflow` within the bounds declared by the
+/// approved plan.
+pub(crate) const INTERNAL_ACTOR_PREFIX: &str = "internal:";
+
 impl WorkflowSpec {
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         ensure!(
@@ -221,14 +236,7 @@ impl WorkflowSpec {
             "response byte budget must be 1..=10485760"
         );
 
-        let allowed_handlers = BTreeSet::from([
-            "goal_planner",
-            "provider_analysis",
-            "session_replay",
-            "self_test_suite",
-            "evolution_evaluate",
-            "manual_gate",
-        ]);
+        let allowed_handlers = BTreeSet::from_iter(ALLOWED_WORKFLOW_HANDLERS.iter().copied());
         let mut step_ids = BTreeSet::new();
         for step in &self.steps {
             ensure!(

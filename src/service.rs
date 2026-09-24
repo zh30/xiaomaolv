@@ -25,6 +25,7 @@ use crate::harness::evolution::{EvolutionPolicyRuntime, render_evolution_policy_
 use crate::harness::execution_environment::{
     ExecutionEnvironment, LocalExecutionEnvironment, SubprocessExecutionEnvironment,
 };
+use crate::harness::loop_engine::LoopEngine;
 use crate::harness::observability::TrajectoryMetrics;
 use crate::harness::output_exit::{OutputExit, OutputExitRequest};
 use crate::harness::run::{AgentRun, AgentRunExit, AgentRunStart};
@@ -188,6 +189,7 @@ pub struct MessageService {
     provider: Arc<dyn ChatProvider>,
     memory: Arc<dyn MemoryBackend>,
     harness_store: Option<Arc<dyn HarnessStore>>,
+    loop_engine: Option<Arc<LoopEngine>>,
     mcp_runtime: Option<Arc<RwLock<McpRuntime>>>,
     code_mode_planner: Arc<dyn CodeModePlanner>,
     skills_runtime: Option<Arc<RwLock<SkillRuntime>>>,
@@ -292,6 +294,7 @@ impl MessageService {
             provider,
             memory,
             harness_store: None,
+            loop_engine: None,
             mcp_runtime,
             code_mode_planner: Arc::new(DisabledCodeModePlanner),
             skills_runtime: None,
@@ -385,6 +388,14 @@ impl MessageService {
 
     pub fn with_harness_store(mut self, store: Arc<dyn HarnessStore>) -> Self {
         self.harness_store = Some(store);
+        self
+    }
+
+    /// Inject the shared Loop Engine used to durably project internal
+    /// execution (currently Agent Swarm runs). Projection is best-effort: the
+    /// user-visible reply path never depends on it.
+    pub fn with_loop_engine(mut self, engine: Option<Arc<LoopEngine>>) -> Self {
+        self.loop_engine = engine;
         self
     }
 
