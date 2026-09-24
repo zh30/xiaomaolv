@@ -103,3 +103,31 @@ and the durability work is ornamental. The strategy therefore commits to Phase C
 through the gate model (approval, effect manifests, idempotency, reconciliation), never around
 it. Any future proposal to "just let the model call tools in workflows" without those gates
 contradicts the north star and should be rejected.
+
+## Decisions
+
+### 2026-09-24 — Ordinary chat turns stay outside the Goal/Attempt model
+
+**Decision:** `handle`/`handle_stream` do not emit a loop-engine Attempt per turn. Swarm runs
+project into loop-engine state (Phase B); ordinary turns do not.
+
+**Rationale:**
+
+- The durable record already exists. A turn persists the inbound message, one trajectory frame
+  per provider call (when `enable_trajectory` is on), and the assistant reply. A mid-turn crash
+  leaves a diagnosable state — stored question, partial frames, no reply — not a mystery.
+- Recovery is not the same as replayability. Resuming a chat turn means re-running the provider
+  call *and* re-delivering to the channel, and channel delivery is exactly the `external_write`
+  Phase C has not opened yet. Even then the Telegram reply context and stream sink are not
+  durable, so a resumed turn could only be a degraded re-send. The honest primitive is a
+  delivery gate (T9 `channel_send`), not a turn-level DAG.
+- The cost is asymmetric. Goal + plan + approval + claim + attempt + checkpoint + verify is a
+  heavy write amplification for a high-frequency, mostly read-only path; the Goal model exists
+  for multi-step durable work, not per-message bookkeeping.
+- Turns that do perform durable work already project through their own paths (swarm → Goal,
+  scheduler → jobs table). What remains uncovered is only "reply not delivered" — a channel
+  concern, not an execution-model gap.
+
+**Revisit when:** Phase C lands `channel_send`; if post-crash silence proves annoying, the seam
+is a small pending-reply reconciliation in `prepare_turn`/`persist_assistant_reply`, not a full
+turn workflow.

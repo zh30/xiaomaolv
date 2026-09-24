@@ -284,10 +284,13 @@ the loop, which today does not exist.
 
 ### T8 (P2) — Message-turn durability decision
 
-- [ ] Evaluate whether per-completion trajectory frames already give chat turns enough durable
+- [x] Evaluate whether per-completion trajectory frames already give chat turns enough durable
   record, or whether `handle` should also emit a loop-engine Attempt. Record the decision in
   `docs/direction.md`; implement only if the gap is real (e.g., mid-turn crash leaves memory
   with a user message and no assistant reply — acceptable or not?).
+  *Decided 2026-09-24: no per-turn Attempt — see "Decisions" in `docs/direction.md`. The
+  durable record (message + frames + reply) suffices; real recovery needs Phase C's delivery
+  gate anyway. Revisit at `channel_send`.*
 
 ### T9 (P2) — Controlled `external_write`
 
