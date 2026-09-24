@@ -151,13 +151,14 @@ chunker, code-mode audit/circuit functions) are ~1,500 lines of provider-call ma
 ### T4 (P1) — Move delegates and streaming adapters into submodules
 
 **Steps:**
-- [ ] Create `src/service/delegates.rs`: the ~30 thin storage proxies (`observe`, scheduler job
-  CRUD/claim/complete/fail, pending-intent, swarm audit reads if not already in swarm.rs,
-  trajectory queries, group alias/profile proxies) and `detect_telegram_scheduler_intent` +
-  `parse_scheduler_intent_json`.
-- [ ] Create `src/service/streaming.rs`: `StreamSink` adapter structs, `replay_text`,
-  `resolve_provider_stream_reply`, `chunk_text_for_stream_replay` if not already moved in T3.
-- [ ] Verify: `cargo test --all-targets`.
+- [x] Create `src/service/delegates.rs`: the thin storage proxies (`observe`, scheduler job
+  CRUD/claim/complete/fail, pending-intent, trajectory queries, group alias/profile proxies)
+  and `detect_telegram_scheduler_intent` + `parse_scheduler_intent_json`. Swarm audit reads
+  already live in `swarm.rs`.
+- [x] ~~Create `src/service/streaming.rs`~~ — satisfied by T3: `StreamSink` adapter structs,
+  `replay_text`, `resolve_provider_stream_reply`, `chunk_text_for_stream_replay` all moved into
+  `src/service/completion/mod.rs` with the completion paths that use them.
+- [x] Verify: `cargo test --all-targets`.
 
 ### T5 (P1) — Move tests into `src/service/tests.rs`
 
