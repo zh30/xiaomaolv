@@ -43,13 +43,20 @@ Startup validation enforces:
 | `worker_lease_secs` | `1..=3600` |
 | `worker_max_parallel` | `1..=16` |
 | `self_test_interval_secs` | `0`, or `10..=2592000` |
+| `external_write_enabled` | `false` default; enables allowlisted `external_write` steps |
+| `external_write_handlers` | list of handler names; currently only `channel_send` exists |
 
 `worker_enabled = true` requires `enabled = true`. Periodic maintenance is independent of work
 claiming: when the Loop Engine is enabled, a positive self-test interval runs even if the worker
 is disabled. Set `enable_trajectory = true` to capture provider frames from normal message paths.
 
-The built-in worker accepts only registered `pure`, `read`, and `local_write` handlers. Arbitrary
-code changes, deployments, credential changes, and unknown external writes are not enabled.
+The built-in worker accepts only registered `pure`, `read`, and `local_write` handlers by
+default. Arbitrary code changes, deployments, credential changes, and unknown external writes
+are not enabled. `external_write_enabled = true` opens a narrow gate: only handlers named in
+`external_write_handlers` may plan, approve, register, or dispatch `external_write` steps —
+checked again at approve and dispatch time so disabling the flag between plan and run fails
+closed. Delivery is at-least-once: a crash between send and commit parks the work item in
+`waiting_confirmation` for operator review instead of resending.
 When `[agent.harness.evolution].enabled = true`, the `evolution_evaluate` handler adapts the
 existing prompt-candidate engine: it reserves exactly two provider calls per enabled eval case,
 enforces the Goal deadline and cumulative response-byte budget, and publishes only a compact
@@ -101,6 +108,7 @@ Registered handlers:
 | `session_replay` | Runs structural replay and publishes `replay_corpus` |
 | `manual_gate` | Produces evidence that a manual gate was reached |
 | `evolution_evaluate` | Bounded adapter to an existing prompt candidate evaluation |
+| `channel_send` | Sends `{channel, session_id, text}` through the configured outbound channel; `external_write`, registered only when the feature flag is on and the handler is allowlisted |
 
 `evolution_evaluate` is registered as unavailable unless
 `[agent.harness.evolution].enabled = true`. When enabled, it reserves exactly two provider calls
@@ -219,8 +227,8 @@ checkpoint phases, signals, Self-test cases/runs, provider frames/replay runs, a
 The current release intentionally does not provide:
 
 - a Desktop GUI (the HTTP collection/detail resources and per-Goal SSE cursor are the contract),
-- arbitrary code edits, commits, deployments, credentials/permission changes, or unknown
-  `external_write` handlers,
+- arbitrary code edits, commits, deployments, credentials/permission changes, or
+  `external_write` handlers beyond the configured allowlist,
 - comparative live-provider replay or live MCP calls during structural replay,
 - automatic retention/pruning, or vendor-specific community connectors,
 - automatic approval or activation of Prompt Evolution candidates.

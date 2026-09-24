@@ -297,20 +297,35 @@ the loop, which today does not exist.
 **Problem:** the harness can prove safety but cannot act. Enable writes through the gates.
 
 **Steps:**
-- [ ] Config: `[agent.harness.loop_engine] external_write_enabled = false` (default off) +
+- [x] Config: `[agent.harness.loop_engine] external_write_enabled = false` (default off) +
   `external_write_handlers = ["channel_send"]` allowlist.
-- [ ] `WorkflowSpec::validate` gains a policy parameter (or validation moves to an engine-side
+- [x] `WorkflowSpec::validate` gains a policy parameter (or validation moves to an engine-side
   `validate_plan(spec, policy)`) so `external_write` steps are rejected unless the handler is in
   the allowlist and the flag is on; keep the unconditional rejection as the default path.
-- [ ] `WorkHandlerRegistry::register` rejects `external_write` handlers not in the allowlist.
-- [ ] New handler `channel_send`: input `{channel, session_id, text}`; writes a `prepared`
+  *As built:* `ExternalWritePolicy { enabled, allowed_handlers }` lives on `LoopEngine`;
+  `WorkflowSpec::validate_with_policy` gates plan, `approve_goal` re-checks the *current*
+  policy, `extend_workflow` gates appended steps, and the worker re-checks `enabled` at
+  dispatch time — so a flag flip between plan and execution fails closed.
+- [x] `WorkHandlerRegistry::register` rejects `external_write` handlers not in the allowlist.
+  *As built:* the registry carries `external_write_allowlist` seeded from the engine policy;
+  registering a `channel_send` sender without the allowlist entry is a startup error.
+- [x] New handler `channel_send`: input `{channel, session_id, text}`; writes a `prepared`
   checkpoint carrying an idempotency key derived from `(goal_id, step_id, attempt_number)`
   *before* sending; sends through the registered channel; records evidence `{sent_at,
   channel}`; on resume, `reconciled` marks committed sends without re-sending (document
   at-least-once honestly).
-- [ ] Approval surface (HTTP detail + Telegram `/goal` review) renders the effect manifest so
+  *As built:* `OutboundSender` is the injected delivery capability
+  (`ChannelOutboundSender` maps `channel="telegram"` onto `TelegramSender`, parsing
+  `tg:{chat_id}[:thread:{id}|:reply:{id}]` session ids); the prepared checkpoint is written by
+  `process_claim` before `execute` under key `{work_item.id}:{attempt.id}:v1`; a crash between
+  send and commit parks the item in `waiting_confirmation` — never resent.
+- [x] Approval surface (HTTP detail + Telegram `/goal` review) renders the effect manifest so
   an operator sees `external_write` before approving.
-- [ ] Tests: flag off -> rejection; flag on + allowlisted -> executes once; crash between
+  *As built:* `GET /v1/harness/goals/{id}` now embeds the latest plan (`plan_hash`, `workflow`,
+  `acceptance_criteria`, `effect_manifest`) via a new `LoopStore::latest_plan` accessor;
+  Telegram `/goal` review prints the manifest and per-step `handler [effect]`, and `/resume`
+  item lines show the effect class.
+- [x] Tests: flag off -> rejection; flag on + allowlisted -> executes once; crash between
   prepared and committed -> resume reconciles without a duplicate send (assert via fake channel
   sink counting sends).
 
@@ -349,3 +364,19 @@ cargo test --test agent_swarm_store --test service_pipeline --test harness_eval 
   `handle`/`handle_stream` are now thin tails (~110 duplicate lines removed). **T2 done:**
   swarm subsystem moved to `src/service/swarm.rs` (917 lines); `service.rs` 5,575 -> 4,605.
   `fmt`/`clippy -D warnings`/`cargo test --all-targets` all green, zero behavior change.
+- 2026-09-24 — **T3 done:** completion paths split into `service/completion/` (mod 527,
+  mcp_loop 728, code_mode_path 357). **T4 done:** storage delegates + scheduler intent moved to
+  `service/delegates.rs` (348). **T5 done:** tests -> `service/tests.rs` (899), time-query
+  helpers -> `service/time_query.rs` (325); `service.rs` lands at 1,469 lines (<= 1,500).
+- 2026-09-24 — **T6 done:** swarm runs project into durable Goal/WorkItem/Attempt/Checkpoint
+  via `claim_work_item` (targeted claim) + `extend_workflow` (internal-actor, manifest/budget
+  bounded); projection is best-effort and never alters reply behavior.
+- 2026-09-24 — **T7 done:** `internal:auto` approvals bounded by `InternalApprovalPolicy`
+  (effect ceiling + provider-call cap); subsystem actors keep their code-built plan path.
+- 2026-09-24 — **T8 done:** decision recorded — ordinary chat turns do not emit Loop Engine
+  Attempts; reply recovery waits for the `channel_send` gate.
+- 2026-09-24 — **T9 done:** controlled `external_write` behind `external_write_enabled` +
+  handler allowlist enforced at plan/approve/register/dispatch; `channel_send` handler via
+  `OutboundSender`; prepared->committed->reconciled checkpoints; crash between send and commit
+  parks in `waiting_confirmation`; approval surfaces render effect manifests over HTTP and
+  Telegram. 41 test binaries green, `harness_loop_engine` 20/20.

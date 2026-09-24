@@ -12,7 +12,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::domain::{IncomingMessage, ReplyTarget};
-use crate::harness::loop_engine::LoopEngine;
+use crate::harness::loop_engine::{LoopEngine, OutboundSender};
 use crate::mcp_commands::{
     discover_mcp_registry, execute_mcp_command, mcp_help_text, parse_telegram_mcp_command,
 };
@@ -716,6 +716,95 @@ impl TelegramSender {
 
         Ok(())
     }
+}
+
+/// `OutboundSender` adapter for the Loop Engine `channel_send` handler.
+/// Routes a bounded send to the configured channel by name; only channels
+/// with a real outbound capability are accepted — there is no silent fallback.
+#[derive(Clone)]
+pub struct ChannelOutboundSender {
+    telegram: Option<TelegramSender>,
+}
+
+impl ChannelOutboundSender {
+    pub fn with_telegram(sender: TelegramSender) -> Self {
+        Self {
+            telegram: Some(sender),
+        }
+    }
+}
+
+#[async_trait]
+impl OutboundSender for ChannelOutboundSender {
+    async fn send(
+        &self,
+        channel: &str,
+        session_id: &str,
+        text: &str,
+        idempotency_key: &str,
+    ) -> anyhow::Result<Value> {
+        match channel {
+            "telegram" => {
+                let sender = self
+                    .telegram
+                    .as_ref()
+                    .context("telegram channel is not configured for outbound sends")?;
+                let target = parse_telegram_outbound_target(session_id)?;
+                sender
+                    .send_message(target.chat_id, target.thread_id, target.reply_to, text)
+                    .await?;
+                Ok(serde_json::json!({
+                    "sent_at_unix": unix_now_i64(),
+                    "telegram_chat_id": target.chat_id,
+                }))
+            }
+            other => bail!("channel_send has no outbound sender for channel '{other}'"),
+        }
+        .map(|mut evidence| {
+            evidence["idempotency_key"] = Value::String(idempotency_key.to_string());
+            evidence
+        })
+    }
+}
+
+struct TelegramOutboundTarget {
+    chat_id: i64,
+    thread_id: Option<i64>,
+    reply_to: Option<i64>,
+}
+
+/// Parses `tg:{chat_id}[:thread:{id}|:reply:{id}]` session ids produced by the
+/// Telegram update pipeline.
+fn parse_telegram_outbound_target(session_id: &str) -> anyhow::Result<TelegramOutboundTarget> {
+    let rest = session_id
+        .strip_prefix("tg:")
+        .context("telegram channel_send session_id must start with 'tg:'")?;
+    let mut parts = rest.split(':');
+    let chat_id: i64 = parts
+        .next()
+        .and_then(|raw| raw.parse().ok())
+        .context("telegram channel_send session_id has no numeric chat id")?;
+    let mut target = TelegramOutboundTarget {
+        chat_id,
+        thread_id: None,
+        reply_to: None,
+    };
+    while let (Some(kind), Some(value)) = (parts.next(), parts.next()) {
+        let parsed: Option<i64> = value.parse().ok();
+        match kind {
+            "thread" => target.thread_id = parsed,
+            "reply" => target.reply_to = parsed,
+            _ => {}
+        }
+    }
+    Ok(target)
+}
+
+fn unix_now_i64() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default()
 }
 
 #[derive(Clone)]

@@ -117,7 +117,7 @@ Capability metadata filters MCP access before execution. `subprocess` is not an 
 - Planning never dispatches work; approval binds the exact goal revision, plan hash, effect manifest, acceptance criteria, and execution budget
 - `LoopWorker` uses at-least-once claims, expiring leases, monotonically increasing fencing tokens, and prepared/committed/reconciled checkpoints
 - `/resume` expires stale leases and reconciles committed outcomes without replaying their effects
-- Registered handlers are `goal_planner`, `provider_analysis`, `self_test_suite`, `session_replay`, `manual_gate`, and `evolution_evaluate`; `external_write` handlers are rejected
+- Registered handlers are `goal_planner`, `provider_analysis`, `self_test_suite`, `session_replay`, `manual_gate`, `evolution_evaluate`, and — only behind `external_write_enabled` plus a handler allowlist — `channel_send`; unlisted `external_write` handlers are rejected at plan/approve/register/dispatch
 - Multi-source `EvolutionSignal` records preserve source/trust/deduplication metadata; only an operator route can convert them into `proposed` goals
 - Production `core` self-tests are read-only; repeated identical failure sets produce one deduplicated internal signal
 - Provider frames are recorded for main plain, Code Mode, and MCP completion paths when trajectory logging is enabled; structural replay executes zero live tools

@@ -4,9 +4,10 @@ use anyhow::Context;
 
 use super::domain::{
     AcceptanceCriterion, ApproveGoalRequest, CheckpointRecord, CreateGoalRequest, EffectClass,
-    ExecutionBudget, GoalRecord, GoalVerificationReport, LoopEventRecord, PlanGoalRequest,
-    PlannedGoal, ProviderBudgetReservation, ResumeReport, RetryPolicy, WorkClaim, WorkItemRecord,
-    WorkOutcome, WorkflowEdge, WorkflowSpec, WorkflowStep, hash_serializable, validate_actor,
+    ExecutionBudget, ExternalWritePolicy, GoalRecord, GoalVerificationReport, LoopEventRecord,
+    PlanGoalRequest, PlannedGoal, ProviderBudgetReservation, ResumeReport, RetryPolicy, WorkClaim,
+    WorkItemRecord, WorkOutcome, WorkflowEdge, WorkflowSpec, WorkflowStep, hash_serializable,
+    validate_actor,
 };
 use super::store::LoopStore;
 use super::{
@@ -18,11 +19,26 @@ use super::{
 #[derive(Clone)]
 pub struct LoopEngine {
     store: Arc<dyn LoopStore>,
+    external_write_policy: ExternalWritePolicy,
 }
 
 impl LoopEngine {
     pub fn new(store: Arc<dyn LoopStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            external_write_policy: ExternalWritePolicy::default(),
+        }
+    }
+
+    /// Feature gate + handler allowlist for `external_write` steps. Defaults
+    /// to disabled — the strictest policy — so callers must opt in explicitly.
+    pub fn with_external_write_policy(mut self, policy: ExternalWritePolicy) -> Self {
+        self.external_write_policy = policy;
+        self
+    }
+
+    pub fn external_write_policy(&self) -> &ExternalWritePolicy {
+        &self.external_write_policy
     }
 
     pub async fn create_goal(
@@ -173,9 +189,15 @@ impl LoopEngine {
         request: PlanGoalRequest,
         actor: &str,
     ) -> anyhow::Result<PlannedGoal> {
-        request.validate()?;
+        request.validate_with_policy(&self.external_write_policy)?;
         validate_actor(actor)?;
         self.store.plan_goal(goal_id, request, actor).await
+    }
+
+    /// Latest planned workflow for a goal — approval surfaces use this to
+    /// show the effect manifest again after `plan_goal` already returned.
+    pub async fn get_goal_plan(&self, goal_id: &str) -> anyhow::Result<Option<PlannedGoal>> {
+        self.store.latest_plan(goal_id).await
     }
 
     pub async fn plan_goal_recommended(
@@ -244,7 +266,9 @@ impl LoopEngine {
         actor: &str,
     ) -> anyhow::Result<ResumeReport> {
         validate_actor(actor)?;
-        self.store.approve_goal(goal_id, request, actor).await
+        self.store
+            .approve_goal(goal_id, request, actor, &self.external_write_policy)
+            .await
     }
 
     pub async fn claim_goal_work(
@@ -298,7 +322,9 @@ impl LoopEngine {
         actor: &str,
     ) -> anyhow::Result<Vec<WorkItemRecord>> {
         validate_actor(actor)?;
-        self.store.extend_workflow(goal_id, steps, actor).await
+        self.store
+            .extend_workflow(goal_id, steps, actor, &self.external_write_policy)
+            .await
     }
 
     pub async fn publish_artifact(

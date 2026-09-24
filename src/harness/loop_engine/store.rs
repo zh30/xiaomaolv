@@ -14,9 +14,9 @@ use super::artifacts::{
 };
 use super::domain::{
     ALLOWED_WORKFLOW_HANDLERS, AcceptanceCriterion, ApproveGoalRequest, AttemptRecord,
-    AttemptStatus, CheckpointPhase, CheckpointRecord, CreateGoalRequest, EffectClass, GoalRecord,
-    GoalStatus, GoalVerificationReport, INTERNAL_ACTOR_PREFIX, INTERNAL_AUTO_ACTOR,
-    InternalApprovalPolicy, LoopEventRecord, PlanGoalRequest, PlannedGoal,
+    AttemptStatus, CheckpointPhase, CheckpointRecord, CreateGoalRequest, EffectClass,
+    ExternalWritePolicy, GoalRecord, GoalStatus, GoalVerificationReport, INTERNAL_ACTOR_PREFIX,
+    INTERNAL_AUTO_ACTOR, InternalApprovalPolicy, LoopEventRecord, PlanGoalRequest, PlannedGoal,
     ProviderBudgetReservation, ResumeReport, WorkClaim, WorkItemRecord, WorkItemStatus,
     WorkOutcome, WorkflowSpec, WorkflowStep, hash_serializable,
 };
@@ -139,11 +139,19 @@ pub trait LoopStore: Send + Sync {
         actor: &str,
     ) -> anyhow::Result<PlannedGoal>;
 
+    /// Most recent planned workflow for a goal, for approval surfaces that
+    /// need to re-display the effect manifest after `plan_goal` returned.
+    async fn latest_plan(&self, goal_id: &str) -> anyhow::Result<Option<PlannedGoal>>;
+
+    /// `external_write` is the *current* engine policy: external-write steps
+    /// admitted when the plan was created are re-checked at approval time so a
+    /// flag flip between plan and approve cannot sneak a write through.
     async fn approve_goal(
         &self,
         goal_id: &str,
         request: ApproveGoalRequest,
         actor: &str,
+        external_write: &ExternalWritePolicy,
     ) -> anyhow::Result<ResumeReport>;
 
     async fn claim_goal_work(
@@ -170,12 +178,14 @@ pub trait LoopStore: Send + Sync {
     /// Append steps to an `approved`/`active` goal. Restricted to `internal:`
     /// actors and bounded by the expansion marker declared in the approved
     /// workflow (a step input carrying `"swarm_root": true` and `max_nodes`).
-    /// Appended steps start `ready`; no edges are created.
+    /// Appended steps start `ready`; no edges are created. `external_write`
+    /// gates external-write steps against the current engine policy.
     async fn extend_workflow(
         &self,
         goal_id: &str,
         steps: Vec<WorkflowStep>,
         actor: &str,
+        external_write: &ExternalWritePolicy,
     ) -> anyhow::Result<Vec<WorkItemRecord>>;
 
     async fn prepare_checkpoint(
@@ -942,11 +952,41 @@ impl LoopStore for SqliteLoopStore {
         })
     }
 
+    async fn latest_plan(&self, goal_id: &str) -> anyhow::Result<Option<PlannedGoal>> {
+        ensure_valid_id(goal_id, "goal id")?;
+        let Some(goal) = self.get_goal(goal_id).await? else {
+            return Ok(None);
+        };
+        let row = sqlx::query(
+            "SELECT plan_hash, workflow_json, acceptance_json, effect_manifest_json
+             FROM harness_workflows
+             WHERE goal_id = ?1
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(goal_id)
+        .fetch_optional(self.store.pool())
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let workflow_json: String = row.try_get("workflow_json")?;
+        let acceptance_json: String = row.try_get("acceptance_json")?;
+        let effect_json: String = row.try_get("effect_manifest_json")?;
+        Ok(Some(PlannedGoal {
+            goal,
+            plan_hash: row.try_get("plan_hash")?,
+            workflow: serde_json::from_str(&workflow_json)?,
+            acceptance_criteria: serde_json::from_str(&acceptance_json)?,
+            effect_manifest: serde_json::from_str(&effect_json)?,
+        }))
+    }
+
     async fn approve_goal(
         &self,
         goal_id: &str,
         request: ApproveGoalRequest,
         actor: &str,
+        external_write: &ExternalWritePolicy,
     ) -> anyhow::Result<ResumeReport> {
         ensure_valid_id(goal_id, "goal id")?;
         ensure!(
@@ -992,6 +1032,15 @@ impl LoopStore for SqliteLoopStore {
         let workflow: WorkflowSpec = serde_json::from_str(&workflow_json)?;
         let acceptance: Vec<AcceptanceCriterion> = serde_json::from_str(&acceptance_json)?;
         let effects: Vec<EffectClass> = serde_json::from_str(&effect_json)?;
+        // External-write admission is re-checked against the policy in effect
+        // *now*, not the policy in effect when the plan was drafted.
+        for step in &workflow.steps {
+            ensure!(
+                step.effect != EffectClass::ExternalWrite || external_write.allows(&step.handler),
+                "external_write step '{}' requires external_write_enabled and an allowlisted handler",
+                step.handler
+            );
+        }
         // The generic internal auto-approval path is the only one that binds
         // plans it did not author, so it is held to the configured policy.
         // Subsystem actors (e.g. `internal:swarm`) approve their own
@@ -1129,6 +1178,7 @@ impl LoopStore for SqliteLoopStore {
         goal_id: &str,
         steps: Vec<WorkflowStep>,
         actor: &str,
+        external_write: &ExternalWritePolicy,
     ) -> anyhow::Result<Vec<WorkItemRecord>> {
         ensure_valid_id(goal_id, "goal id")?;
         ensure!(
@@ -1228,8 +1278,9 @@ impl LoopStore for SqliteLoopStore {
                 "unregistered workflow handler"
             );
             ensure!(
-                step.effect != EffectClass::ExternalWrite,
-                "external_write steps are rejected in this release"
+                step.effect != EffectClass::ExternalWrite || external_write.allows(&step.handler),
+                "external_write step '{}' requires external_write_enabled and an allowlisted handler",
+                step.handler
             );
             ensure!(
                 manifest.contains(step.effect.as_str()),

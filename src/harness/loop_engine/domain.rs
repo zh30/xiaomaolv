@@ -208,6 +208,7 @@ pub(crate) const ALLOWED_WORKFLOW_HANDLERS: &[&str] = &[
     "self_test_suite",
     "evolution_evaluate",
     "manual_gate",
+    "channel_send",
 ];
 
 /// Actor prefix reserved for subsystem-driven (non-operator) loop-engine
@@ -281,8 +282,31 @@ impl InternalApprovalPolicy {
     }
 }
 
+/// Feature gate plus handler allowlist for `external_write` workflow steps.
+/// Disabled and empty by default: external writes are rejected unless the
+/// feature flag is on and the step's handler name is allowlisted. Delivery is
+/// at-least-once — a committed send is never replayed, while a crash between
+/// send and commit parks the work item in `waiting_confirmation`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExternalWritePolicy {
+    pub enabled: bool,
+    pub allowed_handlers: BTreeSet<String>,
+}
+
+impl ExternalWritePolicy {
+    pub(crate) fn allows(&self, handler: &str) -> bool {
+        self.enabled && self.allowed_handlers.contains(handler)
+    }
+}
+
 impl WorkflowSpec {
-    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+    /// Validates the workflow against the configured external-write gate. The
+    /// default policy (disabled, empty allowlist) rejects every
+    /// `external_write` step.
+    pub(crate) fn validate_with_policy(
+        &self,
+        external_write: &ExternalWritePolicy,
+    ) -> anyhow::Result<()> {
         ensure!(
             !self.steps.is_empty() && self.steps.len() <= 32,
             "workflow must contain 1..=32 steps"
@@ -318,8 +342,9 @@ impl WorkflowSpec {
                 step.handler
             );
             ensure!(
-                step.effect != EffectClass::ExternalWrite,
-                "external_write handlers are not enabled in this release"
+                step.effect != EffectClass::ExternalWrite || external_write.allows(&step.handler),
+                "external_write step '{}' requires external_write_enabled and an allowlisted handler",
+                step.handler
             );
             ensure!(
                 (1..=10).contains(&step.retry.max_attempts),
@@ -421,8 +446,11 @@ pub struct PlanGoalRequest {
 }
 
 impl PlanGoalRequest {
-    pub(crate) fn validate(&self) -> anyhow::Result<()> {
-        self.workflow.validate()?;
+    pub(crate) fn validate_with_policy(
+        &self,
+        external_write: &ExternalWritePolicy,
+    ) -> anyhow::Result<()> {
+        self.workflow.validate_with_policy(external_write)?;
         ensure!(
             !self.acceptance_criteria.is_empty() && self.acceptance_criteria.len() <= 16,
             "plan must contain 1..=16 acceptance criteria"

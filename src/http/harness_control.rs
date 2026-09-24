@@ -133,9 +133,18 @@ async fn get_goal(
         .await
         .map_err(internal)?
         .ok_or_else(|| ApiError::NotFound(format!("goal not found: {goal_id}")))?;
-    Ok(Json(
-        serde_json::to_value(goal).map_err(|error| ApiError::Internal(error.into()))?,
-    ))
+    let plan = engine.get_goal_plan(&goal_id).await.map_err(internal)?;
+    let mut value =
+        serde_json::to_value(&goal).map_err(|error| ApiError::Internal(error.into()))?;
+    value["plan"] = plan.map_or(serde_json::Value::Null, |plan| {
+        serde_json::json!({
+            "plan_hash": plan.plan_hash,
+            "workflow": plan.workflow,
+            "acceptance_criteria": plan.acceptance_criteria,
+            "effect_manifest": plan.effect_manifest,
+        })
+    });
+    Ok(Json(value))
 }
 
 #[derive(Debug, Deserialize)]

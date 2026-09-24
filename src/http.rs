@@ -19,8 +19,8 @@ use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
 use crate::channel::{
-    ChannelContext, ChannelInbound, ChannelPlugin, ChannelPluginConfig, ChannelPluginError,
-    ChannelRegistry, ChannelRuntimeContext, ChannelWorker,
+    ChannelContext, ChannelInbound, ChannelOutboundSender, ChannelPlugin, ChannelPluginConfig,
+    ChannelPluginError, ChannelRegistry, ChannelRuntimeContext, ChannelWorker, TelegramSender,
 };
 use crate::code_mode::LlmCodeModePlanner;
 use crate::config::AppConfig;
@@ -32,7 +32,8 @@ use crate::harness::evolution::{
     EvolutionGateConfig, EvolutionRollbackResult, evolution_cycle_skip_reason,
 };
 use crate::harness::loop_engine::{
-    InternalApprovalPolicy, LoopEngine, LoopWorker, SqliteLoopStore,
+    ExternalWritePolicy, InternalApprovalPolicy, LoopEngine, LoopWorker, OutboundSender,
+    SqliteLoopStore,
 };
 use crate::harness::observability::TrajectoryMetrics;
 use crate::harness::store::{
@@ -577,10 +578,43 @@ async fn build_runtime_handles(
         .context("invalid agent.harness.loop_engine.internal_auto_approve_max_effect")?,
         max_provider_calls: loop_config.internal_auto_approve_max_provider_calls,
     };
-    let loop_engine = Arc::new(LoopEngine::new(Arc::new(
-        SqliteLoopStore::new(memory_store.clone())
-            .with_internal_approval_policy(internal_approval_policy),
-    )));
+    for handler in &loop_config.external_write_handlers {
+        if handler.trim().is_empty() || handler.len() > 96 {
+            bail!("external_write_handlers entries must be 1..=96 bytes");
+        }
+    }
+    let external_write_policy = ExternalWritePolicy {
+        enabled: loop_config.external_write_enabled,
+        allowed_handlers: loop_config
+            .external_write_handlers
+            .iter()
+            .cloned()
+            .collect(),
+    };
+    let loop_engine = Arc::new(
+        LoopEngine::new(Arc::new(
+            SqliteLoopStore::new(memory_store.clone())
+                .with_internal_approval_policy(internal_approval_policy),
+        ))
+        .with_external_write_policy(external_write_policy),
+    );
+    let outbound_sender: Option<Arc<dyn OutboundSender>> = loop_config
+        .external_write_enabled
+        .then(|| {
+            config
+                .channels
+                .telegram
+                .as_ref()
+                .filter(|telegram| {
+                    telegram.enabled && !is_missing_required_value(&telegram.bot_token)
+                })
+                .map(|telegram| {
+                    Arc::new(ChannelOutboundSender::with_telegram(TelegramSender::new(
+                        telegram.bot_token.clone(),
+                    ))) as Arc<dyn OutboundSender>
+                })
+        })
+        .flatten();
     let max_recent_turns = if config.memory.max_recent_turns == 0 {
         config.app.max_history
     } else {
@@ -688,7 +722,8 @@ async fn build_runtime_handles(
                 loop_engine.clone(),
                 provider.clone(),
                 evolution_engine.clone(),
-            )
+                outbound_sender,
+            )?
             .with_runtime_options("loop-worker:runtime", loop_config.worker_lease_secs)?,
         ))
     } else {

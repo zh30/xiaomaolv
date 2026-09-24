@@ -9,11 +9,12 @@ use xiaomaolv::harness::evolution::{
     EvolutionGateConfig,
 };
 use xiaomaolv::harness::loop_engine::{
-    AcceptanceCriterion, ApproveGoalRequest, ArtifactKind, CreateGoalRequest, CreateSignalRequest,
-    EffectClass, ExecutionBudget, GoalStatus, LoopEngine, LoopWorker, PlanGoalRequest,
-    PublishArtifactRequest, ReplayStatus, RetryPolicy, SelfTestStatus, SignalKind, SignalTrust,
-    SqliteLoopStore, TrajectoryFrameCapture, TrajectoryFrameDraft, WorkItemStatus, WorkOutcome,
-    WorkflowEdge, WorkflowSpec, WorkflowStep,
+    AcceptanceCriterion, ApproveGoalRequest, ArtifactKind, CheckpointPhase, CreateGoalRequest,
+    CreateSignalRequest, EffectClass, ExecutionBudget, ExternalWritePolicy, GoalStatus, LoopEngine,
+    LoopWorker, OutboundSender, PlanGoalRequest, PublishArtifactRequest, ReplayStatus, RetryPolicy,
+    SelfTestStatus, SignalKind, SignalTrust, SqliteLoopStore, TrajectoryFrameCapture,
+    TrajectoryFrameDraft, WorkHandler, WorkHandlerContext, WorkHandlerRegistry, WorkItemStatus,
+    WorkOutcome, WorkflowEdge, WorkflowSpec, WorkflowStep,
 };
 use xiaomaolv::harness::store::SqliteEvolutionStore;
 use xiaomaolv::memory::SqliteMemoryStore;
@@ -62,7 +63,7 @@ async fn built_in_worker_dispatches_the_approved_dag_and_verifies_the_goal() -> 
         )
         .await?;
 
-    let worker = LoopWorker::with_builtins(engine.clone(), Arc::new(WorkerProvider), None);
+    let worker = LoopWorker::with_builtins(engine.clone(), Arc::new(WorkerProvider), None, None)?;
     let report = worker.run_goal_until_idle(&goal.id, 8).await?;
 
     assert_eq!(report.goal.status, GoalStatus::Achieved);
@@ -173,7 +174,8 @@ async fn built_in_worker_runs_evolution_evaluation_with_persisted_budgets() -> a
         )
         .await?;
 
-    let worker = LoopWorker::with_builtins(loop_engine, Arc::new(WorkerProvider), Some(evolution));
+    let worker =
+        LoopWorker::with_builtins(loop_engine, Arc::new(WorkerProvider), Some(evolution), None)?;
     let report = worker.run_goal_until_idle(&goal.id, 4).await?;
     assert_eq!(report.goal.status, GoalStatus::Achieved);
     Ok(())
@@ -1196,5 +1198,351 @@ async fn internal_auto_approval_is_bounded_by_policy() -> anyhow::Result<()> {
             .iter()
             .any(|event| event.actor == "internal:auto" && event.event_type.contains("approv"))
     );
+    Ok(())
+}
+
+struct RecordingOutboundSender {
+    sends: Mutex<Vec<(String, String, String, String)>>,
+}
+
+#[async_trait]
+impl OutboundSender for RecordingOutboundSender {
+    async fn send(
+        &self,
+        channel: &str,
+        session_id: &str,
+        text: &str,
+        idempotency_key: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.sends.lock().expect("sends").push((
+            channel.to_string(),
+            session_id.to_string(),
+            text.to_string(),
+            idempotency_key.to_string(),
+        ));
+        Ok(serde_json::json!({"sent_at_unix": 1_700_000_000}))
+    }
+}
+
+fn channel_send_plan_request() -> PlanGoalRequest {
+    PlanGoalRequest {
+        workflow: WorkflowSpec {
+            steps: vec![WorkflowStep {
+                id: "notify".to_string(),
+                handler: "channel_send".to_string(),
+                effect: EffectClass::ExternalWrite,
+                input: serde_json::json!({
+                    "channel": "telegram",
+                    "session_id": "tg:42",
+                    "text": "goal completed",
+                }),
+                retry: RetryPolicy {
+                    max_attempts: 1,
+                    backoff_secs: 0,
+                },
+            }],
+            edges: Vec::new(),
+            budget: ExecutionBudget {
+                max_provider_calls: 0,
+                deadline_secs: 60,
+                max_response_bytes: 1024,
+            },
+        },
+        acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+            label: "operator confirms the outbound send".to_string(),
+        }],
+    }
+}
+
+fn external_write_engine(memory: SqliteMemoryStore, allowlist: &[&str]) -> Arc<LoopEngine> {
+    Arc::new(
+        LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))).with_external_write_policy(
+            ExternalWritePolicy {
+                enabled: true,
+                allowed_handlers: allowlist.iter().map(|name| name.to_string()).collect(),
+            },
+        ),
+    )
+}
+
+#[tokio::test]
+async fn external_write_plan_rejected_when_disabled() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("ext-off.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Notify me externally".to_string(),
+                source_signal_ids: Vec::new(),
+            },
+            "operator:test",
+        )
+        .await?;
+    let error = engine
+        .plan_goal(&goal.id, channel_send_plan_request(), "operator:test")
+        .await
+        .expect_err("external_write must be rejected when the flag is off");
+    assert!(error.to_string().contains("external_write"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn external_write_plan_rejected_when_handler_not_allowlisted() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("ext-deny.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = external_write_engine(memory, &["other_handler"]);
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Notify me externally".to_string(),
+                source_signal_ids: Vec::new(),
+            },
+            "operator:test",
+        )
+        .await?;
+    let error = engine
+        .plan_goal(&goal.id, channel_send_plan_request(), "operator:test")
+        .await
+        .expect_err("non-allowlisted external_write handler must be rejected");
+    assert!(error.to_string().contains("channel_send"));
+
+    // Registration is gated by the same allowlist.
+    let mut registry = WorkHandlerRegistry::default();
+    let error = registry
+        .register(Arc::new(ChannelSendProbe))
+        .expect_err("registration must reject non-allowlisted external_write handlers");
+    assert!(error.to_string().contains("allowlist"));
+    Ok(())
+}
+
+struct ChannelSendProbe;
+
+#[async_trait]
+impl WorkHandler for ChannelSendProbe {
+    fn name(&self) -> &'static str {
+        "channel_send"
+    }
+
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::ExternalWrite
+    }
+
+    async fn execute(&self, _context: &WorkHandlerContext) -> anyhow::Result<WorkOutcome> {
+        Ok(WorkOutcome {
+            summary: "probe".to_string(),
+            artifact_ids: Vec::new(),
+            evidence: serde_json::Value::Null,
+        })
+    }
+}
+
+#[tokio::test]
+async fn channel_send_executes_and_commits_with_evidence() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("ext-run.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = external_write_engine(memory, &["channel_send"]);
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Notify me externally".to_string(),
+                source_signal_ids: Vec::new(),
+            },
+            "operator:test",
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(&goal.id, channel_send_plan_request(), "operator:test")
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+
+    let sends = Arc::new(RecordingOutboundSender {
+        sends: Mutex::new(Vec::new()),
+    });
+    let worker = LoopWorker::with_builtins(
+        engine.clone(),
+        Arc::new(WorkerProvider),
+        None,
+        Some(sends.clone()),
+    )?;
+    // The send commits, then the goal parks in `verifying` awaiting the
+    // manual-approval criterion; the idle loop reports that state as
+    // non-dispatchable, which is expected — assert on durable state instead.
+    let _ = worker.run_goal_until_idle(&goal.id, 4).await;
+    let report = engine.resume_goal(&goal.id, "operator:test").await?;
+
+    let item = report
+        .work_items
+        .iter()
+        .find(|item| item.step_id == "notify")
+        .expect("channel_send work item");
+    assert_eq!(item.status, WorkItemStatus::Succeeded);
+    let recorded = sends.sends.lock().expect("sends");
+    assert_eq!(recorded.len(), 1);
+    let (channel, session_id, text, key) = &recorded[0];
+    assert_eq!(channel, "telegram");
+    assert_eq!(session_id, "tg:42");
+    assert_eq!(text, "goal completed");
+    // The delivery key is the same (work item, attempt) unit the checkpoint
+    // was prepared under.
+    assert!(key.starts_with(&item.id));
+    drop(recorded);
+
+    // The send's checkpoint was committed, and resume reconciled it — the
+    // durable evidence survives without replaying the effect.
+    let checkpoint = report
+        .latest_checkpoint
+        .as_ref()
+        .expect("committed checkpoint");
+    assert_eq!(checkpoint.phase, CheckpointPhase::Reconciled);
+    let outcome = checkpoint.outcome.as_ref().expect("send outcome");
+    assert_eq!(outcome.evidence["send"]["sent_at_unix"], 1_700_000_000);
+    assert_eq!(report.goal.status, GoalStatus::Verifying);
+    Ok(())
+}
+
+#[tokio::test]
+async fn channel_send_crash_before_commit_parks_item_without_resend() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("ext-crash.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = external_write_engine(memory, &["channel_send"]);
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Notify me externally".to_string(),
+                source_signal_ids: Vec::new(),
+            },
+            "operator:test",
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(&goal.id, channel_send_plan_request(), "operator:test")
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+
+    // Simulate: worker claimed the item, wrote the prepared checkpoint, the
+    // send went out, and the process died before commit_checkpoint.
+    let sends = Arc::new(RecordingOutboundSender {
+        sends: Mutex::new(Vec::new()),
+    });
+    let claim = engine
+        .claim_work_item(&goal.id, "notify", "worker:ext", 1, "operator:test")
+        .await?
+        .expect("channel_send work item should be claimable");
+    let idempotency_key = format!("{}:{}:v1", claim.work_item.id, claim.attempt.id);
+    let checkpoint = engine
+        .prepare_checkpoint(&claim, &idempotency_key, "worker:ext")
+        .await?;
+    assert_eq!(checkpoint.phase, CheckpointPhase::Prepared);
+    sends
+        .send("telegram", "tg:42", "goal completed", &idempotency_key)
+        .await?;
+    drop(engine);
+
+    // Lease expiry is whole-second compared; wait past it, then resume on a
+    // reopened store as if the process restarted.
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    let reopened_memory = SqliteMemoryStore::new(&database_url).await?;
+    let reopened = external_write_engine(reopened_memory, &["channel_send"]);
+    let report = reopened.resume_goal(&goal.id, "operator:test").await?;
+    let item = report
+        .work_items
+        .iter()
+        .find(|item| item.step_id == "notify")
+        .expect("channel_send work item");
+    assert_eq!(item.status, WorkItemStatus::WaitingConfirmation);
+
+    // A fresh worker must not re-dispatch the parked item — at-least-once
+    // means at most one send lands for this attempt.
+    let worker = LoopWorker::with_builtins(
+        reopened.clone(),
+        Arc::new(WorkerProvider),
+        None,
+        Some(sends.clone()),
+    )?;
+    let _ = worker.run_goal_until_idle(&goal.id, 4).await?;
+    assert_eq!(sends.sends.lock().expect("sends").len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn channel_send_dispatch_blocked_when_flag_off_on_worker() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("ext-gate.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    // Plan + approve on an enabled engine…
+    let enabled = external_write_engine(memory.clone(), &["channel_send"]);
+    let goal = enabled
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Notify me externally".to_string(),
+                source_signal_ids: Vec::new(),
+            },
+            "operator:test",
+        )
+        .await?;
+    let plan = enabled
+        .plan_goal(&goal.id, channel_send_plan_request(), "operator:test")
+        .await?;
+    enabled
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+
+    // …but the worker runs on an engine where the flag is off (e.g. restart
+    // with a downgraded config): the item must fail closed, never send.
+    let sends = Arc::new(RecordingOutboundSender {
+        sends: Mutex::new(Vec::new()),
+    });
+    let disabled = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    // Registration itself fails closed on a disabled policy.
+    let error = match LoopWorker::with_builtins(
+        disabled.clone(),
+        Arc::new(WorkerProvider),
+        None,
+        Some(sends.clone()),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("channel_send sender without allowlist must fail registration"),
+    };
+    assert!(error.to_string().contains("channel_send"));
+
+    let worker = LoopWorker::with_builtins(disabled, Arc::new(WorkerProvider), None, None)?;
+    let report = worker.run_goal_until_idle(&goal.id, 4).await?;
+    let item = report
+        .work_items
+        .iter()
+        .find(|item| item.step_id == "notify")
+        .expect("channel_send work item");
+    assert_eq!(item.status, WorkItemStatus::Failed);
+    assert!(sends.sends.lock().expect("sends").is_empty());
     Ok(())
 }

@@ -723,15 +723,30 @@ async fn handle_telegram_goal_command(
     };
     match engine.plan_goal_recommended(&created.id, &actor).await {
         Ok(plan) => {
+            let effect_manifest = plan
+                .effect_manifest
+                .iter()
+                .map(|effect| effect.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let step_lines = plan
+                .workflow
+                .steps
+                .iter()
+                .map(|step| format!("- {}: {} [{}]", step.id, step.handler, step.effect.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n");
             send_telegram_command_reply(
                 sender,
                 message,
                 &format!(
-                    "Goal 已生成安全计划，尚未执行。\ngoal_id={}\nstatus={}\nrevision={}\nplan_hash={}\n\n确认后执行:\n/goal approve {} {} {}",
+                    "Goal 已生成安全计划，尚未执行。\ngoal_id={}\nstatus={}\nrevision={}\nplan_hash={}\neffects: {}\n{}\n\n确认后执行:\n/goal approve {} {} {}",
                     plan.goal.id,
                     enum_label(&plan.goal.status),
                     plan.goal.revision,
                     plan.plan_hash,
+                    effect_manifest,
+                    step_lines,
                     plan.goal.id,
                     plan.goal.revision,
                     plan.plan_hash,
@@ -790,10 +805,11 @@ async fn handle_telegram_resume_command(
             ];
             for item in report.work_items.iter().take(20) {
                 lines.push(format!(
-                    "- {} · {} · {}",
+                    "- {} · {} · {} [{}]",
                     item.step_id,
                     enum_label(&item.status),
-                    item.handler
+                    item.handler,
+                    item.effect.as_str()
                 ));
             }
             if let Some(checkpoint) = report.latest_checkpoint {

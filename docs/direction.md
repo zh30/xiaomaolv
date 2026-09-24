@@ -131,3 +131,32 @@ project into loop-engine state (Phase B); ordinary turns do not.
 **Revisit when:** Phase C lands `channel_send`; if post-crash silence proves annoying, the seam
 is a small pending-reply reconciliation in `prepare_turn`/`persist_assistant_reply`, not a full
 turn workflow.
+
+### 2026-09-24 — External writes open through layered gates, not one flag
+
+**Decision:** `external_write` is admitted by `ExternalWritePolicy { enabled, allowed_handlers }`
+held on `LoopEngine`, and enforced at four independent points — plan validation
+(`WorkflowSpec::validate_with_policy`), approval (re-checks the *current* policy inside the
+approval transaction), dynamic extension (`extend_workflow`), and worker dispatch. Handler
+registration carries the same allowlist, so constructing a `channel_send` worker without the
+allowlist entry is a startup error, not a runtime surprise.
+
+**Rationale:**
+
+- Each layer is a distinct failure mode. A flag flip between plan and approve is covered by the
+  approval re-check; a config downgrade between approve and dispatch is covered by the worker
+  gate; dynamic extension cannot smuggle a write past the manifest. No single point is trusted.
+- `channel_send` is deliberately the only handler. The `OutboundSender` seam keeps the engine
+  ignorant of channel internals — the channel layer adapts `TelegramSender`, parses
+  `tg:{chat_id}[:thread|reply:{id}]` session ids, and returns evidence (`sent_at`, chat id).
+  New external-write handlers must each earn an allowlist entry.
+- The idempotency key is the prepared checkpoint key `{work_item.id}:{attempt.id}:v1` — the
+  same (work item, attempt) unit the engine already treats as the at-least-once boundary. A
+  crash between send and commit lands in `waiting_confirmation`: visible in goal detail and
+  `/resume`, never silently resent, never silently lost. That is the honest semantics — we do
+  not claim exactly-once.
+
+**Open seam:** `waiting_confirmation` has no operator resolve/reject path yet — parked items
+stay visible but cannot be unblocked. If that proves to matter, add an operator confirm route
+that either marks the item satisfied (send verified externally) or re-queues it with a new
+attempt number (new idempotency key, explicit operator-authorized resend).

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,18 +31,42 @@ pub trait WorkHandler: Send + Sync {
     async fn execute(&self, context: &WorkHandlerContext) -> anyhow::Result<WorkOutcome>;
 }
 
+/// Outbound delivery capability injected into `external_write` handlers such
+/// as `channel_send`. `idempotency_key` is stable per (work item, attempt);
+/// delivery is at-least-once — implementations should dedupe on the key where
+/// the underlying channel supports it.
+#[async_trait]
+pub trait OutboundSender: Send + Sync {
+    async fn send(
+        &self,
+        channel: &str,
+        session_id: &str,
+        text: &str,
+        idempotency_key: &str,
+    ) -> anyhow::Result<serde_json::Value>;
+}
+
 #[derive(Default)]
 pub struct WorkHandlerRegistry {
     handlers: HashMap<String, Arc<dyn WorkHandler>>,
+    external_write_allowlist: BTreeSet<String>,
 }
 
 impl WorkHandlerRegistry {
+    /// Allowlist applied to `external_write` handler registration. Without it
+    /// (the default) every external-write handler is rejected.
+    pub fn with_external_write_allowlist(mut self, allowlist: BTreeSet<String>) -> Self {
+        self.external_write_allowlist = allowlist;
+        self
+    }
+
     pub fn register(&mut self, handler: Arc<dyn WorkHandler>) -> anyhow::Result<()> {
-        ensure!(
-            handler.effect_class() != EffectClass::ExternalWrite,
-            "external_write handlers are not enabled in this release"
-        );
         let name = handler.name();
+        ensure!(
+            handler.effect_class() != EffectClass::ExternalWrite
+                || self.external_write_allowlist.contains(name),
+            "external_write handler '{name}' is not in the allowlist"
+        );
         ensure!(!name.trim().is_empty(), "handler name cannot be empty");
         ensure!(
             self.handlers.insert(name.to_string(), handler).is_none(),
@@ -64,12 +88,17 @@ pub struct LoopWorker {
 }
 
 impl LoopWorker {
+    /// `outbound` supplies the `channel_send` delivery capability. It is only
+    /// registered when the engine's `ExternalWritePolicy` allowlists it —
+    /// passing a sender without the allowlist entry is a startup error.
     pub fn with_builtins(
         engine: Arc<LoopEngine>,
         provider: Arc<dyn ChatProvider>,
         evolution_engine: Option<Arc<EvolutionEngine>>,
-    ) -> Self {
-        let mut handlers = WorkHandlerRegistry::default();
+        outbound: Option<Arc<dyn OutboundSender>>,
+    ) -> anyhow::Result<Self> {
+        let mut handlers = WorkHandlerRegistry::default()
+            .with_external_write_allowlist(engine.external_write_policy().allowed_handlers.clone());
         handlers
             .register(Arc::new(GoalPlannerHandler))
             .expect("built-in handler names are unique");
@@ -94,12 +123,19 @@ impl LoopWorker {
                 .register(Arc::new(BoundedEvolutionUnavailableHandler))
                 .expect("built-in handler names are unique");
         }
-        Self {
+        if let Some(sender) = outbound {
+            handlers
+                .register(Arc::new(ChannelSendHandler { sender }))
+                .context(
+                    "channel_send requires external_write_enabled and 'channel_send' in external_write_handlers",
+                )?;
+        }
+        Ok(Self {
             engine,
             handlers: Arc::new(handlers),
             worker_id: format!("loop-worker:{}", std::process::id()),
             lease_secs: 30,
-        }
+        })
     }
 
     pub fn with_registry(
@@ -191,6 +227,16 @@ impl LoopWorker {
                     false,
                     actor,
                 )
+                .await;
+        }
+        // Dispatch-time gate: the flag can be turned off after a plan was
+        // approved, so admission at plan/approve time is not sufficient.
+        if claim.work_item.effect == EffectClass::ExternalWrite
+            && !self.engine.external_write_policy().enabled
+        {
+            return self
+                .engine
+                .fail_attempt(&claim, "external_write is disabled", false, actor)
                 .await;
         }
         let checkpoint = self
@@ -379,6 +425,79 @@ impl WorkHandler for ProviderAnalysisHandler {
             summary: truncate_utf8(&response, 8_000),
             artifact_ids: vec![artifact.id],
             evidence: serde_json::json!({"artifact_kind": "analysis_report"}),
+        })
+    }
+}
+
+/// `channel_send` — the first controlled `external_write` handler. Sends a
+/// bounded text through the injected `OutboundSender`. The checkpoint written
+/// by `process_claim` before `execute` runs carries the same idempotency key,
+/// so a crash between send and commit parks the item in
+/// `waiting_confirmation` instead of resending.
+struct ChannelSendHandler {
+    sender: Arc<dyn OutboundSender>,
+}
+
+#[async_trait]
+impl WorkHandler for ChannelSendHandler {
+    fn name(&self) -> &'static str {
+        "channel_send"
+    }
+
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::ExternalWrite
+    }
+
+    async fn execute(&self, context: &WorkHandlerContext) -> anyhow::Result<WorkOutcome> {
+        let input = &context.claim.work_item.input;
+        let channel = input
+            .get("channel")
+            .and_then(serde_json::Value::as_str)
+            .context("channel_send requires input.channel")?;
+        let session_id = input
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .context("channel_send requires input.session_id")?;
+        let text = input
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .context("channel_send requires input.text")?;
+        ensure!(
+            !channel.trim().is_empty() && channel.len() <= 64,
+            "channel_send channel must be 1..=64 bytes"
+        );
+        ensure!(
+            !session_id.trim().is_empty() && session_id.len() <= 160,
+            "channel_send session_id must be 1..=160 bytes"
+        );
+        ensure!(
+            !text.trim().is_empty() && text.chars().count() <= 8192,
+            "channel_send text must be 1..=8192 chars"
+        );
+        // Same key shape `process_claim` used for the prepared checkpoint:
+        // (work item, attempt) is the at-least-once unit of delivery.
+        let idempotency_key = format!(
+            "{}:{}:v1",
+            context.claim.work_item.id, context.claim.attempt.id
+        );
+        let mut evidence = self
+            .sender
+            .send(channel, session_id, text, &idempotency_key)
+            .await?;
+        if let serde_json::Value::Object(map) = &mut evidence {
+            map.insert(
+                "idempotency_key".to_string(),
+                serde_json::Value::String(idempotency_key.clone()),
+            );
+        }
+        Ok(WorkOutcome {
+            summary: format!("sent channel message to {channel}:{session_id}"),
+            artifact_ids: Vec::new(),
+            evidence: serde_json::json!({
+                "channel": channel,
+                "session_id": session_id,
+                "send": evidence,
+            }),
         })
     }
 }
