@@ -363,6 +363,17 @@ the loop, which today does not exist.
   resume/verify/propose/ignore/evolution actions; fetch-based SSE reader for the goal event
   stream. No new backend semantics; native Desktop shell still deferred.
 
+### T13 — `waiting_confirmation` operator resolve path
+
+- [x] `ConfirmationResolution` (`confirmed`/`retry`/`abandoned`) +
+  `CheckpointPhase::Voided`; `LoopStore::resolve_waiting_confirmation` runs the
+  verdict in one goal-scoped transaction (commit+reconcile the prepared
+  checkpoint, or void it and re-queue/fail the item) and emits an auditable
+  `confirmation.resolved` event; `GET /goals/{id}/work-items` +
+  `POST /goals/{goal_id}/work-items/{work_item_id}/resolve-confirmation`
+  expose it to operators; the console renders parked items with resolve
+  buttons. Closes the last open seam in the `channel_send` crash story.
+
 ## Verification commands
 
 ```bash
@@ -411,3 +422,11 @@ cargo test --test agent_swarm_store --test service_pipeline --test harness_eval 
   self-tests, evolution), all plan/approve/resume/verify/propose/ignore/evolution actions,
   and a fetch-based SSE reader for live goal events. Browser-verified end-to-end against a
   live instance. `http_api` 17/17.
+- 2026-09-24 — **T12 follow-up:** browser-driven test fixed console action routing,
+  actor headers, and SSE stream persistence (commit 3c1abee). **T13 done:**
+  `waiting_confirmation` gains a single-use, goal-scoped operator exit —
+  `resolve-confirmation` with `confirmed`/`retry`/`abandoned` + mandatory audit
+  reason; `CheckpointPhase::Voided` terminalizes superseded prepared
+  checkpoints; `GET /work-items` exposes item state; console renders parked
+  items with resolve buttons. `harness_loop_engine` 28/28,
+  `http_loop_engine_api` 3/3, 41 test binaries green.

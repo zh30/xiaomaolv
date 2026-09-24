@@ -14,11 +14,11 @@ use super::artifacts::{
 };
 use super::domain::{
     ALLOWED_WORKFLOW_HANDLERS, AcceptanceCriterion, ApproveGoalRequest, AttemptRecord,
-    AttemptStatus, CheckpointPhase, CheckpointRecord, CreateGoalRequest, EffectClass,
-    ExternalWritePolicy, GoalRecord, GoalStatus, GoalVerificationReport, INTERNAL_ACTOR_PREFIX,
-    INTERNAL_AUTO_ACTOR, InternalApprovalPolicy, LoopEventRecord, PlanGoalRequest, PlannedGoal,
-    ProviderBudgetReservation, ResumeReport, WorkClaim, WorkItemRecord, WorkItemStatus,
-    WorkOutcome, WorkflowSpec, WorkflowStep, hash_serializable,
+    AttemptStatus, CheckpointPhase, CheckpointRecord, ConfirmationResolution, CreateGoalRequest,
+    EffectClass, ExternalWritePolicy, GoalRecord, GoalStatus, GoalVerificationReport,
+    INTERNAL_ACTOR_PREFIX, INTERNAL_AUTO_ACTOR, InternalApprovalPolicy, LoopEventRecord,
+    PlanGoalRequest, PlannedGoal, ProviderBudgetReservation, ResumeReport, WorkClaim,
+    WorkItemRecord, WorkItemStatus, WorkOutcome, WorkflowSpec, WorkflowStep, hash_serializable,
 };
 use super::replay::{
     ReplayRun, TrajectoryFrame, TrajectoryFrameDraft, initialize_replay_schema, list_frames,
@@ -233,6 +233,22 @@ pub trait LoopStore: Send + Sync {
 
     async fn resume_goal(&self, goal_id: &str, actor: &str)
     -> anyhow::Result<Option<ResumeReport>>;
+
+    /// Lists durable work items for a goal (operator inspection surface).
+    async fn list_work_items(&self, goal_id: &str) -> anyhow::Result<Vec<WorkItemRecord>>;
+
+    /// Operator verdict for a work item parked in `waiting_confirmation`.
+    /// `confirmed` commits the prepared checkpoint with an operator-attested
+    /// outcome; `retry` voids it and re-queues the item; `abandoned` voids it
+    /// and fails the item. Requires `reason` so the decision is auditable.
+    async fn resolve_waiting_confirmation(
+        &self,
+        goal_id: &str,
+        work_item_id: &str,
+        resolution: ConfirmationResolution,
+        reason: &str,
+        actor: &str,
+    ) -> anyhow::Result<WorkItemRecord>;
 }
 
 #[derive(Clone)]
@@ -1649,28 +1665,7 @@ impl LoopStore for SqliteLoopStore {
         let Some(goal) = self.get_goal(goal_id).await? else {
             return Ok(None);
         };
-        let rows = sqlx::query(
-            "SELECT id, goal_id, status, step_id, handler, effect_class, input_json,
-                    max_attempts, ordinal
-             FROM harness_work_items WHERE goal_id = ?1 ORDER BY ordinal, id",
-        )
-        .bind(goal_id)
-        .fetch_all(self.store.pool())
-        .await
-        .context("failed to load resumable work items")?;
-        let mut work_items = Vec::with_capacity(rows.len());
-        for row in rows {
-            let mut item = decode_work_item(row)?;
-            item.dependency_ids = sqlx::query_scalar::<_, String>(
-                "SELECT depends_on_work_item_id FROM harness_work_item_dependencies
-                 WHERE work_item_id = ?1 ORDER BY depends_on_work_item_id",
-            )
-            .bind(&item.id)
-            .fetch_all(self.store.pool())
-            .await
-            .context("failed to load work item dependencies")?;
-            work_items.push(item);
-        }
+        let work_items = load_goal_work_items(self.store.pool(), goal_id).await?;
         let attempts = sqlx::query(
             "SELECT id, goal_id, work_item_id, attempt_number, status, worker_id,
                     lease_token, fencing_token, started_at, finished_at, error
@@ -1710,6 +1705,242 @@ impl LoopStore for SqliteLoopStore {
             attempts,
             latest_checkpoint: checkpoint,
         }))
+    }
+
+    async fn list_work_items(&self, goal_id: &str) -> anyhow::Result<Vec<WorkItemRecord>> {
+        ensure_valid_id(goal_id, "goal id")?;
+        load_goal_work_items(self.store.pool(), goal_id).await
+    }
+
+    async fn resolve_waiting_confirmation(
+        &self,
+        goal_id: &str,
+        work_item_id: &str,
+        resolution: ConfirmationResolution,
+        reason: &str,
+        actor: &str,
+    ) -> anyhow::Result<WorkItemRecord> {
+        ensure_valid_id(goal_id, "goal id")?;
+        ensure_valid_id(work_item_id, "work item id")?;
+        let reason = reason.trim();
+        ensure!(
+            !reason.is_empty() && reason.len() <= 512,
+            "confirmation reason must be 1..=512 characters"
+        );
+        let mut tx = self.store.pool().begin().await?;
+        let item_row = sqlx::query(
+            "SELECT id, goal_id, status, step_id, handler, effect_class, input_json,
+                    max_attempts, ordinal
+             FROM harness_work_items WHERE id = ?1 AND goal_id = ?2",
+        )
+        .bind(work_item_id)
+        .bind(goal_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .context("work item not found")?;
+        let item = decode_work_item(item_row)?;
+        ensure!(
+            item.status == WorkItemStatus::WaitingConfirmation,
+            "work item is not awaiting confirmation"
+        );
+        ensure!(
+            item.effect == EffectClass::ExternalWrite,
+            "waiting_confirmation is only reachable for external_write work"
+        );
+        let attempt = sqlx::query(
+            "SELECT id, goal_id, work_item_id, attempt_number, status, worker_id,
+                    lease_token, fencing_token, started_at, finished_at, error
+             FROM harness_attempts
+             WHERE work_item_id = ?1 AND status = 'waiting_confirmation'
+             ORDER BY attempt_number DESC LIMIT 1",
+        )
+        .bind(work_item_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(decode_attempt)
+        .transpose()?
+        .context("no attempt is parked in waiting_confirmation")?;
+        let checkpoint = sqlx::query(
+            "SELECT id, goal_id, work_item_id, attempt_id, phase, idempotency_key,
+                    outcome_json, created_at, updated_at
+             FROM harness_checkpoints
+             WHERE attempt_id = ?1 AND phase = 'prepared'
+             ORDER BY sequence DESC LIMIT 1",
+        )
+        .bind(&attempt.id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(decode_checkpoint)
+        .transpose()?
+        .context("parked attempt has no prepared checkpoint")?;
+
+        let now = unix_now();
+        match resolution {
+            ConfirmationResolution::Confirmed => {
+                let outcome = WorkOutcome {
+                    summary: format!("operator confirmed external delivery: {reason}"),
+                    artifact_ids: Vec::new(),
+                    evidence: serde_json::json!({
+                        "confirmation": "operator",
+                        "resolution": "confirmed",
+                        "reason": reason,
+                    }),
+                };
+                sqlx::query(
+                    "UPDATE harness_checkpoints
+                     SET phase = 'committed', outcome_json = ?1, updated_at = ?2
+                     WHERE id = ?3 AND phase = 'prepared'",
+                )
+                .bind(serde_json::to_string(&outcome)?)
+                .bind(now)
+                .bind(&checkpoint.id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE harness_checkpoints
+                     SET phase = 'reconciled', updated_at = ?1
+                     WHERE id = ?2 AND phase = 'committed'",
+                )
+                .bind(now)
+                .bind(&checkpoint.id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE harness_attempts
+                     SET status = 'succeeded', finished_at = ?1, error = NULL
+                     WHERE id = ?2 AND status = 'waiting_confirmation'",
+                )
+                .bind(now)
+                .bind(&attempt.id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE harness_work_items
+                     SET status = 'succeeded', lease_token = NULL, lease_until = NULL,
+                         next_attempt_at = NULL, last_error = NULL, updated_at = ?1
+                     WHERE id = ?2 AND status = 'waiting_confirmation'",
+                )
+                .bind(now)
+                .bind(work_item_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            ConfirmationResolution::Retry => {
+                sqlx::query(
+                    "UPDATE harness_checkpoints
+                     SET phase = 'voided', updated_at = ?1
+                     WHERE id = ?2 AND phase = 'prepared'",
+                )
+                .bind(now)
+                .bind(&checkpoint.id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE harness_attempts
+                     SET status = 'abandoned', finished_at = ?1, error = ?2
+                     WHERE id = ?3 AND status = 'waiting_confirmation'",
+                )
+                .bind(now)
+                .bind(format!(
+                    "operator: effect not delivered, retry authorized ({reason})"
+                ))
+                .bind(&attempt.id)
+                .execute(&mut *tx)
+                .await?;
+                let attempt_count: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM harness_attempts WHERE work_item_id = ?1",
+                )
+                .bind(work_item_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                let (work_status, next_attempt_at, last_error) =
+                    if attempt_count >= i64::from(item.max_attempts) {
+                        (
+                            "failed",
+                            None,
+                            Some("attempt budget exhausted after operator retry".to_string()),
+                        )
+                    } else {
+                        (
+                            "ready",
+                            Some(now),
+                            Some(format!("retry authorized: {reason}")),
+                        )
+                    };
+                sqlx::query(
+                    "UPDATE harness_work_items
+                     SET status = ?1, lease_token = NULL, lease_until = NULL,
+                         next_attempt_at = ?2, last_error = ?3, updated_at = ?4
+                     WHERE id = ?5 AND status = 'waiting_confirmation'",
+                )
+                .bind(work_status)
+                .bind(next_attempt_at)
+                .bind(last_error)
+                .bind(now)
+                .bind(work_item_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            ConfirmationResolution::Abandoned => {
+                sqlx::query(
+                    "UPDATE harness_checkpoints
+                     SET phase = 'voided', updated_at = ?1
+                     WHERE id = ?2 AND phase = 'prepared'",
+                )
+                .bind(now)
+                .bind(&checkpoint.id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE harness_attempts
+                     SET status = 'failed', finished_at = ?1, error = ?2
+                     WHERE id = ?3 AND status = 'waiting_confirmation'",
+                )
+                .bind(now)
+                .bind(format!("operator abandoned: {reason}"))
+                .bind(&attempt.id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE harness_work_items
+                     SET status = 'failed', lease_token = NULL, lease_until = NULL,
+                         next_attempt_at = NULL, last_error = ?1, updated_at = ?2
+                     WHERE id = ?3 AND status = 'waiting_confirmation'",
+                )
+                .bind(format!("operator abandoned: {reason}"))
+                .bind(now)
+                .bind(work_item_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        unlock_ready_work_tx(&mut tx, &item.goal_id).await?;
+        refresh_goal_status_tx(&mut tx, &item.goal_id).await?;
+        insert_event(
+            &mut tx,
+            &item.goal_id,
+            "confirmation.resolved",
+            actor,
+            &serde_json::json!({
+                "work_item_id": work_item_id,
+                "attempt_id": attempt.id,
+                "checkpoint_id": checkpoint.id,
+                "resolution": resolution.as_str(),
+                "reason": reason,
+            })
+            .to_string(),
+        )
+        .await?;
+        tx.commit().await?;
+        let updated = sqlx::query(
+            "SELECT id, goal_id, status, step_id, handler, effect_class, input_json,
+                    max_attempts, ordinal
+             FROM harness_work_items WHERE id = ?1",
+        )
+        .bind(work_item_id)
+        .fetch_one(self.store.pool())
+        .await?;
+        decode_work_item(updated)
     }
 }
 
@@ -2211,6 +2442,35 @@ async fn recover_goal_state(pool: &SqlitePool, goal_id: &str, actor: &str) -> an
     }
     tx.commit().await?;
     Ok(())
+}
+
+async fn load_goal_work_items(
+    pool: &SqlitePool,
+    goal_id: &str,
+) -> anyhow::Result<Vec<WorkItemRecord>> {
+    let rows = sqlx::query(
+        "SELECT id, goal_id, status, step_id, handler, effect_class, input_json,
+                max_attempts, ordinal
+         FROM harness_work_items WHERE goal_id = ?1 ORDER BY ordinal, id",
+    )
+    .bind(goal_id)
+    .fetch_all(pool)
+    .await
+    .context("failed to load work items")?;
+    let mut work_items = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut item = decode_work_item(row)?;
+        item.dependency_ids = sqlx::query_scalar::<_, String>(
+            "SELECT depends_on_work_item_id FROM harness_work_item_dependencies
+             WHERE work_item_id = ?1 ORDER BY depends_on_work_item_id",
+        )
+        .bind(&item.id)
+        .fetch_all(pool)
+        .await
+        .context("failed to load work item dependencies")?;
+        work_items.push(item);
+    }
+    Ok(work_items)
 }
 
 fn unix_now() -> i64 {

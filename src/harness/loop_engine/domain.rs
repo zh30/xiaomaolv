@@ -105,6 +105,10 @@ pub enum CheckpointPhase {
     Prepared,
     Committed,
     Reconciled,
+    /// Terminal state for a prepared checkpoint superseded by an operator
+    /// decision: the external effect was confirmed NOT to have happened, so
+    /// the idempotency key will never be committed or replayed.
+    Voided,
 }
 
 impl CheckpointPhase {
@@ -113,6 +117,7 @@ impl CheckpointPhase {
             "prepared" => Ok(Self::Prepared),
             "committed" => Ok(Self::Committed),
             "reconciled" => Ok(Self::Reconciled),
+            "voided" => Ok(Self::Voided),
             other => bail!("unknown checkpoint phase: {other}"),
         }
     }
@@ -279,6 +284,42 @@ impl InternalApprovalPolicy {
             self.max_provider_calls
         );
         Ok(())
+    }
+}
+
+/// Operator resolution for a work item parked in `waiting_confirmation`.
+/// A crash between an external send and its checkpoint commit leaves the
+/// outcome unknowable to the engine; the operator supplies the verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmationResolution {
+    /// The external effect DID happen — commit the prepared checkpoint with
+    /// an operator-attested outcome and mark the item succeeded.
+    Confirmed,
+    /// The external effect did NOT happen — void the prepared checkpoint and
+    /// return the item to `ready` (or `failed` if attempts are exhausted).
+    Retry,
+    /// Do not retry and do not confirm — fail the item outright.
+    Abandoned,
+}
+
+impl ConfirmationResolution {
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "confirmed" => Ok(Self::Confirmed),
+            "retry" => Ok(Self::Retry),
+            "abandoned" => Ok(Self::Abandoned),
+            other => bail!(
+                "unknown confirmation resolution: {other} (expected confirmed|retry|abandoned)"
+            ),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Confirmed => "confirmed",
+            Self::Retry => "retry",
+            Self::Abandoned => "abandoned",
+        }
     }
 }
 

@@ -56,7 +56,12 @@ are not enabled. `external_write_enabled = true` opens a narrow gate: only handl
 `external_write_handlers` may plan, approve, register, or dispatch `external_write` steps —
 checked again at approve and dispatch time so disabling the flag between plan and run fails
 closed. Delivery is at-least-once: a crash between send and commit parks the work item in
-`waiting_confirmation` for operator review instead of resending.
+`waiting_confirmation` for operator review instead of resending. The operator then resolves the
+park through `POST .../resolve-confirmation` with a required audit reason: `confirmed` attests
+the external effect happened and commits the prepared checkpoint with an operator-attested
+outcome (item `succeeded`); `retry` attests it did not, voids the checkpoint, and re-queues the
+item (or fails it when the attempt budget is exhausted); `abandoned` voids the checkpoint and
+fails the item. Resolutions are single-use and goal-scoped.
 When `[agent.harness.evolution].enabled = true`, the `evolution_evaluate` handler adapts the
 existing prompt-candidate engine: it reserves exactly two provider calls per enabled eval case,
 enforces the Goal deadline and cumulative response-byte budget, and publishes only a compact
@@ -156,6 +161,8 @@ they require a configured operator key and `loop_engine.enabled = true`.
 | `POST` | `/v1/harness/goals/{id}/plan` | Store a validated Dynamic Workflow revision |
 | `POST` | `/v1/harness/goals/{id}/approve` | Approve the immutable revision/hash |
 | `POST` | `/v1/harness/goals/{id}/resume` | Recover and return work/attempt/checkpoint state |
+| `GET` | `/v1/harness/goals/{id}/work-items` | List durable work items for a goal |
+| `POST` | `/v1/harness/goals/{goal_id}/work-items/{work_item_id}/resolve-confirmation` | Operator verdict for a `waiting_confirmation` item |
 | `GET` | `/v1/harness/goals/{id}/events` | Cursor-based durable event snapshot |
 | `GET` | `/v1/harness/goals/{id}/events/stream` | SSE event stream for Desktop |
 | `POST` | `/v1/harness/goals/{id}/verify/manual` | Record a named manual criterion and re-verify |

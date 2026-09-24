@@ -3,11 +3,11 @@ use std::sync::Arc;
 use anyhow::Context;
 
 use super::domain::{
-    AcceptanceCriterion, ApproveGoalRequest, CheckpointRecord, CreateGoalRequest, EffectClass,
-    ExecutionBudget, ExternalWritePolicy, GoalRecord, GoalVerificationReport, LoopEventRecord,
-    PlanGoalRequest, PlannedGoal, ProviderBudgetReservation, ResumeReport, RetryPolicy, WorkClaim,
-    WorkItemRecord, WorkOutcome, WorkflowEdge, WorkflowSpec, WorkflowStep, hash_serializable,
-    validate_actor,
+    AcceptanceCriterion, ApproveGoalRequest, CheckpointRecord, ConfirmationResolution,
+    CreateGoalRequest, EffectClass, ExecutionBudget, ExternalWritePolicy, GoalRecord,
+    GoalVerificationReport, LoopEventRecord, PlanGoalRequest, PlannedGoal,
+    ProviderBudgetReservation, ResumeReport, RetryPolicy, WorkClaim, WorkItemRecord, WorkOutcome,
+    WorkflowEdge, WorkflowSpec, WorkflowStep, hash_serializable, validate_actor,
 };
 use super::store::LoopStore;
 use super::{
@@ -474,5 +474,28 @@ impl LoopEngine {
             .resume_goal(goal_id, actor)
             .await?
             .with_context(|| format!("goal not found: {goal_id}"))
+    }
+
+    /// Lists durable work items for a goal (operator inspection surface).
+    pub async fn list_work_items(&self, goal_id: &str) -> anyhow::Result<Vec<WorkItemRecord>> {
+        self.store.list_work_items(goal_id).await
+    }
+
+    /// Operator verdict for a `waiting_confirmation` work item. The operator
+    /// attests whether the external effect happened (`confirmed`), did not
+    /// happen and may retry (`retry`), or should be abandoned (`abandoned`).
+    /// `reason` is required so the decision is auditable in the event log.
+    pub async fn resolve_waiting_confirmation(
+        &self,
+        goal_id: &str,
+        work_item_id: &str,
+        resolution: ConfirmationResolution,
+        reason: &str,
+        actor: &str,
+    ) -> anyhow::Result<WorkItemRecord> {
+        validate_actor(actor)?;
+        self.store
+            .resolve_waiting_confirmation(goal_id, work_item_id, resolution, reason, actor)
+            .await
     }
 }

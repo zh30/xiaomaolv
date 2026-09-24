@@ -231,3 +231,139 @@ async fn operator_filters_signals_by_status_and_ignores_with_reason() {
         .await;
     propose.assert_status_bad_request();
 }
+
+#[tokio::test]
+async fn work_item_confirmation_resolve_over_http() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let database_url = format!("sqlite://{}", temp.path().join("resolve.db").display());
+    let mut cfg = config();
+    cfg.agent.harness.loop_engine.external_write_enabled = true;
+    cfg.agent.harness.loop_engine.external_write_handlers = vec!["channel_send".to_string()];
+    let app = build_router(
+        cfg.clone(),
+        &database_url,
+        Some(Arc::new(HarnessHttpProvider)),
+    )
+    .await
+    .expect("router");
+    let server = TestServer::new(app).expect("server");
+
+    // Create + plan + approve a channel_send goal over HTTP.
+    let created = operator(server.post("/v1/harness/goals"))
+        .json(&serde_json::json!({"objective": "notify", "auto_plan": false}))
+        .await;
+    created.assert_status_ok();
+    let goal: serde_json::Value = created.json();
+    let goal_id = goal["id"].as_str().expect("goal id");
+    let planned = operator(server.post(&format!("/v1/harness/goals/{goal_id}/plan")))
+        .json(&serde_json::json!({
+            "workflow": {
+                "steps": [{
+                    "id": "notify", "handler": "channel_send", "effect": "external_write",
+                    "input": {"channel": "telegram", "session_id": "tg:42", "text": "hi"},
+                    "retry": {"max_attempts": 1, "backoff_secs": 0}
+                }],
+                "edges": [],
+                "budget": {"max_provider_calls": 0, "deadline_secs": 60, "max_response_bytes": 1024}
+            },
+            "acceptance_criteria": [{"kind": "manual_approval", "label": "op"}]
+        }))
+        .await;
+    planned.assert_status_ok();
+    let planned: serde_json::Value = planned.json();
+    operator(server.post(&format!("/v1/harness/goals/{goal_id}/approve")))
+        .json(&serde_json::json!({
+            "expected_goal_revision": planned["goal"]["revision"],
+            "expected_plan_hash": planned["plan_hash"]
+        }))
+        .await
+        .assert_status_ok();
+
+    // Work items are visible to the operator.
+    let items = operator(server.get(&format!("/v1/harness/goals/{goal_id}/work-items"))).await;
+    items.assert_status_ok();
+    let items: serde_json::Value = items.json();
+    let work_item_id = items["work_items"][0]["id"]
+        .as_str()
+        .expect("work item id")
+        .to_string();
+    assert_eq!(items["work_items"][0]["status"], "ready");
+
+    // Park the item through a second engine on the same database (crash path).
+    {
+        use xiaomaolv::harness::loop_engine::{ExternalWritePolicy, LoopEngine, SqliteLoopStore};
+        use xiaomaolv::memory::SqliteMemoryStore;
+        let memory = SqliteMemoryStore::new(&database_url).await.expect("memory");
+        let engine = std::sync::Arc::new(
+            LoopEngine::new(std::sync::Arc::new(SqliteLoopStore::new(memory)))
+                .with_external_write_policy(ExternalWritePolicy {
+                    enabled: true,
+                    allowed_handlers: ["channel_send".to_string()].into_iter().collect(),
+                }),
+        );
+        let claim = engine
+            .claim_work_item(goal_id, "notify", "worker:ext", 1, "operator:test")
+            .await
+            .expect("claim")
+            .expect("claimable");
+        engine
+            .prepare_checkpoint(
+                &claim,
+                &format!("{}:{}:v1", claim.work_item.id, claim.attempt.id),
+                "worker:ext",
+            )
+            .await
+            .expect("prepare");
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+        engine
+            .resume_goal(goal_id, "operator:test")
+            .await
+            .expect("resume");
+    }
+
+    let parked = operator(server.get(&format!("/v1/harness/goals/{goal_id}/work-items"))).await;
+    let parked: serde_json::Value = parked.json();
+    assert_eq!(parked["work_items"][0]["status"], "waiting_confirmation");
+
+    // Wrong scope (ingest key) is rejected.
+    server
+        .post(&format!(
+            "/v1/harness/goals/{goal_id}/work-items/{work_item_id}/resolve-confirmation"
+        ))
+        .add_header("authorization", "Bearer ingest-key")
+        .json(&serde_json::json!({"resolution": "confirmed", "reason": "x"}))
+        .await
+        .assert_status_unauthorized();
+    // Unknown resolution is rejected.
+    operator(server.post(&format!(
+        "/v1/harness/goals/{goal_id}/work-items/{work_item_id}/resolve-confirmation"
+    )))
+    .json(&serde_json::json!({"resolution": "bogus", "reason": "x"}))
+    .await
+    .assert_status_bad_request();
+    // Cross-goal scoping is rejected.
+    operator(server.post(&format!(
+        "/v1/harness/goals/goal_other/work-items/{work_item_id}/resolve-confirmation"
+    )))
+    .json(&serde_json::json!({"resolution": "confirmed", "reason": "x"}))
+    .await
+    .assert_status_not_found();
+
+    // Confirmed resolution succeeds the item.
+    let resolved = operator(server.post(&format!(
+        "/v1/harness/goals/{goal_id}/work-items/{work_item_id}/resolve-confirmation"
+    )))
+    .json(&serde_json::json!({"resolution": "confirmed", "reason": "verified in telegram"}))
+    .await;
+    resolved.assert_status_ok();
+    let resolved: serde_json::Value = resolved.json();
+    assert_eq!(resolved["status"], "succeeded");
+
+    // Resolving again is a conflict.
+    operator(server.post(&format!(
+        "/v1/harness/goals/{goal_id}/work-items/{work_item_id}/resolve-confirmation"
+    )))
+    .json(&serde_json::json!({"resolution": "confirmed", "reason": "again"}))
+    .await
+    .assert_status(axum::http::StatusCode::CONFLICT);
+}

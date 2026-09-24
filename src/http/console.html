@@ -204,8 +204,29 @@ async function goalsList() {
     <table><tr><th>id</th><th>status</th><th>rev</th><th>objective</th><th>updated</th></tr>${rows || `<tr><td colspan="5" class="muted">none</td></tr>`}</table>`;
 }
 async function goalDetail(id) {
-  const g = await api("/v1/harness/goals/" + encodeURIComponent(id));
+  const [g, wi] = await Promise.all([
+    api("/v1/harness/goals/" + encodeURIComponent(id)),
+    api(`/v1/harness/goals/${encodeURIComponent(id)}/work-items`).catch(() => ({ work_items: [] })),
+  ]);
   const plan = g.plan;
+  const parked = (wi.work_items || []).filter((w) => w.status === "waiting_confirmation");
+  const parkedHtml = parked.length ? `<h2>awaiting confirmation</h2>` +
+    parked.map((w) => `
+      <div class="step"><b>${esc(w.step_id)}</b> · ${esc(w.handler)} ${chip("waiting_confirmation")}
+        <div class="muted small">external effect may have executed before the crash — did it happen?</div>
+        <div class="toolbar">
+          <input class="confReason" data-wid="${esc(w.id)}" placeholder="audit reason…" />
+          <button data-conf="confirmed" data-wid="${esc(w.id)}">confirmed</button>
+          <button data-conf="retry" data-wid="${esc(w.id)}">retry</button>
+          <button data-conf="abandoned" class="danger" data-wid="${esc(w.id)}">abandon</button>
+        </div>
+      </div>`).join("") : "";
+  const wiHtml = (wi.work_items || []).length ? `<h2>work items</h2>
+    <table><tr><th>step</th><th>handler</th><th>effect</th><th>status</th></tr>` +
+    (wi.work_items || []).map((w) => `
+      <tr><td>${esc(w.step_id)}</td><td class="muted">${esc(w.handler)}</td>
+      <td>${esc(w.effect)}</td><td>${chip(w.status)}</td></tr>`).join("") +
+    `</table>` : "";
   let planHtml = "";
   if (plan) {
     const steps = (plan.workflow?.steps || []).map((s) => `
@@ -243,6 +264,8 @@ async function goalDetail(id) {
       <textarea id="planJson">${esc(pretty(planTemplate(g.objective)))}</textarea>
       <button data-act="plan">POST plan</button></details>
     ${planHtml}
+    ${parkedHtml}
+    ${wiHtml}
     <h2>events</h2>
     <div class="toolbar">
       <button data-act="events">load events</button>
@@ -594,6 +617,24 @@ async function selectRow(id, tr) {
 function bindRight(id) {
   $("#right").querySelectorAll("[data-act]").forEach((b) =>
     b.addEventListener("click", () => act(id, b.dataset.act, b)));
+  $("#right").querySelectorAll("[data-conf]").forEach((b) =>
+    b.addEventListener("click", () => resolveConfirmation(id, b.dataset.wid, b.dataset.conf, b)));
+}
+async function resolveConfirmation(goalId, workItemId, resolution, btn) {
+  const reason = document.querySelector(`.confReason[data-wid="${workItemId}"]`)?.value.trim();
+  if (!reason) { toast("audit reason required", true); return; }
+  btn.disabled = true;
+  try {
+    const item = await api(
+      `/v1/harness/goals/${encodeURIComponent(goalId)}/work-items/${encodeURIComponent(workItemId)}/resolve-confirmation`,
+      { method: "POST", body: { resolution, reason } });
+    toast(`resolved: ${item.status}`);
+    await selectRow(goalId);
+    await refresh();
+  } catch (e) {
+    toast(e.message, true);
+    btn.disabled = false;
+  }
 }
 async function act(id, action, btn) {
   btn.disabled = true;

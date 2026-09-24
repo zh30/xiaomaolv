@@ -12,8 +12,8 @@ use axum::{Json, Router};
 use serde::Deserialize;
 
 use crate::harness::loop_engine::{
-    ApproveGoalRequest, CreateGoalRequest, CreateSignalRequest, LoopEngine, PlanGoalRequest,
-    PublishArtifactRequest, SignalStatus, SignalTrust,
+    ApproveGoalRequest, ConfirmationResolution, CreateGoalRequest, CreateSignalRequest, LoopEngine,
+    PlanGoalRequest, PublishArtifactRequest, SignalStatus, SignalTrust,
 };
 
 use super::{ApiError, AppState, check_rate_limit, constant_time_eq, verify_api_key};
@@ -32,6 +32,14 @@ pub(super) fn router() -> Router<AppState> {
         .route("/v1/harness/goals/{id}/plan", post(post_goal_plan))
         .route("/v1/harness/goals/{id}/approve", post(post_goal_approve))
         .route("/v1/harness/goals/{id}/resume", post(post_goal_resume))
+        .route(
+            "/v1/harness/goals/{id}/work-items",
+            get(get_goal_work_items),
+        )
+        .route(
+            "/v1/harness/goals/{goal_id}/work-items/{work_item_id}/resolve-confirmation",
+            post(post_work_item_resolve_confirmation),
+        )
         .route(
             "/v1/harness/goals/{id}/verify/manual",
             post(post_goal_manual_verification),
@@ -298,6 +306,52 @@ async fn post_goal_resume(
         })?;
     Ok(Json(
         serde_json::to_value(resumed).map_err(|error| ApiError::Internal(error.into()))?,
+    ))
+}
+
+async fn get_goal_work_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(goal_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (engine, _actor) = operator_context(&state, &headers).await?;
+    let work_items = engine.list_work_items(&goal_id).await.map_err(|error| {
+        if error.to_string().contains("invalid") {
+            bad_request(error)
+        } else {
+            internal(error)
+        }
+    })?;
+    Ok(Json(serde_json::json!({"work_items": work_items})))
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolveConfirmationRequest {
+    resolution: String,
+    reason: String,
+}
+
+async fn post_work_item_resolve_confirmation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((goal_id, work_item_id)): Path<(String, String)>,
+    Json(request): Json<ResolveConfirmationRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (engine, actor) = operator_context(&state, &headers).await?;
+    let resolution = ConfirmationResolution::parse(&request.resolution).map_err(bad_request)?;
+    let item = engine
+        .resolve_waiting_confirmation(&goal_id, &work_item_id, resolution, &request.reason, &actor)
+        .await
+        .map_err(|error| {
+            let message = error.to_string();
+            if message.contains("not found") {
+                ApiError::NotFound(message)
+            } else {
+                conflict(error)
+            }
+        })?;
+    Ok(Json(
+        serde_json::to_value(item).map_err(|error| ApiError::Internal(error.into()))?,
     ))
 }
 

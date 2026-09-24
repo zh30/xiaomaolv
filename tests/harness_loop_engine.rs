@@ -9,12 +9,12 @@ use xiaomaolv::harness::evolution::{
     EvolutionGateConfig,
 };
 use xiaomaolv::harness::loop_engine::{
-    AcceptanceCriterion, ApproveGoalRequest, ArtifactKind, CheckpointPhase, CreateGoalRequest,
-    CreateSignalRequest, EffectClass, ExecutionBudget, ExternalWritePolicy, GoalStatus, LoopEngine,
-    LoopWorker, OutboundSender, PlanGoalRequest, PublishArtifactRequest, ReplayStatus, RetryPolicy,
-    SelfTestStatus, SignalKind, SignalStatus, SignalTrust, SqliteLoopStore, TrajectoryFrameCapture,
-    TrajectoryFrameDraft, WorkHandler, WorkHandlerContext, WorkHandlerRegistry, WorkItemStatus,
-    WorkOutcome, WorkflowEdge, WorkflowSpec, WorkflowStep,
+    AcceptanceCriterion, ApproveGoalRequest, ArtifactKind, CheckpointPhase, ConfirmationResolution,
+    CreateGoalRequest, CreateSignalRequest, EffectClass, ExecutionBudget, ExternalWritePolicy,
+    GoalStatus, LoopEngine, LoopWorker, OutboundSender, PlanGoalRequest, PublishArtifactRequest,
+    ReplayStatus, RetryPolicy, SelfTestStatus, SignalKind, SignalStatus, SignalTrust,
+    SqliteLoopStore, TrajectoryFrameCapture, TrajectoryFrameDraft, WorkHandler, WorkHandlerContext,
+    WorkHandlerRegistry, WorkItemStatus, WorkOutcome, WorkflowEdge, WorkflowSpec, WorkflowStep,
 };
 use xiaomaolv::harness::store::SqliteEvolutionStore;
 use xiaomaolv::memory::SqliteMemoryStore;
@@ -1726,6 +1726,268 @@ async fn operator_reviews_signals_with_status_filter_ignore_and_propose() -> any
             .await?
             .len(),
         1
+    );
+    Ok(())
+}
+
+// ---- T13: waiting_confirmation operator resolve path ----
+
+/// Builds a goal with a parked channel_send work item: claimed, prepared
+/// checkpoint, lease expired, resume parks it in `waiting_confirmation`.
+/// Returns (engine, goal_id, work_item_id).
+async fn parked_channel_send(
+    database_url: &str,
+    max_attempts: u8,
+) -> anyhow::Result<(Arc<LoopEngine>, String, String)> {
+    let memory = SqliteMemoryStore::new(database_url).await?;
+    let engine = external_write_engine(memory, &["channel_send"]);
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Notify me externally".to_string(),
+                source_signal_ids: Vec::new(),
+            },
+            "operator:test",
+        )
+        .await?;
+    let mut request = channel_send_plan_request();
+    request.workflow.steps[0].retry.max_attempts = max_attempts;
+    let plan = engine.plan_goal(&goal.id, request, "operator:test").await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+    let claim = engine
+        .claim_work_item(&goal.id, "notify", "worker:ext", 1, "operator:test")
+        .await?
+        .expect("channel_send work item should be claimable");
+    let work_item_id = claim.work_item.id.clone();
+    engine
+        .prepare_checkpoint(
+            &claim,
+            &format!("{}:{}:v1", claim.work_item.id, claim.attempt.id),
+            "worker:ext",
+        )
+        .await?;
+    drop(engine);
+    // Lease expiry is whole-second compared; wait past it, then resume on a
+    // reopened store as if the process restarted.
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    let reopened = external_write_engine(
+        SqliteMemoryStore::new(database_url).await?,
+        &["channel_send"],
+    );
+    let report = reopened.resume_goal(&goal.id, "operator:test").await?;
+    assert_eq!(
+        report
+            .work_items
+            .iter()
+            .find(|item| item.id == work_item_id)
+            .map(|item| item.status),
+        Some(WorkItemStatus::WaitingConfirmation)
+    );
+    Ok((reopened, goal.id, work_item_id))
+}
+
+#[tokio::test]
+async fn resolve_confirmed_commits_operator_attested_outcome() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("conf-ok.db").display());
+    let (engine, goal_id, work_item_id) = parked_channel_send(&database_url, 1).await?;
+
+    let item = engine
+        .resolve_waiting_confirmation(
+            &goal_id,
+            &work_item_id,
+            ConfirmationResolution::Confirmed,
+            "telegram shows the message delivered",
+            "operator:test",
+        )
+        .await?;
+    assert_eq!(item.status, WorkItemStatus::Succeeded);
+
+    let report = engine.resume_goal(&goal_id, "operator:test").await?;
+    let checkpoint = report.latest_checkpoint.expect("resolved checkpoint");
+    assert_eq!(checkpoint.phase, CheckpointPhase::Reconciled);
+    let outcome = checkpoint.outcome.expect("attested outcome");
+    assert_eq!(outcome.evidence["resolution"], "confirmed");
+    assert!(outcome.summary.contains("telegram shows the message"));
+    assert!(
+        report
+            .attempts
+            .iter()
+            .any(|a| a.status == xiaomaolv::harness::loop_engine::AttemptStatus::Succeeded)
+    );
+    let events = engine.list_goal_events(&goal_id, 0, 50).await?;
+    assert!(
+        events
+            .iter()
+            .any(|e| e.event_type == "confirmation.resolved"
+                && e.details["resolution"] == "confirmed")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn resolve_retry_voids_checkpoint_and_requeues() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("conf-retry.db").display());
+    let (engine, goal_id, work_item_id) = parked_channel_send(&database_url, 2).await?;
+
+    let item = engine
+        .resolve_waiting_confirmation(
+            &goal_id,
+            &work_item_id,
+            ConfirmationResolution::Retry,
+            "chat history shows nothing was sent",
+            "operator:test",
+        )
+        .await?;
+    assert_eq!(item.status, WorkItemStatus::Ready);
+
+    // The prepared checkpoint is voided — its idempotency key can never be
+    // committed, and the work item is claimable again under a new attempt.
+    let report = engine.resume_goal(&goal_id, "operator:test").await?;
+    assert_eq!(
+        report.latest_checkpoint.map(|c| c.phase),
+        Some(CheckpointPhase::Voided)
+    );
+    let reclaim = engine
+        .claim_work_item(&goal_id, "notify", "worker:ext", 1, "operator:test")
+        .await?;
+    assert!(reclaim.is_some(), "retry-resolved item must be claimable");
+    Ok(())
+}
+
+#[tokio::test]
+async fn resolve_retry_exhausts_budget_fails_item() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("conf-exhaust.db").display());
+    let (engine, goal_id, work_item_id) = parked_channel_send(&database_url, 1).await?;
+
+    let item = engine
+        .resolve_waiting_confirmation(
+            &goal_id,
+            &work_item_id,
+            ConfirmationResolution::Retry,
+            "not delivered but no attempts remain",
+            "operator:test",
+        )
+        .await?;
+    assert_eq!(item.status, WorkItemStatus::Failed);
+    let goal = engine.get_goal(&goal_id).await?.expect("goal");
+    assert_eq!(goal.status, GoalStatus::Failed);
+    Ok(())
+}
+
+#[tokio::test]
+async fn resolve_abandoned_fails_item_and_goal() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("conf-abandon.db").display());
+    let (engine, goal_id, work_item_id) = parked_channel_send(&database_url, 2).await?;
+
+    let item = engine
+        .resolve_waiting_confirmation(
+            &goal_id,
+            &work_item_id,
+            ConfirmationResolution::Abandoned,
+            "do not retry; the notification is stale",
+            "operator:test",
+        )
+        .await?;
+    assert_eq!(item.status, WorkItemStatus::Failed);
+    let goal = engine.get_goal(&goal_id).await?.expect("goal");
+    assert_eq!(goal.status, GoalStatus::Failed);
+
+    // A parked item that was resolved cannot be resolved again.
+    let second = engine
+        .resolve_waiting_confirmation(
+            &goal_id,
+            &work_item_id,
+            ConfirmationResolution::Confirmed,
+            "late change of mind",
+            "operator:test",
+        )
+        .await;
+    assert!(second.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn resolve_rejects_non_parked_and_cross_goal_items() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("conf-reject.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = external_write_engine(memory, &["channel_send"]);
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Notify me externally".to_string(),
+                source_signal_ids: Vec::new(),
+            },
+            "operator:test",
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(&goal.id, channel_send_plan_request(), "operator:test")
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+    let items = engine.list_work_items(&goal.id).await?;
+    let item = items.first().expect("work item");
+
+    // Not parked yet — resolving must fail.
+    assert!(
+        engine
+            .resolve_waiting_confirmation(
+                &goal.id,
+                &item.id,
+                ConfirmationResolution::Confirmed,
+                "premature",
+                "operator:test",
+            )
+            .await
+            .is_err()
+    );
+    // Cross-goal scoping: a different goal id must not resolve the item.
+    assert!(
+        engine
+            .resolve_waiting_confirmation(
+                "goal_nonexistent",
+                &item.id,
+                ConfirmationResolution::Confirmed,
+                "wrong goal",
+                "operator:test",
+            )
+            .await
+            .is_err()
+    );
+    // Reason is required.
+    assert!(
+        engine
+            .resolve_waiting_confirmation(
+                &goal.id,
+                &item.id,
+                ConfirmationResolution::Confirmed,
+                "   ",
+                "operator:test",
+            )
+            .await
+            .is_err()
     );
     Ok(())
 }

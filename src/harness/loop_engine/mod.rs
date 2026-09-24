@@ -10,10 +10,11 @@ mod worker;
 pub use artifacts::{ArtifactKind, ArtifactPublishResult, ArtifactRecord, PublishArtifactRequest};
 pub use domain::{
     AcceptanceCriterion, ApproveGoalRequest, AttemptRecord, AttemptStatus, CheckpointPhase,
-    CheckpointRecord, CreateGoalRequest, EffectClass, ExecutionBudget, ExternalWritePolicy,
-    GoalRecord, GoalStatus, GoalVerificationReport, InternalApprovalPolicy, LoopEventRecord,
-    PlanGoalRequest, PlannedGoal, ProviderBudgetReservation, ResumeReport, RetryPolicy, WorkClaim,
-    WorkItemRecord, WorkItemStatus, WorkOutcome, WorkflowEdge, WorkflowSpec, WorkflowStep,
+    CheckpointRecord, ConfirmationResolution, CreateGoalRequest, EffectClass, ExecutionBudget,
+    ExternalWritePolicy, GoalRecord, GoalStatus, GoalVerificationReport, InternalApprovalPolicy,
+    LoopEventRecord, PlanGoalRequest, PlannedGoal, ProviderBudgetReservation, ResumeReport,
+    RetryPolicy, WorkClaim, WorkItemRecord, WorkItemStatus, WorkOutcome, WorkflowEdge,
+    WorkflowSpec, WorkflowStep,
 };
 pub use engine::LoopEngine;
 pub use replay::{
