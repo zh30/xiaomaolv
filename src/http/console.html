@@ -109,7 +109,7 @@ const $ = (s) => document.querySelector(s);
 const state = {
   base: localStorage.getItem("xc.base") || location.origin,
   key: localStorage.getItem("xc.key") || "",
-  actor: localStorage.getItem("xc.actor") || "operator:console",
+  actor: localStorage.getItem("xc.actor") || "operator-console",
   tab: "goals",
   sel: null,
   stream: null,
@@ -121,7 +121,7 @@ $("#actor").value = state.actor;
 function saveCreds() {
   state.base = $("#base").value.trim().replace(/\/+$/, "") || location.origin;
   state.key = $("#key").value.trim();
-  state.actor = $("#actor").value.trim() || "operator:console";
+  state.actor = $("#actor").value.trim() || "operator-console";
   localStorage.setItem("xc.base", state.base);
   localStorage.setItem("xc.key", state.key);
   localStorage.setItem("xc.actor", state.actor);
@@ -147,7 +147,7 @@ function pretty(v) { return JSON.stringify(v, null, 2); }
 
 async function api(path, opts = {}) {
   const headers = Object.assign(
-    { "x-harness-actor": state.actor },
+    { "x-harness-actor": state.actor, "x-evolution-actor": state.actor },
     opts.headers || {}
   );
   if (state.key) headers["Authorization"] = "Bearer " + state.key;
@@ -500,8 +500,8 @@ async function candDetail(id) {
     <div class="toolbar">
       <button data-act="evaluate">evaluate</button>
       <input id="candReason" placeholder="reason (approve/activate)" />
-      <button data-act="approve">approve</button>
-      <button data-act="activate" class="primary">activate</button>
+      <button data-act="evapprove">approve</button>
+      <button data-act="evactivate" class="primary">activate</button>
     </div>
     ${ev ? `<h2>latest evaluation</h2><pre>${esc(pretty(ev))}</pre>` : ""}
     ${rawBlock(c)}`;
@@ -653,21 +653,23 @@ async function act(id, action, btn) {
         $("#right").insertAdjacentHTML("beforeend", `<h2>evaluation</h2><pre>${esc(pretty(d.evaluation))}</pre>`);
         return;
       }
-      case "approve": {
+      case "evapprove": {
         const reason = $("#candReason").value.trim() || "operator approved";
         await api(`/v1/harness/evolution/candidates/${encodeURIComponent(id)}/approve`, {
           method: "POST", body: { reason } });
         toast("approved"); break;
       }
-      case "activate": {
+      case "evactivate": {
         const reason = $("#candReason").value.trim() || "operator activated";
         await api(`/v1/harness/evolution/candidates/${encodeURIComponent(id)}/activate`, {
           method: "POST", body: { reason } });
         toast("activated"); break;
       }
     }
+    const wasStreaming = !!state.stream;
     await selectRow(id); // refresh detail after mutations
     await refresh();
+    if (wasStreaming && state.tab === "goals") streamGoal(id);
   } catch (e) {
     toast(e.message, true);
     btn.disabled = false;
