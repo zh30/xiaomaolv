@@ -135,15 +135,17 @@ plus their free helpers (`build_mcp_system_prompt`, `parse_mcp_tool_call`, strea
 chunker, code-mode audit/circuit functions) are ~1,500 lines of provider-call machinery.
 
 **Steps:**
-- [ ] Create `src/service/completion.rs` (or `completion/` if it exceeds ~900 lines — split as
-  `completion/mcp_loop.rs` + `completion/code_mode_path.rs`).
-- [ ] Move the completion methods into `impl MessageService` in the submodule(s) plus the free
-  helpers they own. Move `CompletionOutcome`, `CodeModeCompletion`, `CodeModeAttempt`,
-  `CodeModeCircuitChange`, `McpLoopObserver`, stream sink adapters (`IdentitySink`,
-  `BufferedStreamReplay`, `StreamReplayChunker`) if only completion code uses them.
-- [ ] Keep `code_mode_diagnostics`/`code_mode_metrics_prometheus` accessors in `service.rs`
-  (public API) or move with `pub use` — pick whichever keeps the diff smallest.
-- [ ] Verify: full `cargo test --all-targets` — MCP loop and code-mode tests must pass
+- [x] Create `src/service/completion/` split as `mod.rs` (dispatch + stream sinks + telemetry),
+  `mcp_loop.rs` (both MCP loop variants + prompt builder), and `code_mode_path.rs` (Code Mode
+  path + timeout circuit) — the single-file form exceeded the ~900-line threshold.
+- [x] Move the completion methods into `impl MessageService` in the submodule(s) plus the free
+  helpers they own. `CompletionOutcome` stays in `service.rs` (consumed by `handle`);
+  `CodeModeCompletion`, `CodeModeAttempt`, `CodeModeCircuitChange`, `McpLoopTelemetry`, and the
+  stream sink adapters moved into `completion/`. Test-only imports reach them via
+  `pub(super)`/`pub(crate)` re-exports in `completion/mod.rs`.
+- [x] Keep `code_mode_diagnostics`/`code_mode_metrics_prometheus` accessors in `service.rs`
+  (public API) — smallest diff.
+- [x] Verify: full `cargo test --all-targets` — MCP loop and code-mode tests must pass
   unchanged.
 
 ### T4 (P1) — Move delegates and streaming adapters into submodules
