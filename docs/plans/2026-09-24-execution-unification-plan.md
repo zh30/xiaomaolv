@@ -163,12 +163,14 @@ chunker, code-mode audit/circuit functions) are ~1,500 lines of provider-call ma
 ### T5 (P1) — Move tests into `src/service/tests.rs`
 
 **Steps:**
-- [ ] Move `#[cfg(test)] mod tests` (and `#[cfg(test)]` free helpers like `truncate_json_value`,
-  `parse_mcp_tool_call` if only tests use them) into `src/service/tests.rs` as
-  `use super::*;` + test fns.
-- [ ] Target: `service.rs` <= ~1,500 lines containing settings structs, `MessageService`,
+- [x] Move `#[cfg(test)] mod tests` (and `#[cfg(test)]` free helpers like `truncate_json_value`,
+  `parse_mcp_tool_call` if only tests use them) into `src/service/tests.rs` — `parse_mcp_tool_call`
+  moved earlier into `completion/mcp_loop.rs` and is reached via re-export.
+- [x] Additionally split `src/service/time_query.rs` (time fast-path free helpers) so the root
+  file meets its size target without mixing unrelated domains.
+- [x] Target: `service.rs` is now ~1,470 lines containing settings structs, `MessageService`,
   builders, `handle`/`handle_stream` orchestration, `prepare_turn`, and stage helpers.
-- [ ] Verify: `cargo test --all-targets`, `cargo clippy --all-targets -- -D warnings`.
+- [x] Verify: `cargo test --all-targets`, `cargo clippy --all-targets -- -D warnings`.
 
 ### T6 (P1) — Durable swarm projection
 
