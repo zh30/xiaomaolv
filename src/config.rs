@@ -524,6 +524,25 @@ pub struct AgentLoopEngineConfig {
     pub worker_max_parallel: usize,
     #[serde(default)]
     pub self_test_interval_secs: u64,
+    /// Effect ceiling for `internal:auto` plan approvals (`"pure"`, `"read"`,
+    /// `"local_write"`, `"external_write"`). Subsystem actors such as
+    /// `internal:swarm` are unaffected: they approve only their own
+    /// code-constructed plan shapes.
+    #[serde(default = "default_internal_auto_approve_max_effect")]
+    pub internal_auto_approve_max_effect: String,
+    /// Provider-call budget ceiling for `internal:auto` plan approvals.
+    #[serde(default = "default_internal_auto_approve_max_provider_calls")]
+    pub internal_auto_approve_max_provider_calls: u32,
+    /// Feature gate for `external_write` workflow steps. Disabled by default;
+    /// delivery is at-least-once and a crash between send and commit parks the
+    /// work item in `waiting_confirmation` for operator review.
+    #[serde(default)]
+    pub external_write_enabled: bool,
+    /// Handler allowlist applied when `external_write_enabled = true`. Only
+    /// allowlisted names may plan, approve, register, or dispatch
+    /// external-write work. Currently only `channel_send` exists.
+    #[serde(default)]
+    pub external_write_handlers: Vec<String>,
 }
 
 impl Default for AgentLoopEngineConfig {
@@ -536,6 +555,11 @@ impl Default for AgentLoopEngineConfig {
             worker_lease_secs: default_loop_worker_lease_secs(),
             worker_max_parallel: default_loop_worker_max_parallel(),
             self_test_interval_secs: 0,
+            internal_auto_approve_max_effect: default_internal_auto_approve_max_effect(),
+            internal_auto_approve_max_provider_calls:
+                default_internal_auto_approve_max_provider_calls(),
+            external_write_enabled: false,
+            external_write_handlers: Vec::new(),
         }
     }
 }
@@ -897,6 +921,14 @@ fn default_loop_worker_lease_secs() -> u32 {
 
 fn default_loop_worker_max_parallel() -> usize {
     2
+}
+
+fn default_internal_auto_approve_max_effect() -> String {
+    "read".to_string()
+}
+
+fn default_internal_auto_approve_max_provider_calls() -> u32 {
+    16
 }
 
 fn default_agent_swarm_enabled() -> bool {

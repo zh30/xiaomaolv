@@ -12,8 +12,8 @@ use axum::{Json, Router};
 use serde::Deserialize;
 
 use crate::harness::loop_engine::{
-    ApproveGoalRequest, CreateGoalRequest, CreateSignalRequest, LoopEngine, PlanGoalRequest,
-    PublishArtifactRequest, SignalTrust,
+    ApproveGoalRequest, ConfirmationResolution, CreateGoalRequest, CreateSignalRequest, LoopEngine,
+    PlanGoalRequest, PublishArtifactRequest, SignalStatus, SignalTrust,
 };
 
 use super::{ApiError, AppState, check_rate_limit, constant_time_eq, verify_api_key};
@@ -33,6 +33,14 @@ pub(super) fn router() -> Router<AppState> {
         .route("/v1/harness/goals/{id}/approve", post(post_goal_approve))
         .route("/v1/harness/goals/{id}/resume", post(post_goal_resume))
         .route(
+            "/v1/harness/goals/{id}/work-items",
+            get(get_goal_work_items),
+        )
+        .route(
+            "/v1/harness/goals/{goal_id}/work-items/{work_item_id}/resolve-confirmation",
+            post(post_work_item_resolve_confirmation),
+        )
+        .route(
             "/v1/harness/goals/{id}/verify/manual",
             post(post_goal_manual_verification),
         )
@@ -42,6 +50,7 @@ pub(super) fn router() -> Router<AppState> {
             "/v1/harness/signals/{id}/propose-goal",
             post(post_signal_propose_goal),
         )
+        .route("/v1/harness/signals/{id}/ignore", post(post_signal_ignore))
         .route("/v1/harness/self-tests/{suite}", post(post_self_test))
         .route("/v1/harness/self-test-runs/{id}", get(get_self_test_run))
         .route(
@@ -76,6 +85,9 @@ fn default_auto_plan() -> bool {
 struct ListQuery {
     #[serde(default = "default_list_limit")]
     limit: usize,
+    /// Optional signal status filter; ignored by non-signal list endpoints.
+    #[serde(default)]
+    status: Option<SignalStatus>,
 }
 
 fn default_list_limit() -> usize {
@@ -133,9 +145,18 @@ async fn get_goal(
         .await
         .map_err(internal)?
         .ok_or_else(|| ApiError::NotFound(format!("goal not found: {goal_id}")))?;
-    Ok(Json(
-        serde_json::to_value(goal).map_err(|error| ApiError::Internal(error.into()))?,
-    ))
+    let plan = engine.get_goal_plan(&goal_id).await.map_err(internal)?;
+    let mut value =
+        serde_json::to_value(&goal).map_err(|error| ApiError::Internal(error.into()))?;
+    value["plan"] = plan.map_or(serde_json::Value::Null, |plan| {
+        serde_json::json!({
+            "plan_hash": plan.plan_hash,
+            "workflow": plan.workflow,
+            "acceptance_criteria": plan.acceptance_criteria,
+            "effect_manifest": plan.effect_manifest,
+        })
+    });
+    Ok(Json(value))
 }
 
 #[derive(Debug, Deserialize)]
@@ -288,6 +309,52 @@ async fn post_goal_resume(
     ))
 }
 
+async fn get_goal_work_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(goal_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (engine, _actor) = operator_context(&state, &headers).await?;
+    let work_items = engine.list_work_items(&goal_id).await.map_err(|error| {
+        if error.to_string().contains("invalid") {
+            bad_request(error)
+        } else {
+            internal(error)
+        }
+    })?;
+    Ok(Json(serde_json::json!({"work_items": work_items})))
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolveConfirmationRequest {
+    resolution: String,
+    reason: String,
+}
+
+async fn post_work_item_resolve_confirmation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((goal_id, work_item_id)): Path<(String, String)>,
+    Json(request): Json<ResolveConfirmationRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (engine, actor) = operator_context(&state, &headers).await?;
+    let resolution = ConfirmationResolution::parse(&request.resolution).map_err(bad_request)?;
+    let item = engine
+        .resolve_waiting_confirmation(&goal_id, &work_item_id, resolution, &request.reason, &actor)
+        .await
+        .map_err(|error| {
+            let message = error.to_string();
+            if message.contains("not found") {
+                ApiError::NotFound(message)
+            } else {
+                conflict(error)
+            }
+        })?;
+    Ok(Json(
+        serde_json::to_value(item).map_err(|error| ApiError::Internal(error.into()))?,
+    ))
+}
+
 #[derive(Debug, Deserialize)]
 struct ManualVerificationRequest {
     label: String,
@@ -339,7 +406,10 @@ async fn list_signals(
     Query(query): Query<ListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (engine, _) = operator_context(&state, &headers).await?;
-    let signals = engine.list_signals(query.limit).await.map_err(internal)?;
+    let signals = engine
+        .list_signals(query.limit, query.status)
+        .await
+        .map_err(internal)?;
     Ok(Json(serde_json::json!({"signals": signals})))
 }
 
@@ -377,6 +447,27 @@ async fn post_signal_propose_goal(
         .map_err(bad_request)?;
     Ok(Json(
         serde_json::to_value(goal).map_err(|error| ApiError::Internal(error.into()))?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct IgnoreSignalRequest {
+    reason: String,
+}
+
+async fn post_signal_ignore(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(signal_id): Path<String>,
+    Json(request): Json<IgnoreSignalRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (engine, actor) = operator_context(&state, &headers).await?;
+    let signal = engine
+        .ignore_signal(&signal_id, &request.reason, &actor)
+        .await
+        .map_err(bad_request)?;
+    Ok(Json(
+        serde_json::to_value(signal).map_err(|error| ApiError::Internal(error.into()))?,
     ))
 }
 

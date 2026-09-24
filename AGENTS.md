@@ -107,6 +107,7 @@ Capability metadata filters MCP access before execution. `subprocess` is not an 
 - Evolution is disabled by default and only evolves a bounded replacement system-prompt patch
 - Automatic cycles consume failed trajectories or negative feedback and stop at `ready`
 - Shadow evaluation calls the provider directly and cannot execute tools, write memory, or send messages
+- Shadow evaluation scores operator eval cases plus the versioned benchmark suite (`harness/benchmark.rs`, `id@version`); benchmark regressions are always fatal regardless of `max_regressions`
 - Human approval and activation are separate authenticated operations; rollback restores the prior deployment
 - SQLite stores candidates, eval snapshots, feedback, deployments, the active pointer, and immutable audit events
 - Full bounded evidence SHA-256 is globally unique to prevent stale or concurrent duplicate proposals
@@ -117,11 +118,11 @@ Capability metadata filters MCP access before execution. `subprocess` is not an 
 - Planning never dispatches work; approval binds the exact goal revision, plan hash, effect manifest, acceptance criteria, and execution budget
 - `LoopWorker` uses at-least-once claims, expiring leases, monotonically increasing fencing tokens, and prepared/committed/reconciled checkpoints
 - `/resume` expires stale leases and reconciles committed outcomes without replaying their effects
-- Registered handlers are `goal_planner`, `provider_analysis`, `self_test_suite`, `session_replay`, `manual_gate`, and `evolution_evaluate`; `external_write` handlers are rejected
-- Multi-source `EvolutionSignal` records preserve source/trust/deduplication metadata; only an operator route can convert them into `proposed` goals
+- Registered handlers are `goal_planner`, `provider_analysis`, `self_test_suite`, `session_replay`, `manual_gate`, `evolution_evaluate`, and — only behind `external_write_enabled` plus a handler allowlist — `channel_send`; unlisted `external_write` handlers are rejected at plan/approve/register/dispatch; `waiting_confirmation` parks are resolved via the goal-scoped `resolve-confirmation` route (`confirmed`/`retry`/`abandoned` + audit reason)
+- Multi-source `EvolutionSignal` records preserve source/trust/deduplication metadata; ingestion dedups on exact keys, normalized content, and token-set near-duplicates; only an operator route can convert `observed`/`triaged` signals into `proposed` goals or mark them `ignored` (HTTP + Telegram `/signals`)
 - Production `core` self-tests are read-only; repeated identical failure sets produce one deduplicated internal signal
 - Provider frames are recorded for main plain, Code Mode, and MCP completion paths when trajectory logging is enabled; structural replay executes zero live tools
-- HTTP collection/detail resources plus per-goal monotonic SSE are the Desktop boundary; no Desktop GUI is implemented
+- HTTP collection/detail resources plus per-goal monotonic SSE are the Desktop boundary; `GET /console` serves an embedded single-file operator dashboard over that contract (same bearer auth, no new backend semantics)
 - The evolution adapter may evaluate an existing prompt candidate, but approval, activation, and rollback remain exclusively in `EvolutionEngine`
 
 ### Plugin Architecture

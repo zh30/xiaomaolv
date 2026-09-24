@@ -105,6 +105,10 @@ pub enum CheckpointPhase {
     Prepared,
     Committed,
     Reconciled,
+    /// Terminal state for a prepared checkpoint superseded by an operator
+    /// decision: the external effect was confirmed NOT to have happened, so
+    /// the idempotency key will never be committed or replayed.
+    Voided,
 }
 
 impl CheckpointPhase {
@@ -113,6 +117,7 @@ impl CheckpointPhase {
             "prepared" => Ok(Self::Prepared),
             "committed" => Ok(Self::Committed),
             "reconciled" => Ok(Self::Reconciled),
+            "voided" => Ok(Self::Voided),
             other => bail!("unknown checkpoint phase: {other}"),
         }
     }
@@ -201,8 +206,148 @@ pub struct WorkflowSpec {
     pub budget: ExecutionBudget,
 }
 
+pub(crate) const ALLOWED_WORKFLOW_HANDLERS: &[&str] = &[
+    "goal_planner",
+    "provider_analysis",
+    "session_replay",
+    "self_test_suite",
+    "evolution_evaluate",
+    "manual_gate",
+    "channel_send",
+];
+
+/// Actor prefix reserved for subsystem-driven (non-operator) loop-engine
+/// operations such as the swarm projection. Internal actors may append steps
+/// to an approved goal via `extend_workflow` within the bounds declared by the
+/// approved plan.
+pub(crate) const INTERNAL_ACTOR_PREFIX: &str = "internal:";
+
+/// Actor name for the generic internal auto-approval path. Unlike
+/// subsystem-scoped actors (`internal:swarm` approves only its own
+/// code-constructed plan shape), `internal:auto` may approve plans it did not
+/// author, so every approval is checked against `InternalApprovalPolicy`.
+pub(crate) const INTERNAL_AUTO_ACTOR: &str = "internal:auto";
+
+/// Bounds applied when the `internal:auto` actor approves a goal plan without
+/// an operator in the loop. Defaults are conservative; the hard ceilings in
+/// `WorkflowSpec::validate` still apply on top.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InternalApprovalPolicy {
+    /// Highest effect class an auto-approved plan may declare.
+    pub max_effect: EffectClass,
+    /// Provider-call budget ceiling for auto-approved plans.
+    pub max_provider_calls: u32,
+}
+
+impl Default for InternalApprovalPolicy {
+    fn default() -> Self {
+        Self {
+            max_effect: EffectClass::Read,
+            max_provider_calls: 16,
+        }
+    }
+}
+
+impl InternalApprovalPolicy {
+    /// Parses a policy effect ceiling from config (`"pure"`, `"read"`,
+    /// `"local_write"`, `"external_write"`). `external_write` is accepted but
+    /// ineffective because domain validation rejects such steps anyway.
+    pub fn effect_class_from_name(name: &str) -> anyhow::Result<EffectClass> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "pure" => Ok(EffectClass::Pure),
+            "read" => Ok(EffectClass::Read),
+            "local_write" => Ok(EffectClass::LocalWrite),
+            "external_write" => Ok(EffectClass::ExternalWrite),
+            other => bail!("unknown effect class ceiling: {other}"),
+        }
+    }
+
+    /// Ensures an `internal:auto` approval stays within the configured effect
+    /// and budget bounds. Called with the plan being approved.
+    pub(crate) fn check_plan(
+        &self,
+        workflow: &WorkflowSpec,
+        manifest: &[EffectClass],
+    ) -> anyhow::Result<()> {
+        for effect in manifest {
+            ensure!(
+                *effect <= self.max_effect,
+                "internal auto-approval rejected: plan effect '{}' exceeds ceiling '{}'",
+                effect.as_str(),
+                self.max_effect.as_str()
+            );
+        }
+        ensure!(
+            workflow.budget.max_provider_calls <= self.max_provider_calls,
+            "internal auto-approval rejected: provider call budget {} exceeds ceiling {}",
+            workflow.budget.max_provider_calls,
+            self.max_provider_calls
+        );
+        Ok(())
+    }
+}
+
+/// Operator resolution for a work item parked in `waiting_confirmation`.
+/// A crash between an external send and its checkpoint commit leaves the
+/// outcome unknowable to the engine; the operator supplies the verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmationResolution {
+    /// The external effect DID happen — commit the prepared checkpoint with
+    /// an operator-attested outcome and mark the item succeeded.
+    Confirmed,
+    /// The external effect did NOT happen — void the prepared checkpoint and
+    /// return the item to `ready` (or `failed` if attempts are exhausted).
+    Retry,
+    /// Do not retry and do not confirm — fail the item outright.
+    Abandoned,
+}
+
+impl ConfirmationResolution {
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "confirmed" => Ok(Self::Confirmed),
+            "retry" => Ok(Self::Retry),
+            "abandoned" => Ok(Self::Abandoned),
+            other => bail!(
+                "unknown confirmation resolution: {other} (expected confirmed|retry|abandoned)"
+            ),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Confirmed => "confirmed",
+            Self::Retry => "retry",
+            Self::Abandoned => "abandoned",
+        }
+    }
+}
+
+/// Feature gate plus handler allowlist for `external_write` workflow steps.
+/// Disabled and empty by default: external writes are rejected unless the
+/// feature flag is on and the step's handler name is allowlisted. Delivery is
+/// at-least-once — a committed send is never replayed, while a crash between
+/// send and commit parks the work item in `waiting_confirmation`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExternalWritePolicy {
+    pub enabled: bool,
+    pub allowed_handlers: BTreeSet<String>,
+}
+
+impl ExternalWritePolicy {
+    pub(crate) fn allows(&self, handler: &str) -> bool {
+        self.enabled && self.allowed_handlers.contains(handler)
+    }
+}
+
 impl WorkflowSpec {
-    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+    /// Validates the workflow against the configured external-write gate. The
+    /// default policy (disabled, empty allowlist) rejects every
+    /// `external_write` step.
+    pub(crate) fn validate_with_policy(
+        &self,
+        external_write: &ExternalWritePolicy,
+    ) -> anyhow::Result<()> {
         ensure!(
             !self.steps.is_empty() && self.steps.len() <= 32,
             "workflow must contain 1..=32 steps"
@@ -221,14 +366,7 @@ impl WorkflowSpec {
             "response byte budget must be 1..=10485760"
         );
 
-        let allowed_handlers = BTreeSet::from([
-            "goal_planner",
-            "provider_analysis",
-            "session_replay",
-            "self_test_suite",
-            "evolution_evaluate",
-            "manual_gate",
-        ]);
+        let allowed_handlers = BTreeSet::from_iter(ALLOWED_WORKFLOW_HANDLERS.iter().copied());
         let mut step_ids = BTreeSet::new();
         for step in &self.steps {
             ensure!(
@@ -245,8 +383,9 @@ impl WorkflowSpec {
                 step.handler
             );
             ensure!(
-                step.effect != EffectClass::ExternalWrite,
-                "external_write handlers are not enabled in this release"
+                step.effect != EffectClass::ExternalWrite || external_write.allows(&step.handler),
+                "external_write step '{}' requires external_write_enabled and an allowlisted handler",
+                step.handler
             );
             ensure!(
                 (1..=10).contains(&step.retry.max_attempts),
@@ -348,8 +487,11 @@ pub struct PlanGoalRequest {
 }
 
 impl PlanGoalRequest {
-    pub(crate) fn validate(&self) -> anyhow::Result<()> {
-        self.workflow.validate()?;
+    pub(crate) fn validate_with_policy(
+        &self,
+        external_write: &ExternalWritePolicy,
+    ) -> anyhow::Result<()> {
+        self.workflow.validate_with_policy(external_write)?;
         ensure!(
             !self.acceptance_criteria.is_empty() && self.acceptance_criteria.len() <= 16,
             "plan must contain 1..=16 acceptance criteria"

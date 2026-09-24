@@ -19,8 +19,8 @@ use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
 use crate::channel::{
-    ChannelContext, ChannelInbound, ChannelPlugin, ChannelPluginConfig, ChannelPluginError,
-    ChannelRegistry, ChannelRuntimeContext, ChannelWorker,
+    ChannelContext, ChannelInbound, ChannelOutboundSender, ChannelPlugin, ChannelPluginConfig,
+    ChannelPluginError, ChannelRegistry, ChannelRuntimeContext, ChannelWorker, TelegramSender,
 };
 use crate::code_mode::LlmCodeModePlanner;
 use crate::config::AppConfig;
@@ -31,7 +31,10 @@ use crate::harness::evolution::{
     EvolutionEvalCase, EvolutionEvaluationRecord, EvolutionFeedbackDraft, EvolutionFeedbackRecord,
     EvolutionGateConfig, EvolutionRollbackResult, evolution_cycle_skip_reason,
 };
-use crate::harness::loop_engine::{LoopEngine, LoopWorker, SqliteLoopStore};
+use crate::harness::loop_engine::{
+    ExternalWritePolicy, InternalApprovalPolicy, LoopEngine, LoopWorker, OutboundSender,
+    SqliteLoopStore,
+};
 use crate::harness::observability::TrajectoryMetrics;
 use crate::harness::store::{
     EvolutionStore, HarnessStore, SqliteEvolutionStore, SqliteHarnessStore,
@@ -47,6 +50,7 @@ use crate::service::{
 };
 use crate::skills::{SkillConfigPaths, SkillRegistry, SkillRuntime};
 
+mod console;
 mod harness_control;
 
 const CODE_MODE_DIAG_OVERFLOW_SOURCE_KEY: &str = "__overflow__";
@@ -545,9 +549,6 @@ async fn build_runtime_handles(
     };
 
     let memory_store = SqliteMemoryStore::new(database_url).await?;
-    let loop_engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(
-        memory_store.clone(),
-    ))));
     let loop_config = &config.agent.harness.loop_engine;
     if loop_config.worker_enabled && !loop_config.enabled {
         bail!("loop engine worker requires agent.harness.loop_engine.enabled=true");
@@ -568,6 +569,53 @@ async fn build_runtime_handles(
     {
         bail!("loop self-test interval must be 10..=2592000 seconds or 0 to disable");
     }
+    if !(1..=64).contains(&loop_config.internal_auto_approve_max_provider_calls) {
+        bail!("internal auto-approve provider-call ceiling must be 1..=64");
+    }
+    let internal_approval_policy = InternalApprovalPolicy {
+        max_effect: InternalApprovalPolicy::effect_class_from_name(
+            &loop_config.internal_auto_approve_max_effect,
+        )
+        .context("invalid agent.harness.loop_engine.internal_auto_approve_max_effect")?,
+        max_provider_calls: loop_config.internal_auto_approve_max_provider_calls,
+    };
+    for handler in &loop_config.external_write_handlers {
+        if handler.trim().is_empty() || handler.len() > 96 {
+            bail!("external_write_handlers entries must be 1..=96 bytes");
+        }
+    }
+    let external_write_policy = ExternalWritePolicy {
+        enabled: loop_config.external_write_enabled,
+        allowed_handlers: loop_config
+            .external_write_handlers
+            .iter()
+            .cloned()
+            .collect(),
+    };
+    let loop_engine = Arc::new(
+        LoopEngine::new(Arc::new(
+            SqliteLoopStore::new(memory_store.clone())
+                .with_internal_approval_policy(internal_approval_policy),
+        ))
+        .with_external_write_policy(external_write_policy),
+    );
+    let outbound_sender: Option<Arc<dyn OutboundSender>> = loop_config
+        .external_write_enabled
+        .then(|| {
+            config
+                .channels
+                .telegram
+                .as_ref()
+                .filter(|telegram| {
+                    telegram.enabled && !is_missing_required_value(&telegram.bot_token)
+                })
+                .map(|telegram| {
+                    Arc::new(ChannelOutboundSender::with_telegram(TelegramSender::new(
+                        telegram.bot_token.clone(),
+                    ))) as Arc<dyn OutboundSender>
+                })
+        })
+        .flatten();
     let max_recent_turns = if config.memory.max_recent_turns == 0 {
         config.app.max_history
     } else {
@@ -661,6 +709,7 @@ async fn build_runtime_handles(
         )
         .await?
         .with_harness_store(harness_store.clone())
+        .with_benchmark_suite(crate::harness::benchmark::core_benchmark_suite())?
         .with_evidence_limits(
             evolution_config.max_source_trajectories,
             evolution_config.max_evidence_chars,
@@ -675,7 +724,8 @@ async fn build_runtime_handles(
                 loop_engine.clone(),
                 provider.clone(),
                 evolution_engine.clone(),
-            )
+                outbound_sender,
+            )?
             .with_runtime_options("loop-worker:runtime", loop_config.worker_lease_secs)?,
         ))
     } else {
@@ -735,7 +785,8 @@ async fn build_runtime_handles(
         reply_summary_enabled: config.agent.swarm.reply_summary_enabled,
         audit_retention_days: config.agent.swarm.audit_retention_days,
     })
-    .with_harness_config(&config.agent.harness);
+    .with_harness_config(&config.agent.harness)
+    .with_loop_engine(loop_config.enabled.then(|| loop_engine.clone()));
     if let Some(engine) = &evolution_engine {
         service = service.with_evolution_policy_runtime(engine.policy_runtime());
     }
@@ -901,6 +952,7 @@ fn build_axum_router(state: AppState, http_enabled: bool) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/setup", get(get_setup_page))
+        .route("/console", get(console::console_page))
         .route("/v1/config/ui/state", get(get_config_ui_state))
         .route("/v1/config/ui/save", post(post_config_ui_save))
         .merge(

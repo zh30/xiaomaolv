@@ -3,26 +3,42 @@ use std::sync::Arc;
 use anyhow::Context;
 
 use super::domain::{
-    AcceptanceCriterion, ApproveGoalRequest, CheckpointRecord, CreateGoalRequest, EffectClass,
-    ExecutionBudget, GoalRecord, GoalVerificationReport, LoopEventRecord, PlanGoalRequest,
-    PlannedGoal, ProviderBudgetReservation, ResumeReport, RetryPolicy, WorkClaim, WorkOutcome,
+    AcceptanceCriterion, ApproveGoalRequest, CheckpointRecord, ConfirmationResolution,
+    CreateGoalRequest, EffectClass, ExecutionBudget, ExternalWritePolicy, GoalRecord,
+    GoalVerificationReport, LoopEventRecord, PlanGoalRequest, PlannedGoal,
+    ProviderBudgetReservation, ResumeReport, RetryPolicy, WorkClaim, WorkItemRecord, WorkOutcome,
     WorkflowEdge, WorkflowSpec, WorkflowStep, hash_serializable, validate_actor,
 };
 use super::store::LoopStore;
 use super::{
     ArtifactKind, ArtifactPublishResult, ArtifactRecord, CreateSignalRequest,
     PublishArtifactRequest, ReplayRun, SelfTestRun, SelfTestStatus, SignalIngestResult, SignalKind,
-    SignalRecord, SignalTrust, TrajectoryFrame, TrajectoryFrameDraft,
+    SignalRecord, SignalStatus, SignalTrust, TrajectoryFrame, TrajectoryFrameDraft,
 };
 
 #[derive(Clone)]
 pub struct LoopEngine {
     store: Arc<dyn LoopStore>,
+    external_write_policy: ExternalWritePolicy,
 }
 
 impl LoopEngine {
     pub fn new(store: Arc<dyn LoopStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            external_write_policy: ExternalWritePolicy::default(),
+        }
+    }
+
+    /// Feature gate + handler allowlist for `external_write` steps. Defaults
+    /// to disabled — the strictest policy — so callers must opt in explicitly.
+    pub fn with_external_write_policy(mut self, policy: ExternalWritePolicy) -> Self {
+        self.external_write_policy = policy;
+        self
+    }
+
+    pub fn external_write_policy(&self) -> &ExternalWritePolicy {
+        &self.external_write_policy
     }
 
     pub async fn create_goal(
@@ -72,8 +88,22 @@ impl LoopEngine {
         self.store.get_signal(signal_id).await
     }
 
-    pub async fn list_signals(&self, limit: usize) -> anyhow::Result<Vec<SignalRecord>> {
-        self.store.list_signals(limit).await
+    pub async fn list_signals(
+        &self,
+        limit: usize,
+        status: Option<SignalStatus>,
+    ) -> anyhow::Result<Vec<SignalRecord>> {
+        self.store.list_signals(limit, status).await
+    }
+
+    pub async fn ignore_signal(
+        &self,
+        signal_id: &str,
+        reason: &str,
+        actor: &str,
+    ) -> anyhow::Result<SignalRecord> {
+        validate_actor(actor)?;
+        self.store.ignore_signal(signal_id, reason, actor).await
     }
 
     pub async fn propose_goal_from_signal(
@@ -83,9 +113,18 @@ impl LoopEngine {
         actor: &str,
     ) -> anyhow::Result<GoalRecord> {
         validate_actor(actor)?;
+        let signal = self
+            .store
+            .get_signal(signal_id)
+            .await?
+            .context("signal not found")?;
         anyhow::ensure!(
-            self.store.get_signal(signal_id).await?.is_some(),
-            "signal not found"
+            matches!(
+                signal.status,
+                SignalStatus::Observed | SignalStatus::Triaged
+            ),
+            "signal cannot be proposed from status '{}'",
+            signal.status.as_str()
         );
         let goal = self
             .create_goal(
@@ -173,9 +212,15 @@ impl LoopEngine {
         request: PlanGoalRequest,
         actor: &str,
     ) -> anyhow::Result<PlannedGoal> {
-        request.validate()?;
+        request.validate_with_policy(&self.external_write_policy)?;
         validate_actor(actor)?;
         self.store.plan_goal(goal_id, request, actor).await
+    }
+
+    /// Latest planned workflow for a goal — approval surfaces use this to
+    /// show the effect manifest again after `plan_goal` already returned.
+    pub async fn get_goal_plan(&self, goal_id: &str) -> anyhow::Result<Option<PlannedGoal>> {
+        self.store.latest_plan(goal_id).await
     }
 
     pub async fn plan_goal_recommended(
@@ -244,7 +289,9 @@ impl LoopEngine {
         actor: &str,
     ) -> anyhow::Result<ResumeReport> {
         validate_actor(actor)?;
-        self.store.approve_goal(goal_id, request, actor).await
+        self.store
+            .approve_goal(goal_id, request, actor, &self.external_write_policy)
+            .await
     }
 
     pub async fn claim_goal_work(
@@ -262,6 +309,44 @@ impl LoopEngine {
         );
         self.store
             .claim_goal_work(goal_id, worker_id, lease_secs, actor)
+            .await
+    }
+
+    /// Targeted claim for in-process subsystems (e.g. the agent swarm) that
+    /// bind claims to a specific `step_id` rather than the lowest-ordinal
+    /// ready item.
+    pub async fn claim_work_item(
+        &self,
+        goal_id: &str,
+        step_id: &str,
+        worker_id: &str,
+        lease_secs: u32,
+        actor: &str,
+    ) -> anyhow::Result<Option<WorkClaim>> {
+        validate_actor(worker_id)?;
+        validate_actor(actor)?;
+        anyhow::ensure!(
+            (1..=3600).contains(&lease_secs),
+            "lease must be 1..=3600 seconds"
+        );
+        self.store
+            .claim_work_item(goal_id, step_id, worker_id, lease_secs, actor)
+            .await
+    }
+
+    /// Append steps to an `approved`/`active` goal. Restricted to `internal:`
+    /// actors; the approved workflow must declare an expansion marker
+    /// (`swarm_root` + `max_nodes`) and appended steps stay within its effect
+    /// manifest.
+    pub async fn extend_workflow(
+        &self,
+        goal_id: &str,
+        steps: Vec<WorkflowStep>,
+        actor: &str,
+    ) -> anyhow::Result<Vec<WorkItemRecord>> {
+        validate_actor(actor)?;
+        self.store
+            .extend_workflow(goal_id, steps, actor, &self.external_write_policy)
             .await
     }
 
@@ -389,5 +474,28 @@ impl LoopEngine {
             .resume_goal(goal_id, actor)
             .await?
             .with_context(|| format!("goal not found: {goal_id}"))
+    }
+
+    /// Lists durable work items for a goal (operator inspection surface).
+    pub async fn list_work_items(&self, goal_id: &str) -> anyhow::Result<Vec<WorkItemRecord>> {
+        self.store.list_work_items(goal_id).await
+    }
+
+    /// Operator verdict for a `waiting_confirmation` work item. The operator
+    /// attests whether the external effect happened (`confirmed`), did not
+    /// happen and may retry (`retry`), or should be abandoned (`abandoned`).
+    /// `reason` is required so the decision is auditable in the event log.
+    pub async fn resolve_waiting_confirmation(
+        &self,
+        goal_id: &str,
+        work_item_id: &str,
+        resolution: ConfirmationResolution,
+        reason: &str,
+        actor: &str,
+    ) -> anyhow::Result<WorkItemRecord> {
+        validate_actor(actor)?;
+        self.store
+            .resolve_waiting_confirmation(goal_id, work_item_id, resolution, reason, actor)
+            .await
     }
 }

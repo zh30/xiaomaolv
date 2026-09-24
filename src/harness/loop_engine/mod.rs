@@ -10,10 +10,11 @@ mod worker;
 pub use artifacts::{ArtifactKind, ArtifactPublishResult, ArtifactRecord, PublishArtifactRequest};
 pub use domain::{
     AcceptanceCriterion, ApproveGoalRequest, AttemptRecord, AttemptStatus, CheckpointPhase,
-    CheckpointRecord, CreateGoalRequest, EffectClass, ExecutionBudget, GoalRecord, GoalStatus,
-    GoalVerificationReport, LoopEventRecord, PlanGoalRequest, PlannedGoal,
-    ProviderBudgetReservation, ResumeReport, RetryPolicy, WorkClaim, WorkItemRecord,
-    WorkItemStatus, WorkOutcome, WorkflowEdge, WorkflowSpec, WorkflowStep,
+    CheckpointRecord, ConfirmationResolution, CreateGoalRequest, EffectClass, ExecutionBudget,
+    ExternalWritePolicy, GoalRecord, GoalStatus, GoalVerificationReport, InternalApprovalPolicy,
+    LoopEventRecord, PlanGoalRequest, PlannedGoal, ProviderBudgetReservation, ResumeReport,
+    RetryPolicy, WorkClaim, WorkItemRecord, WorkItemStatus, WorkOutcome, WorkflowEdge,
+    WorkflowSpec, WorkflowStep,
 };
 pub use engine::LoopEngine;
 pub use replay::{
@@ -25,4 +26,6 @@ pub use signals::{
     CreateSignalRequest, SignalIngestResult, SignalKind, SignalRecord, SignalStatus, SignalTrust,
 };
 pub use store::{LoopStore, SqliteLoopStore, initialize_loop_engine_schema};
-pub use worker::{LoopWorker, WorkHandler, WorkHandlerContext, WorkHandlerRegistry};
+pub use worker::{
+    LoopWorker, OutboundSender, WorkHandler, WorkHandlerContext, WorkHandlerRegistry,
+};

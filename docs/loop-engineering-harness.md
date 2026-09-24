@@ -43,17 +43,38 @@ Startup validation enforces:
 | `worker_lease_secs` | `1..=3600` |
 | `worker_max_parallel` | `1..=16` |
 | `self_test_interval_secs` | `0`, or `10..=2592000` |
+| `external_write_enabled` | `false` default; enables allowlisted `external_write` steps |
+| `external_write_handlers` | list of handler names; currently only `channel_send` exists |
 
 `worker_enabled = true` requires `enabled = true`. Periodic maintenance is independent of work
 claiming: when the Loop Engine is enabled, a positive self-test interval runs even if the worker
 is disabled. Set `enable_trajectory = true` to capture provider frames from normal message paths.
 
-The built-in worker accepts only registered `pure`, `read`, and `local_write` handlers. Arbitrary
-code changes, deployments, credential changes, and unknown external writes are not enabled.
+The built-in worker accepts only registered `pure`, `read`, and `local_write` handlers by
+default. Arbitrary code changes, deployments, credential changes, and unknown external writes
+are not enabled. `external_write_enabled = true` opens a narrow gate: only handlers named in
+`external_write_handlers` may plan, approve, register, or dispatch `external_write` steps —
+checked again at approve and dispatch time so disabling the flag between plan and run fails
+closed. Delivery is at-least-once: a crash between send and commit parks the work item in
+`waiting_confirmation` for operator review instead of resending. The operator then resolves the
+park through `POST .../resolve-confirmation` with a required audit reason: `confirmed` attests
+the external effect happened and commits the prepared checkpoint with an operator-attested
+outcome (item `succeeded`); `retry` attests it did not, voids the checkpoint, and re-queues the
+item (or fails it when the attempt budget is exhausted); `abandoned` voids the checkpoint and
+fails the item. Resolutions are single-use and goal-scoped.
 When `[agent.harness.evolution].enabled = true`, the `evolution_evaluate` handler adapts the
 existing prompt-candidate engine: it reserves exactly two provider calls per enabled eval case,
 enforces the Goal deadline and cumulative response-byte budget, and publishes only a compact
 evaluation reference. Human approval/activation remains in the existing evolution control plane.
+
+Shadow evaluation always scores two populations together: operator-managed eval cases and the
+versioned benchmark suite (`src/harness/benchmark.rs`, labeled `id@version`, currently
+`core@2026-09-24.1`). Benchmark cases carry the same assertion vocabulary — required/forbidden
+substrings, JSON validity, and `max_output_chars` — and are marked `benchmark` in the scorecard
+with the suite label recorded alongside. A benchmark regression (baseline pass -> candidate
+fail on a benchmark case) is always fatal to promotion: `benchmark_regressions > 0` rejects the
+candidate regardless of `max_regressions`, which bounds only operator-case regressions. An
+operator eval case whose id collides with a benchmark case fails the evaluation closed.
 
 ## Durable loop
 
@@ -101,6 +122,7 @@ Registered handlers:
 | `session_replay` | Runs structural replay and publishes `replay_corpus` |
 | `manual_gate` | Produces evidence that a manual gate was reached |
 | `evolution_evaluate` | Bounded adapter to an existing prompt candidate evaluation |
+| `channel_send` | Sends `{channel, session_id, text}` through the configured outbound channel; `external_write`, registered only when the feature flag is on and the handler is allowlisted |
 
 `evolution_evaluate` is registered as unavailable unless
 `[agent.harness.evolution].enabled = true`. When enabled, it reserves exactly two provider calls
@@ -139,13 +161,16 @@ they require a configured operator key and `loop_engine.enabled = true`.
 | `POST` | `/v1/harness/goals/{id}/plan` | Store a validated Dynamic Workflow revision |
 | `POST` | `/v1/harness/goals/{id}/approve` | Approve the immutable revision/hash |
 | `POST` | `/v1/harness/goals/{id}/resume` | Recover and return work/attempt/checkpoint state |
+| `GET` | `/v1/harness/goals/{id}/work-items` | List durable work items for a goal |
+| `POST` | `/v1/harness/goals/{goal_id}/work-items/{work_item_id}/resolve-confirmation` | Operator verdict for a `waiting_confirmation` item |
 | `GET` | `/v1/harness/goals/{id}/events` | Cursor-based durable event snapshot |
 | `GET` | `/v1/harness/goals/{id}/events/stream` | SSE event stream for Desktop |
 | `POST` | `/v1/harness/goals/{id}/verify/manual` | Record a named manual criterion and re-verify |
-| `GET` | `/v1/harness/signals` | List provenance-preserving evolution signals |
+| `GET` | `/v1/harness/signals` | List signals; `?status=observed|triaged|proposed|ignored` filters by triage state |
 | `POST` | `/v1/harness/signals` | Ingest one external/authenticated signal with the scoped key |
 | `GET` | `/v1/harness/signals/{id}` | Read one signal and its current triage status |
-| `POST` | `/v1/harness/signals/{id}/propose-goal` | Convert a signal into a proposed goal |
+| `POST` | `/v1/harness/signals/{id}/propose-goal` | Convert a pending signal into a proposed goal |
+| `POST` | `/v1/harness/signals/{id}/ignore` | Mark a pending signal ignored with an operator reason |
 | `POST` | `/v1/harness/self-tests/{suite}` | Run a bounded read-only suite (`core`) |
 | `GET` | `/v1/harness/self-test-runs/{id}` | Read persisted maintenance evidence |
 | `GET` | `/v1/harness/trajectories/{id}/frames` | Read per-provider-call replay frames |
@@ -170,9 +195,18 @@ curl -sS -X POST "$XIAOMAOLV_URL/v1/harness/signals" \
 ```
 
 Scoped clients cannot assert `internal` trust or create, approve, dispatch, resume, verify, or
-activate anything. Source/external-ID/content fingerprints make ingestion idempotent. Community,
+activate anything. Ingestion is idempotent across three dedup layers, all scoped to the signal
+source: exact `(source, external_id)` or `(source, fingerprint)` match, a normalized-content
+hash that collapses case/whitespace/punctuation variants per kind, and token-set near-duplicate
+detection (Jaccard >= 0.9 against the 128 most recent same-source/kind signals). Community,
 user, developer, trajectory, replay, manual, and self-test signals all use the same immutable
-model; they can only become proposed goals until an operator reviews the resulting plan.
+model.
+
+Signal triage is a small lifecycle: `observed` (or `triaged`) -> `proposed` via the
+propose-goal route, or -> `ignored` with a required operator reason. `proposed` and `ignored`
+are terminal for both transitions — an ignored signal cannot be proposed, and a proposed
+signal cannot be proposed again or ignored. Over Telegram, `/signals` lists pending signals and
+`/signal <id> [ignore <reason> | goal <objective>]` reviews, rejects, or converts one.
 
 Supported signal kinds are `trajectory`, `user_feedback`, `developer_feedback`, `community`,
 `self_test`, `session_replay`, and `manual`; trust levels are `internal`, `authenticated`, and
@@ -180,7 +214,13 @@ Supported signal kinds are `trajectory`, `user_feedback`, `developer_feedback`, 
 200 bytes, content to 16384 characters, and metadata to 64 entries/8192 serialized bytes.
 
 The HTTP resources plus monotonic goal-event cursor are the supported Desktop contract. Desktop
-business logic does not live in the server core.
+business logic does not live in the server core. `GET /console` serves an embedded single-file
+operator dashboard over this contract: it authenticates with the same `app.api_key` bearer plus
+`x-harness-actor` header, renders goals/signals/artifacts/trajectories/self-tests/evolution,
+drives the existing plan/approve/resume/verify/propose/ignore/evolution POST routes, and reads
+the goal SSE stream via a fetch reader (native `EventSource` cannot send the Authorization
+header). The page adds no backend semantics; a native Desktop shell can consume the same
+contract later.
 
 ## Self-test and Session Replay
 
@@ -218,9 +258,10 @@ SQLite schema version 1 stores the current Goal/work state plus append-only even
 checkpoint phases, signals, Self-test cases/runs, provider frames/replay runs, and Artifact events.
 The current release intentionally does not provide:
 
-- a Desktop GUI (the HTTP collection/detail resources and per-Goal SSE cursor are the contract),
-- arbitrary code edits, commits, deployments, credentials/permission changes, or unknown
-  `external_write` handlers,
+- a native Desktop GUI shell (the browser dashboard at `/console` is the reference client; the
+  HTTP collection/detail resources and per-Goal SSE cursor are the contract),
+- arbitrary code edits, commits, deployments, credentials/permission changes, or
+  `external_write` handlers beyond the configured allowlist,
 - comparative live-provider replay or live MCP calls during structural replay,
 - automatic retention/pruning, or vendor-specific community connectors,
 - automatic approval or activation of Prompt Evolution candidates.

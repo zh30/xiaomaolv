@@ -125,7 +125,8 @@ enabled = false
 # Separate, scoped key for POST /v1/harness/signals. Never reuse app.api_key.
 ingest_api_key = "${XIAOMAOLV_HARNESS_INGEST_API_KEY:-}"
 # Safe registered handlers only: goal planning, provider analysis, core self-test, structural
-# replay, manual gate, and bounded evolution evaluation. external_write is rejected.
+# replay, manual gate, and bounded evolution evaluation. external_write requires the
+# explicit gate below.
 worker_enabled = false
 # Valid: poll 1..=60s, lease 1..=3600s, parallel 1..=16.
 worker_poll_interval_secs = 2
@@ -133,6 +134,18 @@ worker_lease_secs = 30
 worker_max_parallel = 2
 # 0 disables periodic read-only maintenance; otherwise valid 10..=2592000s.
 self_test_interval_secs = 0
+# Bounds for the generic `internal:auto` approval actor: plan effect manifest must stay
+# within this ceiling (pure|read|local_write|external_write) and within the provider-call cap.
+# Subsystem actors like internal:swarm approve only their own code-built plans and are
+# unaffected. Valid: provider calls 1..=64.
+internal_auto_approve_max_effect = "read"
+internal_auto_approve_max_provider_calls = 16
+# Controlled external writes. Disabled by default: external_write steps are rejected at plan,
+# approve, register, and dispatch time. When enabled, only allowlisted handler names may run;
+# currently only "channel_send" exists. Delivery is at-least-once — a crash between send and
+# commit parks the work item in waiting_confirmation instead of resending.
+external_write_enabled = false
+external_write_handlers = ["channel_send"]
 
 [agent.harness.evolution]
 # Closed-loop improvement control plane. It is inert until explicitly enabled.

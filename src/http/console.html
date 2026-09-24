@@ -1,0 +1,746 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>xiaomaolv · harness console</title>
+<style>
+:root {
+  --bg: #0d1117; --panel: #161b22; --panel2: #1c2430; --border: #2d3746;
+  --fg: #dbe2ec; --dim: #8b98a9; --accent: #58a6ff; --ok: #3fb950;
+  --warn: #d29922; --err: #f85149; --mono: ui-monospace, SFMono-Regular,
+    Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--fg);
+  font-family: var(--mono); font-size: 13px;
+}
+header {
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+  padding: 10px 14px; background: var(--panel); border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; z-index: 5;
+}
+header .brand { font-weight: 700; color: var(--accent); margin-right: 8px; }
+header input { width: 200px; }
+header input.wide { width: 320px; }
+input, select, textarea, button {
+  background: var(--panel2); color: var(--fg); border: 1px solid var(--border);
+  border-radius: 4px; font-family: var(--mono); font-size: 12px; padding: 5px 8px;
+}
+button { cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button.primary { border-color: var(--accent); color: var(--accent); }
+button.danger { border-color: var(--err); color: var(--err); }
+button:disabled { opacity: .45; cursor: default; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--dim); display: inline-block; }
+.dot.ok { background: var(--ok); } .dot.err { background: var(--err); }
+nav { display: flex; gap: 2px; padding: 6px 14px; background: var(--panel); border-bottom: 1px solid var(--border); }
+nav button { border: none; background: transparent; color: var(--dim); padding: 6px 12px; }
+nav button.active { color: var(--fg); border-bottom: 2px solid var(--accent); }
+main { padding: 14px; display: grid; grid-template-columns: minmax(340px, 44%) 1fr; gap: 14px; }
+.pane { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 10px; min-height: 200px; }
+.pane h2 { margin: 0 0 8px; font-size: 12px; color: var(--dim); text-transform: uppercase; letter-spacing: .08em; }
+.toolbar { display: flex; gap: 6px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { color: var(--dim); font-weight: 400; font-size: 11px; }
+tr.row { cursor: pointer; }
+tr.row:hover td { background: var(--panel2); }
+tr.sel td { background: #1d2a3d; }
+.chip {
+  display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px;
+  border: 1px solid var(--border); white-space: nowrap;
+}
+.chip.ok { color: var(--ok); border-color: var(--ok); }
+.chip.warn { color: var(--warn); border-color: var(--warn); }
+.chip.err { color: var(--err); border-color: var(--err); }
+.chip.info { color: var(--accent); border-color: var(--accent); }
+.chip.dim { color: var(--dim); }
+.muted { color: var(--dim); }
+.small { font-size: 11px; }
+pre {
+  background: var(--panel2); border: 1px solid var(--border); border-radius: 4px;
+  padding: 8px; overflow: auto; max-height: 420px; white-space: pre-wrap; word-break: break-word;
+}
+textarea { width: 100%; min-height: 120px; }
+.kv { display: grid; grid-template-columns: 150px 1fr; gap: 3px 10px; }
+.kv div:nth-child(odd) { color: var(--dim); }
+#toast {
+  position: fixed; bottom: 16px; right: 16px; background: var(--panel2);
+  border: 1px solid var(--accent); padding: 10px 14px; border-radius: 6px;
+  max-width: 480px; display: none; z-index: 10;
+}
+#toast.err { border-color: var(--err); color: var(--err); }
+#log { max-height: 260px; overflow: auto; }
+#log div { padding: 1px 0; border-bottom: 1px solid #20262f; }
+.rowflex { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.grow { flex: 1; }
+.steps { margin: 4px 0 8px; }
+.step { border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; margin: 4px 0; }
+</style>
+</head>
+<body>
+<header>
+  <span class="brand">xiaomaolv console</span>
+  <input id="base" class="wide" placeholder="base url" />
+  <input id="key" type="password" placeholder="api key (Bearer)" />
+  <input id="actor" placeholder="actor label" />
+  <button id="ping" class="primary">connect</button>
+  <span id="conn" class="dot"></span><span id="connLabel" class="muted small">offline</span>
+</header>
+<nav id="tabs">
+  <button data-tab="goals" class="active">goals</button>
+  <button data-tab="signals">signals</button>
+  <button data-tab="artifacts">artifacts</button>
+  <button data-tab="trajectories">trajectories</button>
+  <button data-tab="selftests">self-tests</button>
+  <button data-tab="evolution">evolution</button>
+</nav>
+<main>
+  <section class="pane" id="left"></section>
+  <section class="pane" id="right"><h2>detail</h2><div class="muted">select a row</div></section>
+</main>
+<div id="toast"></div>
+
+<script>
+"use strict";
+const $ = (s) => document.querySelector(s);
+const state = {
+  base: localStorage.getItem("xc.base") || location.origin,
+  key: localStorage.getItem("xc.key") || "",
+  actor: localStorage.getItem("xc.actor") || "operator-console",
+  tab: "goals",
+  sel: null,
+  stream: null,
+};
+$("#base").value = state.base;
+$("#key").value = state.key;
+$("#actor").value = state.actor;
+
+function saveCreds() {
+  state.base = $("#base").value.trim().replace(/\/+$/, "") || location.origin;
+  state.key = $("#key").value.trim();
+  state.actor = $("#actor").value.trim() || "operator-console";
+  localStorage.setItem("xc.base", state.base);
+  localStorage.setItem("xc.key", state.key);
+  localStorage.setItem("xc.actor", state.actor);
+}
+function toast(msg, isErr) {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.className = isErr ? "err" : "";
+  t.style.display = "block";
+  clearTimeout(t._h);
+  t._h = setTimeout(() => (t.style.display = "none"), 5000);
+}
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function ts(unix) {
+  if (!unix) return "";
+  return new Date(unix * 1000).toISOString().replace("T", " ").slice(0, 19);
+}
+function short(id) { return id && id.length > 14 ? id.slice(0, 8) + "…" + id.slice(-4) : id; }
+function pretty(v) { return JSON.stringify(v, null, 2); }
+
+async function api(path, opts = {}) {
+  const headers = Object.assign(
+    { "x-harness-actor": state.actor, "x-evolution-actor": state.actor },
+    opts.headers || {}
+  );
+  if (state.key) headers["Authorization"] = "Bearer " + state.key;
+  if (opts.body !== undefined) headers["Content-Type"] = "application/json";
+  const res = await fetch(state.base + path, {
+    method: opts.method || "GET",
+    headers,
+    body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
+  });
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+  if (!res.ok) {
+    const msg = (data && (data.error || data.message)) || `${res.status} ${res.statusText}`;
+    throw new Error(typeof msg === "string" ? msg : pretty(msg));
+  }
+  return data;
+}
+function chip(status) {
+  const s = String(status || "");
+  const cls =
+    /achieved|succeeded|connected|passed/.test(s) ? "ok" :
+    /failed|error|rejected/.test(s) ? "err" :
+    /waiting|blocked|verifying|review|planning|paused|proposed|observed|triaged/.test(s) ? "warn" :
+    /active|approved|running|committing/.test(s) ? "info" : "dim";
+  return `<span class="chip ${cls}">${esc(s)}</span>`;
+}
+function detailKv(pairs) {
+  return `<div class="kv">${pairs.map(([k, v]) => `<div>${esc(k)}</div><div>${v}</div>`).join("")}</div>`;
+}
+function rawBlock(obj) {
+  return `<details><summary class="muted small">raw json</summary><pre>${esc(pretty(obj))}</pre></details>`;
+}
+function stopStream() {
+  if (state.stream) { state.stream.abort(); state.stream = null; }
+}
+
+// ---------- Goals ----------
+async function goalsList() {
+  const d = await api("/v1/harness/goals?limit=100");
+  const rows = (d.goals || []).map((g) => `
+    <tr class="row" data-id="${esc(g.id)}">
+      <td>${esc(short(g.id))}</td><td>${chip(g.status)}</td>
+      <td class="muted">r${g.revision}</td>
+      <td>${esc(g.objective.slice(0, 70))}</td>
+      <td class="muted small">${esc(ts(g.updated_at_unix))}</td>
+    </tr>`).join("");
+  return `<h2>goals</h2>
+    <div class="toolbar">
+      <input id="newGoal" class="grow" placeholder="new goal objective…" />
+      <button id="mkGoal">create + plan</button>
+      <button id="ref">refresh</button>
+    </div>
+    <table><tr><th>id</th><th>status</th><th>rev</th><th>objective</th><th>updated</th></tr>${rows || `<tr><td colspan="5" class="muted">none</td></tr>`}</table>`;
+}
+async function goalDetail(id) {
+  const [g, wi] = await Promise.all([
+    api("/v1/harness/goals/" + encodeURIComponent(id)),
+    api(`/v1/harness/goals/${encodeURIComponent(id)}/work-items`).catch(() => ({ work_items: [] })),
+  ]);
+  const plan = g.plan;
+  const parked = (wi.work_items || []).filter((w) => w.status === "waiting_confirmation");
+  const parkedHtml = parked.length ? `<h2>awaiting confirmation</h2>` +
+    parked.map((w) => `
+      <div class="step"><b>${esc(w.step_id)}</b> · ${esc(w.handler)} ${chip("waiting_confirmation")}
+        <div class="muted small">external effect may have executed before the crash — did it happen?</div>
+        <div class="toolbar">
+          <input class="confReason" data-wid="${esc(w.id)}" placeholder="audit reason…" />
+          <button data-conf="confirmed" data-wid="${esc(w.id)}">confirmed</button>
+          <button data-conf="retry" data-wid="${esc(w.id)}">retry</button>
+          <button data-conf="abandoned" class="danger" data-wid="${esc(w.id)}">abandon</button>
+        </div>
+      </div>`).join("") : "";
+  const wiHtml = (wi.work_items || []).length ? `<h2>work items</h2>
+    <table><tr><th>step</th><th>handler</th><th>effect</th><th>status</th></tr>` +
+    (wi.work_items || []).map((w) => `
+      <tr><td>${esc(w.step_id)}</td><td class="muted">${esc(w.handler)}</td>
+      <td>${esc(w.effect)}</td><td>${chip(w.status)}</td></tr>`).join("") +
+    `</table>` : "";
+  let planHtml = "";
+  if (plan) {
+    const steps = (plan.workflow?.steps || []).map((s) => `
+      <div class="step"><b>${esc(s.id)}</b> · ${esc(s.handler)}
+        ${chip(s.effect)}
+        <div class="muted small">retry ${s.retry?.max_attempts ?? "?"}×/${s.retry?.backoff_secs ?? "?"}s</div>
+        ${s.input && Object.keys(s.input).length ? `<pre>${esc(pretty(s.input))}</pre>` : ""}
+      </div>`).join("");
+    planHtml = `<h2>plan</h2>
+      ${detailKv([
+        ["plan_hash", `<span class="small">${esc(plan.plan_hash)}</span>`],
+        ["effect_manifest", (plan.effect_manifest || []).map(chip).join(" ")],
+        ["budget", esc(pretty(plan.workflow?.budget || {}))],
+        ["acceptance", esc(pretty(plan.acceptance_criteria || []))],
+        ["edges", esc(pretty(plan.workflow?.edges || []))],
+      ])}
+      <div class="steps">${steps}</div>`;
+  }
+  const canApprove = g.status === "review_ready" || g.status === "proposed";
+  return `<h2>goal ${esc(short(g.id))}</h2>
+    ${detailKv([
+      ["id", esc(g.id)], ["status", chip(g.status)],
+      ["revision", "r" + g.revision], ["objective", esc(g.objective)],
+      ["created_by", esc(g.created_by)],
+      ["created", esc(ts(g.created_at_unix))], ["updated", esc(ts(g.updated_at_unix))],
+      ["source_signals", esc((g.source_signal_ids || []).join(", ") || "—")],
+    ])}
+    <div class="toolbar" style="margin-top:8px">
+      <button data-act="approve" ${canApprove && plan ? "" : "disabled"}>approve</button>
+      <button data-act="resume">resume</button>
+      <input id="verifyLabel" placeholder="verify label" />
+      <button data-act="verify">manual verify</button>
+    </div>
+    <details><summary class="muted small">submit plan (JSON)</summary>
+      <textarea id="planJson">${esc(pretty(planTemplate(g.objective)))}</textarea>
+      <button data-act="plan">POST plan</button></details>
+    ${planHtml}
+    ${parkedHtml}
+    ${wiHtml}
+    <h2>events</h2>
+    <div class="toolbar">
+      <button data-act="events">load events</button>
+      <button data-act="stream">stream ▸</button>
+      <span class="muted small" id="streamState"></span>
+    </div>
+    <div id="log"></div>
+    ${rawBlock(g)}`;
+}
+function planTemplate(objective) {
+  return {
+    workflow: {
+      steps: [{
+        id: "analyze", handler: "provider_analysis", effect: "local_write",
+        input: { objective }, retry: { max_attempts: 1, backoff_secs: 0 },
+      }],
+      edges: [],
+      budget: { max_provider_calls: 4, deadline_secs: 300, max_response_bytes: 65536 },
+    },
+    acceptance_criteria: [{ kind: "manual_approval", label: "operator review" }],
+  };
+}
+async function loadEvents(goalId, after = 0) {
+  const d = await api(`/v1/harness/goals/${encodeURIComponent(goalId)}/events?after=${after}&limit=100`);
+  return d;
+}
+async function streamGoal(goalId) {
+  stopStream();
+  const ctl = new AbortController();
+  state.stream = ctl;
+  const headers = { "x-harness-actor": state.actor };
+  if (state.key) headers["Authorization"] = "Bearer " + state.key;
+  $("#streamState").textContent = "connecting…";
+  try {
+    const res = await fetch(
+      `${state.base}/v1/harness/goals/${encodeURIComponent(goalId)}/events/stream`,
+      { headers, signal: ctl.signal });
+    if (!res.ok || !res.body) throw new Error(`stream failed: ${res.status}`);
+    $("#streamState").textContent = "streaming ■";
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        const chunk = buf.slice(0, idx); buf = buf.slice(idx + 2);
+        handleSse(chunk);
+      }
+    }
+    $("#streamState").textContent = "closed";
+  } catch (e) {
+    if (!ctl.signal.aborted) $("#streamState").textContent = "error: " + e.message;
+  }
+}
+function handleSse(chunk) {
+  let ev = "message", data = "", id = "";
+  for (const line of chunk.split("\n")) {
+    if (line.startsWith("event:")) ev = line.slice(6).trim();
+    else if (line.startsWith("data:")) data += line.slice(5).trim();
+    else if (line.startsWith("id:")) id = line.slice(3).trim();
+  }
+  if (!data) return;
+  const log = $("#log");
+  const div = document.createElement("div");
+  div.innerHTML = `<span class="muted small">#${esc(id)}</span> ${chip(ev)} <span class="small">${esc(data.slice(0, 300))}</span>`;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+
+// ---------- Signals ----------
+async function signalsList(status) {
+  const q = status ? `?status=${status}&limit=100` : "?limit=100";
+  const d = await api("/v1/harness/signals" + q);
+  const rows = (d.signals || []).map((s) => `
+    <tr class="row" data-id="${esc(s.id)}">
+      <td>${esc(short(s.id))}</td><td>${esc(s.kind)}</td>
+      <td class="muted">${esc(s.trust)}</td><td>${chip(s.status)}</td>
+      <td class="muted">${esc(s.source)}</td>
+      <td>${esc(s.content.slice(0, 60))}</td>
+      <td class="muted small">${esc(ts(s.created_at_unix))}</td>
+    </tr>`).join("");
+  return `<h2>signals</h2>
+    <div class="toolbar">
+      <select id="sigFilter">
+        ${["", "observed", "triaged", "proposed", "ignored"].map((o) =>
+          `<option value="${o}"${o === status ? " selected" : ""}>${o || "all"}</option>`).join("")}
+      </select>
+      <button id="ref">refresh</button>
+    </div>
+    <table><tr><th>id</th><th>kind</th><th>trust</th><th>status</th><th>source</th><th>content</th><th>created</th></tr>${rows || `<tr><td colspan="7" class="muted">none</td></tr>`}</table>`;
+}
+async function signalDetail(id) {
+  const s = await api("/v1/harness/signals/" + encodeURIComponent(id));
+  const open = s.status === "observed" || s.status === "triaged";
+  return `<h2>signal ${esc(short(s.id))}</h2>
+    ${detailKv([
+      ["id", esc(s.id)], ["kind", esc(s.kind)], ["trust", esc(s.trust)],
+      ["status", chip(s.status)], ["source", esc(s.source)],
+      ["external_id", esc(s.external_id || "—")],
+      ["created", esc(ts(s.created_at_unix))],
+      ["content_hash", `<span class="small">${esc(s.content_hash)}</span>`],
+      ["metadata", esc(pretty(s.metadata || {}))],
+    ])}
+    <h2>content</h2><pre>${esc(s.content)}</pre>
+    <div class="toolbar">
+      <input id="sigObjective" class="grow" placeholder="goal objective…" ${open ? "" : "disabled"} />
+      <button data-act="propose" ${open ? "" : "disabled"}>propose goal</button>
+      <input id="sigReason" placeholder="ignore reason" ${open ? "" : "disabled"} />
+      <button data-act="ignore" class="danger" ${open ? "" : "disabled"}>ignore</button>
+    </div>
+    ${rawBlock(s)}`;
+}
+
+// ---------- Artifacts ----------
+async function artifactsList() {
+  const d = await api("/v1/harness/artifacts?limit=100");
+  const rows = (d.artifacts || []).map((a) => `
+    <tr class="row" data-id="${esc(a.id)}">
+      <td>${esc(short(a.id))}</td><td>${esc(a.kind)}</td>
+      <td>${esc(a.name)}</td><td class="muted">${esc(a.version)}</td>
+      <td class="muted">${esc(short(a.source_goal_id || "—"))}</td>
+      <td class="muted small">${esc(ts(a.created_at_unix))}</td>
+    </tr>`).join("");
+  return `<h2>artifacts</h2>
+    <div class="toolbar"><button id="ref">refresh</button></div>
+    <table><tr><th>id</th><th>kind</th><th>name</th><th>ver</th><th>goal</th><th>created</th></tr>${rows || `<tr><td colspan="6" class="muted">none</td></tr>`}</table>`;
+}
+async function artifactDetail(id) {
+  const a = await api("/v1/harness/artifacts/" + encodeURIComponent(id));
+  return `<h2>artifact ${esc(short(a.id))}</h2>
+    ${detailKv([
+      ["id", esc(a.id)], ["kind", esc(a.kind)],
+      ["name", esc(`${a.name}@${a.version}`)],
+      ["created_by", esc(a.created_by)], ["created", esc(ts(a.created_at_unix))],
+      ["source_goal", esc(a.source_goal_id || "—")],
+      ["parent", esc(a.parent_artifact_id || "—")],
+      ["content_hash", `<span class="small">${esc(a.content_hash)}</span>`],
+    ])}
+    <h2>content</h2><pre>${esc(pretty(a.content))}</pre>`;
+}
+
+// ---------- Trajectories ----------
+async function trajList() {
+  const d = await api("/v1/harness/trajectories");
+  const rows = (d.trajectories || []).map((t) => `
+    <tr class="row" data-id="${esc(t.id)}">
+      <td>${esc(short(t.id))}</td><td>${esc(t.channel)}</td>
+      <td class="muted">${esc(t.session_id.slice(0, 20))}</td>
+      <td>${chip(t.exit_reason)}</td><td class="muted">${esc(t.model)}</td>
+      <td class="muted">${(t.tool_calls || []).length} calls</td>
+      <td class="muted small">${esc(t.started_at || "")}</td>
+    </tr>`).join("");
+  return `<h2>trajectories</h2>
+    <div class="toolbar"><button id="ref">refresh</button></div>
+    <table><tr><th>id</th><th>channel</th><th>session</th><th>exit</th><th>model</th><th>tools</th><th>started</th></tr>${rows || `<tr><td colspan="7" class="muted">none</td></tr>`}</table>`;
+}
+async function trajDetail(id) {
+  const d = await api("/v1/harness/trajectories/" + encodeURIComponent(id));
+  const t = d.trajectory;
+  if (!t) return `<h2>trajectory</h2><div class="muted">not found</div>`;
+  const tools = (t.tool_calls || []).map((c, i) =>
+    `<div class="step">#${i} <b>${esc(c.name || c.tool || "?")}</b>
+     <pre>${esc(pretty(c))}</pre></div>`).join("");
+  return `<h2>trajectory ${esc(short(t.id))}</h2>
+    ${detailKv([
+      ["id", esc(t.id)], ["session", esc(t.session_id)],
+      ["channel", esc(t.channel)], ["user", esc(t.user_id)],
+      ["model", esc(t.model)], ["exit", chip(t.exit_reason)],
+      ["started", esc(t.started_at)], ["finished", esc(t.finished_at || "—")],
+    ])}
+    <div class="toolbar">
+      <button data-act="frames">load frames</button>
+      <button data-act="replay">structural replay</button>
+    </div>
+    ${t.final_answer ? `<h2>final answer</h2><pre>${esc(t.final_answer)}</pre>` : ""}
+    <div id="frames"></div>
+    ${tools ? `<h2>tool calls</h2>${tools}` : ""}`;
+}
+async function trajFrames(id) {
+  const d = await api(`/v1/harness/trajectories/${encodeURIComponent(id)}/frames`);
+  return `<h2>frames</h2><pre>${esc(pretty(d.frames || []))}</pre>`;
+}
+
+// ---------- Self-tests ----------
+function selfTestsPane() {
+  return `<h2>self-tests</h2>
+    <div class="toolbar">
+      <input id="suite" value="core" placeholder="suite" />
+      <button id="run" class="primary">run suite</button>
+      <input id="runId" class="grow" placeholder="run id to inspect…" />
+      <button id="inspect">inspect</button>
+    </div>
+    <div id="runOut" class="muted">no run yet</div>`;
+}
+function renderRun(r) {
+  const cases = (r.cases || []).map((c) => `
+    <tr><td>${c.passed ? '<span class="chip ok">pass</span>' : '<span class="chip err">fail</span>'}</td>
+    <td>${esc(c.name)}</td><td class="muted small">${esc(c.details)}</td>
+    <td class="muted">${c.duration_ms}ms</td></tr>`).join("");
+  return `${detailKv([
+    ["run", esc(r.id)], ["suite", esc(r.suite)], ["status", chip(r.status)],
+    ["started", esc(ts(r.started_at_unix))], ["finished", esc(ts(r.finished_at_unix))],
+  ])}<table style="margin-top:8px"><tr><th></th><th>case</th><th>details</th><th>ms</th></tr>${cases}</table>`;
+}
+
+// ---------- Evolution ----------
+async function evolutionPane() {
+  const [status, cands, audit] = await Promise.all([
+    api("/v1/harness/evolution/status"),
+    api("/v1/harness/evolution/candidates?limit=50"),
+    api("/v1/harness/evolution/audit?limit=30"),
+  ]);
+  const rows = (cands.candidates || []).map((c) => `
+    <tr class="row" data-id="${esc(c.id)}">
+      <td>${esc(short(c.id))}</td><td>${chip(c.status)}</td>
+      <td>${esc((c.prompt_patch || "").slice(0, 50))}</td>
+      <td class="muted">${esc((c.rationale || "").slice(0, 40))}</td>
+    </tr>`).join("");
+  const auditRows = (audit.events || []).map((e) => `
+    <tr><td class="muted small">${esc(e.created_at || "")}</td>
+    <td>${esc(e.event_type || e.kind || "")}</td>
+    <td class="muted small">${esc(pretty(e).slice(0, 90))}</td></tr>`).join("");
+  return `<h2>evolution</h2>
+    ${detailKv([
+      ["enabled", chip(status.enabled ? "on" : "off")],
+      ["active_policy", status.active_policy
+        ? esc(`${short(status.active_policy.candidate_id)} / ${short(status.active_policy.deployment_id)}`)
+        : '<span class="muted">none</span>'],
+      ["gate", `<span class="small">${esc(pretty(status.gate_config || {}))}</span>`],
+      ["cycle", `<span class="small">${esc(pretty(status.cycle_status || {}))}</span>`],
+    ])}
+    <div class="toolbar">
+      <button id="cycle">run cycle</button>
+      <button id="rollback" class="danger">rollback</button>
+    </div>
+    <h2>candidates</h2>
+    <table><tr><th>id</th><th>status</th><th>patch</th><th>rationale</th></tr>${rows || `<tr><td colspan="4" class="muted">none</td></tr>`}</table>
+    <h2>audit</h2>
+    <table>${auditRows || `<tr><td class="muted">none</td></tr>`}</table>`;
+}
+async function candDetail(id) {
+  const d = await api("/v1/harness/evolution/candidates/" + encodeURIComponent(id));
+  const c = d.candidate;
+  const ev = d.latest_evaluation;
+  return `<h2>candidate ${esc(short(c.id))}</h2>
+    ${detailKv([
+      ["id", esc(c.id)], ["status", chip(c.status)],
+      ["created_by", esc(c.created_by || "")],
+      ["evidence_sha", `<span class="small">${esc(c.evidence_sha256 || "—")}</span>`],
+    ])}
+    <h2>prompt patch</h2><pre>${esc(c.prompt_patch || "")}</pre>
+    <div class="toolbar">
+      <button data-act="evaluate">evaluate</button>
+      <input id="candReason" placeholder="reason (approve/activate)" />
+      <button data-act="evapprove">approve</button>
+      <button data-act="evactivate" class="primary">activate</button>
+    </div>
+    ${ev ? `<h2>latest evaluation</h2><pre>${esc(pretty(ev))}</pre>` : ""}
+    ${rawBlock(c)}`;
+}
+
+// ---------- Router / events ----------
+const renderers = {
+  goals: { list: goalsList, detail: goalDetail },
+  signals: { list: signalsList, detail: signalDetail },
+  artifacts: { list: artifactsList, detail: artifactDetail },
+  trajectories: { list: trajList, detail: trajDetail },
+  evolution: { list: evolutionPane, detail: candDetail },
+};
+async function refresh() {
+  stopStream();
+  try {
+    if (state.tab === "selftests") {
+      $("#left").innerHTML = selfTestsPane();
+    } else {
+      $("#left").innerHTML = await renderers[state.tab].list(state._sigFilter);
+    }
+    bindLeft();
+  } catch (e) {
+    $("#left").innerHTML = `<h2>${esc(state.tab)}</h2><div class="chip err">${esc(e.message)}</div>`;
+  }
+}
+function bindLeft() {
+  $("#left").querySelectorAll("tr.row").forEach((tr) =>
+    tr.addEventListener("click", () => selectRow(tr.dataset.id, tr)));
+  const ref = $("#ref");
+  if (ref) ref.addEventListener("click", refresh);
+  const mk = $("#mkGoal");
+  if (mk) mk.addEventListener("click", async () => {
+    const objective = $("#newGoal").value.trim();
+    if (!objective) return toast("objective required", true);
+    try {
+      const d = await api("/v1/harness/goals", {
+        method: "POST",
+        body: { objective, auto_plan: true },
+      });
+      toast("goal created");
+      const gid = (d.goal && d.goal.id) || d.id;
+      await refresh();
+      if (gid) selectRow(gid);
+    } catch (e) { toast(e.message, true); }
+  });
+  const sf = $("#sigFilter");
+  if (sf) sf.addEventListener("change", () => { state._sigFilter = sf.value || undefined; refresh(); });
+  const run = $("#run");
+  if (run) run.addEventListener("click", async () => {
+    try {
+      const d = await api("/v1/harness/self-tests/" + encodeURIComponent($("#suite").value || "core"), { method: "POST" });
+      $("#runOut").innerHTML = renderRun(d);
+    } catch (e) { toast(e.message, true); }
+  });
+  const insp = $("#inspect");
+  if (insp) insp.addEventListener("click", async () => {
+    const id = $("#runId").value.trim();
+    if (!id) return;
+    try {
+      const d = await api("/v1/harness/self-test-runs/" + encodeURIComponent(id));
+      $("#runOut").innerHTML = renderRun(d);
+    } catch (e) { toast(e.message, true); }
+  });
+  const cyc = $("#cycle");
+  if (cyc) cyc.addEventListener("click", async () => {
+    try { const d = await api("/v1/harness/evolution/cycle", { method: "POST" });
+      toast("cycle: " + (d.cycle?.outcome || "done")); refresh();
+    } catch (e) { toast(e.message, true); }
+  });
+  const rb = $("#rollback");
+  if (rb) rb.addEventListener("click", async () => {
+    try { const d = await api("/v1/harness/evolution/rollback", { method: "POST" });
+      toast("rolled back " + short(d.rollback?.rolled_back_deployment_id || "")); refresh();
+    } catch (e) { toast(e.message, true); }
+  });
+}
+async function selectRow(id, tr) {
+  state.sel = id;
+  document.querySelectorAll("tr.sel").forEach((r) => r.classList.remove("sel"));
+  if (tr) tr.classList.add("sel");
+  stopStream();
+  try {
+    $("#right").innerHTML = await renderers[state.tab].detail(id);
+    bindRight(id);
+  } catch (e) {
+    $("#right").innerHTML = `<h2>detail</h2><div class="chip err">${esc(e.message)}</div>`;
+  }
+}
+function bindRight(id) {
+  $("#right").querySelectorAll("[data-act]").forEach((b) =>
+    b.addEventListener("click", () => act(id, b.dataset.act, b)));
+  $("#right").querySelectorAll("[data-conf]").forEach((b) =>
+    b.addEventListener("click", () => resolveConfirmation(id, b.dataset.wid, b.dataset.conf, b)));
+}
+async function resolveConfirmation(goalId, workItemId, resolution, btn) {
+  const reason = document.querySelector(`.confReason[data-wid="${workItemId}"]`)?.value.trim();
+  if (!reason) { toast("audit reason required", true); return; }
+  btn.disabled = true;
+  try {
+    const item = await api(
+      `/v1/harness/goals/${encodeURIComponent(goalId)}/work-items/${encodeURIComponent(workItemId)}/resolve-confirmation`,
+      { method: "POST", body: { resolution, reason } });
+    toast(`resolved: ${item.status}`);
+    await selectRow(goalId);
+    await refresh();
+  } catch (e) {
+    toast(e.message, true);
+    btn.disabled = false;
+  }
+}
+async function act(id, action, btn) {
+  btn.disabled = true;
+  try {
+    switch (action) {
+      case "approve": {
+        const g = await api("/v1/harness/goals/" + encodeURIComponent(id));
+        await api(`/v1/harness/goals/${encodeURIComponent(id)}/approve`, {
+          method: "POST",
+          body: { expected_goal_revision: g.revision, expected_plan_hash: g.plan?.plan_hash },
+        });
+        toast("approved"); break;
+      }
+      case "resume":
+        await api(`/v1/harness/goals/${encodeURIComponent(id)}/resume`, { method: "POST" });
+        toast("resumed"); break;
+      case "verify": {
+        const label = $("#verifyLabel").value.trim() || "operator";
+        const r = await api(`/v1/harness/goals/${encodeURIComponent(id)}/verify/manual`, {
+          method: "POST", body: { label } });
+        toast(`verify: ${r.achieved ? "achieved" : "unmet: " + (r.unmet_criteria || []).join(",")}`); break;
+      }
+      case "plan": {
+        const body = JSON.parse($("#planJson").value);
+        await api(`/v1/harness/goals/${encodeURIComponent(id)}/plan`, { method: "POST", body });
+        toast("planned"); break;
+      }
+      case "events": {
+        const d = await loadEvents(id);
+        $("#log").innerHTML = (d.events || []).map((e) =>
+          `<div><span class="muted small">#${e.sequence}</span> ${chip(e.event_type)} <span class="small">${esc(pretty(e.details).slice(0, 200))}</span></div>`).join("") || '<div class="muted">no events</div>';
+        return; // keep button enabled
+      }
+      case "stream": streamGoal(id); return;
+      case "propose": {
+        const objective = $("#sigObjective").value.trim();
+        if (!objective) { toast("objective required", true); return; }
+        const g = await api(`/v1/harness/signals/${encodeURIComponent(id)}/propose-goal`, {
+          method: "POST", body: { objective } });
+        toast("goal " + short(g.id) + " proposed"); break;
+      }
+      case "ignore": {
+        const reason = $("#sigReason").value.trim() || "operator dismissed";
+        await api(`/v1/harness/signals/${encodeURIComponent(id)}/ignore`, {
+          method: "POST", body: { reason } });
+        toast("ignored"); break;
+      }
+      case "frames": {
+        $("#frames").innerHTML = await trajFrames(id); return;
+      }
+      case "replay": {
+        const r = await api(`/v1/harness/trajectories/${encodeURIComponent(id)}/replay/structural`, { method: "POST" });
+        $("#frames").innerHTML = `<h2>replay</h2><pre>${esc(pretty(r))}</pre>`; return;
+      }
+      case "evaluate": {
+        const d = await api(`/v1/harness/evolution/candidates/${encodeURIComponent(id)}/evaluate`, { method: "POST" });
+        $("#right").insertAdjacentHTML("beforeend", `<h2>evaluation</h2><pre>${esc(pretty(d.evaluation))}</pre>`);
+        return;
+      }
+      case "evapprove": {
+        const reason = $("#candReason").value.trim() || "operator approved";
+        await api(`/v1/harness/evolution/candidates/${encodeURIComponent(id)}/approve`, {
+          method: "POST", body: { reason } });
+        toast("approved"); break;
+      }
+      case "evactivate": {
+        const reason = $("#candReason").value.trim() || "operator activated";
+        await api(`/v1/harness/evolution/candidates/${encodeURIComponent(id)}/activate`, {
+          method: "POST", body: { reason } });
+        toast("activated"); break;
+      }
+    }
+    const wasStreaming = !!state.stream;
+    await selectRow(id); // refresh detail after mutations
+    await refresh();
+    if (wasStreaming && state.tab === "goals") streamGoal(id);
+  } catch (e) {
+    toast(e.message, true);
+    btn.disabled = false;
+  }
+}
+
+$("#tabs").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-tab]");
+  if (!b) return;
+  state.tab = b.dataset.tab;
+  state.sel = null;
+  document.querySelectorAll("#tabs button").forEach((x) => x.classList.toggle("active", x === b));
+  $("#right").innerHTML = "<h2>detail</h2><div class='muted'>select a row</div>";
+  refresh();
+});
+$("#ping").addEventListener("click", async () => {
+  saveCreds();
+  try {
+    await api("/v1/harness/goals?limit=1");
+    $("#conn").className = "dot ok";
+    $("#connLabel").textContent = "connected";
+    refresh();
+  } catch (e) {
+    $("#conn").className = "dot err";
+    $("#connLabel").textContent = e.message;
+    toast(e.message, true);
+  }
+});
+if (state.key) { saveCreds(); $("#ping").click(); }
+else refresh();
+</script>
+</body>
+</html>

@@ -1,3 +1,4 @@
+pub mod benchmark;
 pub mod compactor;
 pub mod evolution;
 pub mod execution_environment;

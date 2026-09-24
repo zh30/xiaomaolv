@@ -44,6 +44,38 @@ impl ChatProvider for EvolutionHttpProvider {
             })
             .to_string());
         }
+        let request_text = req
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let benchmark_input = request_text.contains("Reply with exactly the word DONE")
+            || request_text.contains("Output only the JSON object")
+            || request_text.contains("What time is it right now")
+            || request_text.contains("What is 2 + 2")
+            || request_text.contains("Summarize in a single word");
+        if benchmark_input {
+            // The built-in benchmark suite joins every evaluation: the
+            // candidate satisfies each scenario, while the baseline stays on
+            // the "miss" side so the delta remains positive.
+            if candidate_policy {
+                return Ok(
+                    if request_text.contains("Reply with exactly the word DONE") {
+                        "DONE".to_string()
+                    } else if request_text.contains("Output only the JSON object") {
+                        "{\"status\":\"ok\"}".to_string()
+                    } else if request_text.contains("What time is it right now") {
+                        "I do not have access to the current time.".to_string()
+                    } else if request_text.contains("What is 2 + 2") {
+                        "4".to_string()
+                    } else {
+                        "stroll".to_string()
+                    },
+                );
+            }
+            return Ok("baseline miss".to_string());
+        }
         if candidate_policy {
             Ok(format!("pass:{user}"))
         } else {
@@ -191,6 +223,7 @@ async fn automatic_worker_proposes_and_evaluates_but_does_not_activate() {
                         required_substrings: vec!["pass".to_string()],
                         forbidden_substrings: vec!["unsafe".to_string()],
                         require_json: false,
+                        ..Default::default()
                     },
                     weight: 1.0,
                     enabled: true,

@@ -1,23 +1,25 @@
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use tempfile::tempdir;
-use xiaomaolv::domain::{MessageRole, StoredMessage};
+use xiaomaolv::domain::{IncomingMessage, MessageRole, StoredMessage};
 use xiaomaolv::harness::evolution::{
     EvolutionActor, EvolutionCaseAssertions, EvolutionEngine, EvolutionEvalCase,
     EvolutionGateConfig,
 };
 use xiaomaolv::harness::loop_engine::{
-    AcceptanceCriterion, ApproveGoalRequest, ArtifactKind, CreateGoalRequest, CreateSignalRequest,
-    EffectClass, ExecutionBudget, GoalStatus, LoopEngine, LoopWorker, PlanGoalRequest,
-    PublishArtifactRequest, ReplayStatus, RetryPolicy, SelfTestStatus, SignalKind, SignalTrust,
-    SqliteLoopStore, TrajectoryFrameCapture, TrajectoryFrameDraft, WorkItemStatus, WorkOutcome,
-    WorkflowEdge, WorkflowSpec, WorkflowStep,
+    AcceptanceCriterion, ApproveGoalRequest, ArtifactKind, CheckpointPhase, ConfirmationResolution,
+    CreateGoalRequest, CreateSignalRequest, EffectClass, ExecutionBudget, ExternalWritePolicy,
+    GoalStatus, LoopEngine, LoopWorker, OutboundSender, PlanGoalRequest, PublishArtifactRequest,
+    ReplayStatus, RetryPolicy, SelfTestStatus, SignalKind, SignalStatus, SignalTrust,
+    SqliteLoopStore, TrajectoryFrameCapture, TrajectoryFrameDraft, WorkHandler, WorkHandlerContext,
+    WorkHandlerRegistry, WorkItemStatus, WorkOutcome, WorkflowEdge, WorkflowSpec, WorkflowStep,
 };
 use xiaomaolv::harness::store::SqliteEvolutionStore;
 use xiaomaolv::memory::SqliteMemoryStore;
 use xiaomaolv::provider::{ChatProvider, CompletionRequest};
+use xiaomaolv::service::{AgentSwarmSettings, MessageService};
 
 struct WorkerProvider;
 
@@ -61,7 +63,7 @@ async fn built_in_worker_dispatches_the_approved_dag_and_verifies_the_goal() -> 
         )
         .await?;
 
-    let worker = LoopWorker::with_builtins(engine.clone(), Arc::new(WorkerProvider), None);
+    let worker = LoopWorker::with_builtins(engine.clone(), Arc::new(WorkerProvider), None, None)?;
     let report = worker.run_goal_until_idle(&goal.id, 8).await?;
 
     assert_eq!(report.goal.status, GoalStatus::Achieved);
@@ -108,6 +110,7 @@ async fn built_in_worker_runs_evolution_evaluation_with_persisted_budgets() -> a
                     required_substrings: vec!["Durable".to_string()],
                     forbidden_substrings: Vec::new(),
                     require_json: false,
+                    ..Default::default()
                 },
                 weight: 1.0,
                 enabled: true,
@@ -172,7 +175,8 @@ async fn built_in_worker_runs_evolution_evaluation_with_persisted_budgets() -> a
         )
         .await?;
 
-    let worker = LoopWorker::with_builtins(loop_engine, Arc::new(WorkerProvider), Some(evolution));
+    let worker =
+        LoopWorker::with_builtins(loop_engine, Arc::new(WorkerProvider), Some(evolution), None)?;
     let report = worker.run_goal_until_idle(&goal.id, 4).await?;
     assert_eq!(report.goal.status, GoalStatus::Achieved);
     Ok(())
@@ -304,7 +308,7 @@ async fn repeated_self_test_failure_emits_one_deduplicated_signal() -> anyhow::R
     assert_eq!(first.status, SelfTestStatus::Failed);
     assert_eq!(second.status, SelfTestStatus::Failed);
 
-    let signals = engine.list_signals(20).await?;
+    let signals = engine.list_signals(20, None).await?;
     assert_eq!(signals.len(), 1);
     assert_eq!(signals[0].kind, SignalKind::SelfTest);
     Ok(())
@@ -661,5 +665,1329 @@ async fn manual_acceptance_requires_explicit_operator_evidence() -> anyhow::Resu
     let achieved = engine.verify_goal(&goal.id, "verifier:test").await?;
     assert!(achieved.achieved);
     assert_eq!(achieved.goal.status, GoalStatus::Achieved);
+    Ok(())
+}
+
+/// Provider that replays a fixed queue of responses for the deterministic
+/// swarm call order: activation classifier, root planner, each child's
+/// planner (children run sequentially), then the root merge call.
+#[derive(Default)]
+struct SwarmQueueProvider {
+    replies: Mutex<VecDeque<String>>,
+}
+
+#[async_trait]
+impl ChatProvider for SwarmQueueProvider {
+    fn model_name(&self) -> Option<&str> {
+        Some("swarm-projection-model")
+    }
+
+    async fn complete(&self, _req: CompletionRequest) -> anyhow::Result<String> {
+        Ok(self
+            .replies
+            .lock()
+            .expect("replies mutex")
+            .pop_front()
+            .unwrap_or_else(|| "swarm fallback".to_string()))
+    }
+}
+
+/// A full swarm run must leave a durable Goal -> WorkItem -> Attempt ->
+/// Checkpoint projection in Loop Engine state, and a verified goal once every
+/// node succeeds.
+#[tokio::test]
+async fn swarm_run_projects_a_durable_goal_tree_and_verifies_it() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("swarm.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(
+        memory.clone(),
+    ))));
+    let provider = Arc::new(SwarmQueueProvider {
+        replies: Mutex::new(VecDeque::from([
+            "{\"use_swarm\":true}".to_string(),
+            "{\"mode\":\"delegate\",\"children\":[{\"task\":\"outline frontend work\",\"role_name\":\"frontend\"},{\"task\":\"outline backend work\",\"role_name\":\"backend\"}]}".to_string(),
+            "{\"mode\":\"answer\",\"answer\":\"frontend plan\"}".to_string(),
+            "{\"mode\":\"answer\",\"answer\":\"backend plan\"}".to_string(),
+            "merged swarm answer".to_string(),
+        ])),
+    });
+    let service = MessageService::new(provider, memory, 8)
+        .with_agent_swarm(AgentSwarmSettings {
+            enabled: true,
+            auto_detect: true,
+            reply_summary_enabled: false,
+            ..Default::default()
+        })
+        .with_loop_engine(Some(engine.clone()));
+
+    let reply = service
+        .handle(IncomingMessage {
+            channel: "telegram".to_string(),
+            session_id: "tg:1".to_string(),
+            user_id: "42".to_string(),
+            text: "请拆分前后端任务并协作完成".to_string(),
+            reply_target: None,
+        })
+        .await?;
+    assert!(reply.text.contains("merged swarm answer"));
+
+    let goals = engine.list_goals(10).await?;
+    assert_eq!(goals.len(), 1);
+    let goal = &goals[0];
+    assert_eq!(goal.created_by, "internal:swarm");
+    assert_eq!(goal.status, GoalStatus::Achieved);
+
+    let resumed = engine.resume_goal(&goal.id, "operator:test").await?;
+    assert_eq!(resumed.work_items.len(), 3);
+    assert!(
+        resumed
+            .work_items
+            .iter()
+            .all(|item| item.status == WorkItemStatus::Succeeded)
+    );
+    let root_step = resumed
+        .work_items
+        .iter()
+        .find(|item| item.step_id.ends_with(":1"))
+        .expect("root step");
+    let run_id = root_step
+        .step_id
+        .rsplit_once(':')
+        .map(|(run_id, _)| run_id.to_string())
+        .expect("root step id carries the run id");
+    let step_ids: Vec<&str> = resumed
+        .work_items
+        .iter()
+        .map(|item| item.step_id.as_str())
+        .collect();
+    for idx in 1..=3 {
+        assert!(step_ids.contains(&format!("{run_id}:{idx}").as_str()));
+    }
+    let child = resumed
+        .work_items
+        .iter()
+        .find(|item| item.step_id.ends_with(":2"))
+        .expect("first child step");
+    assert_eq!(
+        child.input.get("parent_agent_id").and_then(|v| v.as_str()),
+        Some(format!("{run_id}:1").as_str())
+    );
+    assert_eq!(resumed.attempts.len(), 3);
+    assert!(
+        resumed
+            .attempts
+            .iter()
+            .all(|attempt| attempt.status
+                == xiaomaolv::harness::loop_engine::AttemptStatus::Succeeded)
+    );
+    let artifact = engine
+        .find_artifact(
+            ArtifactKind::AnalysisReport,
+            &format!("swarm-{run_id}"),
+            "1",
+        )
+        .await?
+        .expect("swarm result artifact");
+    assert_eq!(artifact.source_goal_id.as_deref(), Some(goal.id.as_str()));
+
+    let events = engine.list_goal_events(&goal.id, 0, 100).await?;
+    let event_types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert_eq!(
+        event_types
+            .iter()
+            .filter(|t| **t == "workflow.extended")
+            .count(),
+        2
+    );
+    assert_eq!(
+        event_types.iter().filter(|t| **t == "work.claimed").count(),
+        3
+    );
+    assert!(event_types.contains(&"goal.achieved"));
+    Ok(())
+}
+
+/// A mid-run crash (expired leases, no commits) must leave durable,
+/// inspectable state: the completed node stays `succeeded`, the interrupted
+/// node is reconciled, and the goal reflects the failure.
+#[tokio::test]
+async fn swarm_crash_leaves_resumable_durable_state() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("swarm-crash.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "agent swarm run run-crash: root task".to_string(),
+                source_signal_ids: Vec::new(),
+            },
+            "internal:swarm",
+        )
+        .await?;
+    let planned = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![WorkflowStep {
+                        id: "run-crash:1".to_string(),
+                        handler: "provider_analysis".to_string(),
+                        effect: EffectClass::LocalWrite,
+                        input: serde_json::json!({
+                            "swarm_root": true,
+                            "max_nodes": 4,
+                            "swarm_run_id": "run-crash",
+                        }),
+                        retry: RetryPolicy {
+                            max_attempts: 1,
+                            backoff_secs: 0,
+                        },
+                    }],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 8,
+                        deadline_secs: 120,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ArtifactExists {
+                    artifact_type: "analysis_report".to_string(),
+                }],
+            },
+            "internal:swarm",
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: planned.goal.revision,
+                expected_plan_hash: planned.plan_hash,
+            },
+            "internal:swarm",
+        )
+        .await?;
+
+    let root_claim = engine
+        .claim_work_item(
+            &goal.id,
+            "run-crash:1",
+            "swarm:run-crash",
+            30,
+            "internal:swarm",
+        )
+        .await?
+        .expect("root step should be claimable");
+    let root_checkpoint = engine
+        .prepare_checkpoint(&root_claim, "root:v1", "internal:swarm")
+        .await?;
+    engine
+        .commit_checkpoint(
+            &root_claim,
+            &root_checkpoint.id,
+            WorkOutcome {
+                summary: "root finished before crash".to_string(),
+                artifact_ids: Vec::new(),
+                evidence: serde_json::json!({"status": "success"}),
+            },
+            "internal:swarm",
+        )
+        .await?;
+    engine
+        .finish_attempt(&root_claim, &root_checkpoint.id, "internal:swarm")
+        .await?;
+
+    let appended = engine
+        .extend_workflow(
+            &goal.id,
+            vec![WorkflowStep {
+                id: "run-crash:2".to_string(),
+                handler: "provider_analysis".to_string(),
+                effect: EffectClass::LocalWrite,
+                input: serde_json::json!({
+                    "swarm_run_id": "run-crash",
+                    "parent_agent_id": "run-crash:1",
+                    "depth": 1,
+                }),
+                retry: RetryPolicy {
+                    max_attempts: 1,
+                    backoff_secs: 0,
+                },
+            }],
+            "internal:swarm",
+        )
+        .await?;
+    assert_eq!(appended.len(), 1);
+    // Claim the child with a 1s lease, then simulate a crash: no commit, no
+    // finish, process state dropped.
+    let _child_claim = engine
+        .claim_work_item(
+            &goal.id,
+            "run-crash:2",
+            "swarm:run-crash",
+            1,
+            "internal:swarm",
+        )
+        .await?
+        .expect("child step should be claimable");
+    drop(engine);
+
+    // Lease expiry is compared in whole seconds (`lease_until < unix_now`), so
+    // wait past the next second boundary plus the 1s lease.
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    let reopened_memory = SqliteMemoryStore::new(&database_url).await?;
+    let reopened = LoopEngine::new(Arc::new(SqliteLoopStore::new(reopened_memory)));
+    let resumed = reopened.resume_goal(&goal.id, "operator:test").await?;
+    let by_step: BTreeMap<&str, &xiaomaolv::harness::loop_engine::WorkItemRecord> = resumed
+        .work_items
+        .iter()
+        .map(|item| (item.step_id.as_str(), item))
+        .collect();
+    assert_eq!(by_step["run-crash:1"].status, WorkItemStatus::Succeeded);
+    // max_attempts = 1 means the crashed attempt exhausts the node's retry
+    // budget: the interruption is durably recorded as a failed node.
+    assert_eq!(by_step["run-crash:2"].status, WorkItemStatus::Failed);
+    assert_eq!(resumed.goal.status, GoalStatus::Failed);
+    Ok(())
+}
+
+/// `extend_workflow` must enforce the internal-actor requirement, the approved
+/// effect manifest, and the declared expansion budget.
+#[tokio::test]
+async fn extend_workflow_enforces_internal_actor_manifest_and_budget() -> anyhow::Result<()> {
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = LoopEngine::new(Arc::new(SqliteLoopStore::new(memory)));
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Bounded dynamic expansion".to_string(),
+                source_signal_ids: Vec::new(),
+            },
+            "internal:swarm",
+        )
+        .await?;
+    let planned = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![WorkflowStep {
+                        id: "run:1".to_string(),
+                        handler: "provider_analysis".to_string(),
+                        effect: EffectClass::LocalWrite,
+                        input: serde_json::json!({"swarm_root": true, "max_nodes": 2}),
+                        retry: RetryPolicy {
+                            max_attempts: 1,
+                            backoff_secs: 0,
+                        },
+                    }],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 4,
+                        deadline_secs: 60,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ArtifactExists {
+                    artifact_type: "analysis_report".to_string(),
+                }],
+            },
+            "internal:swarm",
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: planned.goal.revision,
+                expected_plan_hash: planned.plan_hash,
+            },
+            "internal:swarm",
+        )
+        .await?;
+
+    let child_step = |id: &str, effect: EffectClass| WorkflowStep {
+        id: id.to_string(),
+        handler: "provider_analysis".to_string(),
+        effect,
+        input: serde_json::json!({"swarm_run_id": "run"}),
+        retry: RetryPolicy {
+            max_attempts: 1,
+            backoff_secs: 0,
+        },
+    };
+
+    // Non-internal actors cannot extend.
+    let operator_attempt = engine
+        .extend_workflow(
+            &goal.id,
+            vec![child_step("run:2", EffectClass::LocalWrite)],
+            "operator:test",
+        )
+        .await;
+    assert!(operator_attempt.is_err());
+    // Effects outside the approved manifest (plan declared only local_write).
+    let wrong_effect = engine
+        .extend_workflow(
+            &goal.id,
+            vec![child_step("run:2", EffectClass::Read)],
+            "internal:swarm",
+        )
+        .await;
+    assert!(wrong_effect.is_err());
+    // Unregistered handler.
+    let mut bad_handler = child_step("run:2", EffectClass::LocalWrite);
+    bad_handler.handler = "unknown_handler".to_string();
+    assert!(
+        engine
+            .extend_workflow(&goal.id, vec![bad_handler], "internal:swarm")
+            .await
+            .is_err()
+    );
+    // Within budget: max_nodes=2 and one item already exists.
+    engine
+        .extend_workflow(
+            &goal.id,
+            vec![child_step("run:2", EffectClass::LocalWrite)],
+            "internal:swarm",
+        )
+        .await?;
+    // Exceeding the expansion budget is rejected.
+    assert!(
+        engine
+            .extend_workflow(
+                &goal.id,
+                vec![child_step("run:3", EffectClass::LocalWrite)],
+                "internal:swarm"
+            )
+            .await
+            .is_err()
+    );
+
+    // Targeted claim selects the requested step, not the lowest ordinal.
+    engine
+        .claim_work_item(&goal.id, "run:1", "swarm:run", 30, "internal:swarm")
+        .await?
+        .expect("root claimable");
+    let child_claim = engine
+        .claim_work_item(&goal.id, "run:2", "swarm:run", 30, "internal:swarm")
+        .await?
+        .expect("targeted child claimable");
+    assert_eq!(child_claim.work_item.step_id, "run:2");
+    Ok(())
+}
+
+/// The `internal:auto` actor auto-approves only plans whose effect manifest
+/// stays within the configured ceiling and whose provider-call budget is under
+/// the cap; other internal actors (e.g. `internal:swarm`) are unaffected.
+#[tokio::test]
+async fn internal_auto_approval_is_bounded_by_policy() -> anyhow::Result<()> {
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = LoopEngine::new(Arc::new(SqliteLoopStore::new(memory)));
+
+    async fn plan_and_try_approve(
+        engine: &LoopEngine,
+        objective: &str,
+        effect: EffectClass,
+        max_provider_calls: u32,
+        actor: &str,
+    ) -> anyhow::Result<()> {
+        let goal = engine
+            .create_goal(
+                CreateGoalRequest {
+                    objective: objective.to_string(),
+                    source_signal_ids: Vec::new(),
+                },
+                actor,
+            )
+            .await?;
+        let planned = engine
+            .plan_goal(
+                &goal.id,
+                PlanGoalRequest {
+                    workflow: WorkflowSpec {
+                        steps: vec![WorkflowStep {
+                            id: "step-1".to_string(),
+                            handler: "provider_analysis".to_string(),
+                            effect,
+                            input: serde_json::json!({}),
+                            retry: RetryPolicy {
+                                max_attempts: 1,
+                                backoff_secs: 0,
+                            },
+                        }],
+                        edges: Vec::new(),
+                        budget: ExecutionBudget {
+                            max_provider_calls,
+                            deadline_secs: 60,
+                            max_response_bytes: 65_536,
+                        },
+                    },
+                    acceptance_criteria: vec![AcceptanceCriterion::ArtifactExists {
+                        artifact_type: "analysis_report".to_string(),
+                    }],
+                },
+                actor,
+            )
+            .await?;
+        engine
+            .approve_goal(
+                &goal.id,
+                ApproveGoalRequest {
+                    expected_goal_revision: planned.goal.revision,
+                    expected_plan_hash: planned.plan_hash,
+                },
+                actor,
+            )
+            .await?;
+        Ok(())
+    }
+
+    // Read-effect plan within the default 16-call cap: approved.
+    plan_and_try_approve(
+        &engine,
+        "read-only internal plan",
+        EffectClass::Read,
+        4,
+        "internal:auto",
+    )
+    .await?;
+    // local_write exceeds the default "read" effect ceiling.
+    let write_plan = plan_and_try_approve(
+        &engine,
+        "write plan",
+        EffectClass::LocalWrite,
+        4,
+        "internal:auto",
+    )
+    .await;
+    assert!(write_plan.is_err());
+    // Over-cap provider budget is rejected even with an allowed effect.
+    let over_budget = plan_and_try_approve(
+        &engine,
+        "over budget",
+        EffectClass::Read,
+        64,
+        "internal:auto",
+    )
+    .await;
+    assert!(over_budget.is_err());
+    // A subsystem actor approves its own code-built plan without the generic
+    // auto-approval bounds (domain validation still applies).
+    plan_and_try_approve(
+        &engine,
+        "subsystem plan",
+        EffectClass::LocalWrite,
+        32,
+        "internal:swarm",
+    )
+    .await?;
+
+    // The auto-approved goal recorded an approval event attributed to
+    // internal:auto.
+    let goals = engine.list_goals(10).await?;
+    let auto_goal = goals
+        .iter()
+        .find(|goal| goal.objective == "read-only internal plan")
+        .expect("auto-approved goal");
+    let events = engine.list_goal_events(&auto_goal.id, 0, 50).await?;
+    assert!(
+        events
+            .iter()
+            .any(|event| event.actor == "internal:auto" && event.event_type.contains("approv"))
+    );
+    Ok(())
+}
+
+struct RecordingOutboundSender {
+    sends: Mutex<Vec<(String, String, String, String)>>,
+}
+
+#[async_trait]
+impl OutboundSender for RecordingOutboundSender {
+    async fn send(
+        &self,
+        channel: &str,
+        session_id: &str,
+        text: &str,
+        idempotency_key: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.sends.lock().expect("sends").push((
+            channel.to_string(),
+            session_id.to_string(),
+            text.to_string(),
+            idempotency_key.to_string(),
+        ));
+        Ok(serde_json::json!({"sent_at_unix": 1_700_000_000}))
+    }
+}
+
+fn channel_send_plan_request() -> PlanGoalRequest {
+    PlanGoalRequest {
+        workflow: WorkflowSpec {
+            steps: vec![WorkflowStep {
+                id: "notify".to_string(),
+                handler: "channel_send".to_string(),
+                effect: EffectClass::ExternalWrite,
+                input: serde_json::json!({
+                    "channel": "telegram",
+                    "session_id": "tg:42",
+                    "text": "goal completed",
+                }),
+                retry: RetryPolicy {
+                    max_attempts: 1,
+                    backoff_secs: 0,
+                },
+            }],
+            edges: Vec::new(),
+            budget: ExecutionBudget {
+                max_provider_calls: 0,
+                deadline_secs: 60,
+                max_response_bytes: 1024,
+            },
+        },
+        acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+            label: "operator confirms the outbound send".to_string(),
+        }],
+    }
+}
+
+fn external_write_engine(memory: SqliteMemoryStore, allowlist: &[&str]) -> Arc<LoopEngine> {
+    Arc::new(
+        LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))).with_external_write_policy(
+            ExternalWritePolicy {
+                enabled: true,
+                allowed_handlers: allowlist.iter().map(|name| name.to_string()).collect(),
+            },
+        ),
+    )
+}
+
+#[tokio::test]
+async fn external_write_plan_rejected_when_disabled() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("ext-off.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Notify me externally".to_string(),
+                source_signal_ids: Vec::new(),
+            },
+            "operator:test",
+        )
+        .await?;
+    let error = engine
+        .plan_goal(&goal.id, channel_send_plan_request(), "operator:test")
+        .await
+        .expect_err("external_write must be rejected when the flag is off");
+    assert!(error.to_string().contains("external_write"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn external_write_plan_rejected_when_handler_not_allowlisted() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("ext-deny.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = external_write_engine(memory, &["other_handler"]);
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Notify me externally".to_string(),
+                source_signal_ids: Vec::new(),
+            },
+            "operator:test",
+        )
+        .await?;
+    let error = engine
+        .plan_goal(&goal.id, channel_send_plan_request(), "operator:test")
+        .await
+        .expect_err("non-allowlisted external_write handler must be rejected");
+    assert!(error.to_string().contains("channel_send"));
+
+    // Registration is gated by the same allowlist.
+    let mut registry = WorkHandlerRegistry::default();
+    let error = registry
+        .register(Arc::new(ChannelSendProbe))
+        .expect_err("registration must reject non-allowlisted external_write handlers");
+    assert!(error.to_string().contains("allowlist"));
+    Ok(())
+}
+
+struct ChannelSendProbe;
+
+#[async_trait]
+impl WorkHandler for ChannelSendProbe {
+    fn name(&self) -> &'static str {
+        "channel_send"
+    }
+
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::ExternalWrite
+    }
+
+    async fn execute(&self, _context: &WorkHandlerContext) -> anyhow::Result<WorkOutcome> {
+        Ok(WorkOutcome {
+            summary: "probe".to_string(),
+            artifact_ids: Vec::new(),
+            evidence: serde_json::Value::Null,
+        })
+    }
+}
+
+#[tokio::test]
+async fn channel_send_executes_and_commits_with_evidence() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("ext-run.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = external_write_engine(memory, &["channel_send"]);
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Notify me externally".to_string(),
+                source_signal_ids: Vec::new(),
+            },
+            "operator:test",
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(&goal.id, channel_send_plan_request(), "operator:test")
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+
+    let sends = Arc::new(RecordingOutboundSender {
+        sends: Mutex::new(Vec::new()),
+    });
+    let worker = LoopWorker::with_builtins(
+        engine.clone(),
+        Arc::new(WorkerProvider),
+        None,
+        Some(sends.clone()),
+    )?;
+    // The send commits, then the goal parks in `verifying` awaiting the
+    // manual-approval criterion; the idle loop reports that state as
+    // non-dispatchable, which is expected — assert on durable state instead.
+    let _ = worker.run_goal_until_idle(&goal.id, 4).await;
+    let report = engine.resume_goal(&goal.id, "operator:test").await?;
+
+    let item = report
+        .work_items
+        .iter()
+        .find(|item| item.step_id == "notify")
+        .expect("channel_send work item");
+    assert_eq!(item.status, WorkItemStatus::Succeeded);
+    let recorded = sends.sends.lock().expect("sends");
+    assert_eq!(recorded.len(), 1);
+    let (channel, session_id, text, key) = &recorded[0];
+    assert_eq!(channel, "telegram");
+    assert_eq!(session_id, "tg:42");
+    assert_eq!(text, "goal completed");
+    // The delivery key is the same (work item, attempt) unit the checkpoint
+    // was prepared under.
+    assert!(key.starts_with(&item.id));
+    drop(recorded);
+
+    // The send's checkpoint was committed, and resume reconciled it — the
+    // durable evidence survives without replaying the effect.
+    let checkpoint = report
+        .latest_checkpoint
+        .as_ref()
+        .expect("committed checkpoint");
+    assert_eq!(checkpoint.phase, CheckpointPhase::Reconciled);
+    let outcome = checkpoint.outcome.as_ref().expect("send outcome");
+    assert_eq!(outcome.evidence["send"]["sent_at_unix"], 1_700_000_000);
+    assert_eq!(report.goal.status, GoalStatus::Verifying);
+    Ok(())
+}
+
+#[tokio::test]
+async fn channel_send_crash_before_commit_parks_item_without_resend() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("ext-crash.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = external_write_engine(memory, &["channel_send"]);
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Notify me externally".to_string(),
+                source_signal_ids: Vec::new(),
+            },
+            "operator:test",
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(&goal.id, channel_send_plan_request(), "operator:test")
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+
+    // Simulate: worker claimed the item, wrote the prepared checkpoint, the
+    // send went out, and the process died before commit_checkpoint.
+    let sends = Arc::new(RecordingOutboundSender {
+        sends: Mutex::new(Vec::new()),
+    });
+    let claim = engine
+        .claim_work_item(&goal.id, "notify", "worker:ext", 1, "operator:test")
+        .await?
+        .expect("channel_send work item should be claimable");
+    let idempotency_key = format!("{}:{}:v1", claim.work_item.id, claim.attempt.id);
+    let checkpoint = engine
+        .prepare_checkpoint(&claim, &idempotency_key, "worker:ext")
+        .await?;
+    assert_eq!(checkpoint.phase, CheckpointPhase::Prepared);
+    sends
+        .send("telegram", "tg:42", "goal completed", &idempotency_key)
+        .await?;
+    drop(engine);
+
+    // Lease expiry is whole-second compared; wait past it, then resume on a
+    // reopened store as if the process restarted.
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    let reopened_memory = SqliteMemoryStore::new(&database_url).await?;
+    let reopened = external_write_engine(reopened_memory, &["channel_send"]);
+    let report = reopened.resume_goal(&goal.id, "operator:test").await?;
+    let item = report
+        .work_items
+        .iter()
+        .find(|item| item.step_id == "notify")
+        .expect("channel_send work item");
+    assert_eq!(item.status, WorkItemStatus::WaitingConfirmation);
+
+    // A fresh worker must not re-dispatch the parked item — at-least-once
+    // means at most one send lands for this attempt.
+    let worker = LoopWorker::with_builtins(
+        reopened.clone(),
+        Arc::new(WorkerProvider),
+        None,
+        Some(sends.clone()),
+    )?;
+    let _ = worker.run_goal_until_idle(&goal.id, 4).await?;
+    assert_eq!(sends.sends.lock().expect("sends").len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn channel_send_dispatch_blocked_when_flag_off_on_worker() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("ext-gate.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    // Plan + approve on an enabled engine…
+    let enabled = external_write_engine(memory.clone(), &["channel_send"]);
+    let goal = enabled
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Notify me externally".to_string(),
+                source_signal_ids: Vec::new(),
+            },
+            "operator:test",
+        )
+        .await?;
+    let plan = enabled
+        .plan_goal(&goal.id, channel_send_plan_request(), "operator:test")
+        .await?;
+    enabled
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+
+    // …but the worker runs on an engine where the flag is off (e.g. restart
+    // with a downgraded config): the item must fail closed, never send.
+    let sends = Arc::new(RecordingOutboundSender {
+        sends: Mutex::new(Vec::new()),
+    });
+    let disabled = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    // Registration itself fails closed on a disabled policy.
+    let error = match LoopWorker::with_builtins(
+        disabled.clone(),
+        Arc::new(WorkerProvider),
+        None,
+        Some(sends.clone()),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("channel_send sender without allowlist must fail registration"),
+    };
+    assert!(error.to_string().contains("channel_send"));
+
+    let worker = LoopWorker::with_builtins(disabled, Arc::new(WorkerProvider), None, None)?;
+    let report = worker.run_goal_until_idle(&goal.id, 4).await?;
+    let item = report
+        .work_items
+        .iter()
+        .find(|item| item.step_id == "notify")
+        .expect("channel_send work item");
+    assert_eq!(item.status, WorkItemStatus::Failed);
+    assert!(sends.sends.lock().expect("sends").is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn normalized_signal_variants_deduplicate_across_external_ids() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("signals-norm.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = LoopEngine::new(Arc::new(SqliteLoopStore::new(memory)));
+
+    let signal = |external_id: Option<&str>, source: &str, content: &str| CreateSignalRequest {
+        kind: SignalKind::Community,
+        trust: SignalTrust::External,
+        source: source.to_string(),
+        external_id: external_id.map(str::to_string),
+        content: content.to_string(),
+        metadata: BTreeMap::new(),
+    };
+    let first = engine
+        .ingest_signal(
+            signal(
+                Some("issue-1"),
+                "github:issues",
+                "Database migration failed.",
+            ),
+            "ingest:community",
+        )
+        .await?;
+    assert!(!first.deduplicated);
+
+    // Different external_id but a case/whitespace/punctuation variant of the
+    // same content deduplicates through the normalized hash.
+    let second = engine
+        .ingest_signal(
+            signal(
+                Some("issue-2"),
+                "github:issues",
+                "  DATABASE   migration FAILED!!",
+            ),
+            "ingest:community",
+        )
+        .await?;
+    assert!(second.deduplicated);
+    assert_eq!(second.signal.id, first.signal.id);
+
+    // A different source with the same content is a distinct signal.
+    let third = engine
+        .ingest_signal(
+            signal(None, "slack:community", "Database migration failed."),
+            "ingest:slack",
+        )
+        .await?;
+    assert!(!third.deduplicated);
+    Ok(())
+}
+
+#[tokio::test]
+async fn near_duplicate_signals_deduplicate_but_distinct_content_does_not() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("signals-near.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = LoopEngine::new(Arc::new(SqliteLoopStore::new(memory)));
+
+    let signal = |content: &str| CreateSignalRequest {
+        kind: SignalKind::UserFeedback,
+        trust: SignalTrust::Authenticated,
+        source: "telegram:feedback".to_string(),
+        external_id: None,
+        content: content.to_string(),
+        metadata: BTreeMap::new(),
+    };
+    let first = engine
+        .ingest_signal(
+            signal("the agent failed to retry the timed out search tool call"),
+            "ingest:feedback",
+        )
+        .await?;
+    assert!(!first.deduplicated);
+
+    // One extra word keeps the token overlap above the near-duplicate bar.
+    let second = engine
+        .ingest_signal(
+            signal("the agent failed to retry the timed out search tool call again"),
+            "ingest:feedback",
+        )
+        .await?;
+    assert!(second.deduplicated);
+    assert_eq!(second.signal.id, first.signal.id);
+
+    // A genuinely different report must not be absorbed.
+    let third = engine
+        .ingest_signal(
+            signal("scheduler jobs fire twice after a restart"),
+            "ingest:feedback",
+        )
+        .await?;
+    assert!(!third.deduplicated);
+    assert_ne!(third.signal.id, first.signal.id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn operator_reviews_signals_with_status_filter_ignore_and_propose() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!(
+        "sqlite://{}",
+        temp.path().join("signals-review.db").display()
+    );
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = LoopEngine::new(Arc::new(SqliteLoopStore::new(memory)));
+
+    for (external_id, content) in [
+        ("d-1", "first report about flaky search"),
+        ("d-2", "second report about stalled schedules"),
+    ] {
+        engine
+            .ingest_signal(
+                CreateSignalRequest {
+                    kind: SignalKind::DeveloperFeedback,
+                    trust: SignalTrust::Authenticated,
+                    source: "console:dev".to_string(),
+                    external_id: Some(external_id.to_string()),
+                    content: content.to_string(),
+                    metadata: BTreeMap::new(),
+                },
+                "ingest:dev",
+            )
+            .await?;
+    }
+    let observed = engine
+        .list_signals(20, Some(SignalStatus::Observed))
+        .await?;
+    assert_eq!(observed.len(), 2);
+    assert!(
+        engine
+            .list_signals(20, Some(SignalStatus::Ignored))
+            .await?
+            .is_empty()
+    );
+
+    let ignored = engine
+        .ignore_signal(&observed[0].id, "not actionable noise", "operator:henry")
+        .await?;
+    assert_eq!(ignored.status, SignalStatus::Ignored);
+    let reignore = engine
+        .ignore_signal(&observed[0].id, "again", "operator:henry")
+        .await;
+    assert!(reignore.is_err(), "ignoring twice must fail");
+    let propose_ignored = engine
+        .propose_goal_from_signal(&observed[0].id, "revive", "operator:henry")
+        .await;
+    assert!(propose_ignored.is_err(), "ignored signal cannot propose");
+
+    let goal = engine
+        .propose_goal_from_signal(&observed[1].id, "fix stalled schedules", "operator:henry")
+        .await?;
+    assert_eq!(goal.source_signal_ids, vec![observed[1].id.clone()]);
+    let repropose = engine
+        .propose_goal_from_signal(&observed[1].id, "again", "operator:henry")
+        .await;
+    assert!(repropose.is_err(), "proposed signal cannot propose twice");
+
+    assert!(
+        engine
+            .list_signals(20, Some(SignalStatus::Observed))
+            .await?
+            .is_empty()
+    );
+    assert_eq!(
+        engine
+            .list_signals(20, Some(SignalStatus::Ignored))
+            .await?
+            .len(),
+        1
+    );
+    assert_eq!(
+        engine
+            .list_signals(20, Some(SignalStatus::Proposed))
+            .await?
+            .len(),
+        1
+    );
+    Ok(())
+}
+
+// ---- T13: waiting_confirmation operator resolve path ----
+
+/// Builds a goal with a parked channel_send work item: claimed, prepared
+/// checkpoint, lease expired, resume parks it in `waiting_confirmation`.
+/// Returns (engine, goal_id, work_item_id).
+async fn parked_channel_send(
+    database_url: &str,
+    max_attempts: u8,
+) -> anyhow::Result<(Arc<LoopEngine>, String, String)> {
+    let memory = SqliteMemoryStore::new(database_url).await?;
+    let engine = external_write_engine(memory, &["channel_send"]);
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Notify me externally".to_string(),
+                source_signal_ids: Vec::new(),
+            },
+            "operator:test",
+        )
+        .await?;
+    let mut request = channel_send_plan_request();
+    request.workflow.steps[0].retry.max_attempts = max_attempts;
+    let plan = engine.plan_goal(&goal.id, request, "operator:test").await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+    let claim = engine
+        .claim_work_item(&goal.id, "notify", "worker:ext", 1, "operator:test")
+        .await?
+        .expect("channel_send work item should be claimable");
+    let work_item_id = claim.work_item.id.clone();
+    engine
+        .prepare_checkpoint(
+            &claim,
+            &format!("{}:{}:v1", claim.work_item.id, claim.attempt.id),
+            "worker:ext",
+        )
+        .await?;
+    drop(engine);
+    // Lease expiry is whole-second compared; wait past it, then resume on a
+    // reopened store as if the process restarted.
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    let reopened = external_write_engine(
+        SqliteMemoryStore::new(database_url).await?,
+        &["channel_send"],
+    );
+    let report = reopened.resume_goal(&goal.id, "operator:test").await?;
+    assert_eq!(
+        report
+            .work_items
+            .iter()
+            .find(|item| item.id == work_item_id)
+            .map(|item| item.status),
+        Some(WorkItemStatus::WaitingConfirmation)
+    );
+    Ok((reopened, goal.id, work_item_id))
+}
+
+#[tokio::test]
+async fn resolve_confirmed_commits_operator_attested_outcome() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("conf-ok.db").display());
+    let (engine, goal_id, work_item_id) = parked_channel_send(&database_url, 1).await?;
+
+    let item = engine
+        .resolve_waiting_confirmation(
+            &goal_id,
+            &work_item_id,
+            ConfirmationResolution::Confirmed,
+            "telegram shows the message delivered",
+            "operator:test",
+        )
+        .await?;
+    assert_eq!(item.status, WorkItemStatus::Succeeded);
+
+    let report = engine.resume_goal(&goal_id, "operator:test").await?;
+    let checkpoint = report.latest_checkpoint.expect("resolved checkpoint");
+    assert_eq!(checkpoint.phase, CheckpointPhase::Reconciled);
+    let outcome = checkpoint.outcome.expect("attested outcome");
+    assert_eq!(outcome.evidence["resolution"], "confirmed");
+    assert!(outcome.summary.contains("telegram shows the message"));
+    assert!(
+        report
+            .attempts
+            .iter()
+            .any(|a| a.status == xiaomaolv::harness::loop_engine::AttemptStatus::Succeeded)
+    );
+    let events = engine.list_goal_events(&goal_id, 0, 50).await?;
+    assert!(
+        events
+            .iter()
+            .any(|e| e.event_type == "confirmation.resolved"
+                && e.details["resolution"] == "confirmed")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn resolve_retry_voids_checkpoint_and_requeues() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("conf-retry.db").display());
+    let (engine, goal_id, work_item_id) = parked_channel_send(&database_url, 2).await?;
+
+    let item = engine
+        .resolve_waiting_confirmation(
+            &goal_id,
+            &work_item_id,
+            ConfirmationResolution::Retry,
+            "chat history shows nothing was sent",
+            "operator:test",
+        )
+        .await?;
+    assert_eq!(item.status, WorkItemStatus::Ready);
+
+    // The prepared checkpoint is voided — its idempotency key can never be
+    // committed, and the work item is claimable again under a new attempt.
+    let report = engine.resume_goal(&goal_id, "operator:test").await?;
+    assert_eq!(
+        report.latest_checkpoint.map(|c| c.phase),
+        Some(CheckpointPhase::Voided)
+    );
+    let reclaim = engine
+        .claim_work_item(&goal_id, "notify", "worker:ext", 1, "operator:test")
+        .await?;
+    assert!(reclaim.is_some(), "retry-resolved item must be claimable");
+    Ok(())
+}
+
+#[tokio::test]
+async fn resolve_retry_exhausts_budget_fails_item() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("conf-exhaust.db").display());
+    let (engine, goal_id, work_item_id) = parked_channel_send(&database_url, 1).await?;
+
+    let item = engine
+        .resolve_waiting_confirmation(
+            &goal_id,
+            &work_item_id,
+            ConfirmationResolution::Retry,
+            "not delivered but no attempts remain",
+            "operator:test",
+        )
+        .await?;
+    assert_eq!(item.status, WorkItemStatus::Failed);
+    let goal = engine.get_goal(&goal_id).await?.expect("goal");
+    assert_eq!(goal.status, GoalStatus::Failed);
+    Ok(())
+}
+
+#[tokio::test]
+async fn resolve_abandoned_fails_item_and_goal() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("conf-abandon.db").display());
+    let (engine, goal_id, work_item_id) = parked_channel_send(&database_url, 2).await?;
+
+    let item = engine
+        .resolve_waiting_confirmation(
+            &goal_id,
+            &work_item_id,
+            ConfirmationResolution::Abandoned,
+            "do not retry; the notification is stale",
+            "operator:test",
+        )
+        .await?;
+    assert_eq!(item.status, WorkItemStatus::Failed);
+    let goal = engine.get_goal(&goal_id).await?.expect("goal");
+    assert_eq!(goal.status, GoalStatus::Failed);
+
+    // A parked item that was resolved cannot be resolved again.
+    let second = engine
+        .resolve_waiting_confirmation(
+            &goal_id,
+            &work_item_id,
+            ConfirmationResolution::Confirmed,
+            "late change of mind",
+            "operator:test",
+        )
+        .await;
+    assert!(second.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn resolve_rejects_non_parked_and_cross_goal_items() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("conf-reject.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = external_write_engine(memory, &["channel_send"]);
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Notify me externally".to_string(),
+                source_signal_ids: Vec::new(),
+            },
+            "operator:test",
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(&goal.id, channel_send_plan_request(), "operator:test")
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+    let items = engine.list_work_items(&goal.id).await?;
+    let item = items.first().expect("work item");
+
+    // Not parked yet — resolving must fail.
+    assert!(
+        engine
+            .resolve_waiting_confirmation(
+                &goal.id,
+                &item.id,
+                ConfirmationResolution::Confirmed,
+                "premature",
+                "operator:test",
+            )
+            .await
+            .is_err()
+    );
+    // Cross-goal scoping: a different goal id must not resolve the item.
+    assert!(
+        engine
+            .resolve_waiting_confirmation(
+                "goal_nonexistent",
+                &item.id,
+                ConfirmationResolution::Confirmed,
+                "wrong goal",
+                "operator:test",
+            )
+            .await
+            .is_err()
+    );
+    // Reason is required.
+    assert!(
+        engine
+            .resolve_waiting_confirmation(
+                &goal.id,
+                &item.id,
+                ConfirmationResolution::Confirmed,
+                "   ",
+                "operator:test",
+            )
+            .await
+            .is_err()
+    );
     Ok(())
 }

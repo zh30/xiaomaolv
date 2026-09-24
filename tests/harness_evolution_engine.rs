@@ -107,6 +107,7 @@ async fn seed_eval_cases(store: &SqliteEvolutionStore) -> anyhow::Result<()> {
                         required_substrings: vec!["pass".to_string()],
                         forbidden_substrings: vec!["unsafe".to_string()],
                         require_json: false,
+                        ..Default::default()
                     },
                     weight: 1.0,
                     enabled: true,
@@ -783,4 +784,270 @@ async fn concurrent_engines_create_only_one_candidate_for_shared_evidence() {
             .iter()
             .any(|event| event.event_type == "proposal_deduplicated")
     );
+}
+
+/// Provider whose shadow-evaluation answers satisfy the built-in benchmark
+/// suite, keyed off the eval case input embedded in the request. In regression
+/// mode the candidate emits an oversized answer for `bench:final_answer`.
+struct BenchmarkAwareProvider {
+    requests: Mutex<Vec<Vec<StoredMessage>>>,
+    regress_final_answer: bool,
+}
+
+impl BenchmarkAwareProvider {
+    fn request_count(&self) -> usize {
+        self.requests.lock().expect("requests mutex").len()
+    }
+}
+
+#[async_trait]
+impl ChatProvider for BenchmarkAwareProvider {
+    fn model_name(&self) -> Option<&str> {
+        Some("fake-benchmark-model")
+    }
+
+    async fn complete(&self, req: CompletionRequest) -> anyhow::Result<String> {
+        let is_proposal = req
+            .messages
+            .iter()
+            .any(|message| message.content.contains("SELF_EVOLUTION_PROPOSAL_JSON"));
+        let candidate_policy = req
+            .messages
+            .iter()
+            .any(|message| message.content.contains("candidate wins"));
+        let request_text = req
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.requests
+            .lock()
+            .expect("requests mutex")
+            .push(req.messages);
+
+        if is_proposal {
+            return Ok(serde_json::json!({
+                "prompt_patch": "candidate wins",
+                "rationale": "benchmark suite evidence"
+            })
+            .to_string());
+        }
+
+        let benchmark_answer = if request_text.contains("Reply with exactly the word DONE") {
+            if candidate_policy && self.regress_final_answer {
+                Some(
+                    "DONE, but padded with far too much trailing explanation to fit the budget."
+                        .to_string(),
+                )
+            } else {
+                Some("DONE".to_string())
+            }
+        } else if request_text.contains("Output only the JSON object") {
+            Some("{\"status\":\"ok\"}".to_string())
+        } else if request_text.contains("What time is it right now") {
+            Some("I do not have access to the current time.".to_string())
+        } else if request_text.contains("What is 2 + 2") {
+            Some("4".to_string())
+        } else if request_text.contains("Summarize in a single word") {
+            Some("stroll".to_string())
+        } else {
+            None
+        };
+
+        if let Some(answer) = benchmark_answer {
+            return Ok(answer);
+        }
+        if candidate_policy {
+            Ok("pass".to_string())
+        } else {
+            Ok("baseline miss".to_string())
+        }
+    }
+}
+
+fn relaxed_gate_config() -> EvolutionGateConfig {
+    EvolutionGateConfig {
+        min_eval_cases: 3,
+        min_candidate_score: 0.9,
+        min_score_delta: 0.1,
+        max_regressions: 10,
+        max_prompt_patch_chars: 1_000,
+        require_human_approval: true,
+    }
+}
+
+#[tokio::test]
+async fn benchmark_suite_joins_shadow_evaluation_with_provenance() {
+    let memory = SqliteMemoryStore::new("sqlite::memory:")
+        .await
+        .expect("memory store");
+    let store = Arc::new(SqliteEvolutionStore::new(memory));
+    seed_eval_cases(&store).await.expect("seed eval cases");
+    let provider = Arc::new(BenchmarkAwareProvider {
+        requests: Mutex::new(Vec::new()),
+        regress_final_answer: false,
+    });
+    let engine = EvolutionEngine::new(store.clone(), provider.clone(), relaxed_gate_config())
+        .await
+        .expect("evolution engine")
+        .with_benchmark_suite(xiaomaolv::harness::benchmark::core_benchmark_suite())
+        .expect("attach benchmark suite");
+
+    let candidate = engine
+        .create_candidate(
+            "candidate wins",
+            "evaluate against the benchmark floor",
+            vec![],
+            &EvolutionActor::System("test".to_string()),
+        )
+        .await
+        .expect("candidate");
+    let evaluation = engine
+        .evaluate_candidate(&candidate.id)
+        .await
+        .expect("benchmark-aware evaluation");
+
+    let scorecard = &evaluation.scorecard;
+    assert_eq!(evaluation.decision, EvolutionPromotionDecision::Ready);
+    assert_eq!(scorecard.total_cases, 8);
+    assert_eq!(
+        scorecard.benchmark_suite.as_deref(),
+        Some("core@2026-09-24.1")
+    );
+    assert_eq!(scorecard.benchmark_regressions, 0);
+    assert_eq!(scorecard.baseline_passed_cases, 5);
+    assert_eq!(scorecard.candidate_passed_cases, 8);
+    assert_eq!(provider.request_count(), 16);
+    assert_eq!(
+        scorecard
+            .case_results
+            .iter()
+            .filter(|result| result.benchmark)
+            .count(),
+        5
+    );
+}
+
+#[tokio::test]
+async fn benchmark_regression_rejects_candidate_despite_operator_budget() {
+    let memory = SqliteMemoryStore::new("sqlite::memory:")
+        .await
+        .expect("memory store");
+    let store = Arc::new(SqliteEvolutionStore::new(memory));
+    seed_eval_cases(&store).await.expect("seed eval cases");
+    let provider = Arc::new(BenchmarkAwareProvider {
+        requests: Mutex::new(Vec::new()),
+        regress_final_answer: true,
+    });
+    let engine = EvolutionEngine::new(store.clone(), provider, relaxed_gate_config())
+        .await
+        .expect("evolution engine")
+        .with_benchmark_suite(xiaomaolv::harness::benchmark::core_benchmark_suite())
+        .expect("attach benchmark suite");
+
+    let candidate = engine
+        .create_candidate(
+            "candidate wins",
+            "regresses a benchmark scenario",
+            vec![],
+            &EvolutionActor::System("test".to_string()),
+        )
+        .await
+        .expect("candidate");
+    let evaluation = engine
+        .evaluate_candidate(&candidate.id)
+        .await
+        .expect("evaluation");
+
+    assert_eq!(evaluation.scorecard.benchmark_regressions, 1);
+    let EvolutionPromotionDecision::Rejected { reasons } = &evaluation.decision else {
+        panic!("benchmark regression must reject the candidate");
+    };
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.contains("benchmark scenario regressions"))
+    );
+    assert_eq!(
+        store
+            .get_candidate(&candidate.id)
+            .await
+            .expect("candidate query")
+            .expect("candidate")
+            .status,
+        EvolutionCandidateStatus::Rejected
+    );
+}
+
+#[tokio::test]
+async fn operator_case_id_collision_with_benchmark_suite_fails_evaluation() {
+    let memory = SqliteMemoryStore::new("sqlite::memory:")
+        .await
+        .expect("memory store");
+    let store = Arc::new(SqliteEvolutionStore::new(memory));
+    seed_eval_cases(&store).await.expect("seed eval cases");
+    store
+        .upsert_eval_case(
+            EvolutionEvalCase {
+                id: "bench:final_answer".to_string(),
+                name: "colliding operator case".to_string(),
+                input: "evaluate collision".to_string(),
+                assertions: EvolutionCaseAssertions {
+                    required_substrings: vec!["pass".to_string()],
+                    ..Default::default()
+                },
+                weight: 1.0,
+                enabled: true,
+            },
+            "operator:henry",
+        )
+        .await
+        .expect("seed colliding case");
+    let engine = EvolutionEngine::new(
+        store,
+        Arc::new(FakeEvolutionProvider::default()),
+        gate_config(),
+    )
+    .await
+    .expect("evolution engine")
+    .with_benchmark_suite(xiaomaolv::harness::benchmark::core_benchmark_suite())
+    .expect("attach benchmark suite");
+    let candidate = engine
+        .create_candidate(
+            "candidate wins",
+            "collides with the benchmark suite",
+            vec![],
+            &EvolutionActor::System("test".to_string()),
+        )
+        .await
+        .expect("candidate");
+
+    let error = engine
+        .evaluate_candidate(&candidate.id)
+        .await
+        .expect_err("colliding case ids must fail closed");
+    assert!(error.to_string().contains("collides"));
+}
+
+#[tokio::test]
+async fn invalid_benchmark_suite_is_rejected_when_attaching() {
+    let memory = SqliteMemoryStore::new("sqlite::memory:")
+        .await
+        .expect("memory store");
+    let store = Arc::new(SqliteEvolutionStore::new(memory));
+    let engine = EvolutionEngine::new(
+        store,
+        Arc::new(FakeEvolutionProvider::default()),
+        gate_config(),
+    )
+    .await
+    .expect("evolution engine");
+
+    let invalid = xiaomaolv::harness::evolution::EvolutionBenchmarkSuite {
+        id: "  ".to_string(),
+        version: "v1".to_string(),
+        cases: vec![],
+    };
+    assert!(engine.with_benchmark_suite(invalid).is_err());
 }

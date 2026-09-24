@@ -5,6 +5,12 @@ channel, then opt into safety-gated, auditable evolution when needed.
 
 Chinese version: `README.zh.md`
 
+## Official links
+
+- Official website: https://zhanghe.dev/products/xiaomaolv
+
+The tested MiniMax + Telegram path is in [Quick Start](#quick-start).
+
 ## Table of Contents
 
 - [Features](#features)

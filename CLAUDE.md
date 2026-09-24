@@ -83,7 +83,7 @@ Key config sections:
 - `[memory]` - Memory backend (sqlite-only or hybrid-sqlite-zvec)
 - `[agent]` - MCP/Skills settings and Code Mode execution policy
 - `[agent.harness]` - trajectory, compaction, verification, prompt evolution, and Loop Engineering settings
-- `[agent.harness.evolution]` - bounded prompt candidates, shadow evaluation, and human promotion gates
+- `[agent.harness.evolution]` - bounded prompt candidates, shadow evaluation (operator eval cases plus a versioned benchmark suite whose regressions are always fatal), and human promotion gates
 - `[agent.harness.loop_engine]` - durable goals, scoped signal ingestion, worker polling/leases/concurrency, and periodic self-tests
 
 ### Memory Backend
@@ -118,7 +118,7 @@ filters). Capability metadata controls MCP access, but `subprocess` is not an OS
 
 The persisted execution hierarchy is `Goal -> immutable Workflow revision -> WorkItem DAG -> Attempt -> Checkpoint`. Planning is non-executing; dispatch requires approval of the exact goal revision and plan hash. Claims are at-least-once and protected by leases and fencing tokens. `/resume` reconciles committed checkpoints without replaying effects.
 
-Only registered safe handlers can execute. `external_write`, autonomous code/deploy/credential changes, and automatic prompt activation are not available. Only an operator route can convert a multi-source Signal into a proposed Goal; the production `core` self-test suite is read-only, and structural Session Replay calls no live tools. The HTTP/SSE API is Desktop-ready, but no Desktop GUI is present. See `docs/loop-engineering-harness.md` for the runtime contract.
+Only registered safe handlers can execute. `external_write` is available only through `external_write_enabled` plus a handler allowlist (currently `channel_send`, at-least-once delivery with prepared/committed/reconciled checkpoints and an operator `resolve-confirmation` exit for `waiting_confirmation` parks); autonomous code/deploy/credential changes and automatic prompt activation are not available. Only an operator route can convert a multi-source Signal into a proposed Goal; the production `core` self-test suite is read-only, and structural Session Replay calls no live tools. The HTTP/SSE API is Desktop-ready; `GET /console` serves an embedded single-file operator dashboard over that contract. See `docs/loop-engineering-harness.md` for the runtime contract.
 
 ### Telegram Group Behavior
 
@@ -162,4 +162,4 @@ Integration tests mirror the src structure:
 - `StreamSink::on_delta()` - streaming response handler
 - `ChannelFactory::create_channel()` - channel instance creation
 - `LoopStore` - durable Loop Engineering persistence
-- `WorkHandler` - registered workflow effect boundary; external writes are rejected in this release
+- `WorkHandler` - registered workflow effect boundary; `external_write` handlers require the `external_write_enabled` flag plus allowlist entry
