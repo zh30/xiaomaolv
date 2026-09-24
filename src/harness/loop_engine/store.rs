@@ -28,8 +28,8 @@ use super::self_test::{
     SelfTestRun, get_self_test_run, initialize_self_test_schema, run_self_tests,
 };
 use super::signals::{
-    CreateSignalRequest, SignalIngestResult, SignalRecord, get_signal, ingest_signal,
-    initialize_signal_schema, list_signals, mark_signal_proposed,
+    CreateSignalRequest, SignalIngestResult, SignalRecord, SignalStatus, get_signal, ignore_signal,
+    ingest_signal, initialize_signal_schema, list_signals, mark_signal_proposed,
 };
 
 #[async_trait]
@@ -61,7 +61,18 @@ pub trait LoopStore: Send + Sync {
 
     async fn get_signal(&self, signal_id: &str) -> anyhow::Result<Option<SignalRecord>>;
 
-    async fn list_signals(&self, limit: usize) -> anyhow::Result<Vec<SignalRecord>>;
+    async fn list_signals(
+        &self,
+        limit: usize,
+        status: Option<SignalStatus>,
+    ) -> anyhow::Result<Vec<SignalRecord>>;
+
+    async fn ignore_signal(
+        &self,
+        signal_id: &str,
+        reason: &str,
+        actor: &str,
+    ) -> anyhow::Result<SignalRecord>;
 
     async fn mark_signal_proposed(
         &self,
@@ -520,8 +531,21 @@ impl LoopStore for SqliteLoopStore {
         get_signal(self.store.pool(), signal_id).await
     }
 
-    async fn list_signals(&self, limit: usize) -> anyhow::Result<Vec<SignalRecord>> {
-        list_signals(self.store.pool(), limit).await
+    async fn list_signals(
+        &self,
+        limit: usize,
+        status: Option<SignalStatus>,
+    ) -> anyhow::Result<Vec<SignalRecord>> {
+        list_signals(self.store.pool(), limit, status).await
+    }
+
+    async fn ignore_signal(
+        &self,
+        signal_id: &str,
+        reason: &str,
+        actor: &str,
+    ) -> anyhow::Result<SignalRecord> {
+        ignore_signal(self.store.pool(), signal_id, reason, actor).await
     }
 
     async fn mark_signal_proposed(

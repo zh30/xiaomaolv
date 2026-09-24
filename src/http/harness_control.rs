@@ -13,7 +13,7 @@ use serde::Deserialize;
 
 use crate::harness::loop_engine::{
     ApproveGoalRequest, CreateGoalRequest, CreateSignalRequest, LoopEngine, PlanGoalRequest,
-    PublishArtifactRequest, SignalTrust,
+    PublishArtifactRequest, SignalStatus, SignalTrust,
 };
 
 use super::{ApiError, AppState, check_rate_limit, constant_time_eq, verify_api_key};
@@ -42,6 +42,7 @@ pub(super) fn router() -> Router<AppState> {
             "/v1/harness/signals/{id}/propose-goal",
             post(post_signal_propose_goal),
         )
+        .route("/v1/harness/signals/{id}/ignore", post(post_signal_ignore))
         .route("/v1/harness/self-tests/{suite}", post(post_self_test))
         .route("/v1/harness/self-test-runs/{id}", get(get_self_test_run))
         .route(
@@ -76,6 +77,9 @@ fn default_auto_plan() -> bool {
 struct ListQuery {
     #[serde(default = "default_list_limit")]
     limit: usize,
+    /// Optional signal status filter; ignored by non-signal list endpoints.
+    #[serde(default)]
+    status: Option<SignalStatus>,
 }
 
 fn default_list_limit() -> usize {
@@ -348,7 +352,10 @@ async fn list_signals(
     Query(query): Query<ListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (engine, _) = operator_context(&state, &headers).await?;
-    let signals = engine.list_signals(query.limit).await.map_err(internal)?;
+    let signals = engine
+        .list_signals(query.limit, query.status)
+        .await
+        .map_err(internal)?;
     Ok(Json(serde_json::json!({"signals": signals})))
 }
 
@@ -386,6 +393,27 @@ async fn post_signal_propose_goal(
         .map_err(bad_request)?;
     Ok(Json(
         serde_json::to_value(goal).map_err(|error| ApiError::Internal(error.into()))?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct IgnoreSignalRequest {
+    reason: String,
+}
+
+async fn post_signal_ignore(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(signal_id): Path<String>,
+    Json(request): Json<IgnoreSignalRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (engine, actor) = operator_context(&state, &headers).await?;
+    let signal = engine
+        .ignore_signal(&signal_id, &request.reason, &actor)
+        .await
+        .map_err(bad_request)?;
+    Ok(Json(
+        serde_json::to_value(signal).map_err(|error| ApiError::Internal(error.into()))?,
     ))
 }
 

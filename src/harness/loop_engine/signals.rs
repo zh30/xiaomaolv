@@ -20,7 +20,7 @@ pub enum SignalKind {
 }
 
 impl SignalKind {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Trajectory => "trajectory",
             Self::UserFeedback => "user_feedback",
@@ -55,7 +55,7 @@ pub enum SignalTrust {
 }
 
 impl SignalTrust {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Internal => "internal",
             Self::Authenticated => "authenticated",
@@ -168,6 +168,62 @@ pub struct SignalIngestResult {
     pub deduplicated: bool,
 }
 
+/// Token-set Jaccard similarity at or above which two signals from the same
+/// source and kind are treated as near-duplicates.
+const NEAR_DUPLICATE_SIMILARITY: f64 = 0.9;
+/// How many recent same-source signals are scanned for near-duplicates.
+const NEAR_DUPLICATE_SCAN_LIMIT: i64 = 128;
+
+/// Collapses case, whitespace, and punctuation differences so trivially
+/// reworded duplicates share one hash. Falls back to trimmed raw content when
+/// normalization erases everything (e.g. punctuation-only content).
+fn normalized_signal_hash(kind: SignalKind, content: &str) -> String {
+    let normalized = normalize_for_tokens(content);
+    let hash_input = if normalized.is_empty() {
+        content.trim().to_string()
+    } else {
+        normalized
+    };
+    hash_serializable(&(kind.as_str(), hash_input)).unwrap_or_else(|_| String::new())
+}
+
+fn signal_tokens(content: &str) -> std::collections::BTreeSet<String> {
+    normalize_for_tokens(content)
+        .split(' ')
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn normalize_for_tokens(content: &str) -> String {
+    let mut normalized = String::with_capacity(content.len());
+    let mut pending_space = false;
+    for ch in content.trim().chars() {
+        if ch.is_alphanumeric() {
+            if pending_space && !normalized.is_empty() {
+                normalized.push(' ');
+            }
+            pending_space = false;
+            normalized.extend(ch.to_lowercase());
+        } else {
+            pending_space = true;
+        }
+    }
+    normalized
+}
+
+fn jaccard_similarity(
+    left: &std::collections::BTreeSet<String>,
+    right: &std::collections::BTreeSet<String>,
+) -> f64 {
+    if left.is_empty() || right.is_empty() {
+        return 0.0;
+    }
+    let intersection = left.intersection(right).count() as f64;
+    let union = left.union(right).count() as f64;
+    intersection / union
+}
+
 pub(crate) async fn initialize_signal_schema(pool: &SqlitePool) -> anyhow::Result<()> {
     for statement in [
         "CREATE TABLE IF NOT EXISTS harness_signals (
@@ -179,6 +235,7 @@ pub(crate) async fn initialize_signal_schema(pool: &SqlitePool) -> anyhow::Resul
             content TEXT NOT NULL,
             content_hash TEXT NOT NULL,
             fingerprint TEXT NOT NULL,
+            normalized_hash TEXT,
             metadata_json TEXT NOT NULL,
             created_by TEXT NOT NULL,
             created_at INTEGER NOT NULL DEFAULT (unixepoch()),
@@ -203,6 +260,39 @@ pub(crate) async fn initialize_signal_schema(pool: &SqlitePool) -> anyhow::Resul
             .await
             .context("failed to initialize evolution signal schema")?;
     }
+    // Existing databases predate the normalized_hash column; add and backfill.
+    let has_normalized_hash = sqlx::query(
+        "SELECT 1 FROM pragma_table_info('harness_signals') WHERE name = 'normalized_hash'",
+    )
+    .fetch_optional(pool)
+    .await?
+    .is_some();
+    if !has_normalized_hash {
+        sqlx::query("ALTER TABLE harness_signals ADD COLUMN normalized_hash TEXT")
+            .execute(pool)
+            .await
+            .context("failed to add signal normalized_hash column")?;
+    }
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_harness_signals_source_normhash
+         ON harness_signals(source, normalized_hash)",
+    )
+    .execute(pool)
+    .await
+    .context("failed to index signal normalized hashes")?;
+    let pending: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id, kind, content FROM harness_signals WHERE normalized_hash IS NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    for (id, kind, content) in pending {
+        let kind = SignalKind::from_db(&kind)?;
+        sqlx::query("UPDATE harness_signals SET normalized_hash = ?1 WHERE id = ?2")
+            .bind(normalized_signal_hash(kind, &content))
+            .bind(&id)
+            .execute(pool)
+            .await?;
+    }
     Ok(())
 }
 
@@ -213,6 +303,7 @@ pub(crate) async fn ingest_signal(
 ) -> anyhow::Result<SignalIngestResult> {
     let fingerprint = hash_serializable(&request)?;
     let content_hash = hash_serializable(&request.content)?;
+    let normalized_hash = normalized_signal_hash(request.kind, &request.content);
     let mut tx = pool.begin().await?;
     let existing_id = if let Some(external_id) = &request.external_id {
         sqlx::query_scalar::<_, String>(
@@ -234,6 +325,49 @@ pub(crate) async fn ingest_signal(
         .fetch_optional(&mut *tx)
         .await?
     };
+    // Layer two: normalization-stable duplicates (case/whitespace/punctuation
+    // variants of the same report from the same source and kind).
+    let existing_id = existing_id.or({
+        sqlx::query_scalar::<_, String>(
+            "SELECT id FROM harness_signals
+             WHERE source = ?1 AND normalized_hash = ?2
+             ORDER BY created_at LIMIT 1",
+        )
+        .bind(request.source.trim())
+        .bind(&normalized_hash)
+        .fetch_optional(&mut *tx)
+        .await?
+    });
+    // Layer three: near-duplicates — token-set Jaccard similarity against the
+    // most recent signals from the same source and kind.
+    let existing_id = match existing_id {
+        Some(id) => Some(id),
+        None => {
+            let tokens = signal_tokens(&request.content);
+            if tokens.is_empty() {
+                None
+            } else {
+                let recent: Vec<(String, String)> = sqlx::query_as(
+                    "SELECT id, content FROM harness_signals
+                     WHERE source = ?1 AND kind = ?2
+                     ORDER BY created_at DESC, id DESC LIMIT ?3",
+                )
+                .bind(request.source.trim())
+                .bind(request.kind.as_str())
+                .bind(NEAR_DUPLICATE_SCAN_LIMIT)
+                .fetch_all(&mut *tx)
+                .await?;
+                recent
+                    .into_iter()
+                    .map(|(id, content)| {
+                        (id, jaccard_similarity(&tokens, &signal_tokens(&content)))
+                    })
+                    .filter(|(_, score)| *score >= NEAR_DUPLICATE_SIMILARITY)
+                    .max_by(|left, right| left.1.total_cmp(&right.1))
+                    .map(|(id, _)| id)
+            }
+        }
+    };
     if let Some(existing_id) = existing_id {
         tx.commit().await?;
         let signal = get_signal(pool, &existing_id)
@@ -249,8 +383,8 @@ pub(crate) async fn ingest_signal(
     sqlx::query(
         "INSERT INTO harness_signals
          (id, kind, trust, source, external_id, content, content_hash, fingerprint,
-          metadata_json, created_by)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+          normalized_hash, metadata_json, created_by)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
     )
     .bind(&id)
     .bind(request.kind.as_str())
@@ -260,6 +394,7 @@ pub(crate) async fn ingest_signal(
     .bind(request.content.trim())
     .bind(&content_hash)
     .bind(&fingerprint)
+    .bind(&normalized_hash)
     .bind(serde_json::to_string(&request.metadata)?)
     .bind(actor)
     .execute(&mut *tx)
@@ -303,22 +438,78 @@ pub(crate) async fn get_signal(
 pub(crate) async fn list_signals(
     pool: &SqlitePool,
     limit: usize,
+    status: Option<SignalStatus>,
 ) -> anyhow::Result<Vec<SignalRecord>> {
-    let limit = limit.clamp(1, 500);
-    sqlx::query(
-        "SELECT s.id, s.kind, s.trust, s.source, s.external_id, s.content,
-                s.content_hash, s.metadata_json, s.created_at,
-                COALESCE((SELECT e.status FROM harness_signal_events e
-                          WHERE e.signal_id = s.id ORDER BY e.sequence DESC LIMIT 1),
-                         'observed') AS status
-         FROM harness_signals s ORDER BY s.created_at DESC, s.id DESC LIMIT ?1",
+    let limit = i64::try_from(limit.clamp(1, 500)).context("signal limit exceeds sqlite range")?;
+    let rows = if let Some(status) = status {
+        sqlx::query(
+            "SELECT s.id, s.kind, s.trust, s.source, s.external_id, s.content,
+                    s.content_hash, s.metadata_json, s.created_at,
+                    COALESCE((SELECT e.status FROM harness_signal_events e
+                              WHERE e.signal_id = s.id ORDER BY e.sequence DESC LIMIT 1),
+                             'observed') AS status
+             FROM harness_signals s
+             WHERE COALESCE((SELECT e.status FROM harness_signal_events e
+                             WHERE e.signal_id = s.id ORDER BY e.sequence DESC LIMIT 1),
+                            'observed') = ?2
+             ORDER BY s.created_at DESC, s.id DESC LIMIT ?1",
+        )
+        .bind(limit)
+        .bind(status.as_str())
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query(
+            "SELECT s.id, s.kind, s.trust, s.source, s.external_id, s.content,
+                    s.content_hash, s.metadata_json, s.created_at,
+                    COALESCE((SELECT e.status FROM harness_signal_events e
+                              WHERE e.signal_id = s.id ORDER BY e.sequence DESC LIMIT 1),
+                             'observed') AS status
+             FROM harness_signals s ORDER BY s.created_at DESC, s.id DESC LIMIT ?1",
+        )
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+    };
+    rows.into_iter().map(decode_signal).collect()
+}
+
+/// Marks a pending signal as ignored with an operator reason. `proposed` and
+/// already-`ignored` signals are terminal for this transition.
+pub(crate) async fn ignore_signal(
+    pool: &SqlitePool,
+    signal_id: &str,
+    reason: &str,
+    actor: &str,
+) -> anyhow::Result<SignalRecord> {
+    ensure!(
+        !reason.trim().is_empty() && reason.chars().count() <= 512,
+        "signal ignore reason must be 1..=512 characters"
+    );
+    let signal = get_signal(pool, signal_id)
+        .await?
+        .context("signal not found")?;
+    ensure!(
+        matches!(
+            signal.status,
+            SignalStatus::Observed | SignalStatus::Triaged
+        ),
+        "signal cannot be ignored from status '{}'",
+        signal.status.as_str()
+    );
+    let mut tx = pool.begin().await?;
+    insert_signal_event_tx(
+        &mut tx,
+        signal_id,
+        SignalStatus::Ignored,
+        actor,
+        serde_json::json!({"reason": reason.trim()}),
     )
-    .bind(i64::try_from(limit).context("signal limit exceeds sqlite range")?)
-    .fetch_all(pool)
-    .await?
-    .into_iter()
-    .map(decode_signal)
-    .collect()
+    .await?;
+    tx.commit().await?;
+    get_signal(pool, signal_id)
+        .await?
+        .context("ignored signal disappeared")
 }
 
 pub(crate) async fn mark_signal_proposed(

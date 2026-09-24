@@ -166,3 +166,68 @@ async fn scoped_signal_ingest_and_operator_goal_resume_lifecycle() {
     let artifacts: serde_json::Value = artifacts.json();
     assert_eq!(artifacts["artifacts"].as_array().map(Vec::len), Some(1));
 }
+
+#[tokio::test]
+async fn operator_filters_signals_by_status_and_ignores_with_reason() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let database_url = format!("sqlite://{}", temp.path().join("http-signals.db").display());
+    let app = build_router(config(), &database_url, Some(Arc::new(HarnessHttpProvider)))
+        .await
+        .expect("router");
+    let server = TestServer::new(app).expect("server");
+
+    let ingest = |external_id: &str, content: &str| {
+        server
+            .post("/v1/harness/signals")
+            .add_header("authorization", "Bearer ingest-key")
+            .add_header("x-harness-actor", "ingest:test")
+            .json(&serde_json::json!({
+                "kind": "community",
+                "trust": "external",
+                "source": "github:community",
+                "external_id": external_id,
+                "content": content,
+                "metadata": {}
+            }))
+    };
+    ingest("d-1", "First report about flaky search")
+        .await
+        .assert_status_ok();
+    ingest("d-2", "Second report about stalled schedules")
+        .await
+        .assert_status_ok();
+
+    let observed = operator(server.get("/v1/harness/signals?status=observed")).await;
+    observed.assert_status_ok();
+    let observed: serde_json::Value = observed.json();
+    assert_eq!(observed["signals"].as_array().map(Vec::len), Some(2));
+    let signal_id = observed["signals"][0]["id"].as_str().expect("signal id");
+
+    // Ignoring requires an operator key, not the scoped ingest key.
+    let wrong_scope = server
+        .post(&format!("/v1/harness/signals/{signal_id}/ignore"))
+        .add_header("authorization", "Bearer ingest-key")
+        .json(&serde_json::json!({"reason": "noise"}))
+        .await;
+    wrong_scope.assert_status_unauthorized();
+
+    let ignored = operator(server.post(&format!("/v1/harness/signals/{signal_id}/ignore")))
+        .json(&serde_json::json!({"reason": "not actionable"}))
+        .await;
+    ignored.assert_status_ok();
+    let ignored: serde_json::Value = ignored.json();
+    assert_eq!(ignored["status"], "ignored");
+
+    let after = operator(server.get("/v1/harness/signals?status=observed")).await;
+    let after: serde_json::Value = after.json();
+    assert_eq!(after["signals"].as_array().map(Vec::len), Some(1));
+    let ignored_list = operator(server.get("/v1/harness/signals?status=ignored")).await;
+    let ignored_list: serde_json::Value = ignored_list.json();
+    assert_eq!(ignored_list["signals"].as_array().map(Vec::len), Some(1));
+
+    // An ignored signal cannot be proposed into a goal.
+    let propose = operator(server.post(&format!("/v1/harness/signals/{signal_id}/propose-goal")))
+        .json(&serde_json::json!({"objective": "revive it"}))
+        .await;
+    propose.assert_status_bad_request();
+}

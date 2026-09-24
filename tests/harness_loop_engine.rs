@@ -12,7 +12,7 @@ use xiaomaolv::harness::loop_engine::{
     AcceptanceCriterion, ApproveGoalRequest, ArtifactKind, CheckpointPhase, CreateGoalRequest,
     CreateSignalRequest, EffectClass, ExecutionBudget, ExternalWritePolicy, GoalStatus, LoopEngine,
     LoopWorker, OutboundSender, PlanGoalRequest, PublishArtifactRequest, ReplayStatus, RetryPolicy,
-    SelfTestStatus, SignalKind, SignalTrust, SqliteLoopStore, TrajectoryFrameCapture,
+    SelfTestStatus, SignalKind, SignalStatus, SignalTrust, SqliteLoopStore, TrajectoryFrameCapture,
     TrajectoryFrameDraft, WorkHandler, WorkHandlerContext, WorkHandlerRegistry, WorkItemStatus,
     WorkOutcome, WorkflowEdge, WorkflowSpec, WorkflowStep,
 };
@@ -308,7 +308,7 @@ async fn repeated_self_test_failure_emits_one_deduplicated_signal() -> anyhow::R
     assert_eq!(first.status, SelfTestStatus::Failed);
     assert_eq!(second.status, SelfTestStatus::Failed);
 
-    let signals = engine.list_signals(20).await?;
+    let signals = engine.list_signals(20, None).await?;
     assert_eq!(signals.len(), 1);
     assert_eq!(signals[0].kind, SignalKind::SelfTest);
     Ok(())
@@ -1545,5 +1545,187 @@ async fn channel_send_dispatch_blocked_when_flag_off_on_worker() -> anyhow::Resu
         .expect("channel_send work item");
     assert_eq!(item.status, WorkItemStatus::Failed);
     assert!(sends.sends.lock().expect("sends").is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn normalized_signal_variants_deduplicate_across_external_ids() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("signals-norm.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = LoopEngine::new(Arc::new(SqliteLoopStore::new(memory)));
+
+    let signal = |external_id: Option<&str>, source: &str, content: &str| CreateSignalRequest {
+        kind: SignalKind::Community,
+        trust: SignalTrust::External,
+        source: source.to_string(),
+        external_id: external_id.map(str::to_string),
+        content: content.to_string(),
+        metadata: BTreeMap::new(),
+    };
+    let first = engine
+        .ingest_signal(
+            signal(
+                Some("issue-1"),
+                "github:issues",
+                "Database migration failed.",
+            ),
+            "ingest:community",
+        )
+        .await?;
+    assert!(!first.deduplicated);
+
+    // Different external_id but a case/whitespace/punctuation variant of the
+    // same content deduplicates through the normalized hash.
+    let second = engine
+        .ingest_signal(
+            signal(
+                Some("issue-2"),
+                "github:issues",
+                "  DATABASE   migration FAILED!!",
+            ),
+            "ingest:community",
+        )
+        .await?;
+    assert!(second.deduplicated);
+    assert_eq!(second.signal.id, first.signal.id);
+
+    // A different source with the same content is a distinct signal.
+    let third = engine
+        .ingest_signal(
+            signal(None, "slack:community", "Database migration failed."),
+            "ingest:slack",
+        )
+        .await?;
+    assert!(!third.deduplicated);
+    Ok(())
+}
+
+#[tokio::test]
+async fn near_duplicate_signals_deduplicate_but_distinct_content_does_not() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("signals-near.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = LoopEngine::new(Arc::new(SqliteLoopStore::new(memory)));
+
+    let signal = |content: &str| CreateSignalRequest {
+        kind: SignalKind::UserFeedback,
+        trust: SignalTrust::Authenticated,
+        source: "telegram:feedback".to_string(),
+        external_id: None,
+        content: content.to_string(),
+        metadata: BTreeMap::new(),
+    };
+    let first = engine
+        .ingest_signal(
+            signal("the agent failed to retry the timed out search tool call"),
+            "ingest:feedback",
+        )
+        .await?;
+    assert!(!first.deduplicated);
+
+    // One extra word keeps the token overlap above the near-duplicate bar.
+    let second = engine
+        .ingest_signal(
+            signal("the agent failed to retry the timed out search tool call again"),
+            "ingest:feedback",
+        )
+        .await?;
+    assert!(second.deduplicated);
+    assert_eq!(second.signal.id, first.signal.id);
+
+    // A genuinely different report must not be absorbed.
+    let third = engine
+        .ingest_signal(
+            signal("scheduler jobs fire twice after a restart"),
+            "ingest:feedback",
+        )
+        .await?;
+    assert!(!third.deduplicated);
+    assert_ne!(third.signal.id, first.signal.id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn operator_reviews_signals_with_status_filter_ignore_and_propose() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!(
+        "sqlite://{}",
+        temp.path().join("signals-review.db").display()
+    );
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = LoopEngine::new(Arc::new(SqliteLoopStore::new(memory)));
+
+    for (external_id, content) in [
+        ("d-1", "first report about flaky search"),
+        ("d-2", "second report about stalled schedules"),
+    ] {
+        engine
+            .ingest_signal(
+                CreateSignalRequest {
+                    kind: SignalKind::DeveloperFeedback,
+                    trust: SignalTrust::Authenticated,
+                    source: "console:dev".to_string(),
+                    external_id: Some(external_id.to_string()),
+                    content: content.to_string(),
+                    metadata: BTreeMap::new(),
+                },
+                "ingest:dev",
+            )
+            .await?;
+    }
+    let observed = engine
+        .list_signals(20, Some(SignalStatus::Observed))
+        .await?;
+    assert_eq!(observed.len(), 2);
+    assert!(
+        engine
+            .list_signals(20, Some(SignalStatus::Ignored))
+            .await?
+            .is_empty()
+    );
+
+    let ignored = engine
+        .ignore_signal(&observed[0].id, "not actionable noise", "operator:henry")
+        .await?;
+    assert_eq!(ignored.status, SignalStatus::Ignored);
+    let reignore = engine
+        .ignore_signal(&observed[0].id, "again", "operator:henry")
+        .await;
+    assert!(reignore.is_err(), "ignoring twice must fail");
+    let propose_ignored = engine
+        .propose_goal_from_signal(&observed[0].id, "revive", "operator:henry")
+        .await;
+    assert!(propose_ignored.is_err(), "ignored signal cannot propose");
+
+    let goal = engine
+        .propose_goal_from_signal(&observed[1].id, "fix stalled schedules", "operator:henry")
+        .await?;
+    assert_eq!(goal.source_signal_ids, vec![observed[1].id.clone()]);
+    let repropose = engine
+        .propose_goal_from_signal(&observed[1].id, "again", "operator:henry")
+        .await;
+    assert!(repropose.is_err(), "proposed signal cannot propose twice");
+
+    assert!(
+        engine
+            .list_signals(20, Some(SignalStatus::Observed))
+            .await?
+            .is_empty()
+    );
+    assert_eq!(
+        engine
+            .list_signals(20, Some(SignalStatus::Ignored))
+            .await?
+            .len(),
+        1
+    );
+    assert_eq!(
+        engine
+            .list_signals(20, Some(SignalStatus::Proposed))
+            .await?
+            .len(),
+        1
+    );
     Ok(())
 }

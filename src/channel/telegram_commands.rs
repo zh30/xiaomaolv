@@ -12,6 +12,7 @@ pub(super) enum TelegramSlashCommand {
     Task { tail: String },
     Goal { tail: String },
     Resume { tail: String },
+    Signals { tail: String },
     Unknown { name: String },
 }
 
@@ -303,6 +304,18 @@ pub(super) async fn maybe_handle_telegram_command(
         }
         TelegramSlashCommand::Resume { tail } => {
             handle_telegram_resume_command(
+                ctx,
+                sender,
+                message,
+                &tail,
+                is_private_chat,
+                command_settings,
+            )
+            .await?;
+            Ok(true)
+        }
+        TelegramSlashCommand::Signals { tail } => {
+            handle_telegram_signals_command(
                 ctx,
                 sender,
                 message,
@@ -824,6 +837,198 @@ async fn handle_telegram_resume_command(
         Err(error) => {
             send_telegram_command_reply(sender, message, &format!("恢复 Goal 失败: {error}"))
                 .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_telegram_signals_command(
+    ctx: &ChannelContext,
+    sender: &TelegramSender,
+    message: &TelegramMessage,
+    tail: &str,
+    is_private_chat: bool,
+    command_settings: &TelegramCommandSettings,
+) -> anyhow::Result<()> {
+    if !ensure_harness_command_access(
+        ctx,
+        sender,
+        message,
+        is_private_chat,
+        command_settings,
+        "/signals",
+    )
+    .await?
+    {
+        return Ok(());
+    }
+    let engine = ctx.loop_engine.as_ref().expect("access checked engine");
+    let actor = format!(
+        "telegram:{}",
+        message
+            .from
+            .as_ref()
+            .map(|user| user.id)
+            .unwrap_or(message.chat.id)
+    );
+    let args = shlex::split(tail).ok_or_else(|| anyhow::anyhow!("命令参数错误: 引号未闭合"))?;
+
+    // /signals — list signals still awaiting operator review.
+    if args.is_empty() {
+        let pending = engine
+            .list_signals(64, None)
+            .await?
+            .into_iter()
+            .filter(|signal| {
+                matches!(
+                    signal.status,
+                    crate::harness::loop_engine::SignalStatus::Observed
+                        | crate::harness::loop_engine::SignalStatus::Triaged
+                )
+            })
+            .take(8)
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            send_telegram_command_reply(sender, message, "没有待审阅的 evolution 信号。").await?;
+            return Ok(());
+        }
+        let mut lines = vec!["待审阅信号:".to_string()];
+        for signal in &pending {
+            let excerpt: String = signal.content.chars().take(60).collect();
+            lines.push(format!(
+                "- {} [{}] {}",
+                signal.id,
+                signal.kind.as_str(),
+                excerpt
+            ));
+        }
+        lines.push(
+            "\n查看: /signal <id>\n转为 Goal: /signal <id> goal <目标描述>\n忽略: /signal <id> ignore <原因>"
+                .to_string(),
+        );
+        send_telegram_command_reply(sender, message, &lines.join("\n")).await?;
+        return Ok(());
+    }
+
+    let signal_id = args[0].as_str();
+    if args.len() == 1 {
+        let signal = engine.get_signal(signal_id).await?;
+        let Some(signal) = signal else {
+            send_telegram_command_reply(sender, message, &format!("信号不存在: {signal_id}"))
+                .await?;
+            return Ok(());
+        };
+        send_telegram_command_reply(
+            sender,
+            message,
+            &format!(
+                "Signal {}\nstatus={} kind={} trust={}\nsource={} external_id={}\ncreated={}\n\n{}",
+                signal.id,
+                signal.status.as_str(),
+                signal.kind.as_str(),
+                signal.trust.as_str(),
+                signal.source,
+                signal.external_id.as_deref().unwrap_or("-"),
+                signal.created_at_unix,
+                signal.content
+            ),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    match args[1].as_str() {
+        "ignore" => {
+            let reason = args[2..].join(" ");
+            if reason.trim().is_empty() {
+                send_telegram_command_reply(sender, message, "用法: /signal <id> ignore <原因>")
+                    .await?;
+                return Ok(());
+            }
+            match engine.ignore_signal(signal_id, &reason, &actor).await {
+                Ok(signal) => {
+                    send_telegram_command_reply(
+                        sender,
+                        message,
+                        &format!(
+                            "信号已忽略。\nsignal_id={}\nstatus={}",
+                            signal.id,
+                            signal.status.as_str()
+                        ),
+                    )
+                    .await?;
+                }
+                Err(error) => {
+                    send_telegram_command_reply(sender, message, &format!("忽略信号失败: {error}"))
+                        .await?;
+                }
+            }
+        }
+        "goal" => {
+            let objective = args[2..].join(" ");
+            if objective.trim().is_empty() {
+                send_telegram_command_reply(sender, message, "用法: /signal <id> goal <目标描述>")
+                    .await?;
+                return Ok(());
+            }
+            let created = match engine
+                .propose_goal_from_signal(signal_id, &objective, &actor)
+                .await
+            {
+                Ok(goal) => goal,
+                Err(error) => {
+                    send_telegram_command_reply(
+                        sender,
+                        message,
+                        &format!("信号转 Goal 失败: {error}"),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            match engine.plan_goal_recommended(&created.id, &actor).await {
+                Ok(plan) => {
+                    let effect_manifest = plan
+                        .effect_manifest
+                        .iter()
+                        .map(|effect| effect.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    send_telegram_command_reply(
+                        sender,
+                        message,
+                        &format!(
+                            "信号已转为 Goal 并生成计划。\nsignal_id={}\ngoal_id={}\nstatus={}\nrevision={}\nplan_hash={}\neffects: {}\n\n确认后执行:\n/goal approve {} {} {}",
+                            signal_id,
+                            plan.goal.id,
+                            enum_label(&plan.goal.status),
+                            plan.goal.revision,
+                            plan.plan_hash,
+                            effect_manifest,
+                            plan.goal.id,
+                            plan.goal.revision,
+                            plan.plan_hash,
+                        ),
+                    )
+                    .await?;
+                }
+                Err(error) => {
+                    send_telegram_command_reply(
+                        sender,
+                        message,
+                        &format!("Goal 已创建（goal_id={}），但规划失败: {error}", created.id),
+                    )
+                    .await?;
+                }
+            }
+        }
+        _ => {
+            send_telegram_command_reply(
+                sender,
+                message,
+                "用法:\n/signals\n/signal <id>\n/signal <id> ignore <原因>\n/signal <id> goal <目标描述>",
+            )
+            .await?;
         }
     }
     Ok(())
@@ -1840,6 +2045,7 @@ pub(super) fn parse_telegram_slash_command(
         "task" => Some(TelegramSlashCommand::Task { tail }),
         "goal" => Some(TelegramSlashCommand::Goal { tail }),
         "resume" => Some(TelegramSlashCommand::Resume { tail }),
+        "signals" | "signal" => Some(TelegramSlashCommand::Signals { tail }),
         _ => Some(TelegramSlashCommand::Unknown { name: command }),
     }
 }
@@ -1864,6 +2070,7 @@ pub(super) fn telegram_help_text() -> String {
         "/task - 管理定时任务（仅私聊管理员）",
         "/goal - 创建、审阅或批准 durable Goal（仅私聊管理员）",
         "/resume - 恢复并查看 Goal 状态（仅私聊管理员）",
+        "/signals - 审阅、忽略或将 evolution 信号转为 Goal（仅私聊管理员）",
     ]
     .join("\n")
 }
@@ -1992,6 +2199,7 @@ pub(super) fn telegram_registered_commands() -> Vec<(&'static str, &'static str)
         ("task", "管理定时任务"),
         ("goal", "创建与批准 durable Goal"),
         ("resume", "恢复 Goal 状态"),
+        ("signals", "审阅 evolution 信号"),
     ]
 }
 

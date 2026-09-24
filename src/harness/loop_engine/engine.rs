@@ -13,7 +13,7 @@ use super::store::LoopStore;
 use super::{
     ArtifactKind, ArtifactPublishResult, ArtifactRecord, CreateSignalRequest,
     PublishArtifactRequest, ReplayRun, SelfTestRun, SelfTestStatus, SignalIngestResult, SignalKind,
-    SignalRecord, SignalTrust, TrajectoryFrame, TrajectoryFrameDraft,
+    SignalRecord, SignalStatus, SignalTrust, TrajectoryFrame, TrajectoryFrameDraft,
 };
 
 #[derive(Clone)]
@@ -88,8 +88,22 @@ impl LoopEngine {
         self.store.get_signal(signal_id).await
     }
 
-    pub async fn list_signals(&self, limit: usize) -> anyhow::Result<Vec<SignalRecord>> {
-        self.store.list_signals(limit).await
+    pub async fn list_signals(
+        &self,
+        limit: usize,
+        status: Option<SignalStatus>,
+    ) -> anyhow::Result<Vec<SignalRecord>> {
+        self.store.list_signals(limit, status).await
+    }
+
+    pub async fn ignore_signal(
+        &self,
+        signal_id: &str,
+        reason: &str,
+        actor: &str,
+    ) -> anyhow::Result<SignalRecord> {
+        validate_actor(actor)?;
+        self.store.ignore_signal(signal_id, reason, actor).await
     }
 
     pub async fn propose_goal_from_signal(
@@ -99,9 +113,18 @@ impl LoopEngine {
         actor: &str,
     ) -> anyhow::Result<GoalRecord> {
         validate_actor(actor)?;
+        let signal = self
+            .store
+            .get_signal(signal_id)
+            .await?
+            .context("signal not found")?;
         anyhow::ensure!(
-            self.store.get_signal(signal_id).await?.is_some(),
-            "signal not found"
+            matches!(
+                signal.status,
+                SignalStatus::Observed | SignalStatus::Triaged
+            ),
+            "signal cannot be proposed from status '{}'",
+            signal.status.as_str()
         );
         let goal = self
             .create_goal(

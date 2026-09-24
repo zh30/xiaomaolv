@@ -347,10 +347,13 @@ the loop, which today does not exist.
 
 ### T11 (P3) — Signal->goal polish
 
-- [ ] Dedup quality pass on `signals.rs` (near-duplicate detection, not just exact evidence
-  hash).
-- [ ] Operator review path: list pending signals, convert to proposed goal, reject with reason —
-  complete over HTTP + Telegram.
+- [x] Dedup quality pass on `signals.rs`: three source-scoped layers — exact `(external_id |
+  fingerprint)`, `normalized_hash` column (case/whitespace/punctuation collapsed per kind,
+  backfilled), and token-set near-duplicates (Jaccard >= 0.9 over the last 128 same-source/kind
+  signals).
+- [x] Operator review path: `?status=` filter on `GET /v1/harness/signals`,
+  `POST /v1/harness/signals/{id}/ignore` (reason required; `proposed`/`ignored` are terminal
+  in both directions), and Telegram `/signals` + `/signal <id> [ignore|goal]` surface.
 
 ### T12 (P3) — Desktop control plane (placeholder)
 
@@ -395,3 +398,7 @@ cargo test --test agent_swarm_store --test service_pipeline --test harness_eval 
   to promotion independent of the operator regression budget; new `max_output_chars` assertion
   makes response-budget scenarios enforceable; operator/benchmark case-id collisions fail
   closed. 41 test binaries green.
+- 2026-09-24 — **T11 done:** signal dedup gains normalized-hash and bounded Jaccard
+  near-duplicate layers; triage lifecycle closes (`observed`/`triaged` -> `proposed`|`ignored`,
+  both terminal); operator review works end-to-end via `?status=` + `POST /ignore` on HTTP and
+  `/signals` + `/signal <id> ignore|goal` on Telegram. 41 test binaries green.

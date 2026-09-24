@@ -185,3 +185,25 @@ fatal; `max_regressions` governs only operator-case regressions.
   capability for free.
 - Case-id collisions between operator cases and the suite fail the evaluation closed rather
   than silently shadowing one side's evidence map.
+
+### 2026-09-24 — Signal triage becomes a real lifecycle with layered dedup
+
+**Decision:** signals now dedup on three source-scoped layers — exact `(external_id |
+fingerprint)`, a normalized-content hash (case/whitespace/punctuation collapsed, per kind), and
+token-set near-duplicates (Jaccard ≥ 0.9 over the last 128 same-source/kind signals) — and gain
+an operator triage surface: `observed`/`triaged` → `proposed` or `ignored`, both terminal.
+
+**Rationale:**
+
+- Exact-hash dedup alone let trivially reworded reports flood the review queue — the same
+  incident filed from a retry, a reworded webhook, or a reformatted alert each became a new
+  pending signal. Normalization catches cosmetic variants for free; bounded Jaccard catches
+  one-word-different repeats without pretending at semantic similarity.
+- The scan is deliberately small (128 recent same-source/kind rows) and the threshold high
+  (0.9): dedup must never merge two genuinely different reports — under-merging is recoverable
+  by an operator, over-merging silently loses evidence.
+- `proposed`/`ignored` are terminal in both directions: an ignored signal cannot later produce
+  a goal, and a proposed signal cannot double-create goals. The review path now exists
+  end-to-end — `?status=` filter + `POST /ignore` over HTTP, `/signals` + `/signal <id> ignore
+  | goal` over Telegram — so the loop from signal intake to goal proposal no longer requires
+  touching the database.

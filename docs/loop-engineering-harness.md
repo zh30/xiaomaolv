@@ -159,10 +159,11 @@ they require a configured operator key and `loop_engine.enabled = true`.
 | `GET` | `/v1/harness/goals/{id}/events` | Cursor-based durable event snapshot |
 | `GET` | `/v1/harness/goals/{id}/events/stream` | SSE event stream for Desktop |
 | `POST` | `/v1/harness/goals/{id}/verify/manual` | Record a named manual criterion and re-verify |
-| `GET` | `/v1/harness/signals` | List provenance-preserving evolution signals |
+| `GET` | `/v1/harness/signals` | List signals; `?status=observed|triaged|proposed|ignored` filters by triage state |
 | `POST` | `/v1/harness/signals` | Ingest one external/authenticated signal with the scoped key |
 | `GET` | `/v1/harness/signals/{id}` | Read one signal and its current triage status |
-| `POST` | `/v1/harness/signals/{id}/propose-goal` | Convert a signal into a proposed goal |
+| `POST` | `/v1/harness/signals/{id}/propose-goal` | Convert a pending signal into a proposed goal |
+| `POST` | `/v1/harness/signals/{id}/ignore` | Mark a pending signal ignored with an operator reason |
 | `POST` | `/v1/harness/self-tests/{suite}` | Run a bounded read-only suite (`core`) |
 | `GET` | `/v1/harness/self-test-runs/{id}` | Read persisted maintenance evidence |
 | `GET` | `/v1/harness/trajectories/{id}/frames` | Read per-provider-call replay frames |
@@ -187,9 +188,18 @@ curl -sS -X POST "$XIAOMAOLV_URL/v1/harness/signals" \
 ```
 
 Scoped clients cannot assert `internal` trust or create, approve, dispatch, resume, verify, or
-activate anything. Source/external-ID/content fingerprints make ingestion idempotent. Community,
+activate anything. Ingestion is idempotent across three dedup layers, all scoped to the signal
+source: exact `(source, external_id)` or `(source, fingerprint)` match, a normalized-content
+hash that collapses case/whitespace/punctuation variants per kind, and token-set near-duplicate
+detection (Jaccard >= 0.9 against the 128 most recent same-source/kind signals). Community,
 user, developer, trajectory, replay, manual, and self-test signals all use the same immutable
-model; they can only become proposed goals until an operator reviews the resulting plan.
+model.
+
+Signal triage is a small lifecycle: `observed` (or `triaged`) -> `proposed` via the
+propose-goal route, or -> `ignored` with a required operator reason. `proposed` and `ignored`
+are terminal for both transitions — an ignored signal cannot be proposed, and a proposed
+signal cannot be proposed again or ignored. Over Telegram, `/signals` lists pending signals and
+`/signal <id> [ignore <reason> | goal <objective>]` reviews, rejects, or converts one.
 
 Supported signal kinds are `trajectory`, `user_feedback`, `developer_feedback`, `community`,
 `self_test`, `session_replay`, and `manual`; trust levels are `internal`, `authenticated`, and
