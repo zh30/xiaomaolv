@@ -83,7 +83,7 @@ Key config sections:
 - `[memory]` - Memory backend (sqlite-only or hybrid-sqlite-zvec)
 - `[agent]` - MCP/Skills settings and Code Mode execution policy
 - `[agent.harness]` - trajectory, compaction, verification, prompt evolution, and Loop Engineering settings
-- `[agent.harness.evolution]` - bounded prompt candidates, shadow evaluation, and human promotion gates
+- `[agent.harness.evolution]` - bounded prompt candidates, shadow evaluation (operator eval cases plus a versioned benchmark suite whose regressions are always fatal), and human promotion gates
 - `[agent.harness.loop_engine]` - durable goals, scoped signal ingestion, worker polling/leases/concurrency, and periodic self-tests
 
 ### Memory Backend

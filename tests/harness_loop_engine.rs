@@ -110,6 +110,7 @@ async fn built_in_worker_runs_evolution_evaluation_with_persisted_budgets() -> a
                     required_substrings: vec!["Durable".to_string()],
                     forbidden_substrings: Vec::new(),
                     require_json: false,
+                    ..Default::default()
                 },
                 weight: 1.0,
                 enabled: true,

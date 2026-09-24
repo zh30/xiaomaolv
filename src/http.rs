@@ -708,6 +708,7 @@ async fn build_runtime_handles(
         )
         .await?
         .with_harness_store(harness_store.clone())
+        .with_benchmark_suite(crate::harness::benchmark::core_benchmark_suite())?
         .with_evidence_limits(
             evolution_config.max_source_trajectories,
             evolution_config.max_evidence_chars,

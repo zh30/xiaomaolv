@@ -62,6 +62,15 @@ existing prompt-candidate engine: it reserves exactly two provider calls per ena
 enforces the Goal deadline and cumulative response-byte budget, and publishes only a compact
 evaluation reference. Human approval/activation remains in the existing evolution control plane.
 
+Shadow evaluation always scores two populations together: operator-managed eval cases and the
+versioned benchmark suite (`src/harness/benchmark.rs`, labeled `id@version`, currently
+`core@2026-09-24.1`). Benchmark cases carry the same assertion vocabulary — required/forbidden
+substrings, JSON validity, and `max_output_chars` — and are marked `benchmark` in the scorecard
+with the suite label recorded alongside. A benchmark regression (baseline pass -> candidate
+fail on a benchmark case) is always fatal to promotion: `benchmark_regressions > 0` rejects the
+candidate regardless of `max_regressions`, which bounds only operator-case regressions. An
+operator eval case whose id collides with a benchmark case fails the evaluation closed.
+
 ## Durable loop
 
 The persisted hierarchy is:

@@ -160,3 +160,28 @@ allowlist entry is a startup error, not a runtime surprise.
 stay visible but cannot be unblocked. If that proves to matter, add an operator confirm route
 that either marks the item satisfied (send verified externally) or re-queues it with a new
 attempt number (new idempotency key, explicit operator-authorized resend).
+
+### 2026-09-24 — Evolution gate gets a versioned benchmark floor
+
+**Decision:** prompt-evolution candidates are now scored against two populations in one
+scorecard: operator-managed eval cases (dynamic, store-backed) and a code-curated benchmark
+suite (`src/harness/benchmark.rs`, `core@2026-09-24.1`) attached to `EvolutionEngine` via
+`with_benchmark_suite`. Benchmark regressions — baseline pass, candidate fail — are always
+fatal; `max_regressions` governs only operator-case regressions.
+
+**Rationale:**
+
+- The ceiling of the evolution engine is the quality of its evidence. Operator cases alone are
+  driftable — an operator can weaken them, or a permissive `max_regressions` can waive real
+  breakage. A versioned, in-code suite is the floor nobody configures away; the `id@version`
+  label lands on every persisted scorecard so results stay attributable to the exact suite
+  that produced them.
+- Scoring is shared, provenance is not. `EvolutionScorer::score_with_benchmark` weights
+  benchmark cases into the same baseline/candidate scores (so they count toward
+  `min_eval_cases` and the score floor), but flags each result `benchmark` and counts
+  `benchmark_regressions` separately, letting the gate be stricter where it must be.
+- A new `max_output_chars` assertion turns "stay concise / bounded" expectations into real
+  checks — the benchmark's latency/verbosity scenarios need it, and operator cases get the
+  capability for free.
+- Case-id collisions between operator cases and the suite fail the evaluation closed rather
+  than silently shadowing one side's evidence map.

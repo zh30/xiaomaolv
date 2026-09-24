@@ -73,6 +73,10 @@ pub struct EvolutionCaseAssertions {
     pub forbidden_substrings: Vec<String>,
     #[serde(default)]
     pub require_json: bool,
+    /// Optional upper bound on output size; encodes response-budget scenarios
+    /// that substring checks cannot express.
+    #[serde(default)]
+    pub max_output_chars: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -111,8 +115,14 @@ impl EvolutionEvalCase {
         if self.assertions.required_substrings.is_empty()
             && self.assertions.forbidden_substrings.is_empty()
             && !self.assertions.require_json
+            && self.assertions.max_output_chars.is_none()
         {
             bail!("eval case must define at least one assertion");
+        }
+        if let Some(max_output_chars) = self.assertions.max_output_chars
+            && !(1..=1_048_576).contains(&max_output_chars)
+        {
+            bail!("eval case max_output_chars must be 1..=1048576");
         }
         let assertion_count =
             self.assertions.required_substrings.len() + self.assertions.forbidden_substrings.len();
@@ -147,6 +157,48 @@ pub struct EvolutionCaseResult {
     pub candidate_output_excerpt: String,
     pub baseline_output_sha256: String,
     pub candidate_output_sha256: String,
+    /// True when the case came from the versioned benchmark suite rather than
+    /// operator-managed eval cases.
+    #[serde(default)]
+    pub benchmark: bool,
+}
+
+/// A versioned, code-curated benchmark suite whose cases join every shadow
+/// evaluation as additional scored evidence. Unlike operator eval cases, a
+/// benchmark regression is always fatal to promotion.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvolutionBenchmarkSuite {
+    pub id: String,
+    pub version: String,
+    pub cases: Vec<EvolutionEvalCase>,
+}
+
+impl EvolutionBenchmarkSuite {
+    pub fn label(&self) -> String {
+        format!("{}@{}", self.id, self.version)
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            !self.id.trim().is_empty() && self.id.len() <= 64,
+            "benchmark suite id must be 1..=64 bytes"
+        );
+        ensure!(
+            !self.version.trim().is_empty() && self.version.len() <= 64,
+            "benchmark suite version must be 1..=64 bytes"
+        );
+        ensure!(
+            !self.cases.is_empty() && self.cases.len() <= 16,
+            "benchmark suite must contain 1..=16 cases"
+        );
+        let mut ids = std::collections::BTreeSet::new();
+        for case in &self.cases {
+            case.validate()
+                .with_context(|| format!("invalid benchmark case '{}'", case.id))?;
+            ensure!(ids.insert(case.id.as_str()), "duplicate benchmark case id");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -155,6 +207,14 @@ pub struct EvolutionScorecard {
     pub candidate_score: f64,
     pub score_delta: f64,
     pub regressions: usize,
+    /// Regressions attributable to benchmark cases. Always gated to zero —
+    /// `max_regressions` applies only to operator eval cases.
+    #[serde(default)]
+    pub benchmark_regressions: usize,
+    /// `id@version` label of the benchmark suite that produced benchmark
+    /// cases; `None` when no suite was configured.
+    #[serde(default)]
+    pub benchmark_suite: Option<String>,
     pub baseline_passed_cases: usize,
     pub candidate_passed_cases: usize,
     pub total_cases: usize,
@@ -169,8 +229,30 @@ impl EvolutionScorer {
         baseline_outputs: &BTreeMap<String, String>,
         candidate_outputs: &BTreeMap<String, String>,
     ) -> anyhow::Result<EvolutionScorecard> {
+        Self::score_with_benchmark(cases, None, baseline_outputs, candidate_outputs)
+    }
+
+    /// Scores operator eval cases plus an optional versioned benchmark suite.
+    /// Benchmark cases are scored identically but flagged `benchmark`, and
+    /// their regressions are additionally counted in `benchmark_regressions`
+    /// so the gate can treat them as always fatal.
+    pub fn score_with_benchmark(
+        cases: &[EvolutionEvalCase],
+        benchmark_suite: Option<&EvolutionBenchmarkSuite>,
+        baseline_outputs: &BTreeMap<String, String>,
+        candidate_outputs: &BTreeMap<String, String>,
+    ) -> anyhow::Result<EvolutionScorecard> {
         let enabled_cases = cases.iter().filter(|case| case.enabled).collect::<Vec<_>>();
-        if enabled_cases.is_empty() {
+        let benchmark_cases = benchmark_suite
+            .map(|suite| {
+                suite.validate()?;
+                Ok::<Vec<&EvolutionEvalCase>, anyhow::Error>(
+                    suite.cases.iter().filter(|case| case.enabled).collect(),
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
+        if enabled_cases.is_empty() && benchmark_cases.is_empty() {
             bail!("at least one enabled eval case is required");
         }
         if enabled_cases.len() > MAX_ENABLED_EVOLUTION_EVAL_CASES {
@@ -183,9 +265,14 @@ impl EvolutionScorer {
         let mut baseline_passed_cases = 0;
         let mut candidate_passed_cases = 0;
         let mut regressions = 0;
-        let mut case_results = Vec::with_capacity(enabled_cases.len());
+        let mut benchmark_regressions = 0;
+        let mut case_results = Vec::with_capacity(enabled_cases.len() + benchmark_cases.len());
 
-        for case in enabled_cases {
+        for (case, benchmark) in enabled_cases
+            .iter()
+            .map(|case| (*case, false))
+            .chain(benchmark_cases.iter().map(|case| (*case, true)))
+        {
             case.validate()
                 .with_context(|| format!("invalid eval case '{}'", case.id))?;
             let baseline_output = baseline_outputs
@@ -211,6 +298,9 @@ impl EvolutionScorer {
             }
             if baseline_passed && !candidate_passed {
                 regressions += 1;
+                if benchmark {
+                    benchmark_regressions += 1;
+                }
             }
 
             case_results.push(EvolutionCaseResult {
@@ -233,6 +323,7 @@ impl EvolutionScorer {
                 ),
                 baseline_output_sha256: sha256_hex(baseline_output.as_bytes()),
                 candidate_output_sha256: sha256_hex(candidate_output.as_bytes()),
+                benchmark,
             });
         }
 
@@ -243,6 +334,8 @@ impl EvolutionScorer {
             candidate_score,
             score_delta: candidate_score - baseline_score,
             regressions,
+            benchmark_regressions,
+            benchmark_suite: benchmark_suite.map(EvolutionBenchmarkSuite::label),
             baseline_passed_cases,
             candidate_passed_cases,
             total_cases: case_results.len(),
@@ -265,6 +358,11 @@ fn evaluate_assertions(assertions: &EvolutionCaseAssertions, output: &str) -> Ve
     }
     if assertions.require_json && serde_json::from_str::<serde_json::Value>(output).is_err() {
         issues.push("output is not valid JSON".to_string());
+    }
+    if let Some(max_chars) = assertions.max_output_chars
+        && output.chars().count() > max_chars as usize
+    {
+        issues.push(format!("output exceeds {max_chars} characters"));
     }
     issues
 }
@@ -336,6 +434,15 @@ impl EvolutionGateConfig {
             reasons.push(format!(
                 "regressions {} exceed maximum {}",
                 scorecard.regressions, self.max_regressions
+            ));
+        }
+        // Benchmark regressions are always fatal regardless of the operator
+        // regression budget: the versioned suite is the floor a candidate may
+        // never break.
+        if scorecard.benchmark_regressions > 0 {
+            reasons.push(format!(
+                "benchmark scenario regressions are not tolerated: {}",
+                scorecard.benchmark_regressions
             ));
         }
 
@@ -703,6 +810,7 @@ pub struct EvolutionEngine {
     provider: Arc<dyn ChatProvider>,
     gate_config: EvolutionGateConfig,
     policy_runtime: EvolutionPolicyRuntime,
+    benchmark_suite: Option<EvolutionBenchmarkSuite>,
     max_source_trajectories: usize,
     max_evidence_chars: usize,
     cycle_lock: Arc<Mutex<()>>,
@@ -724,6 +832,7 @@ impl EvolutionEngine {
             provider,
             gate_config,
             policy_runtime: EvolutionPolicyRuntime::new(active),
+            benchmark_suite: None,
             max_source_trajectories: 20,
             max_evidence_chars: 8_000,
             cycle_lock: Arc::new(Mutex::new(())),
@@ -735,6 +844,15 @@ impl EvolutionEngine {
     pub fn with_harness_store(mut self, store: Arc<dyn HarnessStore>) -> Self {
         self.harness_store = Some(store);
         self
+    }
+
+    /// Attaches the versioned benchmark suite whose cases join every shadow
+    /// evaluation as additional scored evidence; a benchmark regression is
+    /// always fatal to promotion.
+    pub fn with_benchmark_suite(mut self, suite: EvolutionBenchmarkSuite) -> anyhow::Result<Self> {
+        suite.validate()?;
+        self.benchmark_suite = Some(suite);
+        Ok(self)
     }
 
     pub fn with_evidence_limits(
@@ -984,12 +1102,26 @@ impl EvolutionEngine {
         deadline: Option<tokio::time::Instant>,
     ) -> anyhow::Result<(EvolutionEvaluationRecord, usize)> {
         let cases = self.store.list_eval_cases(true).await?;
+        let benchmark_suite = self.benchmark_suite.clone();
+        if let Some(suite) = &benchmark_suite {
+            for bench_case in &suite.cases {
+                ensure!(
+                    !cases.iter().any(|case| case.id == bench_case.id),
+                    "benchmark case id '{}' collides with an operator eval case",
+                    bench_case.id
+                );
+            }
+        }
+        let all_cases: Vec<&EvolutionEvalCase> = cases
+            .iter()
+            .chain(benchmark_suite.iter().flat_map(|suite| suite.cases.iter()))
+            .collect();
         let active = self.policy_runtime.active().await;
         let mut baseline_outputs = BTreeMap::new();
         let mut candidate_outputs = BTreeMap::new();
         let mut response_bytes = 0_usize;
 
-        for case in &cases {
+        for case in all_cases {
             let baseline_policy = active.as_ref().map(|policy| {
                 (
                     policy.candidate_id.as_str(),
@@ -1031,7 +1163,12 @@ impl EvolutionEngine {
             candidate_outputs.insert(case.id.clone(), candidate_output);
         }
 
-        let scorecard = EvolutionScorer::score(&cases, &baseline_outputs, &candidate_outputs)?;
+        let scorecard = EvolutionScorer::score_with_benchmark(
+            &cases,
+            benchmark_suite.as_ref(),
+            &baseline_outputs,
+            &candidate_outputs,
+        )?;
         let decision = self.gate_config.decide(&scorecard);
         let evaluation = self
             .store

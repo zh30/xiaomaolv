@@ -331,10 +331,19 @@ the loop, which today does not exist.
 
 ### T10 (P2) — Eval scorecards feed the evolution gate
 
-- [ ] Extend `tests/harness_eval.rs` scenarios into a versioned benchmark producing a scorecard
+- [x] Extend `tests/harness_eval.rs` scenarios into a versioned benchmark producing a scorecard
   artifact (tool-use success, compaction correctness, verification blocks, latency budget).
-- [ ] Wire scorecard artifacts into `EvolutionEngine` shadow eval as additional scored evidence.
-- [ ] Gate: a prompt candidate cannot reach `ready` if any benchmark scenario regresses.
+  Landed as `src/harness/benchmark.rs` (`core@2026-09-24.1`): five prompt-level probes derived
+  from the deterministic eval scenarios (direct answer, JSON contract, no internal leak,
+  bounded verbosity, bounded summary), plus a new `max_output_chars` assertion so response-
+  budget expectations are real checks.
+- [x] Wire scorecard artifacts into `EvolutionEngine` shadow eval as additional scored evidence.
+  `EvolutionBenchmarkSuite` (`id@version`, 1..=16 validated unique-id cases) attaches via
+  `with_benchmark_suite`; `EvolutionScorer::score_with_benchmark` scores operator + benchmark
+  cases together, marks provenance per result, and records `benchmark_regressions` and the
+  suite label on the persisted scorecard. Operator/benchmark case-id collisions fail closed.
+- [x] Gate: a prompt candidate cannot reach `ready` if any benchmark scenario regresses —
+  `benchmark_regressions > 0` rejects regardless of `max_regressions`.
 
 ### T11 (P3) — Signal->goal polish
 
@@ -380,3 +389,9 @@ cargo test --test agent_swarm_store --test service_pipeline --test harness_eval 
   `OutboundSender`; prepared->committed->reconciled checkpoints; crash between send and commit
   parks in `waiting_confirmation`; approval surfaces render effect manifests over HTTP and
   Telegram. 41 test binaries green, `harness_loop_engine` 20/20.
+- 2026-09-24 — **T10 done:** versioned benchmark suite (`core@2026-09-24.1`,
+  `src/harness/benchmark.rs`) joins every shadow evaluation via `with_benchmark_suite`;
+  scorecards record benchmark provenance and `benchmark_regressions`, which are always fatal
+  to promotion independent of the operator regression budget; new `max_output_chars` assertion
+  makes response-budget scenarios enforceable; operator/benchmark case-id collisions fail
+  closed. 41 test binaries green.
