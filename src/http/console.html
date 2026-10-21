@@ -96,6 +96,7 @@ textarea { width: 100%; min-height: 120px; }
   <button data-tab="trajectories">trajectories</button>
   <button data-tab="selftests">self-tests</button>
   <button data-tab="evolution">evolution</button>
+  <button data-tab="swarm">swarm</button>
 </nav>
 <main>
   <section class="pane" id="left"></section>
@@ -530,6 +531,57 @@ async function candDetail(id) {
     ${rawBlock(c)}`;
 }
 
+// ---------- Swarm runs ----------
+function swarmList() {
+  const ch = state._chan || "telegram";
+  return api(`/v1/harness/swarm-runs?channel=${encodeURIComponent(ch)}&limit=50`).then((d) => {
+    const rows = (d.runs || []).map((r) => `
+    <tr class="row" data-id="${esc(r.run_id)}" data-chan="${esc(r.channel)}">
+      <td>${esc(short(r.run_id))}</td><td>${chip(r.status)}</td>
+      <td class="muted small">${esc(r.user_id || "")}</td>
+      <td>${esc((r.root_task || "").slice(0, 60))}</td>
+      <td class="muted small">${r.awaiting_reply ? "awaiting-reply" : ""}</td>
+      <td class="muted small">${esc(ts(r.started_at_unix))}</td>
+    </tr>`).join("");
+    return `<h2>swarm runs</h2>
+    <div class="toolbar">
+      <input id="chanPick" placeholder="channel" value="${esc(ch)}" />
+      <button id="ref">refresh</button>
+    </div>
+    <table><tr><th>run</th><th>status</th><th>user</th><th>task</th><th></th><th>started</th></tr>${rows || `<tr><td colspan="6" class="muted">none</td></tr>`}</table>`;
+  });
+}
+async function swarmDetail(id) {
+  const ch = state._chan || "telegram";
+  const [runs, nodes] = await Promise.all([
+    api(`/v1/harness/swarm-runs?channel=${encodeURIComponent(ch)}&limit=100`),
+    api(`/v1/harness/swarm-runs/${encodeURIComponent(id)}/nodes?channel=${encodeURIComponent(ch)}`),
+  ]);
+  const run = (runs.runs || []).find((r) => r.run_id === id) || { run_id: id };
+  const nodeRows = (nodes.nodes || []).map((n) => `
+    <tr>
+      <td>${esc(n.nickname || n.agent_id)}</td><td class="muted small">${esc(n.role_name || "")}</td>
+      <td class="muted">${esc(String(n.depth))}</td><td>${chip(n.exit_status || n.state)}</td>
+      <td class="muted small">${esc((n.summary || "").slice(0, 90))}</td>
+      <td class="muted small">${esc(n.error || "")}</td>
+    </tr>`).join("");
+  return `<h2>swarm ${esc(short(run.run_id))}</h2>
+    ${detailKv([
+      ["channel", esc(run.channel || "")],
+      ["session", `<span class="small">${esc(run.session_id || "")}</span>`],
+      ["user", esc(run.user_id || "")],
+      ["status", chip(run.status)],
+      ["task", esc(run.root_task || "")],
+      ["awaiting reply", esc(String(run.awaiting_reply ?? false))],
+      ["started / finished", esc(ts(run.started_at_unix) + " → " + ts(run.finished_at_unix))],
+      ["error", esc(run.error || "—")],
+    ])}
+    <h3>nodes (${(nodes.nodes || []).length})</h3>
+    <table><tr><th>agent</th><th>role</th><th>depth</th><th>exit</th><th>output</th><th>error</th></tr>
+    ${nodeRows || `<tr><td colspan="6" class="muted">no node rows mirrored yet</td></tr>`}</table>
+    ${rawBlock(run)}`;
+}
+
 // ---------- Router / events ----------
 const renderers = {
   goals: { list: goalsList, detail: goalDetail },
@@ -537,6 +589,7 @@ const renderers = {
   artifacts: { list: artifactsList, detail: artifactDetail },
   trajectories: { list: trajList, detail: trajDetail },
   evolution: { list: evolutionPane, detail: candDetail },
+  swarm: { list: swarmList, detail: swarmDetail },
 };
 async function refresh() {
   stopStream();
@@ -553,7 +606,10 @@ async function refresh() {
 }
 function bindLeft() {
   $("#left").querySelectorAll("tr.row").forEach((tr) =>
-    tr.addEventListener("click", () => selectRow(tr.dataset.id, tr)));
+    tr.addEventListener("click", () => {
+      if (tr.dataset.chan) state._chan = tr.dataset.chan;
+      selectRow(tr.dataset.id, tr);
+    }));
   const ref = $("#ref");
   if (ref) ref.addEventListener("click", refresh);
   const mk = $("#mkGoal");
@@ -571,6 +627,8 @@ function bindLeft() {
       if (gid) selectRow(gid);
     } catch (e) { toast(e.message, true); }
   });
+  const cp = $("#chanPick");
+  if (cp) cp.addEventListener("change", () => { state._chan = cp.value.trim() || "telegram"; refresh(); });
   const sf = $("#sigFilter");
   if (sf) sf.addEventListener("change", () => { state._sigFilter = sf.value || undefined; refresh(); });
   const run = $("#run");

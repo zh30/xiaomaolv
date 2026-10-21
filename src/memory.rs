@@ -1612,6 +1612,7 @@ impl SqliteMemoryStore {
         let rows = sqlx::query(
             "SELECT r.run_id, r.channel, r.session_id, r.user_id, r.root_task, r.status,
                     r.started_at_unix, r.finished_at_unix, r.error, r.created_at, r.updated_at,
+                    r.awaiting_reply,
                     (SELECT COUNT(*)
                        FROM agent_swarm_nodes n
                       WHERE n.channel = r.channel AND n.run_id = r.run_id) AS agent_count
@@ -1655,6 +1656,7 @@ impl SqliteMemoryStore {
         let rows = sqlx::query(
             "SELECT r.run_id, r.channel, r.session_id, r.user_id, r.root_task, r.status,
                     r.started_at_unix, r.finished_at_unix, r.error, r.created_at, r.updated_at,
+                    r.awaiting_reply,
                     (SELECT COUNT(*)
                        FROM agent_swarm_nodes n
                       WHERE n.channel = r.channel AND n.run_id = r.run_id) AS agent_count
@@ -1678,6 +1680,7 @@ impl SqliteMemoryStore {
         let rows = sqlx::query(
             "SELECT r.run_id, r.channel, r.session_id, r.user_id, r.root_task, r.status,
                     r.started_at_unix, r.finished_at_unix, r.error, r.created_at, r.updated_at,
+                    r.awaiting_reply,
                     (SELECT COUNT(*)
                        FROM agent_swarm_nodes n
                       WHERE n.channel = r.channel AND n.run_id = r.run_id) AS agent_count
@@ -3293,6 +3296,9 @@ pub struct AgentSwarmRunRecord {
     pub created_at: i64,
     pub updated_at: i64,
     pub agent_count: i64,
+    /// Deferred-reply flag: the sync window elapsed and the janitor still
+    /// owes the final answer delivery.
+    pub awaiting_reply: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3428,6 +3434,7 @@ fn agent_swarm_run_from_row(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Agen
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
         agent_count: row.get::<Option<i64>, _>("agent_count").unwrap_or(0),
+        awaiting_reply: row.get::<Option<i64>, _>("awaiting_reply").unwrap_or(0) != 0,
     })
 }
 
