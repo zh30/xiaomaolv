@@ -32,6 +32,7 @@ pub(super) fn router() -> Router<AppState> {
         .route("/v1/harness/goals/{id}/plan", post(post_goal_plan))
         .route("/v1/harness/goals/{id}/approve", post(post_goal_approve))
         .route("/v1/harness/goals/{id}/resume", post(post_goal_resume))
+        .route("/v1/harness/goals/{id}/cancel", post(post_goal_cancel))
         .route(
             "/v1/harness/goals/{id}/work-items",
             get(get_goal_work_items),
@@ -366,6 +367,34 @@ async fn post_goal_approve(
     Ok(Json(
         serde_json::to_value(approved).map_err(|error| ApiError::Internal(error.into()))?,
     ))
+}
+
+#[derive(Debug, Deserialize)]
+struct CancelGoalRequest {
+    reason: String,
+}
+
+/// `POST /goals/{id}/cancel` — operator stop for a live goal. In-flight
+/// attempts die via `ensure_claim_current` on their next commit, so a
+/// cancel never lets a stale worker finish the goal anyway.
+async fn post_goal_cancel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(goal_id): Path<String>,
+    Json(request): Json<CancelGoalRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (engine, actor) = operator_context(&state, &headers).await?;
+    let goal = engine
+        .cancel_goal(&goal_id, &request.reason, &actor)
+        .await
+        .map_err(|error| {
+            if error.to_string().contains("not found") {
+                ApiError::NotFound(error.to_string())
+            } else {
+                ApiError::Conflict(error.to_string())
+            }
+        })?;
+    Ok(Json(serde_json::json!({"goal": goal})))
 }
 
 async fn post_goal_resume(

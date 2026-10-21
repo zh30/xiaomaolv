@@ -710,6 +710,34 @@ async fn handle_telegram_goal_command(
         send_telegram_command_reply(sender, message, &lines.join("\n")).await?;
         return Ok(());
     }
+    if args.first().is_some_and(|value| value == "cancel") {
+        if args.len() < 3 {
+            send_telegram_command_reply(sender, message, "用法: /goal cancel <goal_id> <原因>")
+                .await?;
+            return Ok(());
+        }
+        let goal_id = &args[1];
+        let reason = args[2..].join(" ");
+        match engine.cancel_goal(goal_id, &reason, &actor).await {
+            Ok(goal) => {
+                send_telegram_command_reply(
+                    sender,
+                    message,
+                    &format!(
+                        "goal {} 已取消 [{}]: {}",
+                        goal.id,
+                        enum_label(&goal.status),
+                        reason
+                    ),
+                )
+                .await?;
+            }
+            Err(error) => {
+                send_telegram_command_reply(sender, message, &format!("取消失败: {error}")).await?;
+            }
+        }
+        return Ok(());
+    }
     if args.first().is_some_and(|value| value == "resolve") {
         if args.len() < 5 {
             send_telegram_command_reply(

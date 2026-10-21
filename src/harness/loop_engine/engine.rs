@@ -552,6 +552,16 @@ impl LoopEngine {
         Ok(report)
     }
 
+    /// Operator stop for a live goal — see `LoopStore::cancel_goal`.
+    pub async fn cancel_goal(
+        &self,
+        goal_id: &str,
+        reason: &str,
+        actor: &str,
+    ) -> anyhow::Result<GoalRecord> {
+        self.store.cancel_goal(goal_id, reason, actor).await
+    }
+
     /// Fails goals whose execution deadline passed — called periodically by
     /// the runtime worker loop so an overdue goal stops occupying the
     /// dispatchable set and lands as a terminal, auditable `goal.expired`.
