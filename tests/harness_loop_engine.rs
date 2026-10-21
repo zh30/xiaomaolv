@@ -3668,3 +3668,106 @@ async fn concurrent_workers_claim_sibling_items_in_parallel() -> anyhow::Result<
     );
     Ok(())
 }
+
+/// A swarm goal orphaned mid-run (handler not in `with_builtins`) parks
+/// `blocked` under the plain runtime worker, then resumes under a worker
+/// that registers `swarm_node` via `with_extra_handler`.
+#[tokio::test]
+async fn orphaned_swarm_goal_resumes_once_swarm_handler_registers() -> anyhow::Result<()> {
+    struct AnswerProvider;
+    #[async_trait]
+    impl ChatProvider for AnswerProvider {
+        async fn complete(&self, _req: CompletionRequest) -> anyhow::Result<String> {
+            Ok("orphan-answer".to_string())
+        }
+        fn model_name(&self) -> Option<&str> {
+            Some("answer-provider")
+        }
+    }
+
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let actor = "internal:swarm";
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "ROOT".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            actor,
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![WorkflowStep {
+                        id: "orphan:1".to_string(),
+                        handler: "swarm_node".to_string(),
+                        effect: EffectClass::LocalWrite,
+                        input: serde_json::json!({
+                            "task": "orphan task",
+                            "depth": 99,
+                            "history": [],
+                        }),
+                        retry: RetryPolicy {
+                            max_attempts: 1,
+                            backoff_secs: 0,
+                        },
+                    }],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 0,
+                        deadline_secs: 60,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+                    label: "review".to_string(),
+                }],
+            },
+            actor,
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            actor,
+        )
+        .await?;
+
+    // Phase 1: a runtime worker WITHOUT the swarm handler parks the item.
+    let plain = LoopWorker::with_builtins(engine.clone(), Arc::new(AnswerProvider), None, None)?
+        .with_runtime_options("runtime-plain", 30)?;
+    let _ = plain.run_goal_until_idle(&goal.id, 8).await;
+    let report = engine.resume_goal(&goal.id, "operator:test").await?;
+    assert_eq!(
+        report.work_items[0].status,
+        WorkItemStatus::Blocked,
+        "missing handler parks the item blocked"
+    );
+
+    // Phase 2: "restart" — a worker WITH the swarm handler picks it up.
+    let with_swarm =
+        LoopWorker::with_builtins(engine.clone(), Arc::new(AnswerProvider), None, None)?
+            .with_extra_handler(Arc::new(xiaomaolv::service::swarm::SwarmNodeHandler::new(
+                Arc::new(AnswerProvider),
+                xiaomaolv::service::swarm::AgentSwarmSettings::default(),
+            )))?
+            .with_runtime_options("runtime-swarm", 30)?;
+    let _ = with_swarm.run_goal_until_idle(&goal.id, 8).await;
+    let report = engine.resume_goal(&goal.id, "operator:test").await?;
+    assert_eq!(report.work_items[0].status, WorkItemStatus::Succeeded);
+    let outcome = engine
+        .work_item_outcome(&report.work_items[0].id)
+        .await?
+        .expect("outcome");
+    assert_eq!(outcome.evidence["answer"], "orphan-answer");
+    Ok(())
+}

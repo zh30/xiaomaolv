@@ -173,6 +173,17 @@ impl LoopWorker {
         })
     }
 
+    /// Registers an additional handler after construction. Subsystems that
+    /// own their provider/settings wiring (e.g. the durable swarm runner)
+    /// use this so runtime-picked goals — including ones orphaned by a
+    /// restart — can claim their items instead of parking them `blocked`.
+    pub fn with_extra_handler(mut self, handler: Arc<dyn WorkHandler>) -> anyhow::Result<Self> {
+        let handlers =
+            Arc::get_mut(&mut self.handlers).context("handler registry already shared")?;
+        handlers.register(handler)?;
+        Ok(self)
+    }
+
     pub fn with_registry(
         engine: Arc<LoopEngine>,
         handlers: WorkHandlerRegistry,
