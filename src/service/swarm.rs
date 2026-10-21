@@ -31,6 +31,7 @@ pub struct AgentSwarmSettings {
     /// How long a chat turn waits for the swarm answer before the reply is
     /// deferred (ack now, janitor delivers the final answer later). Serial
     /// per-channel processing means a long sync wait head-blocks updates.
+    /// `0` means always defer — the run only ever answers asynchronously.
     pub reply_sync_wait_ms: u64,
 }
 
@@ -1526,6 +1527,7 @@ impl SwarmNodeHandler {
             .reserve_provider_call(&ctx.claim.attempt.goal_id)
             .await
             .map_err(SwarmModelError::Failure)?;
+
         let request = if json_mode {
             CompletionRequest::json(messages.clone())
         } else {
@@ -1539,6 +1541,7 @@ impl SwarmNodeHandler {
             .max_node_timeout_ms
             .max(1)
             .min(deadline_ms.max(1) as u64);
+
         let result = match timeout(
             Duration::from_millis(node_timeout_ms),
             self.provider.complete(request),
@@ -1549,6 +1552,7 @@ impl SwarmNodeHandler {
             Ok(Err(err)) => Err(SwarmModelError::Failure(err)),
             Err(_) => Err(SwarmModelError::Timeout),
         };
+
         if let Ok(reply) = &result {
             if let Err(error) = ctx
                 .engine

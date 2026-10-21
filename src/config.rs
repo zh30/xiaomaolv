@@ -431,7 +431,7 @@ pub struct AgentSwarmConfig {
     pub durable_engine: bool,
     /// How long a chat turn waits synchronously for a swarm answer before
     /// the reply is deferred (ack now, final answer delivered by the
-    /// janitor once the goal is terminal).
+    /// janitor once the goal is terminal). `0` = always asynchronous.
     #[serde(default = "default_agent_swarm_reply_sync_wait_ms")]
     pub reply_sync_wait_ms: u64,
 }
