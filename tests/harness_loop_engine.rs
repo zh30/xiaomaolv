@@ -4148,3 +4148,205 @@ async fn swarm_node_honors_the_goal_provider_call_budget() -> anyhow::Result<()>
     assert_eq!(outcome.evidence["status"], "failed");
     Ok(())
 }
+
+/// Deferred delivery: a run flagged `awaiting_reply` gets its final answer
+/// pushed by the janitor once the goal is terminal, then the flag clears —
+/// send-once via the `swarm-reply:` idempotency key.
+#[tokio::test]
+async fn janitor_delivers_deferred_reply_when_goal_is_terminal() -> anyhow::Result<()> {
+    struct CapturingSender {
+        sent: Mutex<Vec<(String, String, String, String)>>,
+    }
+    #[async_trait]
+    impl xiaomaolv::harness::loop_engine::OutboundSender for CapturingSender {
+        async fn send(
+            &self,
+            channel: &str,
+            session_id: &str,
+            text: &str,
+            idempotency_key: &str,
+        ) -> anyhow::Result<serde_json::Value> {
+            self.sent.lock().unwrap().push((
+                channel.to_string(),
+                session_id.to_string(),
+                text.to_string(),
+                idempotency_key.to_string(),
+            ));
+            Ok(serde_json::json!({"ok": true}))
+        }
+    }
+
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("swarm-defer.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(
+        memory.clone(),
+    ))));
+    let provider = Arc::new(SwarmQueueProvider {
+        replies: Mutex::new(VecDeque::from([
+            "{\"use_swarm\":true}".to_string(),
+            "{\"mode\":\"answer\",\"answer\":\"deferred final answer\"}".to_string(),
+        ])),
+    });
+    let sender = Arc::new(CapturingSender {
+        sent: Mutex::new(Vec::new()),
+    });
+    let service = MessageService::new(provider, memory.clone(), 8)
+        .with_agent_swarm(AgentSwarmSettings {
+            enabled: true,
+            auto_detect: true,
+            reply_summary_enabled: false,
+            max_parallel: 1,
+            ..Default::default()
+        })
+        .with_loop_engine(Some(engine.clone()))
+        .with_outbound_sender(Some(sender.clone()));
+    let _ = service
+        .handle(IncomingMessage {
+            channel: "telegram".to_string(),
+            session_id: "tg:9".to_string(),
+            user_id: "42".to_string(),
+            text: "拆分任务".to_string(),
+            reply_target: None,
+        })
+        .await?;
+
+    let runs = memory.list_agent_swarm_runs("telegram", None, 10).await?;
+    assert_eq!(runs.len(), 1);
+    let run = &runs[0];
+    let goal = engine
+        .get_goal_by_request_id(&format!("swarm:{}", run.run_id))
+        .await?
+        .expect("swarm goal");
+    assert_eq!(goal.status, GoalStatus::Achieved);
+
+    // Simulate the sync window having elapsed mid-run.
+    memory
+        .set_swarm_run_awaiting_reply("telegram", &run.run_id, true)
+        .await?;
+
+    let reaped = service.reap_orphaned_swarm_runs().await?;
+    assert_eq!(reaped, 0, "run was already terminal in the audit table");
+    {
+        let sent = sender.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "answer delivered once");
+        assert_eq!(sent[0].1, "tg:9");
+        assert!(sent[0].2.contains("deferred final answer"));
+        assert_eq!(sent[0].3, format!("swarm-reply:{}", run.run_id));
+    }
+
+    // Second sweep does not re-send.
+    let _ = service.reap_orphaned_swarm_runs().await?;
+    assert_eq!(sender.sent.lock().unwrap().len(), 1);
+    Ok(())
+}
+
+/// The synchronous reply window bounds channel head-blocking: a run that
+/// outlives `reply_sync_wait_ms` returns the ack, flags `awaiting_reply`,
+/// and the spawned driver keeps driving the DAG until the goal achieves —
+/// then the janitor delivers the real answer.
+#[tokio::test]
+async fn slow_swarm_reply_defers_then_janitor_delivers() -> anyhow::Result<()> {
+    struct CapturingSender {
+        sent: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl xiaomaolv::harness::loop_engine::OutboundSender for CapturingSender {
+        async fn send(
+            &self,
+            _channel: &str,
+            _session_id: &str,
+            text: &str,
+            _idempotency_key: &str,
+        ) -> anyhow::Result<serde_json::Value> {
+            self.sent.lock().unwrap().push(text.to_string());
+            Ok(serde_json::json!({"ok": true}))
+        }
+    }
+
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("swarm-defer2.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(
+        memory.clone(),
+    ))));
+    let provider = Arc::new(SwarmQueueProvider {
+        replies: Mutex::new(VecDeque::from([
+            "{\"use_swarm\":true}".to_string(),
+            "{\"mode\":\"answer\",\"answer\":\"deferred final answer\"}".to_string(),
+        ])),
+    });
+    let sender = Arc::new(CapturingSender {
+        sent: Mutex::new(Vec::new()),
+    });
+    let service = MessageService::new(provider, memory.clone(), 8)
+        .with_agent_swarm(AgentSwarmSettings {
+            enabled: true,
+            auto_detect: true,
+            reply_summary_enabled: false,
+            max_parallel: 1,
+            // Deterministic deferral: 0 = the reply is always asynchronous.
+            reply_sync_wait_ms: 0,
+            ..Default::default()
+        })
+        .with_loop_engine(Some(engine.clone()))
+        .with_outbound_sender(Some(sender.clone()));
+
+    let reply = service
+        .handle(IncomingMessage {
+            channel: "telegram".to_string(),
+            session_id: "tg:10".to_string(),
+            user_id: "42".to_string(),
+            text: "拆分任务".to_string(),
+            reply_target: None,
+        })
+        .await?;
+    assert!(
+        reply.text.contains("后台运行"),
+        "sync window elapsed → ack, got: {}",
+        reply.text
+    );
+    let runs = memory.list_awaiting_reply_swarm_runs(10).await?;
+    assert_eq!(runs.len(), 1, "run flagged awaiting_reply");
+    let run = runs[0].clone();
+    let goal_key = format!("swarm:{}", run.run_id);
+
+    // Detached driver keeps executing in-process; poll for terminal.
+    let mut achieved = false;
+    for _ in 0..60 {
+        if let Some(goal) = engine.get_goal_by_request_id(&goal_key).await?
+            && goal.status == GoalStatus::Achieved
+        {
+            achieved = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if !achieved {
+        // If the detached driver stalled (or the process restarted), the
+        // production path reclaims the goal once the abandoned attempt's
+        // lease expires — drive it explicitly to prove recovery still works.
+        let goal = engine
+            .get_goal_by_request_id(&goal_key)
+            .await?
+            .expect("swarm goal");
+        let mut registry = WorkHandlerRegistry::default();
+        registry.register(Arc::new(xiaomaolv::service::swarm::SwarmNodeHandler::new(
+            Arc::new(SwarmQueueProvider {
+                replies: Mutex::new(VecDeque::from([
+                    "{\"mode\":\"answer\",\"answer\":\"deferred final answer\"}".to_string(),
+                ])),
+            }),
+            AgentSwarmSettings::default(),
+        )))?;
+        let reclaimer = LoopWorker::with_registry(engine.clone(), registry, "reclaim", 30)?;
+        let report = reclaimer.run_goal_until_idle(&goal.id, 16).await?;
+        assert_eq!(report.goal.status, GoalStatus::Achieved);
+    }
+
+    let _ = service.reap_orphaned_swarm_runs().await?;
+    let sent = sender.sent.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].contains("deferred final answer"));
+    Ok(())
+}

@@ -28,6 +28,11 @@ pub struct AgentSwarmSettings {
     /// Execute nodes as durable loop-engine work items when a LoopEngine is
     /// wired; `false` keeps the legacy in-process runner + mirror projection.
     pub durable_engine: bool,
+    /// How long a chat turn waits for the swarm answer before the reply is
+    /// deferred (ack now, janitor delivers the final answer later). Serial
+    /// per-channel processing means a long sync wait head-blocks updates.
+    /// `0` means always defer — the run only ever answers asynchronously.
+    pub reply_sync_wait_ms: u64,
 }
 
 impl Default for AgentSwarmSettings {
@@ -43,6 +48,7 @@ impl Default for AgentSwarmSettings {
             reply_summary_enabled: true,
             audit_retention_days: 30,
             durable_engine: true,
+            reply_sync_wait_ms: 45_000,
         }
     }
 }
@@ -306,16 +312,19 @@ impl MessageService {
             ),
         };
 
-        if let Err(err) = self
-            .memory
-            .finish_agent_swarm_run(FinishAgentSwarmRunRequest {
-                channel: incoming.channel.clone(),
-                run_id: run_id.clone(),
-                status: run_status,
-                finished_at_unix,
-                error: run_error.clone(),
-            })
-            .await
+        // A still-running row means the reply was deferred — the janitor
+        // finishes the audit record after delivering the answer.
+        if run_status != AgentSwarmRunStatus::Running
+            && let Err(err) = self
+                .memory
+                .finish_agent_swarm_run(FinishAgentSwarmRunRequest {
+                    channel: incoming.channel.clone(),
+                    run_id: run_id.clone(),
+                    status: run_status,
+                    finished_at_unix,
+                    error: run_error.clone(),
+                })
+                .await
         {
             warn!(error = %err, run_id = %run_id, "failed to finalize swarm run audit");
         }
@@ -1518,6 +1527,7 @@ impl SwarmNodeHandler {
             .reserve_provider_call(&ctx.claim.attempt.goal_id)
             .await
             .map_err(SwarmModelError::Failure)?;
+
         let request = if json_mode {
             CompletionRequest::json(messages.clone())
         } else {
@@ -1531,6 +1541,7 @@ impl SwarmNodeHandler {
             .max_node_timeout_ms
             .max(1)
             .min(deadline_ms.max(1) as u64);
+
         let result = match timeout(
             Duration::from_millis(node_timeout_ms),
             self.provider.complete(request),
@@ -1541,6 +1552,7 @@ impl SwarmNodeHandler {
             Ok(Err(err)) => Err(SwarmModelError::Failure(err)),
             Err(_) => Err(SwarmModelError::Timeout),
         };
+
         if let Ok(reply) = &result {
             if let Err(error) = ctx
                 .engine
@@ -2021,18 +2033,29 @@ impl MessageService {
         };
         let max_rounds = (self.agent_swarm.max_agents.max(1) * 2 + 8).min(128);
         let run_timeout = Duration::from_millis(self.agent_swarm.max_run_timeout_ms.max(1));
-        // Fan-out: `max_parallel` workers race claims on the same goal —
-        // at-least-once + fencing make the duplication safe, so swarm
-        // children actually run in parallel rather than serially draining.
+        // The synchronous reply window is capped far below the run timeout:
+        // message processing is serial per channel, so a long swarm must not
+        // head-block every later update. Past the cap the run keeps executing
+        // (spawned workers outlive this call), the run row is flagged
+        // `awaiting_reply`, an ack is returned now, and the swarm janitor
+        // delivers the real answer once the goal reaches a terminal state.
+        let sync_cap = run_timeout.min(Duration::from_millis(
+            self.agent_swarm.reply_sync_wait_ms.max(1),
+        ));
+        let mut deferred_reply = false;
         let run_error = match timeout(
-            run_timeout,
+            sync_cap,
             worker.run_goal_concurrent(&goal_id, self.agent_swarm.max_parallel.max(1), max_rounds),
         )
         .await
         {
             Ok(Ok(_)) => None,
             Ok(Err(error)) => Some(format!("goal run failed: {error}")),
-            Err(_) => Some("swarm run timeout".to_string()),
+            Err(_) if run_timeout <= sync_cap => Some("swarm run timeout".to_string()),
+            Err(_) => {
+                deferred_reply = true;
+                None
+            }
         };
 
         // Root answer: the root aggregate's merged outcome when the root
@@ -2126,6 +2149,20 @@ impl MessageService {
             })
             .filter(|answer| !answer.trim().is_empty())
             .or_else(|| root_answer.as_ref().map(|outcome| outcome.summary.clone()));
+        if deferred_reply && answer_text.is_none() {
+            if let Err(error) = self
+                .memory
+                .set_swarm_run_awaiting_reply(&incoming.channel, run_id, true)
+                .await
+            {
+                warn!(error = %error, run_id = %run_id, "failed to flag deferred swarm reply");
+            }
+            return (
+                Some("多智能体任务仍在后台运行，完成后我会把结果发给你。".to_string()),
+                AgentSwarmRunStatus::Running,
+                None,
+            );
+        }
         let status = match (&answer_text, degraded) {
             (None, _) => AgentSwarmRunStatus::Failed,
             (Some(_), true) => AgentSwarmRunStatus::Partial,
@@ -2195,6 +2232,87 @@ impl MessageService {
                 })
                 .await;
             reaped += 1;
+        }
+
+        // Deferred replies: a run whose sync window elapsed carries
+        // `awaiting_reply` — deliver the final answer once the goal is
+        // terminal, then clear the flag so it sends exactly once.
+        let Some(sender) = self.outbound_sender.clone() else {
+            return Ok(reaped);
+        };
+        for run in self
+            .memory
+            .list_awaiting_reply_swarm_runs(32)
+            .await
+            .context("failed to list awaiting-reply swarm runs")?
+        {
+            let Some(goal) = engine
+                .get_goal_by_request_id(&format!("swarm:{}", run.run_id))
+                .await
+                .ok()
+                .flatten()
+            else {
+                continue;
+            };
+            if !matches!(
+                goal.status,
+                GoalStatus::Achieved
+                    | GoalStatus::Failed
+                    | GoalStatus::Blocked
+                    | GoalStatus::Canceled
+                    | GoalStatus::Rejected
+            ) {
+                continue;
+            }
+            let report = match engine.resume_goal(&goal.id, SWARM_LOOP_ACTOR).await {
+                Ok(report) => report,
+                Err(error) => {
+                    warn!(error = %error, run_id = %run.run_id, "swarm reply resume failed");
+                    continue;
+                }
+            };
+            let outcome_for = async |step_id: &str| -> Option<WorkOutcome> {
+                let item = report
+                    .work_items
+                    .iter()
+                    .find(|item| item.step_id == step_id)?;
+                engine.work_item_outcome(&item.id).await.ok().flatten()
+            };
+            let answer = outcome_for(&format!("{}:1.agg", run.run_id))
+                .await
+                .or(outcome_for(&format!("{}:1", run.run_id)).await)
+                .and_then(|outcome| {
+                    outcome
+                        .evidence
+                        .get("answer")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .filter(|a| !a.trim().is_empty())
+                        .or(Some(outcome.summary))
+                });
+            let text = match answer {
+                Some(answer) if goal.status == GoalStatus::Achieved => answer,
+                _ => "多智能体任务结束，但没有产出可送达的结果。".to_string(),
+            };
+            match sender
+                .send(
+                    &run.channel,
+                    &run.session_id,
+                    &text,
+                    &format!("swarm-reply:{}", run.run_id),
+                )
+                .await
+            {
+                Ok(_) => {
+                    let _ = self
+                        .memory
+                        .set_swarm_run_awaiting_reply(&run.channel, &run.run_id, false)
+                        .await;
+                }
+                Err(error) => {
+                    warn!(error = %error, run_id = %run.run_id, "deferred swarm reply send failed");
+                }
+            }
         }
         Ok(reaped)
     }
