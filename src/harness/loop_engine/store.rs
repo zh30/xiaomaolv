@@ -263,6 +263,11 @@ pub trait LoopStore: Send + Sync {
     /// Lists durable work items for a goal (operator inspection surface).
     async fn list_work_items(&self, goal_id: &str) -> anyhow::Result<Vec<WorkItemRecord>>;
 
+    /// The goal's checkpoint trail (prepared/committed/reconciled/voided) —
+    /// the operator surface for auditing effect outcomes and `replay_safe`
+    /// declarations.
+    async fn list_checkpoints(&self, goal_id: &str) -> anyhow::Result<Vec<CheckpointRecord>>;
+
     /// Operator stop: cancels a non-terminal goal — in-flight attempts are
     /// abandoned (their later commits fail `ensure_claim_current`), open
     /// work items fail, and the goal lands `canceled` with an auditable
@@ -806,6 +811,23 @@ impl LoopStore for SqliteLoopStore {
             .fetch_one(self.store.pool())
             .await?;
         decode_goal(row)
+    }
+
+    async fn list_checkpoints(&self, goal_id: &str) -> anyhow::Result<Vec<CheckpointRecord>> {
+        ensure_valid_id(goal_id, "goal id")?;
+        sqlx::query(
+            "SELECT id, goal_id, work_item_id, attempt_id, phase, idempotency_key,
+                    replay_safe, outcome_json, created_at, updated_at
+             FROM harness_checkpoints
+             WHERE goal_id = ?1 ORDER BY sequence, id",
+        )
+        .bind(goal_id)
+        .fetch_all(self.store.pool())
+        .await
+        .context("failed to list checkpoints")?
+        .into_iter()
+        .map(decode_checkpoint)
+        .collect()
     }
 
     async fn pause_goal(

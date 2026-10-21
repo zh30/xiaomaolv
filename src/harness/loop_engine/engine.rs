@@ -552,6 +552,14 @@ impl LoopEngine {
         Ok(report)
     }
 
+    /// The goal's checkpoint trail for operator inspection.
+    pub async fn list_checkpoints(
+        &self,
+        goal_id: &str,
+    ) -> anyhow::Result<Vec<super::domain::CheckpointRecord>> {
+        self.store.list_checkpoints(goal_id).await
+    }
+
     /// Operator hold — new claims stop while the goal is paused;
     /// `unpause_goal` returns it to `active`. See `LoopStore::pause_goal`.
     pub async fn pause_goal(
