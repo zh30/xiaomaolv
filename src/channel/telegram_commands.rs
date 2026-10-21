@@ -1,5 +1,5 @@
 use super::*;
-use crate::harness::loop_engine::{ApproveGoalRequest, CreateGoalRequest};
+use crate::harness::loop_engine::{ApproveGoalRequest, ConfirmationResolution, CreateGoalRequest};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum TelegramSlashCommand {
@@ -658,6 +658,140 @@ async fn handle_telegram_goal_command(
             .unwrap_or(message.chat.id)
     );
     let args = shlex::split(tail).ok_or_else(|| anyhow::anyhow!("命令参数错误: 引号未闭合"))?;
+    if args.first().is_some_and(|value| value == "list") {
+        let goals = match engine.list_goals(5).await {
+            Ok(goals) => goals,
+            Err(error) => {
+                send_telegram_command_reply(
+                    sender,
+                    message,
+                    &format!("读取 goal 列表失败: {error}"),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        if goals.is_empty() {
+            send_telegram_command_reply(sender, message, "当前没有 goal。").await?;
+            return Ok(());
+        }
+        let mut lines = Vec::with_capacity(goals.len());
+        for goal in &goals {
+            // Parked work items are what operators actually need to see —
+            // count them per goal so `resolve` targets are discoverable.
+            let parked = match engine.resume_goal(&goal.id, &actor).await {
+                Ok(report) => report
+                    .work_items
+                    .iter()
+                    .filter(|item| enum_label(&item.status) == "waiting_confirmation")
+                    .map(|item| format!("{}:{}", item.step_id, item.id))
+                    .collect::<Vec<_>>(),
+                Err(_) => Vec::new(),
+            };
+            let objective_preview: String = goal.objective.chars().take(60).collect();
+            if parked.is_empty() {
+                lines.push(format!(
+                    "- {} [{}] {}",
+                    goal.id,
+                    enum_label(&goal.status),
+                    objective_preview
+                ));
+            } else {
+                lines.push(format!(
+                    "- {} [{}] {}\n  等待裁决: {}\n  /goal resolve {} <step_id> <confirmed|retry|abandoned> <原因>",
+                    goal.id,
+                    enum_label(&goal.status),
+                    objective_preview,
+                    parked.join(", "),
+                    goal.id
+                ));
+            }
+        }
+        send_telegram_command_reply(sender, message, &lines.join("\n")).await?;
+        return Ok(());
+    }
+    if args.first().is_some_and(|value| value == "resolve") {
+        if args.len() < 5 {
+            send_telegram_command_reply(
+                sender,
+                message,
+                "用法: /goal resolve <goal_id> <step_id|work_item_id> <confirmed|retry|abandoned> <原因>",
+            )
+            .await?;
+            return Ok(());
+        }
+        let resolution = match args[3].as_str() {
+            "confirmed" | "confirm" => ConfirmationResolution::Confirmed,
+            "retry" => ConfirmationResolution::Retry,
+            "abandoned" | "abandon" => ConfirmationResolution::Abandoned,
+            other => {
+                send_telegram_command_reply(
+                    sender,
+                    message,
+                    &format!("未知裁决 '{other}': confirmed / retry / abandoned"),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        let reason = args[4..].join(" ");
+        if reason.trim().is_empty() {
+            send_telegram_command_reply(sender, message, "裁决原因不能为空（会写入审计日志）。")
+                .await?;
+            return Ok(());
+        }
+        // Accept step_id or raw work_item_id — step_id is what `list` shows.
+        let work_item_id = match engine.resume_goal(&args[1], &actor).await {
+            Ok(report) => match report
+                .work_items
+                .iter()
+                .find(|item| item.id == args[2] || item.step_id == args[2])
+            {
+                Some(item) => item.id.clone(),
+                None => {
+                    send_telegram_command_reply(
+                        sender,
+                        message,
+                        &format!("goal {} 中找不到 work item '{}'", args[1], args[2]),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            },
+            Err(error) => {
+                send_telegram_command_reply(
+                    sender,
+                    message,
+                    &format!("读取 goal 状态失败: {error}"),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        match engine
+            .resolve_waiting_confirmation(&args[1], &work_item_id, resolution, &reason, &actor)
+            .await
+        {
+            Ok(item) => {
+                send_telegram_command_reply(
+                    sender,
+                    message,
+                    &format!(
+                        "裁决已记录。\nwork_item={}\nstep={}\nstatus={}\nresolution={}",
+                        item.id,
+                        item.step_id,
+                        enum_label(&item.status),
+                        args[3]
+                    ),
+                )
+                .await?;
+            }
+            Err(error) => {
+                send_telegram_command_reply(sender, message, &format!("裁决失败: {error}")).await?;
+            }
+        }
+        return Ok(());
+    }
     if args.first().is_some_and(|value| value == "approve") {
         if args.len() != 4 {
             send_telegram_command_reply(
@@ -712,7 +846,7 @@ async fn handle_telegram_goal_command(
         send_telegram_command_reply(
             sender,
             message,
-            "用法:\n/goal <目标描述>\n/goal approve <goal_id> <revision> <plan_hash>",
+            "用法:\n/goal <目标描述>\n/goal list\n/goal approve <goal_id> <revision> <plan_hash>\n/goal resolve <goal_id> <step_id> <confirmed|retry|abandoned> <原因>",
         )
         .await?;
         return Ok(());
@@ -2198,7 +2332,7 @@ pub(super) fn telegram_registered_commands() -> Vec<(&'static str, &'static str)
         ("skills", "管理 Skills"),
         ("agents", "查看 Agent 审计"),
         ("task", "管理定时任务"),
-        ("goal", "创建与批准 durable Goal"),
+        ("goal", "创建、查看、批准与裁决 durable Goal"),
         ("resume", "恢复 Goal 状态"),
         ("signals", "审阅 evolution 信号"),
     ]
