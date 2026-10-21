@@ -2,8 +2,8 @@ use super::*;
 
 use crate::harness::loop_engine::{
     AcceptanceCriterion, ApproveGoalRequest, ArtifactKind, CreateGoalRequest, EffectClass,
-    ExecutionBudget, PlanGoalRequest, PublishArtifactRequest, RetryPolicy, WorkClaim, WorkOutcome,
-    WorkflowSpec, WorkflowStep,
+    ExecutionBudget, PlanGoalRequest, PublishArtifactRequest, ResumeReport, RetryPolicy, WorkClaim,
+    WorkHandlerContext, WorkOutcome, WorkflowSpec, WorkflowStep,
 };
 
 /// Actor used for Loop Engine records created by the swarm projection. The
@@ -25,6 +25,9 @@ pub struct AgentSwarmSettings {
     pub max_run_timeout_ms: u64,
     pub reply_summary_enabled: bool,
     pub audit_retention_days: u32,
+    /// Execute nodes as durable loop-engine work items when a LoopEngine is
+    /// wired; `false` keeps the legacy in-process runner + mirror projection.
+    pub durable_engine: bool,
 }
 
 impl Default for AgentSwarmSettings {
@@ -39,6 +42,7 @@ impl Default for AgentSwarmSettings {
             max_run_timeout_ms: 90_000,
             reply_summary_enabled: true,
             audit_retention_days: 30,
+            durable_engine: true,
         }
     }
 }
@@ -227,7 +231,7 @@ impl MessageService {
             settings: self.agent_swarm.clone(),
             semaphore: Arc::new(Semaphore::new(self.agent_swarm.max_parallel.max(1))),
             loop_projection: self
-                .start_swarm_loop_projection(&run_id, &incoming.text)
+                .start_swarm_loop_projection(&run_id, &incoming.text, history)
                 .await,
             agent_counter: Arc::new(AtomicUsize::new(0)),
             success_count: Arc::new(AtomicUsize::new(0)),
@@ -245,30 +249,56 @@ impl MessageService {
         };
 
         let max_run_timeout = Duration::from_millis(self.agent_swarm.max_run_timeout_ms.max(1));
-        let run_result = timeout(
-            max_run_timeout,
-            self.execute_swarm_node(history.to_vec(), root_spec, 0, None, shared.clone()),
-        )
-        .await;
+        let run_result = if self.agent_swarm.durable_engine
+            && let Some(projection) = shared.loop_projection.as_ref()
+        {
+            // Durable execution: the projected goal IS the run — nodes claim
+            // work items, delegation extends the DAG, aggregates merge
+            // upstream outcomes. Same synchronous reply semantics.
+            let goal_id = projection.goal_id.clone();
+            let durable = timeout(
+                max_run_timeout,
+                self.run_swarm_durable(&run_id, incoming, &goal_id, &shared),
+            )
+            .await;
+            match durable {
+                Ok((text, status, error)) => Ok((text, status, error)),
+                Err(_) => Ok((
+                    None,
+                    AgentSwarmRunStatus::Failed,
+                    Some("swarm run timeout".to_string()),
+                )),
+            }
+        } else {
+            match timeout(
+                max_run_timeout,
+                self.execute_swarm_node(history.to_vec(), root_spec, 0, None, shared.clone()),
+            )
+            .await
+            {
+                Ok(Ok(root)) => {
+                    let has_failures = shared.failed_count.load(Ordering::Relaxed) > 0
+                        || shared.timeout_count.load(Ordering::Relaxed) > 0;
+                    let has_partial = shared.partial_count.load(Ordering::Relaxed) > 0
+                        || shared.skipped_count.load(Ordering::Relaxed) > 0
+                        || root.partial;
+                    let status = if root.answer.trim().is_empty() || root.failed {
+                        AgentSwarmRunStatus::Failed
+                    } else if has_failures || has_partial {
+                        AgentSwarmRunStatus::Partial
+                    } else {
+                        AgentSwarmRunStatus::Completed
+                    };
+                    Ok((Some(root.answer), status, None))
+                }
+                Ok(Err(err)) => Ok((None, AgentSwarmRunStatus::Failed, Some(err.to_string()))),
+                Err(_) => Err(()),
+            }
+        };
 
         let finished_at_unix = current_unix_timestamp_i64();
         let (reply_text, run_status, run_error) = match run_result {
-            Ok(Ok(root)) => {
-                let has_failures = shared.failed_count.load(Ordering::Relaxed) > 0
-                    || shared.timeout_count.load(Ordering::Relaxed) > 0;
-                let has_partial = shared.partial_count.load(Ordering::Relaxed) > 0
-                    || shared.skipped_count.load(Ordering::Relaxed) > 0
-                    || root.partial;
-                let status = if root.answer.trim().is_empty() || root.failed {
-                    AgentSwarmRunStatus::Failed
-                } else if has_failures || has_partial {
-                    AgentSwarmRunStatus::Partial
-                } else {
-                    AgentSwarmRunStatus::Completed
-                };
-                (Some(root.answer), status, None)
-            }
-            Ok(Err(err)) => (None, AgentSwarmRunStatus::Failed, Some(err.to_string())),
+            Ok((text, status, error)) => (text, status, error),
             Err(_) => (
                 None,
                 AgentSwarmRunStatus::Failed,
@@ -849,9 +879,13 @@ impl MessageService {
         &self,
         run_id: &str,
         root_task: &str,
+        history: &[StoredMessage],
     ) -> Option<SwarmLoopProjection> {
         let engine = self.loop_engine.clone()?;
-        match self.create_swarm_goal(&engine, run_id, root_task).await {
+        match self
+            .create_swarm_goal(&engine, run_id, root_task, history)
+            .await
+        {
             Ok(goal_id) => Some(SwarmLoopProjection {
                 engine,
                 goal_id,
@@ -869,6 +903,7 @@ impl MessageService {
         engine: &LoopEngine,
         run_id: &str,
         root_task: &str,
+        history: &[StoredMessage],
     ) -> anyhow::Result<String> {
         let goal = engine
             .create_goal(
@@ -895,7 +930,7 @@ impl MessageService {
                             // The root node's agent_id is `{run_id}:1` because
                             // `next_agent_index` returns 1 for the first node.
                             id: format!("{run_id}:1"),
-                            handler: SWARM_NODE_HANDLER.to_string(),
+                            handler: SWARM_NODE_DURABLE_HANDLER.to_string(),
                             effect: EffectClass::LocalWrite,
                             input: serde_json::json!({
                                 "swarm_root": true,
@@ -903,6 +938,10 @@ impl MessageService {
                                 "swarm_run_id": run_id,
                                 "task": truncate_swarm_text(root_task, 1024),
                                 "role_name": "orchestrator",
+                                "role_definition": "负责分解子任务、并行调度并汇总子结果。",
+                                "nickname": "Orchestrator",
+                                "depth": 0,
+                                "history": bounded_swarm_input_history(history),
                             }),
                             retry: RetryPolicy {
                                 max_attempts: 1,
@@ -1284,4 +1323,591 @@ fn looks_like_swarm_task(text: &str) -> bool {
         "多个步骤",
     ];
     hints.iter().any(|needle| lowered.contains(needle))
+}
+
+/* ------------------------------------------------------------------------
+ * Durable swarm execution (`swarm_node` handler)
+ *
+ * Each node's decide -> answer|delegate cycle is one work item. Delegation
+ * extends the goal's DAG: child items plus an aggregate item that depends
+ * on them; the aggregate merges children through `ctx.upstream`. Model
+ * errors never hard-fail an item — they land in outcome evidence as
+ * `status:"failed"|"timeout"` so the aggregate still merges partial
+ * results (a hard-failed dependency would stall the pending aggregate and
+ * the whole goal). A crash mid-run leaves a resumable DAG — a new attempt
+ * resumes from committed outcomes, not from scratch.
+ * ------------------------------------------------------------------------ */
+
+/// Loop Engine handler that executes one swarm node durably.
+const SWARM_NODE_DURABLE_HANDLER: &str = "swarm_node";
+
+/// Work-item input for the durable swarm path.
+#[derive(Debug, Deserialize)]
+struct SwarmNodeInput {
+    task: String,
+    #[serde(default)]
+    role_name: Option<String>,
+    #[serde(default)]
+    role_definition: Option<String>,
+    #[serde(default)]
+    nickname: Option<String>,
+    #[serde(default)]
+    depth: usize,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    parent_step_id: Option<String>,
+    #[serde(default)]
+    swarm_run_id: Option<String>,
+    #[serde(default)]
+    history: Vec<StoredMessage>,
+}
+
+/// Executes a `swarm_node` work item: decide -> answer|delegate (and the
+/// aggregate half when `mode == "aggregate"`).
+pub struct SwarmNodeHandler {
+    provider: Arc<dyn crate::provider::ChatProvider>,
+    settings: AgentSwarmSettings,
+}
+
+impl SwarmNodeHandler {
+    pub fn new(
+        provider: Arc<dyn crate::provider::ChatProvider>,
+        settings: AgentSwarmSettings,
+    ) -> Self {
+        Self { provider, settings }
+    }
+
+    /// Model call with the per-node timeout; returns the same error kind the
+    /// in-process runner uses.
+    async fn complete(
+        &self,
+        messages: Vec<StoredMessage>,
+        json_mode: bool,
+    ) -> Result<String, SwarmModelError> {
+        let request = if json_mode {
+            CompletionRequest::json(messages)
+        } else {
+            CompletionRequest::from_messages(messages)
+        };
+        match timeout(
+            Duration::from_millis(self.settings.max_node_timeout_ms.max(1)),
+            self.provider.complete(request),
+        )
+        .await
+        {
+            Ok(Ok(reply)) => Ok(reply),
+            Ok(Err(err)) => Err(SwarmModelError::Failure(err)),
+            Err(_) => Err(SwarmModelError::Timeout),
+        }
+    }
+
+    /// The direct-answer leg: use the planner's seeded answer when present,
+    /// otherwise ask for one. Model failures surface as failed-status
+    /// outcomes, not attempt errors (see module note).
+    async fn answer_outcome(
+        &self,
+        input: &SwarmNodeInput,
+        role_name: &str,
+        role_definition: &str,
+        direct_answer: Option<String>,
+    ) -> anyhow::Result<WorkOutcome> {
+        if let Some(answer) = direct_answer
+            && !answer.trim().is_empty()
+        {
+            return Ok(swarm_node_outcome(&answer, "success", input));
+        }
+        let messages =
+            build_swarm_answer_messages(&input.history, &input.task, role_name, role_definition);
+        match self.complete(messages, false).await {
+            Ok(answer) => Ok(swarm_node_outcome(&answer, "success", input)),
+            Err(SwarmModelError::Timeout) => Ok(swarm_node_outcome("", "timeout", input)),
+            Err(SwarmModelError::Failure(err)) => {
+                warn!(error = %err, "swarm node answer call failed");
+                Ok(swarm_node_outcome("", "failed", input))
+            }
+        }
+    }
+
+    /// Aggregation leg: merge declared upstream outcomes into one answer.
+    async fn aggregate_outcome(
+        &self,
+        ctx: &WorkHandlerContext,
+        input: &SwarmNodeInput,
+        role_name: &str,
+    ) -> anyhow::Result<WorkOutcome> {
+        let mut any_failed = false;
+        let mut child_json = Vec::with_capacity(ctx.upstream.len());
+        for (step_id, outcome) in &ctx.upstream {
+            let evidence = &outcome.evidence;
+            let status = evidence
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("success");
+            any_failed |= matches!(status, "failed" | "timeout");
+            child_json.push(serde_json::json!({
+                "agent_id": step_id,
+                "nickname": evidence.get("nickname").and_then(Value::as_str).unwrap_or(step_id),
+                "role_name": evidence.get("role_name").and_then(Value::as_str).unwrap_or("general"),
+                "status": status,
+                "answer": truncate_swarm_text(
+                    evidence
+                        .get("answer")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&outcome.summary),
+                    180,
+                ),
+            }));
+        }
+        let merged = match self
+            .complete(
+                build_swarm_merge_messages(&input.history, &input.task, role_name, &child_json),
+                false,
+            )
+            .await
+        {
+            Ok(text) => text,
+            Err(_) => ctx
+                .upstream
+                .values()
+                .filter_map(|outcome| {
+                    let answer = outcome
+                        .evidence
+                        .get("answer")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&outcome.summary);
+                    (!answer.trim().is_empty()).then(|| answer.trim().to_string())
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        };
+        let status = if any_failed { "partial" } else { "success" };
+        Ok(swarm_node_outcome(&merged, status, input))
+    }
+}
+
+/// Outcome carrying the node result in `evidence` — aggregates read
+/// `answer`/`status`/`nickname`/`role_name` from upstream entries.
+fn swarm_node_outcome(answer: &str, status: &str, input: &SwarmNodeInput) -> WorkOutcome {
+    WorkOutcome {
+        summary: truncate_swarm_text(answer, 240).to_string(),
+        artifact_ids: Vec::new(),
+        evidence: serde_json::json!({
+            "answer": answer,
+            "status": status,
+            "nickname": input.nickname,
+            "role_name": input.role_name,
+            "depth": input.depth,
+        }),
+        sleep_until_unix: None,
+        continuation: None,
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::harness::loop_engine::WorkHandler for SwarmNodeHandler {
+    fn name(&self) -> &'static str {
+        SWARM_NODE_DURABLE_HANDLER
+    }
+
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::LocalWrite
+    }
+
+    /// Model calls only — replaying an attempt after a crash is safe.
+    fn replay_safe(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, ctx: &WorkHandlerContext) -> anyhow::Result<WorkOutcome> {
+        let input: SwarmNodeInput = serde_json::from_value(ctx.claim.work_item.input.clone())
+            .context("invalid swarm_node input")?;
+        let role_name = input
+            .role_name
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "general".to_string());
+        let role_definition = input
+            .role_definition
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "负责当前子任务并输出可交付结果。".to_string());
+        if input.mode.as_deref() == Some("aggregate") {
+            return self.aggregate_outcome(ctx, &input, &role_name).await;
+        }
+
+        // Decide leg: planner picks answer|delegate unless depth forces a
+        // direct answer.
+        let force_answer = input.depth >= self.settings.max_depth.max(1);
+        let mut direct_answer = force_answer.then(String::new);
+        let mut child_specs = Vec::<SwarmChildPlan>::new();
+        if !force_answer {
+            let planner_messages = build_swarm_planner_messages(
+                &input.history,
+                &input.task,
+                &role_name,
+                &role_definition,
+                input.depth,
+                self.settings.max_depth,
+            );
+            match self.complete(planner_messages, true).await {
+                Ok(reply) => {
+                    if let Some(value) = parse_flexible_json_value(&reply)
+                        && let Ok(plan) = serde_json::from_value::<SwarmNodePlanEnvelope>(value)
+                    {
+                        match plan
+                            .mode
+                            .unwrap_or_else(|| "answer".to_string())
+                            .to_ascii_lowercase()
+                            .as_str()
+                        {
+                            "delegate" => {
+                                child_specs = plan
+                                    .children
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .filter(|child| !child.task.trim().is_empty())
+                                    .take(4)
+                                    .collect();
+                            }
+                            _ => {
+                                direct_answer = Some(plan.answer.unwrap_or_default());
+                            }
+                        }
+                    } else {
+                        direct_answer = Some(String::new());
+                    }
+                }
+                Err(SwarmModelError::Timeout) => {
+                    return Ok(swarm_node_outcome("", "timeout", &input));
+                }
+                Err(SwarmModelError::Failure(err)) => {
+                    warn!(error = %err, "swarm planner failed, fallback to direct answer");
+                    direct_answer = Some(String::new());
+                }
+            }
+        }
+        if child_specs.is_empty() {
+            return self
+                .answer_outcome(&input, &role_name, &role_definition, direct_answer)
+                .await;
+        }
+
+        // Delegate leg: extend the goal's DAG — one item per child plus an
+        // aggregate item that depends on all of them. The aggregate carries
+        // the parent's task/role so the merge happens in the node's voice.
+        let own_step = ctx.claim.work_item.step_id.as_str();
+        let history = bounded_swarm_input_history(&input.history);
+        let mut steps = Vec::with_capacity(child_specs.len() + 1);
+        let mut child_step_ids = Vec::with_capacity(child_specs.len());
+        for (index, child) in child_specs.iter().enumerate() {
+            let child_step_id = format!("{own_step}.c{}", index + 1);
+            child_step_ids.push(child_step_id.clone());
+            steps.push(WorkflowStep {
+                id: child_step_id,
+                handler: SWARM_NODE_DURABLE_HANDLER.to_string(),
+                effect: EffectClass::LocalWrite,
+                input: serde_json::json!({
+                    "task": truncate_swarm_text(&child.task, 1024),
+                    "role_name": child
+                        .role_name
+                        .clone()
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or_else(|| "general".to_string()),
+                    "role_definition": child
+                        .role_definition
+                        .clone()
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or_else(|| "负责当前子任务并输出可交付结果。".to_string()),
+                    "nickname": child.nickname,
+                    "depth": input.depth + 1,
+                    "parent_step_id": own_step,
+                    "swarm_run_id": input.swarm_run_id,
+                    "history": history,
+                }),
+                retry: RetryPolicy {
+                    max_attempts: 2,
+                    backoff_secs: 5,
+                },
+            });
+        }
+        let aggregate_step_id = format!("{own_step}.agg");
+        steps.push(WorkflowStep {
+            id: aggregate_step_id.clone(),
+            handler: SWARM_NODE_DURABLE_HANDLER.to_string(),
+            effect: EffectClass::LocalWrite,
+            input: serde_json::json!({
+                "mode": "aggregate",
+                "task": truncate_swarm_text(&input.task, 1024),
+                "role_name": role_name,
+                "depth": input.depth,
+                "parent_step_id": own_step,
+                "swarm_run_id": input.swarm_run_id,
+                "history": history,
+                "depends_on": child_step_ids,
+            }),
+            retry: RetryPolicy {
+                max_attempts: 2,
+                backoff_secs: 5,
+            },
+        });
+        match ctx
+            .engine
+            .extend_workflow(&ctx.claim.attempt.goal_id, steps, SWARM_LOOP_ACTOR)
+            .await
+        {
+            Ok(_) => Ok(WorkOutcome {
+                summary: format!("delegated to {} children", child_step_ids.len()),
+                artifact_ids: Vec::new(),
+                evidence: serde_json::json!({
+                    "delegated": true,
+                    "status": "success",
+                    "aggregate_step_id": aggregate_step_id,
+                    "children_step_ids": child_step_ids,
+                    "nickname": input.nickname,
+                    "role_name": input.role_name,
+                    "depth": input.depth,
+                }),
+                sleep_until_unix: None,
+                continuation: None,
+            }),
+            Err(error) => {
+                warn!(error = %error, step_id = %own_step, "swarm DAG extension rejected; answering directly");
+                self.answer_outcome(&input, &role_name, &role_definition, None)
+                    .await
+            }
+        }
+    }
+}
+
+/// Sampled history bounded for the 8KiB work-item input limit.
+fn bounded_swarm_input_history(history: &[StoredMessage]) -> Vec<StoredMessage> {
+    sample_swarm_history(history, 8)
+        .into_iter()
+        .map(|mut message| {
+            message.content = truncate_swarm_text(&message.content, 400).to_string();
+            message
+        })
+        .collect()
+}
+
+impl MessageService {
+    /// Durable swarm run: the projection's goal IS the execution — nodes
+    /// claim work items, delegation extends the tree, aggregates merge
+    /// upstream outcomes. Returns (reply, run status, error) like the
+    /// in-process runner so the caller's audit/finish path is unchanged.
+    async fn run_swarm_durable(
+        &self,
+        run_id: &str,
+        incoming: &IncomingMessage,
+        goal_id: &str,
+        shared: &SwarmExecutionShared,
+    ) -> (Option<String>, AgentSwarmRunStatus, Option<String>) {
+        let Some(engine) = self.loop_engine.clone() else {
+            return (
+                None,
+                AgentSwarmRunStatus::Failed,
+                Some("loop engine not configured".to_string()),
+            );
+        };
+        let goal_id = goal_id.to_string();
+        let mut registry = crate::harness::loop_engine::WorkHandlerRegistry::default();
+        if let Err(error) = registry.register(Arc::new(SwarmNodeHandler::new(
+            self.provider.clone(),
+            self.agent_swarm.clone(),
+        ))) {
+            return (
+                None,
+                AgentSwarmRunStatus::Failed,
+                Some(format!("handler registration failed: {error}")),
+            );
+        }
+        let lease_secs = ((self.agent_swarm.max_node_timeout_ms / 1000) as u32)
+            .saturating_add(30)
+            .clamp(1, 3600);
+        let worker = match crate::harness::loop_engine::LoopWorker::with_registry(
+            engine.clone(),
+            registry,
+            format!("swarm:{run_id}"),
+            lease_secs,
+        ) {
+            Ok(worker) => worker,
+            Err(error) => {
+                return (
+                    None,
+                    AgentSwarmRunStatus::Failed,
+                    Some(format!("worker setup failed: {error}")),
+                );
+            }
+        };
+        let max_rounds = (self.agent_swarm.max_agents.max(1) * 2 + 8).min(128);
+        let run_timeout = Duration::from_millis(self.agent_swarm.max_run_timeout_ms.max(1));
+        let run_error = match timeout(
+            run_timeout,
+            worker.run_goal_until_idle(&goal_id, max_rounds),
+        )
+        .await
+        {
+            Ok(Ok(_)) => None,
+            Ok(Err(error)) => Some(format!("goal run failed: {error}")),
+            Err(_) => Some("swarm run timeout".to_string()),
+        };
+
+        // Root answer: the root aggregate's merged outcome when the root
+        // delegated, otherwise the root item's own answer.
+        let report = match engine.resume_goal(&goal_id, SWARM_LOOP_ACTOR).await {
+            Ok(report) => report,
+            Err(error) => {
+                return (
+                    None,
+                    AgentSwarmRunStatus::Failed,
+                    Some(format!("resume failed: {error}")),
+                );
+            }
+        };
+        let outcome_for = async |step_id: &str| -> Option<WorkOutcome> {
+            let item = report
+                .work_items
+                .iter()
+                .find(|item| item.step_id == step_id)?;
+            engine.work_item_outcome(&item.id).await.ok().flatten()
+        };
+        let root_answer = outcome_for(&format!("{run_id}:1.agg")).await;
+        let root_answer = match root_answer {
+            Some(outcome) => Some(outcome),
+            None => outcome_for(&format!("{run_id}:1")).await,
+        };
+
+        self.mirror_durable_swarm_audit(run_id, incoming, &report)
+            .await;
+
+        // Summary counters mirror the in-process path's semantics: every
+        // non-aggregate item is one agent; its outcome evidence carries the
+        // terminal status (aggregates merge but aren't user-visible nodes).
+        for item in &report.work_items {
+            if item.input.get("mode").and_then(Value::as_str) == Some("aggregate") {
+                continue;
+            }
+            shared.agent_counter.fetch_add(1, Ordering::Relaxed);
+            match item.status {
+                crate::harness::loop_engine::WorkItemStatus::Succeeded => {
+                    let outcome_status = engine
+                        .work_item_outcome(&item.id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|outcome| {
+                            outcome
+                                .evidence
+                                .get("status")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_else(|| "success".to_string());
+                    match outcome_status.as_str() {
+                        "timeout" => {
+                            shared.timeout_count.fetch_add(1, Ordering::Relaxed);
+                            shared.failed_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                        "failed" => {
+                            shared.failed_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                        "partial" => {
+                            shared.partial_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                        _ => {
+                            shared.success_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                crate::harness::loop_engine::WorkItemStatus::Failed => {
+                    shared.failed_count.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {
+                    shared.skipped_count.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let degraded = run_error.is_some()
+            || shared.failed_count.load(Ordering::Relaxed) > 0
+            || shared.partial_count.load(Ordering::Relaxed) > 0
+            || shared.skipped_count.load(Ordering::Relaxed) > 0;
+        let answer_text = root_answer
+            .as_ref()
+            .and_then(|outcome| {
+                outcome
+                    .evidence
+                    .get("answer")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .filter(|answer| !answer.trim().is_empty())
+            .or_else(|| root_answer.as_ref().map(|outcome| outcome.summary.clone()));
+        let status = match (&answer_text, degraded) {
+            (None, _) => AgentSwarmRunStatus::Failed,
+            (Some(_), true) => AgentSwarmRunStatus::Partial,
+            (Some(_), false) => AgentSwarmRunStatus::Completed,
+        };
+        (answer_text, status, run_error)
+    }
+
+    /// Rebuilds the `/agents` audit rows from the durable goal tree — each
+    /// work item maps to a node row keyed by its step id.
+    async fn mirror_durable_swarm_audit(
+        &self,
+        run_id: &str,
+        incoming: &IncomingMessage,
+        report: &ResumeReport,
+    ) {
+        for item in &report.work_items {
+            let input: SwarmNodeInput = match serde_json::from_value(item.input.clone()) {
+                Ok(input) => input,
+                Err(_) => continue,
+            };
+            if input.mode.as_deref() == Some("aggregate") {
+                continue; // merge nodes are not user-visible agents
+            }
+            let exit_status = match item.status {
+                crate::harness::loop_engine::WorkItemStatus::Succeeded => {
+                    Some(AgentSwarmNodeExitStatus::Success)
+                }
+                crate::harness::loop_engine::WorkItemStatus::Failed => {
+                    Some(AgentSwarmNodeExitStatus::Failed)
+                }
+                _ => Some(AgentSwarmNodeExitStatus::Skipped),
+            };
+            let _ = self
+                .memory
+                .upsert_agent_swarm_node(UpsertAgentSwarmNodeRequest {
+                    agent_id: item.step_id.clone(),
+                    run_id: run_id.to_string(),
+                    channel: incoming.channel.clone(),
+                    parent_agent_id: input.parent_step_id.clone(),
+                    depth: input.depth,
+                    nickname: input.nickname.clone().unwrap_or_else(|| {
+                        default_swarm_nickname(
+                            &input.role_name.clone().unwrap_or_default(),
+                            item.ordinal as usize + 1,
+                        )
+                    }),
+                    role_name: input
+                        .role_name
+                        .clone()
+                        .unwrap_or_else(|| "general".to_string()),
+                    role_definition: input
+                        .role_definition
+                        .clone()
+                        .unwrap_or_else(|| "负责当前子任务并输出可交付结果。".to_string()),
+                    task: input.task.clone(),
+                    state: AgentSwarmNodeState::Exited,
+                    exit_status,
+                    summary: None,
+                    error: None,
+                    started_at_unix: item.created_at_unix,
+                    finished_at_unix: Some(item.created_at_unix),
+                })
+                .await;
+        }
+    }
 }

@@ -577,6 +577,14 @@ impl LoopEngine {
         self.store.upstream_outcomes(work_item_id).await
     }
 
+    /// The work item's own latest committed outcome — read-only.
+    pub async fn work_item_outcome(
+        &self,
+        work_item_id: &str,
+    ) -> anyhow::Result<Option<WorkOutcome>> {
+        self.store.work_item_outcome(work_item_id).await
+    }
+
     /// Commits a phase boundary while the attempt keeps running. The
     /// persisted progress is injected into the next phase's `ctx.resume` and
     /// survives attempt death — a crash after this call resumes from the

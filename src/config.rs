@@ -425,6 +425,10 @@ pub struct AgentSwarmConfig {
     pub reply_summary_enabled: bool,
     #[serde(default = "default_agent_swarm_audit_retention_days")]
     pub audit_retention_days: u32,
+    /// Run swarm nodes as durable loop-engine work items (claims, attempts,
+    /// checkpoints, resumable delegation DAG) instead of in-process mirror.
+    #[serde(default = "default_agent_swarm_durable_engine")]
+    pub durable_engine: bool,
 }
 
 impl Default for AgentSwarmConfig {
@@ -439,6 +443,7 @@ impl Default for AgentSwarmConfig {
             max_run_timeout_ms: default_agent_swarm_max_run_timeout_ms(),
             reply_summary_enabled: default_agent_swarm_reply_summary_enabled(),
             audit_retention_days: default_agent_swarm_audit_retention_days(),
+            durable_engine: default_agent_swarm_durable_engine(),
         }
     }
 }
@@ -960,6 +965,10 @@ fn default_agent_swarm_max_run_timeout_ms() -> u64 {
 }
 
 fn default_agent_swarm_reply_summary_enabled() -> bool {
+    true
+}
+
+fn default_agent_swarm_durable_engine() -> bool {
     true
 }
 

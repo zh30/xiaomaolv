@@ -308,6 +308,10 @@ pub trait LoopStore: Send + Sync {
         work_item_id: &str,
     ) -> anyhow::Result<std::collections::BTreeMap<String, WorkOutcome>>;
 
+    /// The work item's own latest committed (or reconciled) outcome — the
+    /// terminal result a caller reads when a goal has run to completion.
+    async fn work_item_outcome(&self, work_item_id: &str) -> anyhow::Result<Option<WorkOutcome>>;
+
     /// Commits a phase boundary on the claimed work item while the attempt
     /// keeps running: the returned progress is injected into the next
     /// phase's `ctx.resume` and survives attempt death (a later attempt
@@ -1443,7 +1447,7 @@ impl LoopStore for SqliteLoopStore {
                 .await?
                 .into_iter()
                 .collect();
-        let mut step_ids = existing_step_ids;
+        let mut step_ids = existing_step_ids.clone();
         for step in &steps {
             ensure!(
                 !step.id.trim().is_empty() && step.id.len() <= 96,
@@ -1480,15 +1484,55 @@ impl LoopStore for SqliteLoopStore {
             );
         }
 
+        // Declared dependencies: a step may carry `input.depends_on`
+        // ([step_ids]) — deps must name steps already materialized in the
+        // goal or earlier in this batch (acyclic by construction). A step
+        // with deps materializes `pending`; children without deps are
+        // `ready`.
+        let mut depends_on: Vec<Vec<String>> = Vec::with_capacity(steps.len());
+        let mut known = existing_step_ids;
+        for step in &steps {
+            let deps = step
+                .input
+                .get("depends_on")
+                .and_then(|value| value.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            ensure!(
+                deps.len() <= 16,
+                "a step may declare at most 16 dependencies"
+            );
+            for dep in &deps {
+                ensure!(
+                    known.contains(dep.as_str()),
+                    "depends_on references unknown step '{dep}'"
+                );
+                ensure!(dep != &step.id, "a step cannot depend on itself");
+            }
+            known.insert(step.id.clone());
+            depends_on.push(deps);
+        }
+
+        let mut work_ids = Vec::with_capacity(steps.len());
         let mut records = Vec::with_capacity(steps.len());
         for (offset, step) in steps.iter().enumerate() {
             let work_id = new_loop_id("work");
             let ordinal = max_ordinal + 1 + offset as i64;
+            let status = if depends_on[offset].is_empty() {
+                "ready"
+            } else {
+                "pending"
+            };
             sqlx::query(
                 "INSERT INTO harness_work_items
                  (id, goal_id, workflow_id, step_id, handler, effect_class, input_json,
                   status, max_attempts, backoff_secs, ordinal)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ready', ?8, ?9, ?10)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )
             .bind(&work_id)
             .bind(goal_id)
@@ -1497,15 +1541,21 @@ impl LoopStore for SqliteLoopStore {
             .bind(&step.handler)
             .bind(step.effect.as_str())
             .bind(serde_json::to_string(&step.input)?)
+            .bind(status)
             .bind(step.retry.max_attempts as i64)
             .bind(step.retry.backoff_secs as i64)
             .bind(ordinal)
             .execute(&mut *tx)
             .await?;
+            work_ids.push(work_id.clone());
             records.push(WorkItemRecord {
                 id: work_id,
                 goal_id: goal_id.to_string(),
-                status: WorkItemStatus::Ready,
+                status: if status == "ready" {
+                    WorkItemStatus::Ready
+                } else {
+                    WorkItemStatus::Pending
+                },
                 step_id: step.id.clone(),
                 handler: step.handler.clone(),
                 effect: step.effect,
@@ -1516,6 +1566,34 @@ impl LoopStore for SqliteLoopStore {
                 created_at_unix: unix_now(),
                 progress: None,
             });
+        }
+        // Dep rows resolve step ids to the freshly materialized work ids —
+        // batch deps use the batch map, pre-existing deps a lookup.
+        for (offset, deps) in depends_on.iter().enumerate() {
+            for dep in deps {
+                let dep_work_id =
+                    if let Some(batch_pos) = steps.iter().position(|step| step.id == *dep) {
+                        work_ids[batch_pos].clone()
+                    } else {
+                        sqlx::query_scalar::<_, String>(
+                            "SELECT id FROM harness_work_items WHERE goal_id = ?1 AND step_id = ?2",
+                        )
+                        .bind(goal_id)
+                        .bind(dep)
+                        .fetch_one(&mut *tx)
+                        .await
+                        .context("failed to resolve depends_on step")?
+                    };
+                sqlx::query(
+                    "INSERT INTO harness_work_item_dependencies
+                     (work_item_id, depends_on_work_item_id) VALUES (?1, ?2)",
+                )
+                .bind(&work_ids[offset])
+                .bind(dep_work_id)
+                .execute(&mut *tx)
+                .await
+                .context("failed to materialize extended dependency")?;
+            }
         }
         insert_event(
             &mut tx,
@@ -2323,6 +2401,22 @@ impl LoopStore for SqliteLoopStore {
             outcomes.insert(step_id, outcome);
         }
         Ok(outcomes)
+    }
+
+    async fn work_item_outcome(&self, work_item_id: &str) -> anyhow::Result<Option<WorkOutcome>> {
+        let outcome_json = sqlx::query_scalar::<_, String>(
+            "SELECT outcome_json FROM harness_checkpoints
+             WHERE work_item_id = ?1 AND phase IN ('committed', 'reconciled')
+               AND outcome_json IS NOT NULL
+             ORDER BY updated_at DESC, id DESC LIMIT 1",
+        )
+        .bind(work_item_id)
+        .fetch_optional(self.store.pool())
+        .await
+        .context("failed to load work item outcome")?;
+        outcome_json
+            .map(|json| serde_json::from_str(&json).context("invalid stored work outcome"))
+            .transpose()
     }
 
     async fn record_phase_progress(

@@ -731,6 +731,9 @@ async fn swarm_run_projects_a_durable_goal_tree_and_verifies_it() -> anyhow::Res
             enabled: true,
             auto_detect: true,
             reply_summary_enabled: false,
+            // The legacy in-process runner + mirror projection is what this
+            // test pins; durable execution has its own test below.
+            durable_engine: false,
             ..Default::default()
         })
         .with_loop_engine(Some(engine.clone()));
@@ -2905,5 +2908,164 @@ async fn dependent_step_reads_upstream_outcome_by_step_id() -> anyhow::Result<()
         .find(|item| item.step_id == "produce")
         .expect("produce item");
     assert_eq!(produce.status, WorkItemStatus::Succeeded);
+    Ok(())
+}
+
+/// A durable swarm run: the root `swarm_node` item delegates by extending
+/// the goal's DAG — child items plus an aggregate that depends on them and
+/// merges their outcomes through `ctx.upstream`. The whole delegation tree
+/// is durable work, not an in-process recursion.
+#[tokio::test]
+async fn durable_swarm_run_delegates_and_merges_through_the_dag() -> anyhow::Result<()> {
+    use xiaomaolv::provider::{ChatProvider, CompletionRequest};
+    use xiaomaolv::service::swarm::SwarmNodeHandler;
+
+    struct SwarmScriptedProvider;
+    #[async_trait]
+    impl ChatProvider for SwarmScriptedProvider {
+        async fn complete(&self, req: CompletionRequest) -> anyhow::Result<String> {
+            let transcript = req
+                .messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if transcript.contains("hierarchical task planner") {
+                if transcript.contains("ROOT TASK") {
+                    Ok(serde_json::json!({
+                        "mode": "delegate",
+                        "children": [
+                            {"task": "subtask A", "role_name": "researcher"},
+                            {"task": "subtask B", "role_name": "writer"}
+                        ]
+                    })
+                    .to_string())
+                } else {
+                    Ok(serde_json::json!({"mode": "answer", "answer": ""}).to_string())
+                }
+            } else if transcript.contains("Merge child results") {
+                Ok("merged-final-answer".to_string())
+            } else if transcript.contains("direct deliverable") {
+                Ok(if transcript.contains("subtask A") {
+                    "answer-A".to_string()
+                } else {
+                    "answer-B".to_string()
+                })
+            } else {
+                Ok("unexpected-call".to_string())
+            }
+        }
+        fn model_name(&self) -> Option<&str> {
+            Some("swarm-scripted")
+        }
+    }
+
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let actor = "internal:swarm";
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "ROOT TASK".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: Some("swarm:test-run".to_string()),
+            },
+            actor,
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![WorkflowStep {
+                        id: "test-run:1".to_string(),
+                        handler: "swarm_node".to_string(),
+                        effect: EffectClass::LocalWrite,
+                        input: serde_json::json!({
+                            "swarm_root": true,
+                            "max_nodes": 8,
+                            "swarm_run_id": "test-run",
+                            "task": "ROOT TASK",
+                            "role_name": "orchestrator",
+                            "depth": 0,
+                            "history": [],
+                        }),
+                        retry: RetryPolicy {
+                            max_attempts: 2,
+                            backoff_secs: 0,
+                        },
+                    }],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 0,
+                        deadline_secs: 120,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+                    label: "review".to_string(),
+                }],
+            },
+            actor,
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            actor,
+        )
+        .await?;
+
+    let mut registry = WorkHandlerRegistry::default();
+    registry.register(Arc::new(SwarmNodeHandler::new(
+        Arc::new(SwarmScriptedProvider),
+        xiaomaolv::service::swarm::AgentSwarmSettings::default(),
+    )))?;
+    let worker = LoopWorker::with_registry(engine.clone(), registry, "swarm:test", 60)?;
+    // The goal parks in `verifying` after the DAG completes — acceptance
+    // needs an operator — so assert on durable state like the other tests.
+    let _ = worker.run_goal_until_idle(&goal.id, 24).await;
+    let report = engine.resume_goal(&goal.id, "operator:test").await?;
+
+    // DAG grew: root + 2 children + aggregate = 4 items.
+    assert_eq!(report.work_items.len(), 4);
+    let step_ids: Vec<&str> = report
+        .work_items
+        .iter()
+        .map(|item| item.step_id.as_str())
+        .collect();
+    for expected in [
+        "test-run:1",
+        "test-run:1.c1",
+        "test-run:1.c2",
+        "test-run:1.agg",
+    ] {
+        assert!(step_ids.contains(&expected), "missing step {expected}");
+    }
+    // The aggregate waited on both children then merged their outcomes.
+    let aggregate = report
+        .work_items
+        .iter()
+        .find(|item| item.step_id == "test-run:1.agg")
+        .expect("aggregate item");
+    assert_eq!(aggregate.status, WorkItemStatus::Succeeded);
+    assert_eq!(aggregate.dependency_ids.len(), 2);
+    let outcome = engine
+        .work_item_outcome(&aggregate.id)
+        .await?
+        .expect("aggregate outcome");
+    assert_eq!(outcome.summary, "merged-final-answer");
+    // All four items committed — the delegation tree is durable work.
+    assert!(
+        report
+            .work_items
+            .iter()
+            .all(|item| item.status == WorkItemStatus::Succeeded)
+    );
     Ok(())
 }
