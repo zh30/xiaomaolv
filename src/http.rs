@@ -1094,6 +1094,13 @@ async fn start_channel_workers(
                         }
                     }
                     _ = ticker.tick() => {
+                        // Expire goals whose execution deadline passed — the
+                        // clock starts at the first provider reservation, and
+                        // an overdue goal must not keep occupying the
+                        // dispatchable set forever.
+                        if let Err(error) = worker.expire_overdue_goals(64).await {
+                            warn!(%error, "loop worker goal expiry failed");
+                        }
                         match worker
                             .dispatchable_goal_ids(settings.max_parallel.saturating_mul(8))
                             .await

@@ -552,6 +552,13 @@ impl LoopEngine {
         Ok(report)
     }
 
+    /// Fails goals whose execution deadline passed — called periodically by
+    /// the runtime worker loop so an overdue goal stops occupying the
+    /// dispatchable set and lands as a terminal, auditable `goal.expired`.
+    pub async fn expire_overdue_goals(&self, limit: usize) -> anyhow::Result<Vec<String>> {
+        self.store.expire_overdue_goals(limit).await
+    }
+
     pub async fn resume_goal(&self, goal_id: &str, actor: &str) -> anyhow::Result<ResumeReport> {
         validate_actor(actor)?;
         let report = self
