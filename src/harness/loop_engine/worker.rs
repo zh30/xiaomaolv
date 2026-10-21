@@ -69,6 +69,13 @@ pub trait OutboundSender: Send + Sync {
         text: &str,
         idempotency_key: &str,
     ) -> anyhow::Result<serde_json::Value>;
+
+    /// Whether this sender can deliver to `channel` — deferred swarm replies
+    /// gate on this so an unsupported channel never wedges `awaiting_reply`.
+    /// Defaults to `true` for backwards-compatible single-channel senders.
+    fn supports_channel(&self, _channel: &str) -> bool {
+        true
+    }
 }
 
 #[derive(Default)]

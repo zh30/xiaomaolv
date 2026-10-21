@@ -4493,3 +4493,66 @@ async fn goal_past_execution_deadline_expires_and_stops_dispatching() -> anyhow:
     );
     Ok(())
 }
+
+/// Deferred replies only promise delivery when the channel can receive:
+/// an outbound sender that doesn't support the run's channel gets the
+/// plain ack (no "我会发给你"), and `awaiting_reply` is never flagged.
+#[tokio::test]
+async fn deferred_reply_skips_channels_the_sender_cannot_reach() -> anyhow::Result<()> {
+    struct NoTelegramSender;
+    #[async_trait]
+    impl xiaomaolv::harness::loop_engine::OutboundSender for NoTelegramSender {
+        async fn send(
+            &self,
+            _channel: &str,
+            _session_id: &str,
+            _text: &str,
+            _idempotency_key: &str,
+        ) -> anyhow::Result<serde_json::Value> {
+            Ok(serde_json::json!({"ok": true}))
+        }
+        fn supports_channel(&self, _channel: &str) -> bool {
+            false
+        }
+    }
+
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("swarm-defer3.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(
+        memory.clone(),
+    ))));
+    let provider = Arc::new(SwarmQueueProvider {
+        replies: Mutex::new(VecDeque::from([
+            "{\"use_swarm\":true}".to_string(),
+            "{\"mode\":\"answer\",\"answer\":\"deferred\"}".to_string(),
+        ])),
+    });
+    let service = MessageService::new(provider, memory.clone(), 8)
+        .with_agent_swarm(AgentSwarmSettings {
+            enabled: true,
+            auto_detect: true,
+            reply_summary_enabled: false,
+            max_parallel: 1,
+            reply_sync_wait_ms: 0,
+            ..Default::default()
+        })
+        .with_loop_engine(Some(engine.clone()))
+        .with_outbound_sender(Some(Arc::new(NoTelegramSender)));
+
+    let reply = service
+        .handle(IncomingMessage {
+            channel: "http".to_string(),
+            session_id: "http:1".to_string(),
+            user_id: "42".to_string(),
+            text: "拆分任务".to_string(),
+            reply_target: None,
+        })
+        .await?;
+    assert_eq!(reply.text, "多智能体任务仍在后台运行。");
+    assert!(
+        memory.list_awaiting_reply_swarm_runs(10).await?.is_empty(),
+        "undeliverable channel never flags awaiting_reply"
+    );
+    Ok(())
+}

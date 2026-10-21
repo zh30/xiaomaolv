@@ -2150,15 +2150,27 @@ impl MessageService {
             .filter(|answer| !answer.trim().is_empty())
             .or_else(|| root_answer.as_ref().map(|outcome| outcome.summary.clone()));
         if deferred_reply && answer_text.is_none() {
-            if let Err(error) = self
-                .memory
-                .set_swarm_run_awaiting_reply(&incoming.channel, run_id, true)
-                .await
+            // Only promise delivery when an outbound sender exists for this
+            // channel — otherwise the run still finishes but nobody can be
+            // pushed the answer, and `awaiting_reply` would never clear.
+            let can_deliver = self
+                .outbound_sender
+                .as_ref()
+                .is_some_and(|sender| sender.supports_channel(&incoming.channel));
+            if can_deliver
+                && let Err(error) = self
+                    .memory
+                    .set_swarm_run_awaiting_reply(&incoming.channel, run_id, true)
+                    .await
             {
                 warn!(error = %error, run_id = %run_id, "failed to flag deferred swarm reply");
             }
             return (
-                Some("多智能体任务仍在后台运行，完成后我会把结果发给你。".to_string()),
+                Some(if can_deliver {
+                    "多智能体任务仍在后台运行，完成后我会把结果发给你。".to_string()
+                } else {
+                    "多智能体任务仍在后台运行。".to_string()
+                }),
                 AgentSwarmRunStatus::Running,
                 None,
             );
@@ -2262,6 +2274,15 @@ impl MessageService {
                     | GoalStatus::Canceled
                     | GoalStatus::Rejected
             ) {
+                continue;
+            }
+            if !sender.supports_channel(&run.channel) {
+                // Unsendable channel — clear the flag rather than retrying
+                // every sweep forever.
+                let _ = self
+                    .memory
+                    .set_swarm_run_awaiting_reply(&run.channel, &run.run_id, false)
+                    .await;
                 continue;
             }
             let report = match engine.resume_goal(&goal.id, SWARM_LOOP_ACTOR).await {

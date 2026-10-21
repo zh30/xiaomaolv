@@ -780,6 +780,10 @@ impl OutboundSender for ChannelOutboundSender {
             evidence
         })
     }
+
+    fn supports_channel(&self, channel: &str) -> bool {
+        channel == "telegram" && self.telegram.is_some()
+    }
 }
 
 struct TelegramOutboundTarget {
