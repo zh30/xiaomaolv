@@ -387,7 +387,7 @@ impl SqliteLoopStore {
         for _ in 0..3 {
             let now = unix_now();
             let lease_until = now + i64::from(lease_secs);
-            let mut tx = self.store.pool().begin().await?;
+            let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
             let goal_status: Option<String> =
                 sqlx::query_scalar("SELECT status FROM harness_goals WHERE id = ?1")
                     .bind(goal_id)
@@ -779,7 +779,7 @@ impl LoopStore for SqliteLoopStore {
         actor: &str,
     ) -> anyhow::Result<GoalVerificationReport> {
         ensure_valid_id(goal_id, "goal id")?;
-        let mut tx = self.store.pool().begin().await?;
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
         let status: String = sqlx::query_scalar("SELECT status FROM harness_goals WHERE id = ?1")
             .bind(goal_id)
             .fetch_optional(&mut *tx)
@@ -932,7 +932,7 @@ impl LoopStore for SqliteLoopStore {
             !label.is_empty() && label.len() <= 160,
             "manual verification label must be 1..=160 bytes"
         );
-        let mut tx = self.store.pool().begin().await?;
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
         let status: String = sqlx::query_scalar("SELECT status FROM harness_goals WHERE id = ?1")
             .bind(goal_id)
             .fetch_optional(&mut *tx)
@@ -988,7 +988,7 @@ impl LoopStore for SqliteLoopStore {
     ) -> anyhow::Result<ProviderBudgetReservation> {
         ensure_valid_id(goal_id, "goal id")?;
         let now = unix_now();
-        let mut tx = self.store.pool().begin().await?;
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query(
             "SELECT max_provider_calls, deadline_secs, max_response_bytes,
                     provider_calls, response_bytes, started_at
@@ -1062,7 +1062,7 @@ impl LoopStore for SqliteLoopStore {
         let effect_manifest = request.effect_manifest();
         let effect_manifest_json = serde_json::to_string(&effect_manifest)?;
         let plan_id = new_loop_id("plan");
-        let mut tx = self.store.pool().begin().await?;
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
         let current = sqlx::query("SELECT status, revision FROM harness_goals WHERE id = ?1")
             .bind(goal_id)
             .fetch_optional(&mut *tx)
@@ -1177,7 +1177,7 @@ impl LoopStore for SqliteLoopStore {
             request.expected_plan_hash.starts_with("sha256:"),
             "expected plan hash must be sha256"
         );
-        let mut tx = self.store.pool().begin().await?;
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
         let goal_row = sqlx::query("SELECT status, revision FROM harness_goals WHERE id = ?1")
             .bind(goal_id)
             .fetch_optional(&mut *tx)
@@ -1374,7 +1374,7 @@ impl LoopStore for SqliteLoopStore {
             "extend_workflow requires 1..=32 steps"
         );
 
-        let mut tx = self.store.pool().begin().await?;
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
         let goal_status: Option<String> =
             sqlx::query_scalar("SELECT status FROM harness_goals WHERE id = ?1")
                 .bind(goal_id)
@@ -1623,7 +1623,7 @@ impl LoopStore for SqliteLoopStore {
             !idempotency_key.trim().is_empty() && idempotency_key.len() <= 200,
             "idempotency key must be 1..=200 bytes"
         );
-        let mut tx = self.store.pool().begin().await?;
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
         ensure_claim_current(&mut tx, claim).await?;
         if let Some(row) = sqlx::query(
             "SELECT id, goal_id, work_item_id, attempt_id, phase, idempotency_key,
@@ -1708,7 +1708,7 @@ impl LoopStore for SqliteLoopStore {
     ) -> anyhow::Result<CheckpointRecord> {
         ensure_valid_id(checkpoint_id, "checkpoint id")?;
         let outcome_json = serde_json::to_string(&outcome)?;
-        let mut tx = self.store.pool().begin().await?;
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
         ensure_claim_current(&mut tx, claim).await?;
         let current = load_checkpoint_tx(&mut tx, checkpoint_id).await?;
         ensure!(
@@ -1767,7 +1767,7 @@ impl LoopStore for SqliteLoopStore {
         checkpoint_id: &str,
         actor: &str,
     ) -> anyhow::Result<ResumeReport> {
-        let mut tx = self.store.pool().begin().await?;
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
         ensure_claim_current(&mut tx, claim).await?;
         let checkpoint = load_checkpoint_tx(&mut tx, checkpoint_id).await?;
         ensure!(
@@ -1804,7 +1804,7 @@ impl LoopStore for SqliteLoopStore {
         actor: &str,
     ) -> anyhow::Result<ResumeReport> {
         let error = error.chars().take(2_000).collect::<String>();
-        let mut tx = self.store.pool().begin().await?;
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
         ensure_claim_current(&mut tx, claim).await?;
         let row = sqlx::query(
             "SELECT max_attempts, backoff_secs,
@@ -1962,7 +1962,7 @@ impl LoopStore for SqliteLoopStore {
             !reason.is_empty() && reason.len() <= 512,
             "confirmation reason must be 1..=512 characters"
         );
-        let mut tx = self.store.pool().begin().await?;
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
         let item_row = sqlx::query(
             "SELECT id, goal_id, status, step_id, handler, effect_class, input_json,
                     max_attempts, ordinal, created_at, progress_json
@@ -2188,7 +2188,7 @@ impl LoopStore for SqliteLoopStore {
     ) -> anyhow::Result<WorkItemRecord> {
         let reason = reason.chars().take(2_000).collect::<String>();
         let now = unix_now();
-        let mut tx = self.store.pool().begin().await?;
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
         ensure_claim_current(&mut tx, claim).await?;
         sqlx::query(
             "UPDATE harness_checkpoints
@@ -2266,7 +2266,7 @@ impl LoopStore for SqliteLoopStore {
             handlers.len() <= 64,
             "handler list cannot exceed 64 entries"
         );
-        let mut tx = self.store.pool().begin().await?;
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
         let placeholders = handlers
             .iter()
             .enumerate()
@@ -2315,7 +2315,7 @@ impl LoopStore for SqliteLoopStore {
     ) -> anyhow::Result<ResumeReport> {
         ensure!(until_unix > 0, "deferred wake time must be positive");
         let now = unix_now();
-        let mut tx = self.store.pool().begin().await?;
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
         ensure_claim_current(&mut tx, claim).await?;
         sqlx::query(
             "UPDATE harness_checkpoints
@@ -2427,7 +2427,7 @@ impl LoopStore for SqliteLoopStore {
     ) -> anyhow::Result<WorkPhaseProgress> {
         continuation.validate()?;
         let now = unix_now();
-        let mut tx = self.store.pool().begin().await?;
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
         ensure_claim_current(&mut tx, claim).await?;
         let progress = next_phase_progress(&mut tx, &claim.work_item.id, continuation).await?;
         sqlx::query(
@@ -2468,7 +2468,7 @@ impl LoopStore for SqliteLoopStore {
         let until_unix = continuation
             .delay_secs
             .map(|delay| now.saturating_add(i64::from(delay)));
-        let mut tx = self.store.pool().begin().await?;
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
         ensure_claim_current(&mut tx, claim).await?;
         let progress = next_phase_progress(&mut tx, &claim.work_item.id, continuation).await?;
         sqlx::query(

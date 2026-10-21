@@ -1890,11 +1890,21 @@ impl SwarmNodeHandler {
                 backoff_secs: 5,
             },
         });
-        match ctx
+        // Under concurrent workers a transient store error can reject the
+        // extension — retry once before degrading to a direct answer so a
+        // busy seam never silently loses a delegation.
+        let mut extension = ctx
             .engine
-            .extend_workflow(&ctx.claim.attempt.goal_id, steps, SWARM_LOOP_ACTOR)
-            .await
-        {
+            .extend_workflow(&ctx.claim.attempt.goal_id, steps.clone(), SWARM_LOOP_ACTOR)
+            .await;
+        if extension.is_err() {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            extension = ctx
+                .engine
+                .extend_workflow(&ctx.claim.attempt.goal_id, steps, SWARM_LOOP_ACTOR)
+                .await;
+        }
+        match extension {
             Ok(_) => Ok(WorkOutcome {
                 summary: format!("delegated to {} children", child_step_ids.len()),
                 artifact_ids: Vec::new(),
@@ -1982,9 +1992,12 @@ impl MessageService {
         };
         let max_rounds = (self.agent_swarm.max_agents.max(1) * 2 + 8).min(128);
         let run_timeout = Duration::from_millis(self.agent_swarm.max_run_timeout_ms.max(1));
+        // Fan-out: `max_parallel` workers race claims on the same goal —
+        // at-least-once + fencing make the duplication safe, so swarm
+        // children actually run in parallel rather than serially draining.
         let run_error = match timeout(
             run_timeout,
-            worker.run_goal_until_idle(&goal_id, max_rounds),
+            worker.run_goal_concurrent(&goal_id, self.agent_swarm.max_parallel.max(1), max_rounds),
         )
         .await
         {

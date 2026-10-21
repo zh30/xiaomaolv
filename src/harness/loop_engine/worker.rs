@@ -11,7 +11,8 @@ use crate::provider::{ChatProvider, CompletionRequest};
 
 use super::{
     ArtifactKind, EffectClass, GoalStatus, LoopEngine, PublishArtifactRequest, ResumeReport,
-    TrajectoryFrameCapture, TrajectoryFrameDraft, WorkClaim, WorkContinuation, WorkOutcome,
+    TrajectoryFrameCapture, TrajectoryFrameDraft, WorkClaim, WorkContinuation, WorkItemStatus,
+    WorkOutcome,
 };
 
 /// `last_error` prefix marking a work item that was blocked because its
@@ -253,6 +254,117 @@ impl LoopWorker {
             report = self.process_claim(claim, &actor).await?;
         }
         self.engine.resume_goal(goal_id, &actor).await
+    }
+
+    /// Drives a goal with `concurrency` claim loops racing on the same
+    /// leased-claim seam. At-least-once claims + fencing tokens make
+    /// duplicate claims safe; a worker whose claim comes back empty lingers
+    /// briefly while other items are still `running`/`ready` (a sibling
+    /// may unlock new work), and exits once the goal is terminal or nothing
+    /// remains in flight. Used by fan-out workloads like durable swarms.
+    pub async fn run_goal_concurrent(
+        &self,
+        goal_id: &str,
+        concurrency: usize,
+        max_steps: usize,
+    ) -> anyhow::Result<ResumeReport> {
+        let workers = concurrency.clamp(1, 8);
+        if workers <= 1 {
+            return self.run_goal_until_idle(goal_id, max_steps).await;
+        }
+        let mut handles = Vec::with_capacity(workers);
+        for index in 0..workers {
+            let child = LoopWorker {
+                engine: self.engine.clone(),
+                handlers: self.handlers.clone(),
+                worker_id: format!("{}:c{}", self.worker_id, index),
+                lease_secs: self.lease_secs,
+            };
+            let goal_id = goal_id.to_string();
+            handles.push(tokio::spawn(async move {
+                // `claim` errors on a non-dispatchable goal (verifying,
+                // terminal) are structural, not transient — after any
+                // error, re-read the goal and only retry while claimable
+                // work remains in flight.
+                let mut retries = 0u8;
+                loop {
+                    let outcome: anyhow::Result<ResumeReport> =
+                        match child.run_goal_until_idle(&goal_id, max_steps).await {
+                            Ok(report) => Ok(report),
+                            Err(_) => child
+                                .engine
+                                .resume_goal(&goal_id, "runtime:concurrent")
+                                .await
+                                .context("failed to inspect goal after worker error"),
+                        };
+                    match outcome {
+                        Ok(next) => {
+                            let in_flight = next.work_items.iter().any(|item| {
+                                matches!(
+                                    item.status,
+                                    WorkItemStatus::Running | WorkItemStatus::Ready
+                                )
+                            });
+                            if is_terminal(next.goal.status) || !in_flight {
+                                // Pending-alone (deps failed/parked) and
+                                // waiting_confirmation both need a
+                                // resolution path outside the worker loop.
+                                return Ok(next);
+                            }
+                        }
+                        Err(error) => {
+                            retries += 1;
+                            if retries > 10 {
+                                return Err(error);
+                            }
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                }
+            }));
+        }
+        // Join ALL workers: an erroring sibling must not strand attempts
+        // still executing under the others.
+        let mut best: Option<ResumeReport> = None;
+        let mut first_error: Option<anyhow::Error> = None;
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(report)) => {
+                    let dominated = best.as_ref().is_some_and(|current| {
+                        report
+                            .work_items
+                            .iter()
+                            .filter(|i| i.status == WorkItemStatus::Succeeded)
+                            .count()
+                            <= current
+                                .work_items
+                                .iter()
+                                .filter(|i| i.status == WorkItemStatus::Succeeded)
+                                .count()
+                    });
+                    if !dominated {
+                        best = Some(report);
+                    }
+                }
+                Ok(Err(error)) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+                Err(join) => {
+                    if first_error.is_none() {
+                        first_error = Some(
+                            anyhow::Error::new(join).context("concurrent worker task panicked"),
+                        );
+                    }
+                }
+            }
+        }
+        match best {
+            Some(report) => Ok(report),
+            None => Err(first_error
+                .unwrap_or_else(|| anyhow::anyhow!("no concurrent worker produced a report"))),
+        }
     }
 
     async fn process_claim(&self, claim: WorkClaim, actor: &str) -> anyhow::Result<ResumeReport> {
