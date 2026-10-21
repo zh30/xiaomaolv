@@ -1,3 +1,9 @@
+// `async_trait` expansion emits `#[must_use]` on generated fns returning
+// `Pin<Box<dyn Future>>` — already must_use, so clippy 1.99's
+// `double_must_use` fires on macro output we don't control.
+#![allow(unknown_lints)]
+#![allow(clippy::double_must_use)]
+
 pub mod channel;
 pub mod code_mode;
 pub mod config;
