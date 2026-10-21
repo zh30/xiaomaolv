@@ -91,6 +91,30 @@ skills_max_prompt_chars = 8000
 skills_match_min_score = 0.45
 skills_llm_rerank_enabled = false
 
+[agent.swarm]
+# Multi-agent swarm: a classifier decides whether a message becomes a swarm run
+# (decompose into role agents, aggregate their answers). Audit rows land in
+# agent_swarm_runs / agent_swarm_nodes for /agents and the console.
+enabled = true
+auto_detect = true
+max_depth = 3
+max_agents = 16
+max_parallel = 4
+max_node_timeout_ms = 20000
+max_run_timeout_ms = 90000
+reply_summary_enabled = true
+# Audit retention for /agents + /v1/harness/swarm-runs rows.
+audit_retention_days = 30
+# true (default): swarm nodes run as durable Loop Engine work items — claims,
+# attempts, checkpoints, resumable delegation DAG. Requires
+# agent.harness.loop_engine.enabled; falls back to the in-process runner.
+durable_engine = true
+# How long a chat turn waits synchronously for the swarm answer before the
+# reply is deferred: an ack is sent immediately, and the janitor delivers the
+# final answer via the durable outbound sender once the goal reaches a
+# terminal state (survives restarts, exactly-once). 0 = always asynchronous.
+reply_sync_wait_ms = 45000
+
 [agent.harness]
 # Default profile mirrors Rust defaults. Recommended for debugging/ops: set true.
 # Passive: records trajectories and metrics; does not change model output.
