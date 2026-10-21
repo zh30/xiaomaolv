@@ -3000,7 +3000,7 @@ async fn durable_swarm_run_delegates_and_merges_through_the_dag() -> anyhow::Res
                     }],
                     edges: Vec::new(),
                     budget: ExecutionBudget {
-                        max_provider_calls: 0,
+                        max_provider_calls: 32,
                         deadline_secs: 120,
                         max_response_bytes: 65_536,
                     },
@@ -3119,7 +3119,7 @@ async fn durable_swarm_engine(
                     }],
                     edges: Vec::new(),
                     budget: ExecutionBudget {
-                        max_provider_calls: 0,
+                        max_provider_calls: 32,
                         deadline_secs: 120,
                         max_response_bytes: 65_536,
                     },
@@ -3293,7 +3293,7 @@ async fn durable_swarm_extension_budget_rejection_answers_directly() -> anyhow::
                     }],
                     edges: Vec::new(),
                     budget: ExecutionBudget {
-                        max_provider_calls: 0,
+                        max_provider_calls: 32,
                         deadline_secs: 60,
                         max_response_bytes: 65_536,
                     },
@@ -3388,7 +3388,7 @@ async fn durable_swarm_depth_limit_forces_direct_answer() -> anyhow::Result<()> 
                     }],
                     edges: Vec::new(),
                     budget: ExecutionBudget {
-                        max_provider_calls: 0,
+                        max_provider_calls: 32,
                         deadline_secs: 60,
                         max_response_bytes: 65_536,
                     },
@@ -3719,7 +3719,7 @@ async fn orphaned_swarm_goal_resumes_once_swarm_handler_registers() -> anyhow::R
                     }],
                     edges: Vec::new(),
                     budget: ExecutionBudget {
-                        max_provider_calls: 0,
+                        max_provider_calls: 8,
                         deadline_secs: 60,
                         max_response_bytes: 65_536,
                     },
@@ -4040,5 +4040,111 @@ async fn orphan_janitor_closes_runs_whose_goal_is_terminal() -> anyhow::Result<(
     );
     let live = runs.iter().find(|r| r.run_id == "run-live").unwrap();
     assert_eq!(live.status, xiaomaolv::memory::AgentSwarmRunStatus::Running);
+    Ok(())
+}
+
+/// The declared `max_provider_calls` budget now bites inside swarm nodes:
+/// when the reservation is exhausted a node's provider call surfaces as an
+/// evidence-level failure (item still commits — partial-result semantics)
+/// and the provider is never called again.
+#[tokio::test]
+async fn swarm_node_honors_the_goal_provider_call_budget() -> anyhow::Result<()> {
+    struct CountingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl ChatProvider for CountingProvider {
+        async fn complete(&self, _req: CompletionRequest) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok("{\"mode\":\"answer\",\"answer\":\"budgeted\"}".to_string())
+        }
+        fn model_name(&self) -> Option<&str> {
+            Some("counting")
+        }
+    }
+
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let actor = "internal:swarm";
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "budget".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: Some("swarm:run-budget".to_string()),
+            },
+            actor,
+        )
+        .await?;
+    let step = |id: &str| WorkflowStep {
+        id: id.to_string(),
+        handler: "swarm_node".to_string(),
+        effect: EffectClass::LocalWrite,
+        input: serde_json::json!({
+            "task": "t", "depth": 99, "history": [],
+        }),
+        retry: RetryPolicy {
+            max_attempts: 1,
+            backoff_secs: 0,
+        },
+    };
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![step("run-budget:1"), step("run-budget:2")],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 1,
+                        deadline_secs: 60,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+                    label: "review".to_string(),
+                }],
+            },
+            actor,
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            actor,
+        )
+        .await?;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(CountingProvider {
+        calls: calls.clone(),
+    });
+    let mut registry = WorkHandlerRegistry::default();
+    registry.register(Arc::new(xiaomaolv::service::swarm::SwarmNodeHandler::new(
+        provider,
+        xiaomaolv::service::swarm::AgentSwarmSettings::default(),
+    )))?;
+    let worker = LoopWorker::with_registry(engine.clone(), registry, "budget-worker", 30)?;
+    let _ = worker.run_goal_until_idle(&goal.id, 8).await;
+    let report = engine.resume_goal(&goal.id, "operator:test").await?;
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "budget allowed exactly one call"
+    );
+    let failed_outcome = report
+        .work_items
+        .iter()
+        .find(|i| i.step_id == "run-budget:2")
+        .expect("second step");
+    let outcome = engine
+        .work_item_outcome(&failed_outcome.id)
+        .await?
+        .expect("outcome");
+    assert_eq!(outcome.evidence["status"], "failed");
     Ok(())
 }
