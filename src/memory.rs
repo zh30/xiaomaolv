@@ -68,6 +68,52 @@ impl SqliteMemoryStore {
         .await
         .context("failed to initialize messages session index")?;
 
+        // Durable update admission ledger: dedup boundary at the channel.
+        // A row means "we saw this update_id"; `processing` holds a lease so
+        // a crash mid-processing can be reclaimed by a re-delivery (bounded
+        // attempts) or swept into a visible `failed` record.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS telegram_admissions (
+                update_id INTEGER PRIMARY KEY,
+                status TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                summary_json TEXT NOT NULL,
+                detail TEXT,
+                attempts INTEGER NOT NULL DEFAULT 1,
+                lease_until INTEGER NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize telegram_admissions table")?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_telegram_admissions_status_lease
+             ON telegram_admissions(status, lease_until);",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize telegram admission status index")?;
+
+        // Outbound message ledger: which bot message came from which
+        // session at which time. A user's reply-marker resolves the exact
+        // bot message it answered → the session + send timestamp, then the
+        // run that produced it — no recency-window guessing.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS telegram_outbound_messages (
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                session_id TEXT NOT NULL,
+                sent_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                PRIMARY KEY (chat_id, message_id)
+            );",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize telegram_outbound_messages table")?;
+
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS memory_chunks (
                 chunk_id TEXT PRIMARY KEY,
@@ -255,6 +301,9 @@ impl SqliteMemoryStore {
         .execute(&pool)
         .await
         .context("failed to initialize agent_swarm_runs started index")?;
+        // Deferred-delivery flag: a sync wait that timed out marks the run so
+        // the janitor sends the final answer when the goal goes terminal.
+        maybe_add_swarm_runs_column(&pool, "awaiting_reply INTEGER NOT NULL DEFAULT 0").await?;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS agent_swarm_nodes (
@@ -362,6 +411,34 @@ impl SqliteMemoryStore {
         .context("failed to initialize trajectory channel index")?;
 
         sqlx::query(
+            "CREATE TABLE IF NOT EXISTS mcp_trajectory_scorecards (
+                trajectory_id TEXT PRIMARY KEY REFERENCES mcp_trajectories(id),
+                score INTEGER NOT NULL,
+                completion REAL NOT NULL,
+                answer_quality REAL NOT NULL,
+                tool_health REAL NOT NULL,
+                speed REAL NOT NULL,
+                tool_calls INTEGER NOT NULL,
+                failed_tool_calls INTEGER NOT NULL,
+                verification_failures INTEGER NOT NULL,
+                iterations INTEGER NOT NULL,
+                latency_ms INTEGER NOT NULL,
+                computed_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize mcp_trajectory_scorecards table")?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_trajectory_scorecards_computed
+             ON mcp_trajectory_scorecards(computed_at);",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize trajectory scorecard time index")?;
+
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS compaction_summaries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
@@ -410,6 +487,184 @@ impl SqliteMemoryStore {
             .await
             .context("failed to insert message")?;
         Ok(())
+    }
+
+    /// Durable admission gate: the first caller to see an `update_id` owns
+    /// it. A re-delivery while the original attempt still holds a live lease
+    /// (or already finished/failed permanently) is a duplicate and must not
+    /// be processed again; a lease-expired `processing` row — a crash —
+    /// can be reclaimed under a fresh lease while attempts remain.
+    pub async fn admit_telegram_update(
+        &self,
+        update_id: i64,
+        kind: &str,
+        summary_json: &str,
+        lease_secs: i64,
+    ) -> anyhow::Result<bool> {
+        let now = unix_ts();
+        let mut tx = self.pool.begin().await?;
+        let inserted = sqlx::query(
+            "INSERT OR IGNORE INTO telegram_admissions
+             (update_id, status, kind, summary_json, attempts, lease_until)
+             VALUES (?1, 'processing', ?2, ?3, 1, ?4)",
+        )
+        .bind(update_id)
+        .bind(kind)
+        .bind(summary_json)
+        .bind(now + lease_secs)
+        .execute(&mut *tx)
+        .await
+        .context("failed to admit telegram update")?;
+        if inserted.rows_affected() == 1 {
+            tx.commit().await?;
+            return Ok(true);
+        }
+        let reclaimed = sqlx::query(
+            "UPDATE telegram_admissions
+             SET status = 'processing', lease_until = ?1, attempts = attempts + 1,
+                 detail = NULL, updated_at = ?2
+             WHERE update_id = ?3 AND status = 'processing' AND lease_until < ?2
+               AND attempts < ?4",
+        )
+        .bind(now + lease_secs)
+        .bind(now)
+        .bind(update_id)
+        .bind(i64::from(TELEGRAM_ADMISSION_MAX_ATTEMPTS))
+        .execute(&mut *tx)
+        .await
+        .context("failed to reclaim telegram admission")?;
+        tx.commit().await?;
+        Ok(reclaimed.rows_affected() == 1)
+    }
+
+    pub async fn finish_telegram_admission(
+        &self,
+        update_id: i64,
+        detail: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE telegram_admissions
+             SET status = 'done', detail = ?1, updated_at = unixepoch()
+             WHERE update_id = ?2 AND status = 'processing'",
+        )
+        .bind(detail)
+        .bind(update_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to finish telegram admission")?;
+        Ok(())
+    }
+
+    pub async fn fail_telegram_admission(&self, update_id: i64, error: &str) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE telegram_admissions
+             SET status = 'failed', detail = ?1, updated_at = unixepoch()
+             WHERE update_id = ?2 AND status = 'processing'",
+        )
+        .bind(error.chars().take(2_000).collect::<String>())
+        .bind(update_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to fail telegram admission")?;
+        Ok(())
+    }
+
+    /// Records that the bot sent `message_id` in `chat_id` on behalf of
+    /// `session_id` — the anchor a later reply-marker binds to exactly.
+    pub async fn record_telegram_outbound_message(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        session_id: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO telegram_outbound_messages
+             (chat_id, message_id, session_id)
+             VALUES (?1, ?2, ?3)",
+        )
+        .bind(chat_id)
+        .bind(message_id)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to record telegram outbound message")?;
+        Ok(())
+    }
+
+    /// Same record with an explicit send time — callers that learned the
+    /// send timestamp out-of-band (and tests) use it to pin the binding.
+    pub async fn record_telegram_outbound_message_at(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        session_id: &str,
+        sent_at_unix: i64,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO telegram_outbound_messages
+             (chat_id, message_id, session_id, sent_at)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(chat_id)
+        .bind(message_id)
+        .bind(session_id)
+        .bind(sent_at_unix)
+        .execute(&self.pool)
+        .await
+        .context("failed to record telegram outbound message")?;
+        Ok(())
+    }
+
+    /// Resolves the session + send time a bot message belongs to — the
+    /// inputs to the exact trajectory lookup.
+    pub async fn telegram_outbound_ref(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+    ) -> anyhow::Result<Option<TelegramOutboundRef>> {
+        let row = sqlx::query_as::<_, (String, i64)>(
+            "SELECT session_id, sent_at FROM telegram_outbound_messages
+             WHERE chat_id = ?1 AND message_id = ?2",
+        )
+        .bind(chat_id)
+        .bind(message_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to look up telegram outbound message")?;
+        Ok(row.map(|(session_id, sent_at_unix)| TelegramOutboundRef {
+            session_id,
+            sent_at_unix,
+        }))
+    }
+
+    /// Turns long-dead `processing` rows — updates the process died on — into
+    /// visible `failed` records; returns the lost update ids so the caller
+    /// can surface them to operators.
+    pub async fn sweep_stale_telegram_admissions(
+        &self,
+        older_than_secs: i64,
+    ) -> anyhow::Result<Vec<i64>> {
+        let stale_before = unix_ts() - older_than_secs;
+        let mut tx = self.pool.begin().await?;
+        let stale: Vec<i64> = sqlx::query_scalar(
+            "SELECT update_id FROM telegram_admissions
+             WHERE status = 'processing' AND lease_until < ?1",
+        )
+        .bind(stale_before)
+        .fetch_all(&mut *tx)
+        .await
+        .context("failed to find stale telegram admissions")?;
+        sqlx::query(
+            "UPDATE telegram_admissions
+             SET status = 'failed', detail = 'lost mid-processing', updated_at = unixepoch()
+             WHERE status = 'processing' AND lease_until < ?1",
+        )
+        .bind(stale_before)
+        .execute(&mut *tx)
+        .await
+        .context("failed to sweep stale telegram admissions")?;
+        tx.commit().await?;
+        Ok(stale)
     }
 
     pub async fn load_recent(
@@ -1348,6 +1603,72 @@ impl SqliteMemoryStore {
         Ok(())
     }
 
+    /// Runs still marked `running` — used by the orphan sweeper that closes
+    /// audit rows whose durable goal finished while the process was down.
+    pub async fn list_running_agent_swarm_runs(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<AgentSwarmRunRecord>> {
+        let rows = sqlx::query(
+            "SELECT r.run_id, r.channel, r.session_id, r.user_id, r.root_task, r.status,
+                    r.started_at_unix, r.finished_at_unix, r.error, r.created_at, r.updated_at,
+                    (SELECT COUNT(*)
+                       FROM agent_swarm_nodes n
+                      WHERE n.channel = r.channel AND n.run_id = r.run_id) AS agent_count
+             FROM agent_swarm_runs r
+             WHERE r.status = 'running'
+             ORDER BY r.started_at_unix ASC LIMIT ?1",
+        )
+        .bind(i64::try_from(limit).unwrap_or(64))
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list running agent swarm runs")?;
+        rows.into_iter().map(agent_swarm_run_from_row).collect()
+    }
+
+    /// Marks/unmarks a run whose synchronous reply window elapsed — the
+    /// janitor delivers the final answer asynchronously when set.
+    pub async fn set_swarm_run_awaiting_reply(
+        &self,
+        channel: &str,
+        run_id: &str,
+        awaiting: bool,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE agent_swarm_runs SET awaiting_reply = ?1, updated_at = unixepoch()
+             WHERE channel = ?2 AND run_id = ?3",
+        )
+        .bind(i64::from(awaiting))
+        .bind(channel)
+        .bind(run_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to set swarm awaiting_reply")?;
+        Ok(())
+    }
+
+    /// Runs flagged `awaiting_reply` whose answer still needs delivery.
+    pub async fn list_awaiting_reply_swarm_runs(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<AgentSwarmRunRecord>> {
+        let rows = sqlx::query(
+            "SELECT r.run_id, r.channel, r.session_id, r.user_id, r.root_task, r.status,
+                    r.started_at_unix, r.finished_at_unix, r.error, r.created_at, r.updated_at,
+                    (SELECT COUNT(*)
+                       FROM agent_swarm_nodes n
+                      WHERE n.channel = r.channel AND n.run_id = r.run_id) AS agent_count
+             FROM agent_swarm_runs r
+             WHERE r.awaiting_reply = 1
+             ORDER BY r.started_at_unix ASC LIMIT ?1",
+        )
+        .bind(i64::try_from(limit).unwrap_or(64))
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list awaiting-reply swarm runs")?;
+        rows.into_iter().map(agent_swarm_run_from_row).collect()
+    }
+
     pub async fn list_agent_swarm_runs(
         &self,
         channel: &str,
@@ -1528,6 +1849,436 @@ impl SqliteMemoryStore {
         .execute(&self.pool)
         .await
         .context("failed to finish trajectory")?;
+        // Persist the deterministic fitness scorecard next to the finished
+        // run: deployments and proposal evidence are judged against these
+        // numbers rather than a binary failure flag.
+        if let Some(record) = self.get_trajectory(trajectory_id).await? {
+            let scorecard = crate::harness::trajectory::compute_run_scorecard(&record, unix_ts());
+            self.upsert_run_scorecard(&scorecard).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn upsert_run_scorecard(
+        &self,
+        scorecard: &crate::harness::trajectory::RunScorecard,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO mcp_trajectory_scorecards
+             (trajectory_id, score, completion, answer_quality, tool_health,
+              speed, tool_calls, failed_tool_calls, verification_failures,
+              iterations, latency_ms, computed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT(trajectory_id) DO UPDATE SET
+               score = excluded.score,
+               completion = excluded.completion,
+               answer_quality = excluded.answer_quality,
+               tool_health = excluded.tool_health,
+               speed = excluded.speed,
+               tool_calls = excluded.tool_calls,
+               failed_tool_calls = excluded.failed_tool_calls,
+               verification_failures = excluded.verification_failures,
+               iterations = excluded.iterations,
+               latency_ms = excluded.latency_ms,
+               computed_at = excluded.computed_at",
+        )
+        .bind(&scorecard.trajectory_id)
+        .bind(scorecard.score)
+        .bind(scorecard.completion)
+        .bind(scorecard.answer_quality)
+        .bind(scorecard.tool_health)
+        .bind(scorecard.speed)
+        .bind(scorecard.tool_calls)
+        .bind(scorecard.failed_tool_calls)
+        .bind(scorecard.verification_failures)
+        .bind(scorecard.iterations)
+        .bind(scorecard.latency_ms)
+        .bind(scorecard.computed_at_unix)
+        .execute(&self.pool)
+        .await
+        .context("failed to upsert trajectory scorecard")?;
+        Ok(())
+    }
+
+    /// Computes and persists scorecards for finished trajectories that
+    /// predate the scorecard table (self-healing backfill).
+    pub async fn backfill_run_scorecards(&self, limit: i64) -> anyhow::Result<usize> {
+        let missing = sqlx::query_scalar::<_, String>(
+            "SELECT t.id FROM mcp_trajectories t
+             LEFT JOIN mcp_trajectory_scorecards s ON s.trajectory_id = t.id
+             WHERE t.finished_at IS NOT NULL AND s.trajectory_id IS NULL
+             ORDER BY t.finished_at DESC LIMIT ?1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to find trajectories missing scorecards")?;
+        let mut filled = 0_usize;
+        for trajectory_id in missing {
+            if let Some(record) = self.get_trajectory(&trajectory_id).await? {
+                let finished = record
+                    .finished_at
+                    .map(|finished| finished.timestamp())
+                    .unwrap_or_else(unix_ts);
+                self.upsert_run_scorecard(&crate::harness::trajectory::compute_run_scorecard(
+                    &record, finished,
+                ))
+                .await?;
+                filled += 1;
+            }
+        }
+        Ok(filled)
+    }
+
+    pub async fn get_run_scorecard(
+        &self,
+        trajectory_id: &str,
+    ) -> anyhow::Result<Option<crate::harness::trajectory::RunScorecard>> {
+        let row = sqlx::query(
+            "SELECT trajectory_id, score, completion, answer_quality, tool_health,
+                    speed, tool_calls, failed_tool_calls, verification_failures,
+                    iterations, latency_ms, computed_at
+             FROM mcp_trajectory_scorecards WHERE trajectory_id = ?1",
+        )
+        .bind(trajectory_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to get trajectory scorecard")?;
+        if let Some(row) = row {
+            return Ok(Some(run_scorecard_from_row(&row)?));
+        }
+        // Lazy backfill for runs that finished before the table existed.
+        let Some(record) = self.get_trajectory(trajectory_id).await? else {
+            return Ok(None);
+        };
+        if record.finished_at.is_none() {
+            return Ok(None);
+        }
+        let computed = record
+            .finished_at
+            .map(|finished| finished.timestamp())
+            .unwrap_or_else(unix_ts);
+        let scorecard = crate::harness::trajectory::compute_run_scorecard(&record, computed);
+        self.upsert_run_scorecard(&scorecard).await?;
+        Ok(Some(scorecard))
+    }
+
+    pub async fn query_run_scorecards(
+        &self,
+        filter: crate::harness::trajectory::RunScorecardFilter,
+    ) -> anyhow::Result<Vec<crate::harness::trajectory::RunScorecard>> {
+        type RowTuple = (
+            String,
+            i64,
+            f64,
+            f64,
+            f64,
+            f64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        );
+        let limit = crate::harness::trajectory::clamp_trajectory_query_limit(filter.limit) as i64;
+        let mut builder = QueryBuilder::<Sqlite>::new(
+            "SELECT s.trajectory_id, s.score, s.completion, s.answer_quality,
+                    s.tool_health, s.speed, s.tool_calls, s.failed_tool_calls,
+                    s.verification_failures, s.iterations, s.latency_ms, s.computed_at
+             FROM mcp_trajectory_scorecards s
+             JOIN mcp_trajectories t ON t.id = s.trajectory_id",
+        );
+        let mut has_where = false;
+        macro_rules! push_condition {
+            ($sql:expr) => {{
+                if has_where {
+                    builder.push(" AND ");
+                } else {
+                    builder.push(" WHERE ");
+                    has_where = true;
+                }
+                builder.push($sql);
+            }};
+        }
+        if let Some(channel) = &filter.channel {
+            push_condition!("t.channel = ");
+            builder.push_bind(channel);
+        }
+        if let Some(model) = &filter.model {
+            push_condition!("t.model = ");
+            builder.push_bind(model);
+        }
+        if let Some(since) = filter.since_unix {
+            push_condition!("t.finished_at >= ");
+            builder.push_bind(since);
+        }
+        if let Some(until) = filter.until_unix {
+            push_condition!("t.finished_at < ");
+            builder.push_bind(until);
+        }
+        if let Some(min_score) = filter.min_score {
+            push_condition!("s.score >= ");
+            builder.push_bind(min_score);
+        }
+        if let Some(max_score) = filter.max_score {
+            push_condition!("s.score <= ");
+            builder.push_bind(max_score);
+        }
+        let _ = has_where;
+        if filter.ascending {
+            builder.push(" ORDER BY t.finished_at ASC, s.trajectory_id ASC LIMIT ");
+        } else {
+            builder.push(" ORDER BY t.finished_at DESC, s.trajectory_id DESC LIMIT ");
+        }
+        builder.push_bind(limit);
+        let rows = builder
+            .build_query_as::<RowTuple>()
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to query trajectory scorecards")?;
+        rows.into_iter()
+            .map(
+                |(
+                    trajectory_id,
+                    score,
+                    completion,
+                    answer_quality,
+                    tool_health,
+                    speed,
+                    tool_calls,
+                    failed_tool_calls,
+                    verification_failures,
+                    iterations,
+                    latency_ms,
+                    computed_at,
+                )| {
+                    anyhow::Ok(crate::harness::trajectory::RunScorecard {
+                        trajectory_id,
+                        score,
+                        completion,
+                        answer_quality,
+                        tool_health,
+                        speed,
+                        tool_calls,
+                        failed_tool_calls,
+                        verification_failures,
+                        iterations,
+                        latency_ms,
+                        computed_at_unix: computed_at,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    pub async fn run_scorecard_summary(
+        &self,
+        since_unix: i64,
+        until_unix: i64,
+    ) -> anyhow::Result<crate::harness::trajectory::ScorecardSummary> {
+        // Backfill so windows that predate the scorecard table still score.
+        self.backfill_run_scorecards(512).await?;
+        let rows = sqlx::query(
+            "SELECT s.score, s.failed_tool_calls, s.verification_failures, t.exit_reason
+             FROM mcp_trajectory_scorecards s
+             JOIN mcp_trajectories t ON t.id = s.trajectory_id
+             WHERE t.finished_at >= ?1 AND t.finished_at < ?2",
+        )
+        .bind(since_unix)
+        .bind(until_unix)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to summarize trajectory scorecards")?;
+        let mut summary = crate::harness::trajectory::ScorecardSummary {
+            window_start_unix: since_unix,
+            window_end_unix: until_unix,
+            run_count: rows.len() as i64,
+            mean_score: None,
+            low_count: 0,
+            mid_count: 0,
+            high_count: 0,
+            failed_tool_calls: 0,
+            verification_failures: 0,
+            exit_reasons: std::collections::BTreeMap::new(),
+        };
+        let mut total = 0_f64;
+        for row in &rows {
+            let score: i64 = row.get("score");
+            total += score as f64;
+            match score {
+                0..=49 => summary.low_count += 1,
+                50..=79 => summary.mid_count += 1,
+                _ => summary.high_count += 1,
+            }
+            summary.failed_tool_calls += row.get::<i64, _>("failed_tool_calls");
+            summary.verification_failures += row.get::<i64, _>("verification_failures");
+            let exit_reason: String = row.get("exit_reason");
+            *summary.exit_reasons.entry(exit_reason).or_insert(0) += 1;
+        }
+        if summary.run_count > 0 {
+            summary.mean_score = Some(total / summary.run_count as f64);
+        }
+        Ok(summary)
+    }
+
+    /// Most recent finished trajectory whose `session_id` starts with
+    /// `session_prefix` (e.g. `tg:{chat_id}`), finished at or after
+    /// `min_finished_unix`. Binds lightweight reply-feedback to the run
+    /// that produced the answer being rated.
+    pub async fn latest_finished_trajectory(
+        &self,
+        session_prefix: &str,
+        min_finished_unix: i64,
+    ) -> anyhow::Result<Option<crate::harness::trajectory::TrajectoryRecord>> {
+        let escaped = session_prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let row = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM mcp_trajectories
+             WHERE session_id LIKE ?1 ESCAPE '\\'
+               AND finished_at IS NOT NULL AND finished_at >= ?2
+             ORDER BY finished_at DESC, id DESC LIMIT 1",
+        )
+        .bind(format!("{escaped}%"))
+        .bind(min_finished_unix)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to query latest finished trajectory")?;
+        let Some(trajectory_id) = row else {
+            return Ok(None);
+        };
+        self.get_trajectory(&trajectory_id).await
+    }
+
+    /// Most recent trajectory finished for exactly `session_id` at or before
+    /// `before_unix` — the run that produced a specific outbound message.
+    pub async fn latest_finished_trajectory_before(
+        &self,
+        session_id: &str,
+        before_unix: i64,
+    ) -> anyhow::Result<Option<crate::harness::trajectory::TrajectoryRecord>> {
+        let row = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM mcp_trajectories
+             WHERE session_id = ?1 AND finished_at IS NOT NULL AND finished_at <= ?2
+             ORDER BY finished_at DESC, id DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .bind(before_unix)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to query trajectory before timestamp")?;
+        let Some(trajectory_id) = row else {
+            return Ok(None);
+        };
+        self.get_trajectory(&trajectory_id).await
+    }
+
+    /// The user input that started a recorded run: the last user message in
+    /// the earliest captured provider request frame. Returns `None` when no
+    /// request frame was captured.
+    pub async fn trajectory_first_user_input(
+        &self,
+        trajectory_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let json = sqlx::query_scalar::<_, String>(
+            "SELECT request_messages_json FROM harness_trajectory_frames
+             WHERE trajectory_id = ?1 ORDER BY call_index ASC LIMIT 1",
+        )
+        .bind(trajectory_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load trajectory request frame")?;
+        let Some(json) = json else {
+            return Ok(None);
+        };
+        let messages: Vec<StoredMessage> =
+            serde_json::from_str(&json).context("failed to parse trajectory request messages")?;
+        Ok(messages
+            .iter()
+            .rev()
+            .find(|message| matches!(message.role, MessageRole::User))
+            .map(|message| message.content.clone()))
+    }
+
+    /// Inserts or replaces a fully-formed trajectory including its tool calls
+    /// and the computed scorecard. Repairs, imports, and deterministic tests
+    /// use this path; live runs go through `start_trajectory` /
+    /// `finish_trajectory`.
+    pub async fn record_finished_trajectory(
+        &self,
+        record: &crate::harness::trajectory::TrajectoryRecord,
+    ) -> anyhow::Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to begin finished-trajectory transaction")?;
+        sqlx::query(
+            "INSERT INTO mcp_trajectories
+             (id, session_id, channel, user_id, started_at, finished_at,
+              final_answer, exit_reason, model, total_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(id) DO UPDATE SET
+               session_id = excluded.session_id,
+               channel = excluded.channel,
+               user_id = excluded.user_id,
+               started_at = excluded.started_at,
+               finished_at = excluded.finished_at,
+               final_answer = excluded.final_answer,
+               exit_reason = excluded.exit_reason,
+               model = excluded.model,
+               total_tokens = excluded.total_tokens",
+        )
+        .bind(&record.id)
+        .bind(&record.session_id)
+        .bind(&record.channel)
+        .bind(&record.user_id)
+        .bind(record.started_at.timestamp())
+        .bind(record.finished_at.map(|finished| finished.timestamp()))
+        .bind(&record.final_answer)
+        .bind(record.exit_reason.as_str())
+        .bind(&record.model)
+        .bind(record.total_tokens.map(|value| value as i64))
+        .execute(&mut *tx)
+        .await
+        .context("failed to upsert finished trajectory")?;
+        sqlx::query("DELETE FROM mcp_trajectory_tool_calls WHERE trajectory_id = ?1")
+            .bind(&record.id)
+            .execute(&mut *tx)
+            .await
+            .context("failed to clear replaced trajectory tool calls")?;
+        for call in &record.tool_calls {
+            sqlx::query(
+                "INSERT INTO mcp_trajectory_tool_calls
+                 (trajectory_id, call_index, iteration, server, tool,
+                  arguments, result, ok, duration_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )
+            .bind(&record.id)
+            .bind(call.call_index as i64)
+            .bind(call.iteration as i64)
+            .bind(&call.server)
+            .bind(&call.tool)
+            .bind(serde_json::to_string(&call.arguments).unwrap_or_default())
+            .bind(serde_json::to_string(&call.result).unwrap_or_default())
+            .bind(call.ok)
+            .bind(call.duration_ms as i64)
+            .execute(&mut *tx)
+            .await
+            .context("failed to insert replaced trajectory tool call")?;
+        }
+        tx.commit()
+            .await
+            .context("failed to commit finished trajectory")?;
+        if let Some(finished) = record.finished_at {
+            self.upsert_run_scorecard(&crate::harness::trajectory::compute_run_scorecard(
+                record,
+                finished.timestamp(),
+            ))
+            .await?;
+        }
         Ok(())
     }
 
@@ -1799,6 +2550,21 @@ fn trajectory_tool_call_from_row(
     }
 }
 
+async fn maybe_add_swarm_runs_column(pool: &SqlitePool, column_def: &str) -> anyhow::Result<()> {
+    let sql = format!("ALTER TABLE agent_swarm_runs ADD COLUMN {column_def}");
+    match sqlx::query(&sql).execute(pool).await {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            let lower = err.to_string().to_ascii_lowercase();
+            if lower.contains("duplicate column name") {
+                Ok(())
+            } else {
+                Err(err).context("failed to alter agent_swarm_runs table")
+            }
+        }
+    }
+}
+
 async fn maybe_add_scheduler_jobs_column(
     pool: &SqlitePool,
     column_def: &str,
@@ -2029,6 +2795,29 @@ async fn initialize_evolution_schema(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await
     .context("failed to initialize evolution feedback score index")?;
+
+    // In-flight shadow-evaluation cursor: one run per candidate holds the
+    // frozen eval-suite snapshot, the frozen baseline policy, and the
+    // committed per-case outputs — a crash mid-evaluation resumes from the
+    // last committed case instead of restarting the whole suite.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS evolution_eval_runs (
+            id TEXT PRIMARY KEY,
+            candidate_id TEXT NOT NULL UNIQUE,
+            cases_json TEXT NOT NULL,
+            benchmark_tail INTEGER NOT NULL DEFAULT 0,
+            baseline_json TEXT NOT NULL,
+            case_index INTEGER NOT NULL DEFAULT 0,
+            baseline_outputs_json TEXT NOT NULL DEFAULT '{}',
+            candidate_outputs_json TEXT NOT NULL DEFAULT '{}',
+            response_bytes INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );",
+    )
+    .execute(pool)
+    .await
+    .context("failed to initialize evolution_eval_runs table")?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS evolution_audit_events (
@@ -2490,7 +3279,7 @@ impl AgentSwarmNodeExitStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSwarmRunRecord {
     pub run_id: String,
     pub channel: String,
@@ -2506,7 +3295,7 @@ pub struct AgentSwarmRunRecord {
     pub agent_count: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSwarmNodeRecord {
     pub agent_id: String,
     pub run_id: String,
@@ -2798,6 +3587,26 @@ pub trait MemoryBackend: Send + Sync {
     async fn list_agent_swarm_runs(
         &self,
         _req: AgentSwarmRunListRequest,
+    ) -> anyhow::Result<Vec<AgentSwarmRunRecord>> {
+        Ok(vec![])
+    }
+    async fn list_running_agent_swarm_runs(
+        &self,
+        _limit: usize,
+    ) -> anyhow::Result<Vec<AgentSwarmRunRecord>> {
+        Ok(vec![])
+    }
+    async fn set_swarm_run_awaiting_reply(
+        &self,
+        _channel: &str,
+        _run_id: &str,
+        _awaiting: bool,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn list_awaiting_reply_swarm_runs(
+        &self,
+        _limit: usize,
     ) -> anyhow::Result<Vec<AgentSwarmRunRecord>> {
         Ok(vec![])
     }
@@ -3128,6 +3937,31 @@ impl MemoryBackend for SqliteMemoryBackend {
         self.store
             .list_agent_swarm_runs(&req.channel, req.user_id.as_deref(), req.limit)
             .await
+    }
+
+    async fn list_running_agent_swarm_runs(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<AgentSwarmRunRecord>> {
+        self.store.list_running_agent_swarm_runs(limit).await
+    }
+
+    async fn set_swarm_run_awaiting_reply(
+        &self,
+        channel: &str,
+        run_id: &str,
+        awaiting: bool,
+    ) -> anyhow::Result<()> {
+        self.store
+            .set_swarm_run_awaiting_reply(channel, run_id, awaiting)
+            .await
+    }
+
+    async fn list_awaiting_reply_swarm_runs(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<AgentSwarmRunRecord>> {
+        self.store.list_awaiting_reply_swarm_runs(limit).await
     }
 
     async fn load_agent_swarm_tree(
@@ -3685,6 +4519,31 @@ impl MemoryBackend for HybridSqliteZvecMemoryBackend {
         self.store
             .list_agent_swarm_runs(&req.channel, req.user_id.as_deref(), req.limit)
             .await
+    }
+
+    async fn list_running_agent_swarm_runs(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<AgentSwarmRunRecord>> {
+        self.store.list_running_agent_swarm_runs(limit).await
+    }
+
+    async fn set_swarm_run_awaiting_reply(
+        &self,
+        channel: &str,
+        run_id: &str,
+        awaiting: bool,
+    ) -> anyhow::Result<()> {
+        self.store
+            .set_swarm_run_awaiting_reply(channel, run_id, awaiting)
+            .await
+    }
+
+    async fn list_awaiting_reply_swarm_runs(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<AgentSwarmRunRecord>> {
+        self.store.list_awaiting_reply_swarm_runs(limit).await
     }
 
     async fn load_agent_swarm_tree(
@@ -4246,11 +5105,116 @@ impl SidecarMemoryHit {
     }
 }
 
+/// Durable admission ledger at the Telegram channel boundary. `admit` is
+/// the idempotent gate; `finish`/`fail` close the record; `sweep` turns
+/// stale in-flight rows into operator-visible losses. Implemented by
+/// `SqliteMemoryStore`; the service keeps an optional handle so a missing
+/// store never blocks message processing.
+#[async_trait]
+pub trait TelegramAdmissionStore: Send + Sync {
+    async fn admit(
+        &self,
+        update_id: i64,
+        kind: &str,
+        summary_json: &str,
+        lease_secs: i64,
+    ) -> anyhow::Result<bool>;
+    async fn finish(&self, update_id: i64, detail: &str) -> anyhow::Result<()>;
+    async fn fail(&self, update_id: i64, error: &str) -> anyhow::Result<()>;
+    async fn sweep_stale(&self, older_than_secs: i64) -> anyhow::Result<Vec<i64>>;
+}
+
+/// Maximum number of processing attempts an admission may consume; past
+/// this, re-deliveries are treated as duplicates so a poison update cannot
+/// retry forever.
+pub const TELEGRAM_ADMISSION_MAX_ATTEMPTS: u32 = 3;
+
+/// What a bot message was sent from — session plus send timestamp, the
+/// exact lookup inputs for the run that produced it.
+#[derive(Debug, Clone)]
+pub struct TelegramOutboundRef {
+    pub session_id: String,
+    pub sent_at_unix: i64,
+}
+
+/// Durable outbound-message ledger so a user's reply-marker can be bound to
+/// the exact bot message it answered (and thereby the exact run).
+#[async_trait]
+pub trait TelegramOutboundStore: Send + Sync {
+    async fn record(&self, chat_id: i64, message_id: i64, session_id: &str) -> anyhow::Result<()>;
+    async fn session_for(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+    ) -> anyhow::Result<Option<TelegramOutboundRef>>;
+}
+
+#[async_trait]
+impl TelegramOutboundStore for SqliteMemoryStore {
+    async fn record(&self, chat_id: i64, message_id: i64, session_id: &str) -> anyhow::Result<()> {
+        self.record_telegram_outbound_message(chat_id, message_id, session_id)
+            .await
+    }
+
+    async fn session_for(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+    ) -> anyhow::Result<Option<TelegramOutboundRef>> {
+        self.telegram_outbound_ref(chat_id, message_id).await
+    }
+}
+
+#[async_trait]
+impl TelegramAdmissionStore for SqliteMemoryStore {
+    async fn admit(
+        &self,
+        update_id: i64,
+        kind: &str,
+        summary_json: &str,
+        lease_secs: i64,
+    ) -> anyhow::Result<bool> {
+        self.admit_telegram_update(update_id, kind, summary_json, lease_secs)
+            .await
+    }
+
+    async fn finish(&self, update_id: i64, detail: &str) -> anyhow::Result<()> {
+        self.finish_telegram_admission(update_id, detail).await
+    }
+
+    async fn fail(&self, update_id: i64, error: &str) -> anyhow::Result<()> {
+        self.fail_telegram_admission(update_id, error).await
+    }
+
+    async fn sweep_stale(&self, older_than_secs: i64) -> anyhow::Result<Vec<i64>> {
+        self.sweep_stale_telegram_admissions(older_than_secs).await
+    }
+}
+
 fn unix_ts() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+fn run_scorecard_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> anyhow::Result<crate::harness::trajectory::RunScorecard> {
+    Ok(crate::harness::trajectory::RunScorecard {
+        trajectory_id: row.try_get("trajectory_id")?,
+        score: row.try_get("score")?,
+        completion: row.try_get("completion")?,
+        answer_quality: row.try_get("answer_quality")?,
+        tool_health: row.try_get("tool_health")?,
+        speed: row.try_get("speed")?,
+        tool_calls: row.try_get("tool_calls")?,
+        failed_tool_calls: row.try_get("failed_tool_calls")?,
+        verification_failures: row.try_get("verification_failures")?,
+        iterations: row.try_get("iterations")?,
+        latency_ms: row.try_get("latency_ms")?,
+        computed_at_unix: row.try_get("computed_at")?,
+    })
 }
 
 fn unix_ts_nanos() -> u128 {

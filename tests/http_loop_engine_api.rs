@@ -310,6 +310,7 @@ async fn work_item_confirmation_resolve_over_http() {
             .prepare_checkpoint(
                 &claim,
                 &format!("{}:{}:v1", claim.work_item.id, claim.attempt.id),
+                false,
                 "worker:ext",
             )
             .await
@@ -366,4 +367,83 @@ async fn work_item_confirmation_resolve_over_http() {
     .json(&serde_json::json!({"resolution": "confirmed", "reason": "again"}))
     .await
     .assert_status(axum::http::StatusCode::CONFLICT);
+}
+
+/// `/v1/harness/swarm-runs` + `/nodes` — the `/agents` audit surface over
+/// operator-authenticated HTTP, so the console can render swarm runs.
+#[tokio::test]
+async fn swarm_runs_http_surface_is_operator_scoped() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let database_url = format!("sqlite://{}", temp.path().join("swarm-http.db").display());
+    let app = build_router(config(), &database_url, Some(Arc::new(HarnessHttpProvider)))
+        .await
+        .expect("router");
+    let server = TestServer::new(app).expect("server");
+
+    // No auth → rejected.
+    server
+        .get("/v1/harness/swarm-runs?channel=telegram")
+        .await
+        .assert_status_unauthorized();
+
+    // Operator key → empty list, well-formed.
+    let runs = operator(server.get("/v1/harness/swarm-runs?channel=telegram")).await;
+    runs.assert_status_ok();
+    let body: serde_json::Value = runs.json();
+    assert!(body["runs"].is_array());
+
+    // Nodes for a nonexistent run → empty nodes array, not an error.
+    let nodes =
+        operator(server.get("/v1/harness/swarm-runs/run-missing/nodes?channel=telegram")).await;
+    nodes.assert_status_ok();
+    let body: serde_json::Value = nodes.json();
+    assert_eq!(body["nodes"], serde_json::json!([]));
+}
+
+/// `/v1/harness/goals/{id}/checkpoints` — the effect-audit trail over the
+/// operator-authenticated surface.
+#[tokio::test]
+async fn goal_checkpoints_endpoint_is_operator_scoped() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let database_url = format!("sqlite://{}", temp.path().join("ckpt-http.db").display());
+    let app = build_router(config(), &database_url, Some(Arc::new(HarnessHttpProvider)))
+        .await
+        .expect("router");
+    let server = TestServer::new(app).expect("server");
+
+    let unauth = server.get("/v1/harness/goals/goal_x/checkpoints").await;
+    unauth.assert_status_unauthorized();
+
+    let res = operator(server.get("/v1/harness/goals/goal_x/checkpoints")).await;
+    let status = res.status_code();
+    if status != 200 {
+        eprintln!("status {status} body {}", res.text());
+    }
+    res.assert_status_ok();
+    let body: serde_json::Value = res.json();
+    assert_eq!(body["checkpoints"], serde_json::json!([]));
+}
+
+/// `/v1/harness/goals/{id}/attempts` — the claim/fencing audit trail.
+#[tokio::test]
+async fn goal_attempts_endpoint_is_operator_scoped() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let database_url = format!(
+        "sqlite://{}",
+        temp.path().join("attempts-http.db").display()
+    );
+    let app = build_router(config(), &database_url, Some(Arc::new(HarnessHttpProvider)))
+        .await
+        .expect("router");
+    let server = TestServer::new(app).expect("server");
+
+    server
+        .get("/v1/harness/goals/goal_x/attempts")
+        .await
+        .assert_status_unauthorized();
+
+    let res = operator(server.get("/v1/harness/goals/goal_x/attempts")).await;
+    res.assert_status_ok();
+    let body: serde_json::Value = res.json();
+    assert_eq!(body["attempts"], serde_json::json!([]));
 }

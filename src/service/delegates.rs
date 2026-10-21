@@ -255,6 +255,214 @@ impl MessageService {
         store.query_trajectories(filter).await
     }
 
+    pub async fn get_run_scorecard(
+        &self,
+        trajectory_id: &str,
+    ) -> anyhow::Result<Option<crate::harness::trajectory::RunScorecard>> {
+        let Some(store) = &self.harness_store else {
+            return Ok(None);
+        };
+        store.get_run_scorecard(trajectory_id).await
+    }
+
+    pub async fn query_run_scorecards(
+        &self,
+        filter: crate::harness::trajectory::RunScorecardFilter,
+    ) -> anyhow::Result<Vec<crate::harness::trajectory::RunScorecard>> {
+        let Some(store) = &self.harness_store else {
+            return Ok(Vec::new());
+        };
+        store.query_run_scorecards(filter).await
+    }
+
+    pub async fn run_scorecard_summary(
+        &self,
+        since_unix: i64,
+        until_unix: i64,
+    ) -> anyhow::Result<crate::harness::trajectory::ScorecardSummary> {
+        let Some(store) = &self.harness_store else {
+            return Ok(crate::harness::trajectory::ScorecardSummary {
+                window_start_unix: since_unix,
+                window_end_unix: until_unix,
+                run_count: 0,
+                mean_score: None,
+                low_count: 0,
+                mid_count: 0,
+                high_count: 0,
+                failed_tool_calls: 0,
+                verification_failures: 0,
+                exit_reasons: std::collections::BTreeMap::new(),
+            });
+        };
+        store.run_scorecard_summary(since_unix, until_unix).await
+    }
+
+    /// Max age of the run a lightweight reply-marker may attach to.
+    const REPLY_FEEDBACK_MAX_AGE_SECS: i64 = 2 * 3_600;
+
+    /// Records that bot message `message_id` in `chat_id` belongs to
+    /// `session_id` — the anchor for exact reply-marker binding.
+    pub async fn record_telegram_outbound_message(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        session_id: &str,
+    ) -> anyhow::Result<()> {
+        if let Some(store) = self.telegram_outbound_store.as_ref() {
+            store.record(chat_id, message_id, session_id).await?;
+        }
+        Ok(())
+    }
+
+    /// Binds a channel reply-marker to the run that produced the answered
+    /// message and records it as trajectory feedback the proposal engine
+    /// consumes. Exact path first: `reply_to_message_id` resolves the
+    /// recorded outbound message → its session + send time → the trajectory
+    /// finished right before it. Falls back to the most recent finished run
+    /// under `tg:{chat_id}` when no outbound record exists. Returns `false`
+    /// when the feature is unwired or no run binds — callers then treat the
+    /// marker as a normal message.
+    pub async fn record_evolution_reply_feedback(
+        &self,
+        chat_id: i64,
+        reply_to_message_id: Option<i64>,
+        channel: &str,
+        user_id: &str,
+        score: f64,
+        comment: Option<String>,
+    ) -> anyhow::Result<bool> {
+        let (Some(evolution_store), Some(harness_store)) =
+            (self.evolution_store.as_ref(), self.harness_store.as_ref())
+        else {
+            return Ok(false);
+        };
+        // Exact binding: the answered message is a recorded outbound of ours
+        // → the run that finished most recently before it was sent.
+        if let (Some(outbound_store), Some(reply_id)) =
+            (self.telegram_outbound_store.as_ref(), reply_to_message_id)
+            && let Some(outbound) = outbound_store.session_for(chat_id, reply_id).await?
+            && let Some(trajectory) = harness_store
+                .latest_finished_trajectory_before(&outbound.session_id, outbound.sent_at_unix)
+                .await?
+        {
+            return self
+                .record_bound_feedback(
+                    evolution_store.as_ref(),
+                    trajectory,
+                    channel,
+                    user_id,
+                    score,
+                    comment,
+                )
+                .await;
+        }
+        let min_finished_unix = chrono::Utc::now().timestamp() - Self::REPLY_FEEDBACK_MAX_AGE_SECS;
+        let Some(trajectory) = harness_store
+            .latest_finished_trajectory(&format!("tg:{chat_id}"), min_finished_unix)
+            .await?
+        else {
+            return Ok(false);
+        };
+        if trajectory.channel != channel {
+            return Ok(false);
+        }
+        self.record_bound_feedback(
+            evolution_store.as_ref(),
+            trajectory,
+            channel,
+            user_id,
+            score,
+            comment,
+        )
+        .await
+    }
+
+    async fn record_bound_feedback(
+        &self,
+        evolution_store: &dyn crate::harness::store::EvolutionStore,
+        trajectory: crate::harness::trajectory::TrajectoryRecord,
+        channel: &str,
+        user_id: &str,
+        score: f64,
+        comment: Option<String>,
+    ) -> anyhow::Result<bool> {
+        if trajectory.channel != channel {
+            return Ok(false);
+        }
+        evolution_store
+            .record_feedback(
+                crate::harness::evolution::EvolutionFeedbackDraft {
+                    trajectory_id: trajectory.id.clone(),
+                    score,
+                    tags: vec!["telegram-reply".to_string()],
+                    comment: comment.map(|text| {
+                        let mut chars = text.chars();
+                        let mut clipped: String = chars.by_ref().take(200).collect();
+                        if chars.next().is_some() {
+                            clipped.push('…');
+                        }
+                        clipped
+                    }),
+                },
+                &format!("telegram:{user_id}"),
+            )
+            .await?;
+        info!(
+            trajectory_id = %trajectory.id,
+            score,
+            "recorded user reply-marker as trajectory feedback"
+        );
+        Ok(true)
+    }
+
+    /// Durable Telegram update admission: `true` when the caller owns this
+    /// `update_id` (fresh insert, or a lease-expired in-flight row reclaimed
+    /// under a bounded new attempt). `false` marks a duplicate delivery that
+    /// must not be processed again. When no admission store is wired the
+    /// gate is fail-open — updates always process.
+    pub async fn admit_telegram_update(
+        &self,
+        update_id: i64,
+        kind: &str,
+        summary_json: &str,
+        lease_secs: i64,
+    ) -> anyhow::Result<bool> {
+        match self.telegram_admission_store.as_ref() {
+            Some(store) => store.admit(update_id, kind, summary_json, lease_secs).await,
+            None => Ok(true),
+        }
+    }
+
+    pub async fn finish_telegram_admission(
+        &self,
+        update_id: i64,
+        detail: &str,
+    ) -> anyhow::Result<()> {
+        if let Some(store) = self.telegram_admission_store.as_ref() {
+            store.finish(update_id, detail).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn fail_telegram_admission(&self, update_id: i64, error: &str) -> anyhow::Result<()> {
+        if let Some(store) = self.telegram_admission_store.as_ref() {
+            store.fail(update_id, error).await?;
+        }
+        Ok(())
+    }
+
+    /// Marks long-dead in-flight admissions as failed and returns their ids
+    /// so the channel can surface the loss.
+    pub async fn sweep_stale_telegram_admissions(
+        &self,
+        older_than_secs: i64,
+    ) -> anyhow::Result<Vec<i64>> {
+        match self.telegram_admission_store.as_ref() {
+            Some(store) => store.sweep_stale(older_than_secs).await,
+            None => Ok(Vec::new()),
+        }
+    }
+
     pub async fn detect_telegram_scheduler_intent(
         &self,
         text: &str,

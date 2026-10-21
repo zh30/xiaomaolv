@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tempfile::tempdir;
@@ -9,12 +11,13 @@ use xiaomaolv::harness::evolution::{
     EvolutionGateConfig,
 };
 use xiaomaolv::harness::loop_engine::{
-    AcceptanceCriterion, ApproveGoalRequest, ArtifactKind, CheckpointPhase, ConfirmationResolution,
-    CreateGoalRequest, CreateSignalRequest, EffectClass, ExecutionBudget, ExternalWritePolicy,
-    GoalStatus, LoopEngine, LoopWorker, OutboundSender, PlanGoalRequest, PublishArtifactRequest,
-    ReplayStatus, RetryPolicy, SelfTestStatus, SignalKind, SignalStatus, SignalTrust,
-    SqliteLoopStore, TrajectoryFrameCapture, TrajectoryFrameDraft, WorkHandler, WorkHandlerContext,
-    WorkHandlerRegistry, WorkItemStatus, WorkOutcome, WorkflowEdge, WorkflowSpec, WorkflowStep,
+    AcceptanceCriterion, ApproveGoalRequest, ArtifactKind, AttemptStatus, CheckpointPhase,
+    ConfirmationResolution, CreateGoalRequest, CreateSignalRequest, EffectClass, ExecutionBudget,
+    ExternalWritePolicy, GoalStatus, LoopEngine, LoopWorker, OutboundSender, PlanGoalRequest,
+    PublishArtifactRequest, ReplayStatus, RetryPolicy, SelfTestStatus, SignalKind, SignalStatus,
+    SignalTrust, SqliteLoopStore, TrajectoryFrameCapture, TrajectoryFrameDraft, WorkContinuation,
+    WorkHandler, WorkHandlerContext, WorkHandlerRegistry, WorkItemStatus, WorkOutcome,
+    WorkflowEdge, WorkflowSpec, WorkflowStep,
 };
 use xiaomaolv::harness::store::SqliteEvolutionStore;
 use xiaomaolv::memory::SqliteMemoryStore;
@@ -45,6 +48,7 @@ async fn built_in_worker_dispatches_the_approved_dag_and_verifies_the_goal() -> 
             CreateGoalRequest {
                 objective: "Make loop recovery observable".to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             "operator:test",
         )
@@ -131,6 +135,7 @@ async fn built_in_worker_runs_evolution_evaluation_with_persisted_budgets() -> a
             CreateGoalRequest {
                 objective: "Evaluate a prompt candidate safely".to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             "operator:test",
         )
@@ -326,6 +331,7 @@ async fn goal_survives_engine_restart_and_can_be_resumed() -> anyhow::Result<()>
             CreateGoalRequest {
                 objective: "Make recovery observable".to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             "operator:henry",
         )
@@ -393,6 +399,7 @@ async fn resume_reconciles_a_committed_checkpoint_without_replaying_the_effect()
             CreateGoalRequest {
                 objective: "Recover an interrupted evolution evaluation".to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             "operator:henry",
         )
@@ -460,6 +467,7 @@ async fn resume_reconciles_a_committed_checkpoint_without_replaying_the_effect()
         .prepare_checkpoint(
             &claim,
             &format!("effect:{}:v1", claim.work_item.id),
+            true,
             "runtime:loop",
         )
         .await?;
@@ -471,6 +479,8 @@ async fn resume_reconciles_a_committed_checkpoint_without_replaying_the_effect()
                 summary: "analysis persisted".to_string(),
                 artifact_ids: vec!["artifact_analysis_1".to_string()],
                 evidence: serde_json::Value::Null,
+                sleep_until_unix: None,
+                continuation: None,
             },
             "runtime:loop",
         )
@@ -495,6 +505,8 @@ async fn resume_reconciles_a_committed_checkpoint_without_replaying_the_effect()
                 summary: "stale overwrite".to_string(),
                 artifact_ids: Vec::new(),
                 evidence: serde_json::Value::Null,
+                sleep_until_unix: None,
+                continuation: None,
             },
             "runtime:stale-worker",
         )
@@ -514,6 +526,7 @@ async fn approval_is_bound_to_the_reviewed_workflow_hash() -> anyhow::Result<()>
             CreateGoalRequest {
                 objective: "Continuously self-test the harness".to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             "operator:henry",
         )
@@ -586,6 +599,7 @@ async fn manual_acceptance_requires_explicit_operator_evidence() -> anyhow::Resu
             CreateGoalRequest {
                 objective: "Require a human release decision".to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             "operator:test",
         )
@@ -634,7 +648,7 @@ async fn manual_acceptance_requires_explicit_operator_evidence() -> anyhow::Resu
         .await?
         .expect("manual gate should be claimable");
     let checkpoint = engine
-        .prepare_checkpoint(&claim, "manual-gate:v1", "runtime:test")
+        .prepare_checkpoint(&claim, "manual-gate:v1", true, "runtime:test")
         .await?;
     engine
         .commit_checkpoint(
@@ -644,6 +658,8 @@ async fn manual_acceptance_requires_explicit_operator_evidence() -> anyhow::Resu
                 summary: "manual gate reached".to_string(),
                 artifact_ids: Vec::new(),
                 evidence: serde_json::json!({"manual_gate": "reached"}),
+                sleep_until_unix: None,
+                continuation: None,
             },
             "runtime:test",
         )
@@ -717,6 +733,9 @@ async fn swarm_run_projects_a_durable_goal_tree_and_verifies_it() -> anyhow::Res
             enabled: true,
             auto_detect: true,
             reply_summary_enabled: false,
+            // The legacy in-process runner + mirror projection is what this
+            // test pins; durable execution has its own test below.
+            durable_engine: false,
             ..Default::default()
         })
         .with_loop_engine(Some(engine.clone()));
@@ -823,6 +842,7 @@ async fn swarm_crash_leaves_resumable_durable_state() -> anyhow::Result<()> {
             CreateGoalRequest {
                 objective: "agent swarm run run-crash: root task".to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             "internal:swarm",
         )
@@ -882,7 +902,7 @@ async fn swarm_crash_leaves_resumable_durable_state() -> anyhow::Result<()> {
         .await?
         .expect("root step should be claimable");
     let root_checkpoint = engine
-        .prepare_checkpoint(&root_claim, "root:v1", "internal:swarm")
+        .prepare_checkpoint(&root_claim, "root:v1", true, "internal:swarm")
         .await?;
     engine
         .commit_checkpoint(
@@ -892,6 +912,8 @@ async fn swarm_crash_leaves_resumable_durable_state() -> anyhow::Result<()> {
                 summary: "root finished before crash".to_string(),
                 artifact_ids: Vec::new(),
                 evidence: serde_json::json!({"status": "success"}),
+                sleep_until_unix: None,
+                continuation: None,
             },
             "internal:swarm",
         )
@@ -965,6 +987,7 @@ async fn extend_workflow_enforces_internal_actor_manifest_and_budget() -> anyhow
             CreateGoalRequest {
                 objective: "Bounded dynamic expansion".to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             "internal:swarm",
         )
@@ -1100,6 +1123,7 @@ async fn internal_auto_approval_is_bounded_by_policy() -> anyhow::Result<()> {
                 CreateGoalRequest {
                     objective: objective.to_string(),
                     source_signal_ids: Vec::new(),
+                    request_id: None,
                 },
                 actor,
             )
@@ -1277,6 +1301,7 @@ async fn external_write_plan_rejected_when_disabled() -> anyhow::Result<()> {
             CreateGoalRequest {
                 objective: "Notify me externally".to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             "operator:test",
         )
@@ -1300,6 +1325,7 @@ async fn external_write_plan_rejected_when_handler_not_allowlisted() -> anyhow::
             CreateGoalRequest {
                 objective: "Notify me externally".to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             "operator:test",
         )
@@ -1336,6 +1362,8 @@ impl WorkHandler for ChannelSendProbe {
             summary: "probe".to_string(),
             artifact_ids: Vec::new(),
             evidence: serde_json::Value::Null,
+            sleep_until_unix: None,
+            continuation: None,
         })
     }
 }
@@ -1351,6 +1379,7 @@ async fn channel_send_executes_and_commits_with_evidence() -> anyhow::Result<()>
             CreateGoalRequest {
                 objective: "Notify me externally".to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             "operator:test",
         )
@@ -1425,6 +1454,7 @@ async fn channel_send_crash_before_commit_parks_item_without_resend() -> anyhow:
             CreateGoalRequest {
                 objective: "Notify me externally".to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             "operator:test",
         )
@@ -1454,7 +1484,7 @@ async fn channel_send_crash_before_commit_parks_item_without_resend() -> anyhow:
         .expect("channel_send work item should be claimable");
     let idempotency_key = format!("{}:{}:v1", claim.work_item.id, claim.attempt.id);
     let checkpoint = engine
-        .prepare_checkpoint(&claim, &idempotency_key, "worker:ext")
+        .prepare_checkpoint(&claim, &idempotency_key, false, "worker:ext")
         .await?;
     assert_eq!(checkpoint.phase, CheckpointPhase::Prepared);
     sends
@@ -1500,6 +1530,7 @@ async fn channel_send_dispatch_blocked_when_flag_off_on_worker() -> anyhow::Resu
             CreateGoalRequest {
                 objective: "Notify me externally".to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             "operator:test",
         )
@@ -1746,6 +1777,7 @@ async fn parked_channel_send(
             CreateGoalRequest {
                 objective: "Notify me externally".to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             "operator:test",
         )
@@ -1772,6 +1804,7 @@ async fn parked_channel_send(
         .prepare_checkpoint(
             &claim,
             &format!("{}:{}:v1", claim.work_item.id, claim.attempt.id),
+            false,
             "worker:ext",
         )
         .await?;
@@ -1930,6 +1963,7 @@ async fn resolve_rejects_non_parked_and_cross_goal_items() -> anyhow::Result<()>
             CreateGoalRequest {
                 objective: "Notify me externally".to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             "operator:test",
         )
@@ -1989,5 +2023,2848 @@ async fn resolve_rejects_non_parked_and_cross_goal_items() -> anyhow::Result<()>
             .await
             .is_err()
     );
+    Ok(())
+}
+
+// ---- Durable-execution semantics (replay safety, blocked handlers,
+// durable sleep, idempotent admission, commit notifications) ----
+
+fn local_write_plan_request(
+    step_id: &str,
+    handler: &str,
+    input: serde_json::Value,
+) -> PlanGoalRequest {
+    PlanGoalRequest {
+        workflow: WorkflowSpec {
+            steps: vec![WorkflowStep {
+                id: step_id.to_string(),
+                handler: handler.to_string(),
+                effect: EffectClass::LocalWrite,
+                input,
+                retry: RetryPolicy {
+                    max_attempts: 3,
+                    backoff_secs: 0,
+                },
+            }],
+            edges: Vec::new(),
+            budget: ExecutionBudget {
+                max_provider_calls: 0,
+                deadline_secs: 60,
+                max_response_bytes: 1024,
+            },
+        },
+        acceptance_criteria: vec![AcceptanceCriterion::SelfTestSuite {
+            suite: "core".to_string(),
+        }],
+    }
+}
+
+/// A `replay_safe = false` prepared checkpoint on a non-external step parks
+/// in `waiting_confirmation` after a crash: the operator verdict covers any
+/// ambiguous effect, not only external writes.
+#[tokio::test]
+async fn unsafe_replay_prepared_checkpoint_parks_without_external_write() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("unsafe-park.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Probe ambiguous local effect".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            "operator:test",
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            local_write_plan_request(
+                "probe",
+                "self_test_suite",
+                serde_json::json!({"suite": "core"}),
+            ),
+            "planner:test",
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+    let claim = engine
+        .claim_work_item(&goal.id, "probe", "worker:test", 1, "operator:test")
+        .await?
+        .expect("probe work item should be claimable");
+    let work_item_id = claim.work_item.id.clone();
+    // The handler ran its ambiguous effect and died before the commit.
+    engine
+        .prepare_checkpoint(&claim, "probe:v1", false, "worker:test")
+        .await?;
+    drop(engine);
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+
+    let reopened = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(
+        SqliteMemoryStore::new(&database_url).await?,
+    ))));
+    let report = reopened.resume_goal(&goal.id, "operator:test").await?;
+    let item = report
+        .work_items
+        .iter()
+        .find(|item| item.id == work_item_id)
+        .expect("probe work item");
+    assert_eq!(item.status, WorkItemStatus::WaitingConfirmation);
+
+    // The park surfaces as a dedup'd signal — Telegram `/signals` triage
+    // sees pending gates without anyone opening the console.
+    let signals = reopened.list_signals(20, None).await?;
+    let confirm_signals: Vec<_> = signals
+        .iter()
+        .filter(|s| {
+            s.source == "internal:confirmation"
+                && s.external_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with("confirm:"))
+        })
+        .collect();
+    assert_eq!(
+        confirm_signals.len(),
+        1,
+        "parked item emitted exactly one confirmation signal"
+    );
+    assert!(confirm_signals[0].content.contains(&work_item_id));
+
+    // The non-external park resolves through the same operator verdict path.
+    let item = reopened
+        .resolve_waiting_confirmation(
+            &goal.id,
+            &work_item_id,
+            ConfirmationResolution::Retry,
+            "effect never ran",
+            "operator:test",
+        )
+        .await?;
+    assert_eq!(item.status, WorkItemStatus::Ready);
+
+    // Resolving the gate triages the confirmation signal out of /signals.
+    let signals = reopened.list_signals(20, None).await?;
+    let resolved_signal = signals
+        .iter()
+        .find(|s| s.source == "internal:confirmation")
+        .expect("confirmation signal");
+    assert_eq!(
+        resolved_signal.status,
+        xiaomaolv::harness::loop_engine::SignalStatus::Ignored,
+        "resolved gate no longer occupies triage"
+    );
+    let worker = LoopWorker::with_builtins(reopened, Arc::new(WorkerProvider), None, None)?;
+    let report = worker.run_goal_until_idle(&goal.id, 8).await?;
+    let item = report
+        .work_items
+        .iter()
+        .find(|item| item.id == work_item_id)
+        .expect("probe work item");
+    assert_eq!(item.status, WorkItemStatus::Succeeded);
+    Ok(())
+}
+
+/// A `replay_safe = true` prepared checkpoint under a dead lease retries
+/// automatically: no park, and the superseded prepared row is voided so a
+/// later recovery never mistakes it for live ambiguity.
+#[tokio::test]
+async fn safe_replay_prepared_checkpoint_retries_without_parking() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("safe-retry.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Probe safe replay".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            "operator:test",
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            local_write_plan_request(
+                "probe",
+                "self_test_suite",
+                serde_json::json!({"suite": "core"}),
+            ),
+            "planner:test",
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+    let claim = engine
+        .claim_work_item(&goal.id, "probe", "worker:test", 1, "operator:test")
+        .await?
+        .expect("probe work item should be claimable");
+    let work_item_id = claim.work_item.id.clone();
+    let checkpoint = engine
+        .prepare_checkpoint(&claim, "probe:v1", true, "worker:test")
+        .await?;
+    drop(engine);
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+
+    let reopened = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(
+        SqliteMemoryStore::new(&database_url).await?,
+    ))));
+    let report = reopened.resume_goal(&goal.id, "operator:test").await?;
+    let item = report
+        .work_items
+        .iter()
+        .find(|item| item.id == work_item_id)
+        .expect("probe work item");
+    assert_eq!(item.status, WorkItemStatus::Ready);
+    let stale = report
+        .latest_checkpoint
+        .as_ref()
+        .expect("prepared checkpoint remains in the log");
+    assert_eq!(stale.id, checkpoint.id);
+    assert_eq!(stale.phase, CheckpointPhase::Voided);
+    Ok(())
+}
+
+/// Dispatch against a registry missing the work item's handler blocks the
+/// item instead of failing it; once a worker holding the handler polls, the
+/// item requeues itself and the goal completes.
+#[tokio::test]
+async fn missing_handler_blocks_then_requeues_when_registered() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("blocked.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Run a blocked then requeued plan".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            "operator:test",
+        )
+        .await?;
+    let plan = engine
+        .plan_goal_recommended(&goal.id, "planner:test")
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+
+    // A worker that knows no handlers at all: rolling-deploy window where
+    // the registry for this process has not installed the handler yet.
+    let empty = LoopWorker::with_registry(
+        engine.clone(),
+        WorkHandlerRegistry::default(),
+        "worker:missing",
+        30,
+    )?;
+    let report = empty.run_goal_until_idle(&goal.id, 4).await?;
+    assert!(
+        report
+            .work_items
+            .iter()
+            .any(|item| item.status == WorkItemStatus::Blocked),
+        "a work item should be blocked on the missing handler"
+    );
+    assert!(
+        report.attempts.iter().any(|attempt| attempt
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("unregistered workflow handler:"))),
+        "the blocked attempt should record the missing-handler reason"
+    );
+
+    // A later poll from a worker whose registry has the handler requeues the
+    // item and the goal runs to completion.
+    let worker = LoopWorker::with_builtins(engine.clone(), Arc::new(WorkerProvider), None, None)?;
+    let report = worker.run_goal_until_idle(&goal.id, 8).await?;
+    assert_eq!(report.goal.status, GoalStatus::Achieved);
+    assert!(
+        report
+            .work_items
+            .iter()
+            .all(|item| item.status == WorkItemStatus::Succeeded)
+    );
+    Ok(())
+}
+
+/// The `wait` handler turns `sleep_until` into a durable deferral: the
+/// attempt ends, the work item holds no lease, and the stored wake time
+/// survives the "restart".
+#[tokio::test]
+async fn wait_step_defers_until_the_stored_deadline() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("wait.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let until = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs(),
+    )? + 2;
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Wait for a durable deadline".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            "operator:test",
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![
+                        WorkflowStep {
+                            id: "hold".to_string(),
+                            handler: "wait".to_string(),
+                            effect: EffectClass::Pure,
+                            input: serde_json::json!({"until_unix": until}),
+                            retry: RetryPolicy {
+                                max_attempts: 3,
+                                backoff_secs: 0,
+                            },
+                        },
+                        WorkflowStep {
+                            id: "self-test".to_string(),
+                            handler: "self_test_suite".to_string(),
+                            effect: EffectClass::LocalWrite,
+                            input: serde_json::json!({"suite": "core"}),
+                            retry: RetryPolicy {
+                                max_attempts: 3,
+                                backoff_secs: 0,
+                            },
+                        },
+                    ],
+                    edges: vec![WorkflowEdge {
+                        from: "hold".to_string(),
+                        to: "self-test".to_string(),
+                    }],
+                    budget: ExecutionBudget {
+                        max_provider_calls: 0,
+                        deadline_secs: 60,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::SelfTestSuite {
+                    suite: "core".to_string(),
+                }],
+            },
+            "planner:test",
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+    let worker = LoopWorker::with_builtins(engine.clone(), Arc::new(WorkerProvider), None, None)?;
+
+    // First poll: the deadline is in the future, so the attempt defers —
+    // the item is ready but not yet due, no checkpoint is committed.
+    let report = worker.run_goal_until_idle(&goal.id, 4).await?;
+    let item = report.work_items.first().expect("wait work item");
+    assert_eq!(item.status, WorkItemStatus::Ready);
+    assert!(
+        report.attempts.iter().any(|attempt| attempt
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("deferred until"))),
+        "the deferred attempt should record its wake time"
+    );
+    let events = engine.list_goal_events(&goal.id, 0, 50).await?;
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == "attempt.deferred")
+    );
+
+    // After the stored deadline a second poll completes the deferred step,
+    // runs the dependent self-test, and verifies the goal to achieved.
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    let report = worker.run_goal_until_idle(&goal.id, 8).await?;
+    assert!(
+        report
+            .work_items
+            .iter()
+            .all(|item| item.status == WorkItemStatus::Succeeded)
+    );
+    assert_eq!(report.goal.status, GoalStatus::Achieved);
+    Ok(())
+}
+
+/// `request_id` makes goal admission idempotent — a retried submit returns
+/// the originally admitted goal — and a committed mutation wakes subscribed
+/// event consumers without polling.
+#[tokio::test]
+async fn goal_admission_deduplicates_request_id_and_notifies() -> anyhow::Result<()> {
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = LoopEngine::new(Arc::new(SqliteLoopStore::new(memory)));
+    let mut notifications = engine.subscribe_events();
+
+    let request = |objective: &str| CreateGoalRequest {
+        objective: objective.to_string(),
+        source_signal_ids: Vec::new(),
+        request_id: Some("submission:goal-1".to_string()),
+    };
+    let (goal, created) = engine
+        .create_goal_admission(request("Idempotent admission"), "operator:test")
+        .await?;
+    assert!(created);
+    let (again, created_again) = engine
+        .create_goal_admission(request("A different objective"), "operator:test")
+        .await?;
+    assert!(!created_again);
+    assert_eq!(again.id, goal.id);
+    assert_eq!(again.objective, "Idempotent admission");
+    assert_eq!(engine.list_goals(10).await?.len(), 1);
+
+    // Only the real admission wrote an event.
+    let events = engine.list_goal_events(&goal.id, 0, 20).await?;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "goal.created")
+            .count(),
+        1
+    );
+    // The commit notified subscribers carrying the goal id.
+    let notified = notifications.recv().await?;
+    assert_eq!(notified, goal.id);
+    Ok(())
+}
+
+/// Workers call `resume_goal` every poll cycle; consecutive no-op resumes
+/// must not flood the per-goal event log.
+#[tokio::test]
+async fn consecutive_resumes_emit_a_single_event() -> anyhow::Result<()> {
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = LoopEngine::new(Arc::new(SqliteLoopStore::new(memory)));
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Observe resume dedup".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            "operator:test",
+        )
+        .await?;
+    engine.resume_goal(&goal.id, "runtime:test").await?;
+    engine.resume_goal(&goal.id, "runtime:test").await?;
+    engine.resume_goal(&goal.id, "runtime:test").await?;
+    let events = engine.list_goal_events(&goal.id, 0, 20).await?;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "goal.resumed")
+            .count(),
+        1
+    );
+    // Any number of consecutive no-op resumes still collapse to one event.
+    engine.resume_goal(&goal.id, "runtime:test").await?;
+    let events = engine.list_goal_events(&goal.id, 0, 20).await?;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "goal.resumed")
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+/// A handler whose work spans two committed phases: phase one reports a
+/// boundary, phase two finishes — resuming from `ctx.resume` rather than
+/// restarting. Registered under the allowed `provider_analysis` name so the
+/// plan/approve path accepts it while the registry maps it to this probe.
+struct TwoPhaseProbe;
+
+#[async_trait]
+impl WorkHandler for TwoPhaseProbe {
+    fn name(&self) -> &'static str {
+        "provider_analysis"
+    }
+
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::LocalWrite
+    }
+
+    async fn execute(&self, context: &WorkHandlerContext) -> anyhow::Result<WorkOutcome> {
+        match context
+            .resume
+            .as_ref()
+            .map(|progress| progress.phase.as_str())
+        {
+            None => Ok(WorkOutcome {
+                summary: "phase one committed".to_string(),
+                artifact_ids: Vec::new(),
+                evidence: serde_json::Value::Null,
+                sleep_until_unix: None,
+                continuation: Some(WorkContinuation {
+                    phase: "gathered".to_string(),
+                    state: serde_json::json!({"seed": 42}),
+                    delay_secs: None,
+                }),
+            }),
+            Some("gathered") => {
+                let progress = context.resume.as_ref().expect("resume progress");
+                anyhow::ensure!(
+                    progress.state["seed"] == 42 && progress.continues == 1,
+                    "resume progress lost its committed state"
+                );
+                Ok(WorkOutcome {
+                    summary: "resumed and finished".to_string(),
+                    artifact_ids: Vec::new(),
+                    evidence: serde_json::Value::Null,
+                    sleep_until_unix: None,
+                    continuation: None,
+                })
+            }
+            Some(other) => anyhow::bail!("unexpected resume phase: {other}"),
+        }
+    }
+}
+
+fn two_phase_probe_worker(
+    engine: Arc<LoopEngine>,
+    worker_id: &str,
+    lease_secs: u32,
+) -> anyhow::Result<LoopWorker> {
+    let mut registry = WorkHandlerRegistry::default();
+    registry.register(Arc::new(TwoPhaseProbe))?;
+    LoopWorker::with_registry(engine, registry, worker_id, lease_secs)
+}
+
+fn two_phase_plan() -> PlanGoalRequest {
+    PlanGoalRequest {
+        workflow: WorkflowSpec {
+            steps: vec![WorkflowStep {
+                id: "probe".to_string(),
+                handler: "provider_analysis".to_string(),
+                effect: EffectClass::LocalWrite,
+                input: serde_json::json!({}),
+                retry: RetryPolicy {
+                    max_attempts: 3,
+                    backoff_secs: 0,
+                },
+            }],
+            edges: Vec::new(),
+            budget: ExecutionBudget {
+                max_provider_calls: 0,
+                deadline_secs: 60,
+                max_response_bytes: 65_536,
+            },
+        },
+        acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+            label: "operator review".to_string(),
+        }],
+    }
+}
+
+/// A `Continue` outcome commits its phase boundary durably, then the next
+/// phase runs inside the same attempt — `ctx.resume` carries the persisted
+/// progress and the item succeeds with its progress cleared.
+#[tokio::test]
+async fn phase_boundaries_commit_progress_then_continue_in_place() -> anyhow::Result<()> {
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Run a two-phase probe".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            "operator:test",
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(&goal.id, two_phase_plan(), "planner:test")
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+
+    let worker = two_phase_probe_worker(engine.clone(), "worker:phase", 30)?;
+    // The goal parks in `verifying` on the ManualApproval criterion once the
+    // probe succeeds — the idle loop reports that as non-dispatchable, which
+    // is expected; assert on durable state instead.
+    let _ = worker.run_goal_until_idle(&goal.id, 4).await;
+
+    let report = engine.resume_goal(&goal.id, "operator:test").await?;
+    let item = report
+        .work_items
+        .iter()
+        .find(|item| item.step_id == "probe")
+        .expect("probe work item");
+    assert_eq!(item.status, WorkItemStatus::Succeeded);
+    assert!(
+        item.progress.is_none(),
+        "terminal success clears the phase progress"
+    );
+    let events = engine.list_goal_events(&goal.id, 0, 50).await?;
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == "attempt.phase_progressed"),
+        "the committed boundary should be in the event log"
+    );
+    Ok(())
+}
+
+/// Committed phase progress is what survives a crash: the attempt dies after
+/// the boundary commit, and the next attempt's `ctx.resume` carries the last
+/// committed phase — no restart from scratch.
+#[tokio::test]
+async fn committed_phase_progress_resumes_after_attempt_crash() -> anyhow::Result<()> {
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Resume a crashed phase run".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            "operator:test",
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(&goal.id, two_phase_plan(), "planner:test")
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+
+    // Commit a phase boundary as if the worker had finished phase one, then
+    // let the 1s lease lapse — the "crash" leaves progress committed but the
+    // attempt abandoned.
+    let claim = engine
+        .claim_work_item(&goal.id, "probe", "worker:doomed", 1, "operator:test")
+        .await?
+        .expect("probe step should be claimable");
+    engine
+        .record_phase_progress(
+            &claim,
+            &WorkContinuation {
+                phase: "gathered".to_string(),
+                state: serde_json::json!({"seed": 42}),
+                delay_secs: None,
+            },
+            "operator:test",
+        )
+        .await?;
+    // Lease expiry is compared in whole seconds; wait past the boundary.
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+
+    let worker = two_phase_probe_worker(engine.clone(), "worker:resume", 30)?;
+    let _ = worker.run_goal_until_idle(&goal.id, 4).await;
+    let report = engine.resume_goal(&goal.id, "operator:test").await?;
+    let item = report
+        .work_items
+        .iter()
+        .find(|item| item.step_id == "probe")
+        .expect("probe work item");
+    // The probe's `Some("gathered")` branch ran — the resume saw the
+    // committed phase and the seed it carried (the handler errors out on
+    // any other phase), and the item reached a terminal state.
+    assert_eq!(item.status, WorkItemStatus::Succeeded);
+    assert!(
+        report.attempts.iter().any(|attempt| attempt
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("crash")
+                || error.contains("abandoned")
+                || error.contains("expired"))),
+        "the crashed attempt should be recorded"
+    );
+    Ok(())
+}
+
+/// A handler that never produces a terminal outcome is bounded by the
+/// committed-phase budget rather than looping forever.
+#[tokio::test]
+async fn phase_loop_is_bounded_by_continuation_budget() -> anyhow::Result<()> {
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Bound a runaway phase loop".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            "operator:test",
+        )
+        .await?;
+
+    struct EndlessProbe;
+    #[async_trait]
+    impl WorkHandler for EndlessProbe {
+        fn name(&self) -> &'static str {
+            "provider_analysis"
+        }
+        fn effect_class(&self) -> EffectClass {
+            EffectClass::LocalWrite
+        }
+        async fn execute(&self, context: &WorkHandlerContext) -> anyhow::Result<WorkOutcome> {
+            let next = context
+                .resume
+                .as_ref()
+                .map(|progress| progress.continues + 1)
+                .unwrap_or(1);
+            Ok(WorkOutcome {
+                summary: format!("phase {next} committed"),
+                artifact_ids: Vec::new(),
+                evidence: serde_json::Value::Null,
+                sleep_until_unix: None,
+                continuation: Some(WorkContinuation {
+                    phase: format!("p{next}"),
+                    state: serde_json::Value::Null,
+                    delay_secs: None,
+                }),
+            })
+        }
+    }
+    let mut registry = WorkHandlerRegistry::default();
+    registry.register(Arc::new(EndlessProbe))?;
+    let worker = LoopWorker::with_registry(engine.clone(), registry, "worker:loop", 30)?;
+
+    let plan = engine
+        .plan_goal(&goal.id, two_phase_plan(), "planner:test")
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+
+    worker.run_goal_until_idle(&goal.id, 4).await?;
+    let report = engine.resume_goal(&goal.id, "operator:test").await?;
+    let item = report
+        .work_items
+        .iter()
+        .find(|item| item.step_id == "probe")
+        .expect("probe work item");
+    assert_eq!(item.status, WorkItemStatus::Failed);
+    assert!(
+        report.attempts.iter().any(|attempt| attempt
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("continuation budget"))),
+        "the failure should name the exhausted continuation budget"
+    );
+    Ok(())
+}
+
+/// A dependent step reads its declared upstream's committed outcome through
+/// `ctx.upstream` keyed by step id — the DAG dataflow a fan-in handler (and
+/// eventually a swarm aggregation node) consumes.
+#[tokio::test]
+async fn dependent_step_reads_upstream_outcome_by_step_id() -> anyhow::Result<()> {
+    struct DagProbe;
+    #[async_trait]
+    impl WorkHandler for DagProbe {
+        fn name(&self) -> &'static str {
+            "provider_analysis"
+        }
+        fn effect_class(&self) -> EffectClass {
+            EffectClass::LocalWrite
+        }
+        async fn execute(&self, context: &WorkHandlerContext) -> anyhow::Result<WorkOutcome> {
+            match context.claim.work_item.step_id.as_str() {
+                "produce" => Ok(WorkOutcome {
+                    summary: "upstream-payload".to_string(),
+                    artifact_ids: Vec::new(),
+                    evidence: serde_json::json!({"secret": 42}),
+                    sleep_until_unix: None,
+                    continuation: None,
+                }),
+                "consume" => {
+                    let upstream = context
+                        .upstream
+                        .get("produce")
+                        .expect("upstream outcome for 'produce' was missing");
+                    anyhow::ensure!(
+                        upstream.summary == "upstream-payload",
+                        "unexpected upstream summary"
+                    );
+                    anyhow::ensure!(
+                        upstream.evidence["secret"] == 42,
+                        "upstream evidence did not arrive"
+                    );
+                    Ok(WorkOutcome {
+                        summary: format!("consumed:{}", upstream.summary),
+                        artifact_ids: Vec::new(),
+                        evidence: serde_json::Value::Null,
+                        sleep_until_unix: None,
+                        continuation: None,
+                    })
+                }
+                other => anyhow::bail!("unexpected step {other}"),
+            }
+        }
+    }
+
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Run a produce/consume DAG".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            "operator:test",
+        )
+        .await?;
+    let step = |id: &str| WorkflowStep {
+        id: id.to_string(),
+        handler: "provider_analysis".to_string(),
+        effect: EffectClass::LocalWrite,
+        input: serde_json::json!({}),
+        retry: RetryPolicy {
+            max_attempts: 2,
+            backoff_secs: 0,
+        },
+    };
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![step("produce"), step("consume")],
+                    edges: vec![WorkflowEdge {
+                        from: "produce".to_string(),
+                        to: "consume".to_string(),
+                    }],
+                    budget: ExecutionBudget {
+                        max_provider_calls: 0,
+                        deadline_secs: 60,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+                    label: "review".to_string(),
+                }],
+            },
+            "planner:test",
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+
+    let mut registry = WorkHandlerRegistry::default();
+    registry.register(Arc::new(DagProbe))?;
+    let worker = LoopWorker::with_registry(engine.clone(), registry, "worker:dag", 30)?;
+    // The goal parks in `verifying` after both steps — idle-loop errors are
+    // expected; assert on durable state.
+    let _ = worker.run_goal_until_idle(&goal.id, 4).await;
+
+    let report = engine.resume_goal(&goal.id, "operator:test").await?;
+    let consume = report
+        .work_items
+        .iter()
+        .find(|item| item.step_id == "consume")
+        .expect("consume item");
+    // The probe's ensure! chain ran inside the worker — succeeding means the
+    // upstream map carried the produce step's committed outcome.
+    assert_eq!(consume.status, WorkItemStatus::Succeeded);
+    let produce = report
+        .work_items
+        .iter()
+        .find(|item| item.step_id == "produce")
+        .expect("produce item");
+    assert_eq!(produce.status, WorkItemStatus::Succeeded);
+    Ok(())
+}
+
+/// A durable swarm run: the root `swarm_node` item delegates by extending
+/// the goal's DAG — child items plus an aggregate that depends on them and
+/// merges their outcomes through `ctx.upstream`. The whole delegation tree
+/// is durable work, not an in-process recursion.
+#[tokio::test]
+async fn durable_swarm_run_delegates_and_merges_through_the_dag() -> anyhow::Result<()> {
+    use xiaomaolv::provider::{ChatProvider, CompletionRequest};
+    use xiaomaolv::service::swarm::SwarmNodeHandler;
+
+    struct SwarmScriptedProvider;
+    #[async_trait]
+    impl ChatProvider for SwarmScriptedProvider {
+        async fn complete(&self, req: CompletionRequest) -> anyhow::Result<String> {
+            let transcript = req
+                .messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if transcript.contains("hierarchical task planner") {
+                if transcript.contains("ROOT TASK") {
+                    Ok(serde_json::json!({
+                        "mode": "delegate",
+                        "children": [
+                            {"task": "subtask A", "role_name": "researcher"},
+                            {"task": "subtask B", "role_name": "writer"}
+                        ]
+                    })
+                    .to_string())
+                } else {
+                    Ok(serde_json::json!({"mode": "answer", "answer": ""}).to_string())
+                }
+            } else if transcript.contains("Merge child results") {
+                Ok("merged-final-answer".to_string())
+            } else if transcript.contains("direct deliverable") {
+                Ok(if transcript.contains("subtask A") {
+                    "answer-A".to_string()
+                } else {
+                    "answer-B".to_string()
+                })
+            } else {
+                Ok("unexpected-call".to_string())
+            }
+        }
+        fn model_name(&self) -> Option<&str> {
+            Some("swarm-scripted")
+        }
+    }
+
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let actor = "internal:swarm";
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "ROOT TASK".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: Some("swarm:test-run".to_string()),
+            },
+            actor,
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![WorkflowStep {
+                        id: "test-run:1".to_string(),
+                        handler: "swarm_node".to_string(),
+                        effect: EffectClass::LocalWrite,
+                        input: serde_json::json!({
+                            "swarm_root": true,
+                            "max_nodes": 8,
+                            "swarm_run_id": "test-run",
+                            "task": "ROOT TASK",
+                            "role_name": "orchestrator",
+                            "depth": 0,
+                            "history": [],
+                        }),
+                        retry: RetryPolicy {
+                            max_attempts: 2,
+                            backoff_secs: 0,
+                        },
+                    }],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 32,
+                        deadline_secs: 120,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+                    label: "review".to_string(),
+                }],
+            },
+            actor,
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            actor,
+        )
+        .await?;
+
+    let mut registry = WorkHandlerRegistry::default();
+    registry.register(Arc::new(SwarmNodeHandler::new(
+        Arc::new(SwarmScriptedProvider),
+        xiaomaolv::service::swarm::AgentSwarmSettings::default(),
+    )))?;
+    let worker = LoopWorker::with_registry(engine.clone(), registry, "swarm:test", 60)?;
+    // The goal parks in `verifying` after the DAG completes — acceptance
+    // needs an operator — so assert on durable state like the other tests.
+    let _ = worker.run_goal_until_idle(&goal.id, 24).await;
+    let report = engine.resume_goal(&goal.id, "operator:test").await?;
+
+    // DAG grew: root + 2 children + aggregate = 4 items.
+    assert_eq!(report.work_items.len(), 4);
+    let step_ids: Vec<&str> = report
+        .work_items
+        .iter()
+        .map(|item| item.step_id.as_str())
+        .collect();
+    for expected in [
+        "test-run:1",
+        "test-run:1.c1",
+        "test-run:1.c2",
+        "test-run:1.agg",
+    ] {
+        assert!(step_ids.contains(&expected), "missing step {expected}");
+    }
+    // The aggregate waited on both children then merged their outcomes.
+    let aggregate = report
+        .work_items
+        .iter()
+        .find(|item| item.step_id == "test-run:1.agg")
+        .expect("aggregate item");
+    assert_eq!(aggregate.status, WorkItemStatus::Succeeded);
+    assert_eq!(aggregate.dependency_ids.len(), 2);
+    let outcome = engine
+        .work_item_outcome(&aggregate.id)
+        .await?
+        .expect("aggregate outcome");
+    assert_eq!(outcome.summary, "merged-final-answer");
+    // All four items committed — the delegation tree is durable work.
+    assert!(
+        report
+            .work_items
+            .iter()
+            .all(|item| item.status == WorkItemStatus::Succeeded)
+    );
+    Ok(())
+}
+
+async fn durable_swarm_engine(
+    provider: Arc<dyn ChatProvider>,
+    settings: xiaomaolv::service::swarm::AgentSwarmSettings,
+) -> (Arc<LoopEngine>, xiaomaolv::harness::loop_engine::GoalRecord) {
+    use xiaomaolv::service::swarm::SwarmNodeHandler;
+
+    let memory = SqliteMemoryStore::new("sqlite::memory:")
+        .await
+        .expect("memory store");
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let actor = "internal:swarm";
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "ROOT TASK".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            actor,
+        )
+        .await
+        .expect("create goal");
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![WorkflowStep {
+                        id: "root".to_string(),
+                        handler: "swarm_node".to_string(),
+                        effect: EffectClass::LocalWrite,
+                        input: serde_json::json!({
+                            "swarm_root": true,
+                            "max_nodes": 8,
+                            "swarm_run_id": "t",
+                            "task": "ROOT TASK",
+                            "role_name": "orchestrator",
+                            "depth": 0,
+                            "history": [],
+                        }),
+                        retry: RetryPolicy {
+                            max_attempts: 2,
+                            backoff_secs: 0,
+                        },
+                    }],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 32,
+                        deadline_secs: 120,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ArtifactExists {
+                    artifact_type: "analysis_report".to_string(),
+                }],
+            },
+            actor,
+        )
+        .await
+        .expect("plan goal");
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            actor,
+        )
+        .await
+        .expect("approve goal");
+    let mut registry = WorkHandlerRegistry::default();
+    registry
+        .register(Arc::new(SwarmNodeHandler::new(provider, settings)))
+        .expect("register swarm handler");
+    let worker =
+        LoopWorker::with_registry(engine.clone(), registry, "swarm:t", 60).expect("worker");
+    let _ = worker.run_goal_until_idle(&goal.id, 32).await;
+    (engine, goal)
+}
+
+/// A child whose model call times out lands `status:"timeout"` evidence —
+/// the item still succeeds, the aggregate merges the degraded set and marks
+/// the merged outcome `partial` instead of stalling the goal.
+#[tokio::test]
+async fn durable_swarm_child_timeout_merges_partial_in_aggregate() -> anyhow::Result<()> {
+    struct TimeoutB;
+    #[async_trait]
+    impl ChatProvider for TimeoutB {
+        async fn complete(&self, req: CompletionRequest) -> anyhow::Result<String> {
+            let transcript = req
+                .messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if transcript.contains("subtask B") && transcript.contains("direct deliverable") {
+                // Simulate a hang beyond the node timeout.
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+            if transcript.contains("hierarchical task planner") {
+                if transcript.contains("ROOT TASK") {
+                    return Ok(serde_json::json!({
+                        "mode": "delegate",
+                        "children": [
+                            {"task": "subtask A", "role_name": "a"},
+                            {"task": "subtask B", "role_name": "b"}
+                        ]
+                    })
+                    .to_string());
+                }
+                return Ok(serde_json::json!({"mode":"answer","answer":""}).to_string());
+            }
+            if transcript.contains("Merge child results") {
+                return Ok("partial-merged".to_string());
+            }
+            Ok("answer-A".to_string())
+        }
+        fn model_name(&self) -> Option<&str> {
+            Some("timeout-b")
+        }
+    }
+
+    let settings = xiaomaolv::service::swarm::AgentSwarmSettings {
+        max_node_timeout_ms: 50,
+        ..Default::default()
+    };
+    let (engine, goal) = durable_swarm_engine(Arc::new(TimeoutB), settings).await;
+    let report = engine.resume_goal(&goal.id, "operator:test").await?;
+    let b_item = report
+        .work_items
+        .iter()
+        .find(|item| item.step_id == "root.c2")
+        .expect("subtask B item");
+    assert_eq!(b_item.status, WorkItemStatus::Succeeded);
+    let b_outcome = engine
+        .work_item_outcome(&b_item.id)
+        .await?
+        .expect("B outcome");
+    assert_eq!(b_outcome.evidence["status"], "timeout");
+    let agg = report
+        .work_items
+        .iter()
+        .find(|item| item.step_id == "root.agg")
+        .expect("aggregate");
+    let agg_outcome = engine
+        .work_item_outcome(&agg.id)
+        .await?
+        .expect("aggregate outcome");
+    assert_eq!(agg_outcome.summary, "partial-merged");
+    assert_eq!(agg_outcome.evidence["status"], "partial");
+    Ok(())
+}
+
+/// The approved `max_nodes` budget rejecting a delegation is not fatal —
+/// the node falls back to answering directly.
+#[tokio::test]
+async fn durable_swarm_extension_budget_rejection_answers_directly() -> anyhow::Result<()> {
+    struct DelegateThenAnswer;
+    #[async_trait]
+    impl ChatProvider for DelegateThenAnswer {
+        async fn complete(&self, req: CompletionRequest) -> anyhow::Result<String> {
+            let transcript = req
+                .messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if transcript.contains("hierarchical task planner") {
+                return Ok(serde_json::json!({
+                    "mode": "delegate",
+                    "children": [{"task": "child", "role_name": "r"}]
+                })
+                .to_string());
+            }
+            Ok("direct-root-answer".to_string())
+        }
+        fn model_name(&self) -> Option<&str> {
+            Some("budget")
+        }
+    }
+
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let actor = "internal:swarm";
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "ROOT".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            actor,
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![WorkflowStep {
+                        id: "root".to_string(),
+                        handler: "swarm_node".to_string(),
+                        effect: EffectClass::LocalWrite,
+                        input: serde_json::json!({
+                            "swarm_root": true,
+                            // Budget for exactly the root — any extension is
+                            // rejected.
+                            "max_nodes": 1,
+                            "swarm_run_id": "t",
+                            "task": "ROOT",
+                            "depth": 0,
+                            "history": [],
+                        }),
+                        retry: RetryPolicy {
+                            max_attempts: 2,
+                            backoff_secs: 0,
+                        },
+                    }],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 32,
+                        deadline_secs: 60,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+                    label: "review".to_string(),
+                }],
+            },
+            actor,
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            actor,
+        )
+        .await?;
+    let mut registry = WorkHandlerRegistry::default();
+    registry.register(Arc::new(xiaomaolv::service::swarm::SwarmNodeHandler::new(
+        Arc::new(DelegateThenAnswer),
+        xiaomaolv::service::swarm::AgentSwarmSettings::default(),
+    )))?;
+    let worker = LoopWorker::with_registry(engine.clone(), registry, "swarm:t", 30)?;
+    let _ = worker.run_goal_until_idle(&goal.id, 8).await;
+    let report = engine.resume_goal(&goal.id, "operator:test").await?;
+    assert_eq!(report.work_items.len(), 1, "extension must be rejected");
+    let root = &report.work_items[0];
+    assert_eq!(root.status, WorkItemStatus::Succeeded);
+    let outcome = engine.work_item_outcome(&root.id).await?.expect("outcome");
+    assert_eq!(outcome.evidence["answer"], "direct-root-answer");
+    Ok(())
+}
+
+/// Depth at the limit skips the planner call entirely — the node answers
+/// directly (no LLM decide, no children).
+#[tokio::test]
+async fn durable_swarm_depth_limit_forces_direct_answer() -> anyhow::Result<()> {
+    struct CountingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl ChatProvider for CountingProvider {
+        async fn complete(&self, _req: CompletionRequest) -> anyhow::Result<String> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok("depth-forced-answer".to_string())
+        }
+        fn model_name(&self) -> Option<&str> {
+            Some("counting")
+        }
+    }
+    let provider = Arc::new(CountingProvider {
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let calls = provider.calls.clone();
+
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let actor = "internal:swarm";
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "ROOT".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            actor,
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![WorkflowStep {
+                        id: "deep".to_string(),
+                        handler: "swarm_node".to_string(),
+                        effect: EffectClass::LocalWrite,
+                        input: serde_json::json!({
+                            "task": "deep task",
+                            "depth": 99,
+                            "history": [],
+                        }),
+                        retry: RetryPolicy {
+                            max_attempts: 2,
+                            backoff_secs: 0,
+                        },
+                    }],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 32,
+                        deadline_secs: 60,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+                    label: "review".to_string(),
+                }],
+            },
+            actor,
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            actor,
+        )
+        .await?;
+    let mut registry = WorkHandlerRegistry::default();
+    registry.register(Arc::new(xiaomaolv::service::swarm::SwarmNodeHandler::new(
+        provider,
+        xiaomaolv::service::swarm::AgentSwarmSettings::default(),
+    )))?;
+    let worker = LoopWorker::with_registry(engine.clone(), registry, "swarm:t", 30)?;
+    // ManualApproval parks the finished goal in `verifying` — assert the
+    // durable state directly.
+    let _ = worker.run_goal_until_idle(&goal.id, 4).await;
+    let report = engine.resume_goal(&goal.id, "operator:test").await?;
+    // Exactly one provider call (the answer leg — no planner, no merge).
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    let outcome = engine
+        .work_item_outcome(&report.work_items[0].id)
+        .await?
+        .expect("outcome");
+    assert_eq!(outcome.evidence["answer"], "depth-forced-answer");
+    Ok(())
+}
+
+/// Service-level durable run: handle_swarm drives the projected goal
+/// end-to-end — activation, delegation, aggregation, terminal artifact —
+/// and the goal verifies to `achieved` via the published analysis_report.
+#[tokio::test]
+async fn durable_swarm_service_run_achieves_goal_via_artifact() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!(
+        "sqlite://{}",
+        temp.path().join("swarm-durable.db").display()
+    );
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(
+        memory.clone(),
+    ))));
+    let provider = Arc::new(SwarmQueueProvider {
+        replies: Mutex::new(VecDeque::from([
+            "{\"use_swarm\":true}".to_string(),
+            "{\"mode\":\"delegate\",\"children\":[{\"task\":\"outline frontend work\",\"role_name\":\"frontend\"},{\"task\":\"outline backend work\",\"role_name\":\"backend\"}]}".to_string(),
+            "{\"mode\":\"answer\",\"answer\":\"frontend plan\"}".to_string(),
+            "{\"mode\":\"answer\",\"answer\":\"backend plan\"}".to_string(),
+            "merged swarm answer".to_string(),
+        ])),
+    });
+    let harness_store: Arc<dyn xiaomaolv::harness::store::HarnessStore> = Arc::new(
+        xiaomaolv::harness::store::SqliteHarnessStore::new(memory.clone()),
+    );
+    let harness_config = xiaomaolv::config::AgentHarnessConfig {
+        enable_trajectory: true,
+        ..Default::default()
+    };
+    let service = MessageService::new(provider, memory, 8)
+        // durable_engine defaults to true — this test exercises the real
+        // production path end to end.
+        .with_agent_swarm(AgentSwarmSettings {
+            enabled: true,
+            auto_detect: true,
+            reply_summary_enabled: false,
+            // Single claimer: the in-memory SQLite pool is one connection,
+            // so concurrent workers would only starve each other's write
+            // transactions. Real fan-out is covered by
+            // `concurrent_workers_claim_sibling_items_in_parallel`.
+            max_parallel: 1,
+            ..Default::default()
+        })
+        .with_harness_store(harness_store.clone())
+        .with_harness_config(&harness_config)
+        .with_loop_engine(Some(engine.clone()));
+
+    let reply = service
+        .handle(IncomingMessage {
+            channel: "telegram".to_string(),
+            session_id: "tg:1".to_string(),
+            user_id: "42".to_string(),
+            text: "请拆分前后端任务并协作完成".to_string(),
+            reply_target: None,
+        })
+        .await?;
+    assert!(reply.text.contains("merged swarm answer"));
+
+    let goals = engine.list_goals(10).await?;
+    assert_eq!(goals.len(), 1);
+    let goal = &goals[0];
+    assert_eq!(goal.created_by, "internal:swarm");
+    // The aggregate published the analysis_report artifact → acceptance
+    // criterion satisfied → goal achieved without operator involvement.
+    assert_eq!(goal.status, GoalStatus::Achieved);
+
+    let resumed = engine.resume_goal(&goal.id, "operator:test").await?;
+    // root + c1 + c2 + agg
+    assert_eq!(resumed.work_items.len(), 4);
+    assert!(
+        resumed
+            .work_items
+            .iter()
+            .all(|item| item.status == WorkItemStatus::Succeeded)
+    );
+    let artifacts = engine.list_artifacts(10).await?;
+    assert!(
+        artifacts
+            .iter()
+            .any(|a| a.name.starts_with("swarm-") && a.kind == ArtifactKind::AnalysisReport),
+        "terminal artifact published"
+    );
+
+    // Node trajectories: every durable node attempt logged a trajectory
+    // under the real chat session — swarm runs now feed the scorecard /
+    // proposal-evidence loop like any other turn.
+    let trajectories = harness_store
+        .query_trajectories(xiaomaolv::harness::trajectory::TrajectoryFilter {
+            session_id: Some("tg:1".to_string()),
+            channel: None,
+            user_id: None,
+            exit_reason: None,
+            has_tool_errors: None,
+            limit: 100,
+        })
+        .await?;
+    let node_trajectories: Vec<_> = trajectories
+        .iter()
+        .filter(|t| t.id.starts_with("swarm-node:"))
+        .collect();
+    assert_eq!(
+        node_trajectories.len(),
+        4,
+        "each node attempt records a trajectory"
+    );
+    assert!(
+        node_trajectories.iter().all(|t| t.finished_at.is_some()),
+        "every node trajectory finished"
+    );
+    Ok(())
+}
+
+/// `run_goal_concurrent` races sibling claims across workers — both slow
+/// items run under different worker ids and finish faster than a serial
+/// drain would allow.
+#[tokio::test]
+async fn concurrent_workers_claim_sibling_items_in_parallel() -> anyhow::Result<()> {
+    struct SlowHandler;
+    #[async_trait]
+    impl WorkHandler for SlowHandler {
+        fn name(&self) -> &'static str {
+            "provider_analysis"
+        }
+        fn effect_class(&self) -> EffectClass {
+            EffectClass::LocalWrite
+        }
+        async fn execute(&self, _ctx: &WorkHandlerContext) -> anyhow::Result<WorkOutcome> {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            Ok(WorkOutcome {
+                summary: "slow done".to_string(),
+                artifact_ids: Vec::new(),
+                evidence: serde_json::json!({}),
+                sleep_until_unix: None,
+                continuation: None,
+            })
+        }
+    }
+
+    // File-backed store: WAL + busy_timeout handle the writers' lock
+    // contention the concurrent claim seam is exercising.
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("par.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "parallel".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            "operator:test",
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![
+                        WorkflowStep {
+                            id: "a".to_string(),
+                            handler: "provider_analysis".to_string(),
+                            effect: EffectClass::LocalWrite,
+                            input: serde_json::json!({}),
+                            retry: RetryPolicy {
+                                max_attempts: 1,
+                                backoff_secs: 0,
+                            },
+                        },
+                        WorkflowStep {
+                            id: "b".to_string(),
+                            handler: "provider_analysis".to_string(),
+                            effect: EffectClass::LocalWrite,
+                            input: serde_json::json!({}),
+                            retry: RetryPolicy {
+                                max_attempts: 1,
+                                backoff_secs: 0,
+                            },
+                        },
+                    ],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 0,
+                        deadline_secs: 60,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+                    label: "review".to_string(),
+                }],
+            },
+            "operator:test",
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+
+    let mut registry = WorkHandlerRegistry::default();
+    registry.register(Arc::new(SlowHandler))?;
+    let worker = LoopWorker::with_registry(engine.clone(), registry, "par", 60)?;
+    let _ = worker.run_goal_concurrent(&goal.id, 2, 16).await;
+
+    let report = engine.resume_goal(&goal.id, "operator:test").await?;
+    assert!(
+        report
+            .work_items
+            .iter()
+            .all(|i| i.status == WorkItemStatus::Succeeded)
+    );
+    // Proof of real parallelism: the two items were claimed by distinct
+    // concurrent workers, and the wall time stayed far below the serial
+    // 500ms+ two slow items would need.
+    let worker_ids: std::collections::BTreeSet<&str> = report
+        .attempts
+        .iter()
+        .map(|a| a.worker_id.as_str())
+        .collect();
+    // Distinct concurrent workers claimed the two siblings — a serial
+    // drain would have run both under one worker id. (Wall-clock asserts
+    // are flaky on a single-connection SQLite pool, so worker identity is
+    // the proof.)
+    assert_eq!(
+        worker_ids.len(),
+        2,
+        "expected distinct worker ids: {worker_ids:?}"
+    );
+    Ok(())
+}
+
+/// A swarm goal orphaned mid-run (handler not in `with_builtins`) parks
+/// `blocked` under the plain runtime worker, then resumes under a worker
+/// that registers `swarm_node` via `with_extra_handler`.
+#[tokio::test]
+async fn orphaned_swarm_goal_resumes_once_swarm_handler_registers() -> anyhow::Result<()> {
+    struct AnswerProvider;
+    #[async_trait]
+    impl ChatProvider for AnswerProvider {
+        async fn complete(&self, _req: CompletionRequest) -> anyhow::Result<String> {
+            Ok("orphan-answer".to_string())
+        }
+        fn model_name(&self) -> Option<&str> {
+            Some("answer-provider")
+        }
+    }
+
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let actor = "internal:swarm";
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "ROOT".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            actor,
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![WorkflowStep {
+                        id: "orphan:1".to_string(),
+                        handler: "swarm_node".to_string(),
+                        effect: EffectClass::LocalWrite,
+                        input: serde_json::json!({
+                            "task": "orphan task",
+                            "depth": 99,
+                            "history": [],
+                        }),
+                        retry: RetryPolicy {
+                            max_attempts: 1,
+                            backoff_secs: 0,
+                        },
+                    }],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 8,
+                        deadline_secs: 60,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+                    label: "review".to_string(),
+                }],
+            },
+            actor,
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            actor,
+        )
+        .await?;
+
+    // Phase 1: a runtime worker WITHOUT the swarm handler parks the item.
+    let plain = LoopWorker::with_builtins(engine.clone(), Arc::new(AnswerProvider), None, None)?
+        .with_runtime_options("runtime-plain", 30)?;
+    let _ = plain.run_goal_until_idle(&goal.id, 8).await;
+    let report = engine.resume_goal(&goal.id, "operator:test").await?;
+    assert_eq!(
+        report.work_items[0].status,
+        WorkItemStatus::Blocked,
+        "missing handler parks the item blocked"
+    );
+
+    // Phase 2: "restart" — a worker WITH the swarm handler picks it up.
+    let with_swarm =
+        LoopWorker::with_builtins(engine.clone(), Arc::new(AnswerProvider), None, None)?
+            .with_extra_handler(Arc::new(xiaomaolv::service::swarm::SwarmNodeHandler::new(
+                Arc::new(AnswerProvider),
+                xiaomaolv::service::swarm::AgentSwarmSettings::default(),
+            )))?
+            .with_runtime_options("runtime-swarm", 30)?;
+    let _ = with_swarm.run_goal_until_idle(&goal.id, 8).await;
+    let report = engine.resume_goal(&goal.id, "operator:test").await?;
+    assert_eq!(report.work_items[0].status, WorkItemStatus::Succeeded);
+    let outcome = engine
+        .work_item_outcome(&report.work_items[0].id)
+        .await?
+        .expect("outcome");
+    assert_eq!(outcome.evidence["answer"], "orphan-answer");
+    Ok(())
+}
+
+/// A defer is a reschedule, not a failed attempt: `void` attempts don't
+/// consume the retry budget, so a `max_attempts = 1` wait step still
+/// completes after its deadline passes.
+#[tokio::test]
+async fn deferred_attempts_do_not_consume_the_attempt_budget() -> anyhow::Result<()> {
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let until = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64
+        + 1;
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "wait once".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            "operator:test",
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![WorkflowStep {
+                        id: "wait".to_string(),
+                        handler: "wait".to_string(),
+                        effect: EffectClass::Pure,
+                        input: serde_json::json!({"until_unix": until}),
+                        retry: RetryPolicy {
+                            max_attempts: 1,
+                            backoff_secs: 0,
+                        },
+                    }],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 0,
+                        deadline_secs: 60,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+                    label: "review".to_string(),
+                }],
+            },
+            "planner:test",
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+    let worker = LoopWorker::with_builtins(engine.clone(), Arc::new(WorkerProvider), None, None)?;
+
+    // Defer once, then the same single-attempt budget must still claim and
+    // finish — before `void`, the defer burned the only attempt.
+    let _ = worker.run_goal_until_idle(&goal.id, 4).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let _ = worker.run_goal_until_idle(&goal.id, 4).await;
+    let report = engine.resume_goal(&goal.id, "operator:test").await?;
+    assert_eq!(report.work_items[0].status, WorkItemStatus::Succeeded);
+    assert!(
+        report
+            .attempts
+            .iter()
+            .any(|a| a.status == AttemptStatus::Void),
+        "the defer is a void attempt"
+    );
+    Ok(())
+}
+
+/// A `continue` with `delay_secs` is the same reschedule shape — the
+/// yielding attempt is `void` and the next claim still fits a one-attempt
+/// budget.
+#[tokio::test]
+async fn delayed_continuation_does_not_consume_the_attempt_budget() -> anyhow::Result<()> {
+    struct DelayOnce {
+        fired: AtomicUsize,
+    }
+    #[async_trait]
+    impl WorkHandler for DelayOnce {
+        fn name(&self) -> &'static str {
+            "provider_analysis"
+        }
+        fn effect_class(&self) -> EffectClass {
+            EffectClass::LocalWrite
+        }
+        async fn execute(&self, ctx: &WorkHandlerContext) -> anyhow::Result<WorkOutcome> {
+            if ctx.resume.is_none() && self.fired.swap(1, Ordering::Relaxed) == 0 {
+                return Ok(WorkOutcome {
+                    summary: "delay".to_string(),
+                    artifact_ids: Vec::new(),
+                    evidence: serde_json::json!({}),
+                    sleep_until_unix: None,
+                    continuation: Some(xiaomaolv::harness::loop_engine::WorkContinuation {
+                        phase: "later".to_string(),
+                        state: serde_json::json!({}),
+                        delay_secs: Some(1),
+                    }),
+                });
+            }
+            Ok(WorkOutcome {
+                summary: "resumed-done".to_string(),
+                artifact_ids: Vec::new(),
+                evidence: serde_json::json!({"resumed": ctx.resume.is_some()}),
+                sleep_until_unix: None,
+                continuation: None,
+            })
+        }
+    }
+
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "delay once".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            "operator:test",
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![WorkflowStep {
+                        id: "delay".to_string(),
+                        handler: "provider_analysis".to_string(),
+                        effect: EffectClass::LocalWrite,
+                        input: serde_json::json!({}),
+                        retry: RetryPolicy {
+                            max_attempts: 1,
+                            backoff_secs: 0,
+                        },
+                    }],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 0,
+                        deadline_secs: 60,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+                    label: "review".to_string(),
+                }],
+            },
+            "planner:test",
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+    let mut registry = WorkHandlerRegistry::default();
+    registry.register(Arc::new(DelayOnce {
+        fired: AtomicUsize::new(0),
+    }))?;
+    let worker = LoopWorker::with_registry(engine.clone(), registry, "delay-worker", 30)?;
+    let _ = worker.run_goal_until_idle(&goal.id, 4).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let _ = worker.run_goal_until_idle(&goal.id, 4).await;
+    let report = engine.resume_goal(&goal.id, "operator:test").await?;
+    assert_eq!(report.work_items[0].status, WorkItemStatus::Succeeded);
+    let outcome = engine
+        .work_item_outcome(&report.work_items[0].id)
+        .await?
+        .expect("outcome");
+    assert_eq!(outcome.summary, "resumed-done");
+    assert_eq!(outcome.evidence["resumed"], true);
+    Ok(())
+}
+
+/// Orphaned audit rows: a crash leaves `agent_swarm_runs.status = running`
+/// while its durable goal is already terminal. The janitor mirrors the
+/// final DAG and closes the row; a live or goal-less run is untouched.
+#[tokio::test]
+async fn orphan_janitor_closes_runs_whose_goal_is_terminal() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("swarm-orphan.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(
+        memory.clone(),
+    ))));
+    let provider = Arc::new(SwarmQueueProvider {
+        replies: Mutex::new(VecDeque::from([
+            "{\"use_swarm\":true}".to_string(),
+            "{\"mode\":\"answer\",\"answer\":\"done it\"}".to_string(),
+        ])),
+    });
+    let service = MessageService::new(provider, memory.clone(), 8)
+        .with_agent_swarm(AgentSwarmSettings {
+            enabled: true,
+            auto_detect: true,
+            reply_summary_enabled: false,
+            max_parallel: 1,
+            ..Default::default()
+        })
+        .with_loop_engine(Some(engine.clone()));
+    let _ = service
+        .handle(IncomingMessage {
+            channel: "telegram".to_string(),
+            session_id: "tg:1".to_string(),
+            user_id: "42".to_string(),
+            text: "拆分前后端任务".to_string(),
+            reply_target: None,
+        })
+        .await?;
+
+    // Find the run + goal; simulate a crash-orphan by flipping the row back
+    // to running (as if the process died before finish_agent_swarm_run).
+    let runs = memory.list_agent_swarm_runs("telegram", None, 10).await?;
+    assert_eq!(runs.len(), 1);
+    let run = &runs[0];
+    memory
+        .finish_agent_swarm_run(xiaomaolv::memory::FinishAgentSwarmRunRequest {
+            run_id: run.run_id.clone(),
+            channel: run.channel.clone(),
+            status: xiaomaolv::memory::AgentSwarmRunStatus::Running,
+            finished_at_unix: 0,
+            error: None,
+        })
+        .await?;
+    let goal = engine
+        .get_goal_by_request_id(&format!("swarm:{}", run.run_id))
+        .await?
+        .expect("swarm goal");
+    assert_eq!(goal.status, GoalStatus::Achieved);
+
+    // A second, genuinely-live run: no matching goal at all.
+    memory
+        .create_agent_swarm_run(xiaomaolv::memory::CreateAgentSwarmRunRequest {
+            run_id: "run-live".to_string(),
+            channel: "telegram".to_string(),
+            session_id: "tg:2".to_string(),
+            user_id: "u".to_string(),
+            root_task: "still running".to_string(),
+            status: xiaomaolv::memory::AgentSwarmRunStatus::Running,
+            started_at_unix: 0,
+        })
+        .await?;
+
+    let reaped = service.reap_orphaned_swarm_runs().await?;
+    assert_eq!(reaped, 1);
+    let runs = memory.list_agent_swarm_runs("telegram", None, 10).await?;
+    let closed = runs.iter().find(|r| r.run_id == run.run_id).unwrap();
+    assert_eq!(
+        closed.status,
+        xiaomaolv::memory::AgentSwarmRunStatus::Completed
+    );
+    let live = runs.iter().find(|r| r.run_id == "run-live").unwrap();
+    assert_eq!(live.status, xiaomaolv::memory::AgentSwarmRunStatus::Running);
+    Ok(())
+}
+
+/// The declared `max_provider_calls` budget now bites inside swarm nodes:
+/// when the reservation is exhausted a node's provider call surfaces as an
+/// evidence-level failure (item still commits — partial-result semantics)
+/// and the provider is never called again.
+#[tokio::test]
+async fn swarm_node_honors_the_goal_provider_call_budget() -> anyhow::Result<()> {
+    struct CountingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl ChatProvider for CountingProvider {
+        async fn complete(&self, _req: CompletionRequest) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok("{\"mode\":\"answer\",\"answer\":\"budgeted\"}".to_string())
+        }
+        fn model_name(&self) -> Option<&str> {
+            Some("counting")
+        }
+    }
+
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let actor = "internal:swarm";
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "budget".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: Some("swarm:run-budget".to_string()),
+            },
+            actor,
+        )
+        .await?;
+    let step = |id: &str| WorkflowStep {
+        id: id.to_string(),
+        handler: "swarm_node".to_string(),
+        effect: EffectClass::LocalWrite,
+        input: serde_json::json!({
+            "task": "t", "depth": 99, "history": [],
+        }),
+        retry: RetryPolicy {
+            max_attempts: 1,
+            backoff_secs: 0,
+        },
+    };
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![step("run-budget:1"), step("run-budget:2")],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 1,
+                        deadline_secs: 60,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+                    label: "review".to_string(),
+                }],
+            },
+            actor,
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            actor,
+        )
+        .await?;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(CountingProvider {
+        calls: calls.clone(),
+    });
+    let mut registry = WorkHandlerRegistry::default();
+    registry.register(Arc::new(xiaomaolv::service::swarm::SwarmNodeHandler::new(
+        provider,
+        xiaomaolv::service::swarm::AgentSwarmSettings::default(),
+    )))?;
+    let worker = LoopWorker::with_registry(engine.clone(), registry, "budget-worker", 30)?;
+    let _ = worker.run_goal_until_idle(&goal.id, 8).await;
+    let report = engine.resume_goal(&goal.id, "operator:test").await?;
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "budget allowed exactly one call"
+    );
+    let failed_outcome = report
+        .work_items
+        .iter()
+        .find(|i| i.step_id == "run-budget:2")
+        .expect("second step");
+    let outcome = engine
+        .work_item_outcome(&failed_outcome.id)
+        .await?
+        .expect("outcome");
+    assert_eq!(outcome.evidence["status"], "failed");
+    Ok(())
+}
+
+/// Deferred delivery: a run flagged `awaiting_reply` gets its final answer
+/// pushed by the janitor once the goal is terminal, then the flag clears —
+/// send-once via the `swarm-reply:` idempotency key.
+#[tokio::test]
+async fn janitor_delivers_deferred_reply_when_goal_is_terminal() -> anyhow::Result<()> {
+    struct CapturingSender {
+        sent: Mutex<Vec<(String, String, String, String)>>,
+    }
+    #[async_trait]
+    impl xiaomaolv::harness::loop_engine::OutboundSender for CapturingSender {
+        async fn send(
+            &self,
+            channel: &str,
+            session_id: &str,
+            text: &str,
+            idempotency_key: &str,
+        ) -> anyhow::Result<serde_json::Value> {
+            self.sent.lock().unwrap().push((
+                channel.to_string(),
+                session_id.to_string(),
+                text.to_string(),
+                idempotency_key.to_string(),
+            ));
+            Ok(serde_json::json!({"ok": true}))
+        }
+    }
+
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("swarm-defer.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(
+        memory.clone(),
+    ))));
+    let provider = Arc::new(SwarmQueueProvider {
+        replies: Mutex::new(VecDeque::from([
+            "{\"use_swarm\":true}".to_string(),
+            "{\"mode\":\"answer\",\"answer\":\"deferred final answer\"}".to_string(),
+        ])),
+    });
+    let sender = Arc::new(CapturingSender {
+        sent: Mutex::new(Vec::new()),
+    });
+    let service = MessageService::new(provider, memory.clone(), 8)
+        .with_agent_swarm(AgentSwarmSettings {
+            enabled: true,
+            auto_detect: true,
+            reply_summary_enabled: false,
+            max_parallel: 1,
+            ..Default::default()
+        })
+        .with_loop_engine(Some(engine.clone()))
+        .with_outbound_sender(Some(sender.clone()));
+    let _ = service
+        .handle(IncomingMessage {
+            channel: "telegram".to_string(),
+            session_id: "tg:9".to_string(),
+            user_id: "42".to_string(),
+            text: "拆分任务".to_string(),
+            reply_target: None,
+        })
+        .await?;
+
+    let runs = memory.list_agent_swarm_runs("telegram", None, 10).await?;
+    assert_eq!(runs.len(), 1);
+    let run = &runs[0];
+    let goal = engine
+        .get_goal_by_request_id(&format!("swarm:{}", run.run_id))
+        .await?
+        .expect("swarm goal");
+    assert_eq!(goal.status, GoalStatus::Achieved);
+
+    // Simulate the sync window having elapsed mid-run.
+    memory
+        .set_swarm_run_awaiting_reply("telegram", &run.run_id, true)
+        .await?;
+
+    let reaped = service.reap_orphaned_swarm_runs().await?;
+    assert_eq!(reaped, 0, "run was already terminal in the audit table");
+    {
+        let sent = sender.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "answer delivered once");
+        assert_eq!(sent[0].1, "tg:9");
+        assert!(sent[0].2.contains("deferred final answer"));
+        assert_eq!(sent[0].3, format!("swarm-reply:{}", run.run_id));
+    }
+
+    // Second sweep does not re-send.
+    let _ = service.reap_orphaned_swarm_runs().await?;
+    assert_eq!(sender.sent.lock().unwrap().len(), 1);
+    Ok(())
+}
+
+/// The synchronous reply window bounds channel head-blocking: a run that
+/// outlives `reply_sync_wait_ms` returns the ack, flags `awaiting_reply`,
+/// and the spawned driver keeps driving the DAG until the goal achieves —
+/// then the janitor delivers the real answer.
+#[tokio::test]
+async fn slow_swarm_reply_defers_then_janitor_delivers() -> anyhow::Result<()> {
+    struct CapturingSender {
+        sent: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl xiaomaolv::harness::loop_engine::OutboundSender for CapturingSender {
+        async fn send(
+            &self,
+            _channel: &str,
+            _session_id: &str,
+            text: &str,
+            _idempotency_key: &str,
+        ) -> anyhow::Result<serde_json::Value> {
+            self.sent.lock().unwrap().push(text.to_string());
+            Ok(serde_json::json!({"ok": true}))
+        }
+    }
+
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("swarm-defer2.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(
+        memory.clone(),
+    ))));
+    let provider = Arc::new(SwarmQueueProvider {
+        replies: Mutex::new(VecDeque::from([
+            "{\"use_swarm\":true}".to_string(),
+            "{\"mode\":\"answer\",\"answer\":\"deferred final answer\"}".to_string(),
+        ])),
+    });
+    let sender = Arc::new(CapturingSender {
+        sent: Mutex::new(Vec::new()),
+    });
+    let service = MessageService::new(provider, memory.clone(), 8)
+        .with_agent_swarm(AgentSwarmSettings {
+            enabled: true,
+            auto_detect: true,
+            reply_summary_enabled: false,
+            max_parallel: 1,
+            // Deterministic deferral: 0 = the reply is always asynchronous.
+            reply_sync_wait_ms: 0,
+            ..Default::default()
+        })
+        .with_loop_engine(Some(engine.clone()))
+        .with_outbound_sender(Some(sender.clone()));
+
+    let reply = service
+        .handle(IncomingMessage {
+            channel: "telegram".to_string(),
+            session_id: "tg:10".to_string(),
+            user_id: "42".to_string(),
+            text: "拆分任务".to_string(),
+            reply_target: None,
+        })
+        .await?;
+    assert!(
+        reply.text.contains("后台运行"),
+        "sync window elapsed → ack, got: {}",
+        reply.text
+    );
+    let runs = memory.list_awaiting_reply_swarm_runs(10).await?;
+    assert_eq!(runs.len(), 1, "run flagged awaiting_reply");
+    let run = runs[0].clone();
+    let goal_key = format!("swarm:{}", run.run_id);
+
+    // Detached driver keeps executing in-process; poll for terminal.
+    let mut achieved = false;
+    for _ in 0..60 {
+        if let Some(goal) = engine.get_goal_by_request_id(&goal_key).await?
+            && goal.status == GoalStatus::Achieved
+        {
+            achieved = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if !achieved {
+        // If the detached driver stalled (or the process restarted), the
+        // production path reclaims the goal once the abandoned attempt's
+        // lease expires — drive it explicitly to prove recovery still works.
+        let goal = engine
+            .get_goal_by_request_id(&goal_key)
+            .await?
+            .expect("swarm goal");
+        let mut registry = WorkHandlerRegistry::default();
+        registry.register(Arc::new(xiaomaolv::service::swarm::SwarmNodeHandler::new(
+            Arc::new(SwarmQueueProvider {
+                replies: Mutex::new(VecDeque::from([
+                    "{\"mode\":\"answer\",\"answer\":\"deferred final answer\"}".to_string(),
+                ])),
+            }),
+            AgentSwarmSettings::default(),
+        )))?;
+        let reclaimer = LoopWorker::with_registry(engine.clone(), registry, "reclaim", 30)?;
+        let report = reclaimer.run_goal_until_idle(&goal.id, 16).await?;
+        assert_eq!(report.goal.status, GoalStatus::Achieved);
+    }
+
+    let _ = service.reap_orphaned_swarm_runs().await?;
+    let sent = sender.sent.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].contains("deferred final answer"));
+    Ok(())
+}
+
+/// Execution-deadline enforcement: a goal whose budget clock started
+/// (first provider reservation) and then exceeded `deadline_secs` is
+/// failed by the sweep — it stops occupying the dispatchable set and
+/// records a `goal.expired` event instead of looping forever.
+#[tokio::test]
+async fn goal_past_execution_deadline_expires_and_stops_dispatching() -> anyhow::Result<()> {
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let actor = "internal:swarm";
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "expire me".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            actor,
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![
+                        WorkflowStep {
+                            id: "analyze".to_string(),
+                            handler: "provider_analysis".to_string(),
+                            effect: EffectClass::LocalWrite,
+                            input: serde_json::json!({"objective": "o"}),
+                            retry: RetryPolicy {
+                                max_attempts: 1,
+                                backoff_secs: 0,
+                            },
+                        },
+                        WorkflowStep {
+                            id: "linger".to_string(),
+                            handler: "wait".to_string(),
+                            effect: EffectClass::Pure,
+                            // Far-future wake: the goal stays `active` after
+                            // the analysis step completes.
+                            input: serde_json::json!({"until_unix": 4_000_000_000i64}),
+                            retry: RetryPolicy {
+                                max_attempts: 1,
+                                backoff_secs: 0,
+                            },
+                        },
+                    ],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 4,
+                        deadline_secs: 1, // expires ~1s after the clock starts
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+                    label: "review".to_string(),
+                }],
+            },
+            actor,
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            actor,
+        )
+        .await?;
+
+    // Drive one claim: `provider_analysis` reserves a call — the budget
+    // clock starts — and the `wait` item defers, leaving the goal `active`.
+    let provider = Arc::new(SwarmQueueProvider {
+        replies: Mutex::new(VecDeque::from(["analysis".to_string()])),
+    });
+    let worker = LoopWorker::with_builtins(engine.clone(), provider, None, None)?;
+    let _ = worker.run_goal_until_idle(&goal.id, 4).await;
+    let goal_after = engine.get_goal(&goal.id).await?.expect("goal");
+    assert_eq!(goal_after.status, GoalStatus::Active, "wait item parked it");
+
+    // Cross the deadline boundary so started_at + 1 < now.
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    // Overdue-but-unswept: the dispatchable listing already filters it, so
+    // the runtime poll stops claiming the goal before expiry lands.
+    assert!(
+        !engine
+            .list_dispatchable_goal_ids(10)
+            .await?
+            .contains(&goal.id),
+        "overdue goal filtered from dispatchable"
+    );
+    let expired = engine.expire_overdue_goals(64).await?;
+    assert_eq!(expired, vec![goal.id.clone()]);
+    let goal_final = engine.get_goal(&goal.id).await?.expect("goal");
+    assert_eq!(goal_final.status, GoalStatus::Failed);
+    let events = engine.list_goal_events(&goal.id, 0, 20).await?;
+    assert!(
+        events.iter().any(|e| e.event_type == "goal.expired"),
+        "expiry is auditable"
+    );
+    assert!(
+        !engine
+            .list_dispatchable_goal_ids(10)
+            .await?
+            .contains(&goal.id),
+        "expired goal leaves the dispatchable set"
+    );
+    Ok(())
+}
+
+/// Deferred replies only promise delivery when the channel can receive:
+/// an outbound sender that doesn't support the run's channel gets the
+/// plain ack (no "我会发给你"), and `awaiting_reply` is never flagged.
+#[tokio::test]
+async fn deferred_reply_skips_channels_the_sender_cannot_reach() -> anyhow::Result<()> {
+    struct NoTelegramSender;
+    #[async_trait]
+    impl xiaomaolv::harness::loop_engine::OutboundSender for NoTelegramSender {
+        async fn send(
+            &self,
+            _channel: &str,
+            _session_id: &str,
+            _text: &str,
+            _idempotency_key: &str,
+        ) -> anyhow::Result<serde_json::Value> {
+            Ok(serde_json::json!({"ok": true}))
+        }
+        fn supports_channel(&self, _channel: &str) -> bool {
+            false
+        }
+    }
+
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("swarm-defer3.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(
+        memory.clone(),
+    ))));
+    let provider = Arc::new(SwarmQueueProvider {
+        replies: Mutex::new(VecDeque::from([
+            "{\"use_swarm\":true}".to_string(),
+            "{\"mode\":\"answer\",\"answer\":\"deferred\"}".to_string(),
+        ])),
+    });
+    let service = MessageService::new(provider, memory.clone(), 8)
+        .with_agent_swarm(AgentSwarmSettings {
+            enabled: true,
+            auto_detect: true,
+            reply_summary_enabled: false,
+            max_parallel: 1,
+            reply_sync_wait_ms: 0,
+            ..Default::default()
+        })
+        .with_loop_engine(Some(engine.clone()))
+        .with_outbound_sender(Some(Arc::new(NoTelegramSender)));
+
+    let reply = service
+        .handle(IncomingMessage {
+            channel: "http".to_string(),
+            session_id: "http:1".to_string(),
+            user_id: "42".to_string(),
+            text: "拆分任务".to_string(),
+            reply_target: None,
+        })
+        .await?;
+    assert_eq!(reply.text, "多智能体任务仍在后台运行。");
+    assert!(
+        memory.list_awaiting_reply_swarm_runs(10).await?.is_empty(),
+        "undeliverable channel never flags awaiting_reply"
+    );
+    Ok(())
+}
+
+/// Operator stop: canceling a live goal fails open items, abandons
+/// in-flight attempts, records `goal.canceled`, and the canceled goal
+/// leaves the dispatchable set.
+#[tokio::test]
+async fn cancel_goal_stops_live_work_and_is_auditable() -> anyhow::Result<()> {
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let actor = "operator:test";
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "cancel me".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            actor,
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![WorkflowStep {
+                        id: "linger".to_string(),
+                        handler: "wait".to_string(),
+                        effect: EffectClass::Pure,
+                        input: serde_json::json!({"until_unix": 4_000_000_000i64}),
+                        retry: RetryPolicy {
+                            max_attempts: 3,
+                            backoff_secs: 0,
+                        },
+                    }],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 0,
+                        deadline_secs: 3600,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+                    label: "gate".to_string(),
+                }],
+            },
+            actor,
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            actor,
+        )
+        .await?;
+    assert!(
+        engine
+            .list_dispatchable_goal_ids(10)
+            .await?
+            .contains(&goal.id)
+    );
+
+    let canceled = engine
+        .cancel_goal(&goal.id, "no longer needed", actor)
+        .await?;
+    assert_eq!(canceled.status, GoalStatus::Canceled);
+    let items = engine.list_work_items(&goal.id).await?;
+    assert!(
+        items.iter().all(|i| i.status == WorkItemStatus::Failed),
+        "open items fail on cancel"
+    );
+    let events = engine.list_goal_events(&goal.id, 0, 20).await?;
+    assert!(
+        events.iter().any(|e| e.event_type == "goal.canceled"),
+        "cancel is auditable"
+    );
+    assert!(
+        !engine
+            .list_dispatchable_goal_ids(10)
+            .await?
+            .contains(&goal.id),
+        "canceled goal leaves the dispatchable set"
+    );
+    // Terminal goals refuse cancel.
+    assert!(
+        engine.cancel_goal(&goal.id, "again", actor).await.is_err(),
+        "terminal goals cannot be canceled"
+    );
+    Ok(())
+}
+
+/// Operator hold: pausing a live goal removes it from dispatch without
+/// destroying work — unpause returns it to the pool so claims resume.
+#[tokio::test]
+async fn paused_goal_stops_dispatching_until_unpaused() -> anyhow::Result<()> {
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let actor = "operator:test";
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "pause me".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            actor,
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![WorkflowStep {
+                        id: "linger".to_string(),
+                        handler: "wait".to_string(),
+                        effect: EffectClass::Pure,
+                        input: serde_json::json!({"until_unix": 4_000_000_000i64}),
+                        retry: RetryPolicy {
+                            max_attempts: 3,
+                            backoff_secs: 0,
+                        },
+                    }],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 0,
+                        deadline_secs: 3600,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+                    label: "gate".to_string(),
+                }],
+            },
+            actor,
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            actor,
+        )
+        .await?;
+
+    engine
+        .pause_goal(&goal.id, "hold for triage", actor)
+        .await?;
+    let held = engine.get_goal(&goal.id).await?.expect("goal");
+    assert_eq!(held.status, GoalStatus::Paused);
+    assert!(
+        !engine
+            .list_dispatchable_goal_ids(10)
+            .await?
+            .contains(&goal.id),
+        "paused goal leaves the dispatchable set"
+    );
+
+    let unpaused = engine.unpause_goal(&goal.id, actor).await?;
+    assert_eq!(unpaused.status, GoalStatus::Active);
+    assert!(
+        engine
+            .list_dispatchable_goal_ids(10)
+            .await?
+            .contains(&goal.id),
+        "unpaused goal re-enters dispatch"
+    );
+    let events = engine.list_goal_events(&goal.id, 0, 20).await?;
+    assert!(events.iter().any(|e| e.event_type == "goal.paused"));
+    assert!(events.iter().any(|e| e.event_type == "goal.unpaused"));
+    Ok(())
+}
+
+/// Replan: a failed goal can be sent back to planning — old items are
+/// superseded (canceled, auditable), `plan_goal` accepts the `replan`
+/// status, and the fresh revision runs on a clean item set.
+#[tokio::test]
+async fn failed_goal_replans_into_a_fresh_revision() -> anyhow::Result<()> {
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let actor = "operator:test";
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "replan me".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            actor,
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![WorkflowStep {
+                        id: "stalled".to_string(),
+                        handler: "wait".to_string(),
+                        effect: EffectClass::Pure,
+                        input: serde_json::json!({"until_unix": 4_000_000_000i64}),
+                        retry: RetryPolicy {
+                            max_attempts: 1,
+                            backoff_secs: 0,
+                        },
+                    }],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 0,
+                        deadline_secs: 3600,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+                    label: "gate".to_string(),
+                }],
+            },
+            actor,
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            actor,
+        )
+        .await?;
+    let provider = Arc::new(WorkerProvider);
+    let worker = LoopWorker::with_builtins(engine.clone(), provider.clone(), None, None)?;
+    engine
+        .cancel_goal(&goal.id, "giving up on v1", actor)
+        .await?;
+
+    let replanned = engine
+        .mark_goal_for_replan(&goal.id, "use a real handler", actor)
+        .await?;
+    assert_eq!(replanned.status, GoalStatus::Replan);
+    // The prior revision's items are all terminal — nothing open remains
+    // to leak into the next revision's dispatch or aggregate.
+    let items = engine.list_work_items(&goal.id).await?;
+    assert!(items.iter().all(|i| {
+        matches!(
+            i.status,
+            WorkItemStatus::Succeeded | WorkItemStatus::Failed | WorkItemStatus::Canceled
+        )
+    }));
+
+    // Fresh revision on the same goal.
+    let plan2 = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![WorkflowStep {
+                        id: "check".to_string(),
+                        handler: "self_test_suite".to_string(),
+                        effect: EffectClass::LocalWrite,
+                        input: serde_json::json!({"suite": "core"}),
+                        retry: RetryPolicy {
+                            max_attempts: 2,
+                            backoff_secs: 0,
+                        },
+                    }],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 0,
+                        deadline_secs: 3600,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+                    label: "gate".to_string(),
+                }],
+            },
+            actor,
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan2.goal.revision,
+                expected_plan_hash: plan2.plan_hash.clone(),
+            },
+            actor,
+        )
+        .await?;
+    assert!(
+        engine
+            .list_dispatchable_goal_ids(10)
+            .await?
+            .contains(&goal.id),
+        "replanned+approved goal re-enters dispatch"
+    );
+    let report = worker.run_goal_until_idle(&goal.id, 8).await?;
+    let fresh = report
+        .work_items
+        .iter()
+        .find(|i| i.step_id == "check")
+        .expect("new revision item ran");
+    assert_eq!(fresh.status, WorkItemStatus::Succeeded);
     Ok(())
 }

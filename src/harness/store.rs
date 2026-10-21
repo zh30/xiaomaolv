@@ -3,18 +3,22 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::Row;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tracing::warn;
 
 use crate::harness::evolution::{
     ABSOLUTE_MAX_PROMPT_PATCH_CHARS, ActiveEvolutionPolicy, EvolutionAuditEvent,
     EvolutionCandidateDraft, EvolutionCandidateRecord, EvolutionCandidateStatus,
-    EvolutionDeploymentRecord, EvolutionEvalCase, EvolutionEvaluationDraft,
+    EvolutionDeploymentRecord, EvolutionEvalCase, EvolutionEvalRun, EvolutionEvaluationDraft,
     EvolutionEvaluationRecord, EvolutionFeedbackDraft, EvolutionFeedbackRecord,
     EvolutionPromotionDecision, EvolutionRollbackResult, MAX_ENABLED_EVOLUTION_EVAL_CASES,
     PromptPatch,
 };
-use crate::harness::loop_engine::{LoopStore, SqliteLoopStore, TrajectoryFrameDraft};
+use crate::harness::loop_engine::{
+    CreateSignalRequest, LoopStore, SignalKind, SignalTrust, SqliteLoopStore, TrajectoryFrameDraft,
+};
 use crate::harness::trajectory::{
-    ToolCallRecord, TrajectoryExitReason, TrajectoryFilter, TrajectoryRecord,
+    RunScorecard, RunScorecardFilter, ScorecardSummary, ToolCallRecord, TrajectoryExitReason,
+    TrajectoryFilter, TrajectoryRecord,
 };
 use crate::memory::{
     CompactionSummaryLoadRequest, CompactionSummaryRecord, CompactionSummaryUpsertRequest,
@@ -66,6 +70,70 @@ pub trait HarnessStore: Send + Sync {
     async fn record_provider_frame(&self, _draft: TrajectoryFrameDraft) -> anyhow::Result<()> {
         Ok(())
     }
+
+    async fn get_run_scorecard(
+        &self,
+        _trajectory_id: &str,
+    ) -> anyhow::Result<Option<RunScorecard>> {
+        Ok(None)
+    }
+
+    async fn query_run_scorecards(
+        &self,
+        _filter: RunScorecardFilter,
+    ) -> anyhow::Result<Vec<RunScorecard>> {
+        Ok(Vec::new())
+    }
+
+    async fn run_scorecard_summary(
+        &self,
+        _since_unix: i64,
+        _until_unix: i64,
+    ) -> anyhow::Result<ScorecardSummary> {
+        Ok(ScorecardSummary {
+            window_start_unix: 0,
+            window_end_unix: 0,
+            run_count: 0,
+            mean_score: None,
+            low_count: 0,
+            mid_count: 0,
+            high_count: 0,
+            failed_tool_calls: 0,
+            verification_failures: 0,
+            exit_reasons: std::collections::BTreeMap::new(),
+        })
+    }
+
+    /// Most recent finished trajectory whose `session_id` starts with
+    /// `session_prefix` — used to bind lightweight user reply-feedback to
+    /// the run that produced the answer being rated.
+    async fn latest_finished_trajectory(
+        &self,
+        _session_prefix: &str,
+        _min_finished_unix: i64,
+    ) -> anyhow::Result<Option<TrajectoryRecord>> {
+        Ok(None)
+    }
+
+    /// Most recent trajectory finished for exactly `session_id` at or before
+    /// `before_unix` — used by outbound-message binding to name the run that
+    /// produced a specific bot message.
+    async fn latest_finished_trajectory_before(
+        &self,
+        _session_id: &str,
+        _before_unix: i64,
+    ) -> anyhow::Result<Option<TrajectoryRecord>> {
+        Ok(None)
+    }
+
+    /// The user input that started a run — extracted from the earliest
+    /// captured provider request frame. Seeded eval cases default to it.
+    async fn trajectory_first_user_input(
+        &self,
+        _trajectory_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone)]
@@ -111,8 +179,79 @@ impl HarnessStore for SqliteHarnessStore {
         exit_reason: TrajectoryExitReason,
     ) -> anyhow::Result<()> {
         self.store
-            .finish_trajectory(trajectory_id, final_answer, exit_reason)
-            .await
+            .finish_trajectory(trajectory_id, final_answer, exit_reason.clone())
+            .await?;
+        // Self-reporting: a run whose deterministic score lands below the
+        // threshold surfaces as a deduplicated triage signal, so chat-quality
+        // failures enter the same operator pipeline as self-test
+        // regressions. Emission is best-effort and never fails the finish.
+        match self.store.get_run_scorecard(trajectory_id).await {
+            Ok(Some(scorecard)) if scorecard.score < crate::harness::trajectory::LOW_RUN_SCORE => {
+                let trajectory = self.store.get_trajectory(trajectory_id).await?;
+                let signal_store = SqliteLoopStore::new(self.store.clone());
+                let request = CreateSignalRequest {
+                    kind: SignalKind::Trajectory,
+                    trust: SignalTrust::Internal,
+                    source: "trajectory:scorecard".to_string(),
+                    external_id: Some(scorecard.trajectory_id.clone()),
+                    content: format!(
+                        "low-score run ({}): exit={}, failed_tools={}/{}, verification_failures={}, iterations={}, model={}, channel={}",
+                        scorecard.score,
+                        exit_reason.as_str(),
+                        scorecard.failed_tool_calls,
+                        scorecard.tool_calls,
+                        scorecard.verification_failures,
+                        scorecard.iterations,
+                        trajectory
+                            .as_ref()
+                            .map(|record| record.model.as_str())
+                            .unwrap_or("unknown"),
+                        trajectory
+                            .as_ref()
+                            .map(|record| record.channel.as_str())
+                            .unwrap_or("unknown"),
+                    ),
+                    metadata: [
+                        ("trajectory_id", scorecard.trajectory_id.clone()),
+                        (
+                            "session_id",
+                            trajectory
+                                .as_ref()
+                                .map(|record| record.session_id.clone())
+                                .unwrap_or_default(),
+                        ),
+                        ("score", scorecard.score.to_string()),
+                        ("exit_reason", exit_reason.as_str().to_string()),
+                        ("failed_tool_calls", scorecard.failed_tool_calls.to_string()),
+                        (
+                            "verification_failures",
+                            scorecard.verification_failures.to_string(),
+                        ),
+                    ]
+                    .into_iter()
+                    .map(|(key, value)| (key.to_string(), value))
+                    .collect(),
+                };
+                if let Err(error) =
+                    LoopStore::ingest_signal(&signal_store, request, "system:scorecard").await
+                {
+                    warn!(
+                        trajectory_id,
+                        %error,
+                        "failed to emit low-score trajectory signal"
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(
+                    trajectory_id,
+                    %error,
+                    "failed to load scorecard for finished trajectory"
+                );
+            }
+        }
+        Ok(())
     }
 
     async fn get_trajectory(
@@ -148,6 +287,54 @@ impl HarnessStore for SqliteHarnessStore {
         LoopStore::record_trajectory_frame(&store, draft, "trajectory:message-service")
             .await
             .map(|_| ())
+    }
+
+    async fn get_run_scorecard(&self, trajectory_id: &str) -> anyhow::Result<Option<RunScorecard>> {
+        self.store.get_run_scorecard(trajectory_id).await
+    }
+
+    async fn query_run_scorecards(
+        &self,
+        filter: RunScorecardFilter,
+    ) -> anyhow::Result<Vec<RunScorecard>> {
+        self.store.query_run_scorecards(filter).await
+    }
+
+    async fn run_scorecard_summary(
+        &self,
+        since_unix: i64,
+        until_unix: i64,
+    ) -> anyhow::Result<ScorecardSummary> {
+        self.store
+            .run_scorecard_summary(since_unix, until_unix)
+            .await
+    }
+
+    async fn latest_finished_trajectory(
+        &self,
+        session_prefix: &str,
+        min_finished_unix: i64,
+    ) -> anyhow::Result<Option<TrajectoryRecord>> {
+        self.store
+            .latest_finished_trajectory(session_prefix, min_finished_unix)
+            .await
+    }
+
+    async fn latest_finished_trajectory_before(
+        &self,
+        session_id: &str,
+        before_unix: i64,
+    ) -> anyhow::Result<Option<TrajectoryRecord>> {
+        self.store
+            .latest_finished_trajectory_before(session_id, before_unix)
+            .await
+    }
+
+    async fn trajectory_first_user_input(
+        &self,
+        trajectory_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        self.store.trajectory_first_user_input(trajectory_id).await
     }
 }
 
@@ -210,6 +397,23 @@ pub trait EvolutionStore: Send + Sync {
         limit: usize,
     ) -> anyhow::Result<Vec<EvolutionFeedbackRecord>>;
 
+    /// Upserts the durable shadow-evaluation cursor for a candidate —
+    /// creating a run replaces any stale in-flight run for the same
+    /// candidate so a retried evaluation starts clean.
+    async fn upsert_eval_run(&self, _run: &EvolutionEvalRun) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn get_eval_run(&self, _candidate_id: &str) -> anyhow::Result<Option<EvolutionEvalRun>> {
+        Ok(None)
+    }
+
+    /// Drops the evaluation cursor once the suite finalized (or is being
+    /// restarted).
+    async fn clear_eval_run(&self, _candidate_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     async fn activate_candidate(
         &self,
         candidate_id: &str,
@@ -218,6 +422,31 @@ pub trait EvolutionStore: Send + Sync {
     ) -> anyhow::Result<EvolutionDeploymentRecord>;
 
     async fn active_policy(&self) -> anyhow::Result<Option<ActiveEvolutionPolicy>>;
+
+    /// The full record behind `active_policy` — needed by the deployment
+    /// outcome review for `activated_at`, which `ActiveEvolutionPolicy` does
+    /// not carry.
+    async fn active_deployment(&self) -> anyhow::Result<Option<EvolutionDeploymentRecord>>;
+
+    /// Most recent rolled-back deployments, newest first — the "do not
+    /// repeat" memory consulted by every proposal.
+    async fn list_recent_rollbacks(
+        &self,
+        _limit: usize,
+    ) -> anyhow::Result<Vec<EvolutionDeploymentRecord>> {
+        Ok(Vec::new())
+    }
+
+    /// Emits an internally-trusted signal into the harness signal pipeline
+    /// (e.g. a detected deployment regression). Best-effort: callers decide
+    /// whether an emission failure is fatal.
+    async fn emit_internal_signal(
+        &self,
+        _request: crate::harness::loop_engine::CreateSignalRequest,
+        _actor: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     async fn rollback_active(
         &self,
@@ -245,6 +474,51 @@ pub struct SqliteEvolutionStore {
 impl SqliteEvolutionStore {
     pub fn new(store: SqliteMemoryStore) -> Self {
         Self { store }
+    }
+
+    /// Negative-feedback spike detector: three or more distinct runs flagged
+    /// inside six hours emits one deduplicated hourly-bucket triage signal —
+    /// sustained user displeasure becomes operator-visible work, while a
+    /// lone complaint stays evidence-only.
+    async fn maybe_emit_feedback_spike(
+        &self,
+        latest: &EvolutionFeedbackRecord,
+    ) -> anyhow::Result<()> {
+        const SPIKE_WINDOW_SECS: i64 = 6 * 3_600;
+        const SPIKE_RUN_THRESHOLD: i64 = 3;
+        let flagged_runs = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(DISTINCT trajectory_id) FROM evolution_feedback
+             WHERE score < 0 AND created_at >= ?1",
+        )
+        .bind(Utc::now().timestamp() - SPIKE_WINDOW_SECS)
+        .fetch_one(self.store.pool())
+        .await
+        .context("failed to count negative-feedback runs")?;
+        if flagged_runs < SPIKE_RUN_THRESHOLD {
+            return Ok(());
+        }
+        self.emit_internal_signal(
+            CreateSignalRequest {
+                kind: SignalKind::UserFeedback,
+                trust: SignalTrust::Internal,
+                source: "evolution:feedback-spike".to_string(),
+                external_id: Some(Utc::now().format("fb-spike:%Y%m%d%H").to_string()),
+                content: format!(
+                    "negative feedback spike: {flagged_runs} distinct runs flagged in the last 6h (latest: {} score {})",
+                    latest.trajectory_id, latest.score,
+                ),
+                metadata: [
+                    ("flagged_runs", flagged_runs.to_string()),
+                    ("window_secs", SPIKE_WINDOW_SECS.to_string()),
+                    ("latest_trajectory_id", latest.trajectory_id.clone()),
+                ]
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value))
+                .collect(),
+            },
+            "system:evolution-store",
+        )
+        .await
     }
 }
 
@@ -681,7 +955,16 @@ impl EvolutionStore for SqliteEvolutionStore {
         .fetch_one(self.store.pool())
         .await
         .context("recorded evolution feedback is missing")?;
-        feedback_from_row(row)
+        let record = feedback_from_row(row)?;
+        if draft.score < 0.0
+            && let Err(error) = self.maybe_emit_feedback_spike(&record).await
+        {
+            warn!(
+                %error,
+                "failed to emit negative-feedback spike signal"
+            );
+        }
+        Ok(record)
     }
 
     async fn list_feedback(
@@ -704,6 +987,61 @@ impl EvolutionStore for SqliteEvolutionStore {
             .await
             .context("failed to list evolution feedback")?;
         rows.into_iter().map(feedback_from_row).collect()
+    }
+
+    async fn upsert_eval_run(&self, run: &EvolutionEvalRun) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO evolution_eval_runs
+             (id, candidate_id, cases_json, benchmark_tail, baseline_json,
+              case_index, baseline_outputs_json, candidate_outputs_json,
+              response_bytes, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, unixepoch())
+             ON CONFLICT(candidate_id) DO UPDATE SET
+              id = excluded.id, cases_json = excluded.cases_json,
+              benchmark_tail = excluded.benchmark_tail,
+              baseline_json = excluded.baseline_json,
+              case_index = excluded.case_index,
+              baseline_outputs_json = excluded.baseline_outputs_json,
+              candidate_outputs_json = excluded.candidate_outputs_json,
+              response_bytes = excluded.response_bytes,
+              updated_at = unixepoch()",
+        )
+        .bind(&run.id)
+        .bind(&run.candidate_id)
+        .bind(serde_json::to_string(&run.cases)?)
+        .bind(run.benchmark_tail as i64)
+        .bind(serde_json::to_string(&run.baseline)?)
+        .bind(run.case_index as i64)
+        .bind(serde_json::to_string(&run.baseline_outputs)?)
+        .bind(serde_json::to_string(&run.candidate_outputs)?)
+        .bind(run.response_bytes as i64)
+        .execute(self.store.pool())
+        .await
+        .context("failed to persist evolution eval run")?;
+        Ok(())
+    }
+
+    async fn get_eval_run(&self, candidate_id: &str) -> anyhow::Result<Option<EvolutionEvalRun>> {
+        let row = sqlx::query(
+            "SELECT id, candidate_id, cases_json, benchmark_tail, baseline_json,
+                    case_index, baseline_outputs_json, candidate_outputs_json,
+                    response_bytes
+             FROM evolution_eval_runs WHERE candidate_id = ?1",
+        )
+        .bind(candidate_id)
+        .fetch_optional(self.store.pool())
+        .await
+        .context("failed to load evolution eval run")?;
+        row.map(eval_run_from_row).transpose()
+    }
+
+    async fn clear_eval_run(&self, candidate_id: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM evolution_eval_runs WHERE candidate_id = ?1")
+            .bind(candidate_id)
+            .execute(self.store.pool())
+            .await
+            .context("failed to clear evolution eval run")?;
+        Ok(())
     }
 
     async fn activate_candidate(
@@ -849,6 +1187,51 @@ impl EvolutionStore for SqliteEvolutionStore {
             })
         })
         .transpose()
+    }
+
+    async fn active_deployment(&self) -> anyhow::Result<Option<EvolutionDeploymentRecord>> {
+        let row = sqlx::query(
+            "SELECT d.id, d.candidate_id, d.previous_deployment_id, d.activated_by,
+                    d.reason, d.activated_at, d.rolled_back_at, d.rolled_back_by,
+                    d.rollback_reason
+             FROM evolution_runtime_state s
+             JOIN evolution_deployments d ON d.id = s.active_deployment_id
+             WHERE s.singleton_id = 1 AND d.rolled_back_at IS NULL",
+        )
+        .fetch_optional(self.store.pool())
+        .await
+        .context("failed to load active evolution deployment")?;
+        row.map(deployment_from_row).transpose()
+    }
+
+    async fn list_recent_rollbacks(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<EvolutionDeploymentRecord>> {
+        let rows = sqlx::query(
+            "SELECT id, candidate_id, previous_deployment_id, activated_by,
+                    reason, activated_at, rolled_back_at, rolled_back_by,
+                    rollback_reason
+             FROM evolution_deployments
+             WHERE rolled_back_at IS NOT NULL
+             ORDER BY rolled_back_at DESC, id DESC LIMIT ?1",
+        )
+        .bind(i64::try_from(limit.min(100)).context("rollback limit exceeds sqlite range")?)
+        .fetch_all(self.store.pool())
+        .await
+        .context("failed to list rolled-back deployments")?;
+        rows.into_iter().map(deployment_from_row).collect()
+    }
+
+    async fn emit_internal_signal(
+        &self,
+        request: crate::harness::loop_engine::CreateSignalRequest,
+        actor: &str,
+    ) -> anyhow::Result<()> {
+        crate::harness::loop_engine::signals::initialize_signal_schema(self.store.pool()).await?;
+        crate::harness::loop_engine::signals::ingest_signal(self.store.pool(), request, actor)
+            .await
+            .map(|_| ())
     }
 
     async fn rollback_active(
@@ -1131,6 +1514,31 @@ fn feedback_from_row(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<EvolutionFe
         comment: row.get("comment"),
         actor: row.get("actor"),
         created_at: evolution_timestamp(row.get("created_at")),
+    })
+}
+
+fn eval_run_from_row(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<EvolutionEvalRun> {
+    let cases_json: String = row.get("cases_json");
+    let baseline_json: String = row.get("baseline_json");
+    let baseline_outputs_json: String = row.get("baseline_outputs_json");
+    let candidate_outputs_json: String = row.get("candidate_outputs_json");
+    let benchmark_tail: i64 = row.get("benchmark_tail");
+    let case_index: i64 = row.get("case_index");
+    let response_bytes: i64 = row.get("response_bytes");
+    Ok(EvolutionEvalRun {
+        id: row.get("id"),
+        candidate_id: row.get("candidate_id"),
+        cases: serde_json::from_str(&cases_json).context("failed to deserialize eval run cases")?,
+        benchmark_tail: usize::try_from(benchmark_tail).context("invalid benchmark tail")?,
+        baseline: serde_json::from_str(&baseline_json)
+            .context("failed to deserialize eval run baseline")?,
+        case_index: usize::try_from(case_index).context("invalid eval run case index")?,
+        baseline_outputs: serde_json::from_str(&baseline_outputs_json)
+            .context("failed to deserialize eval run baseline outputs")?,
+        candidate_outputs: serde_json::from_str(&candidate_outputs_json)
+            .context("failed to deserialize eval run candidate outputs")?,
+        response_bytes: usize::try_from(response_bytes)
+            .context("invalid eval run response bytes")?,
     })
 }
 

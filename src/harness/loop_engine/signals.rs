@@ -16,6 +16,7 @@ pub enum SignalKind {
     Community,
     SelfTest,
     SessionReplay,
+    DeploymentOutcome,
     Manual,
 }
 
@@ -28,6 +29,7 @@ impl SignalKind {
             Self::Community => "community",
             Self::SelfTest => "self_test",
             Self::SessionReplay => "session_replay",
+            Self::DeploymentOutcome => "deployment_outcome",
             Self::Manual => "manual",
         }
     }
@@ -40,6 +42,7 @@ impl SignalKind {
             "community" => Ok(Self::Community),
             "self_test" => Ok(Self::SelfTest),
             "session_replay" => Ok(Self::SessionReplay),
+            "deployment_outcome" => Ok(Self::DeploymentOutcome),
             "manual" => Ok(Self::Manual),
             other => bail!("unknown signal kind: {other}"),
         }

@@ -3,7 +3,7 @@ mod domain;
 mod engine;
 mod replay;
 mod self_test;
-mod signals;
+pub(crate) mod signals;
 mod store;
 mod worker;
 
@@ -13,8 +13,8 @@ pub use domain::{
     CheckpointRecord, ConfirmationResolution, CreateGoalRequest, EffectClass, ExecutionBudget,
     ExternalWritePolicy, GoalRecord, GoalStatus, GoalVerificationReport, InternalApprovalPolicy,
     LoopEventRecord, PlanGoalRequest, PlannedGoal, ProviderBudgetReservation, ResumeReport,
-    RetryPolicy, WorkClaim, WorkItemRecord, WorkItemStatus, WorkOutcome, WorkflowEdge,
-    WorkflowSpec, WorkflowStep,
+    RetryPolicy, WorkClaim, WorkContinuation, WorkItemRecord, WorkItemStatus, WorkOutcome,
+    WorkPhaseProgress, WorkflowEdge, WorkflowSpec, WorkflowStep,
 };
 pub use engine::LoopEngine;
 pub use replay::{

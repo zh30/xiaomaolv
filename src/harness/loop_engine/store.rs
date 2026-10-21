@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, ensure};
 use async_trait::async_trait;
 use sqlx::{Row, SqlitePool};
+use tracing::warn;
 
 use crate::memory::SqliteMemoryStore;
 
@@ -17,8 +18,9 @@ use super::domain::{
     AttemptStatus, CheckpointPhase, CheckpointRecord, ConfirmationResolution, CreateGoalRequest,
     EffectClass, ExternalWritePolicy, GoalRecord, GoalStatus, GoalVerificationReport,
     INTERNAL_ACTOR_PREFIX, INTERNAL_AUTO_ACTOR, InternalApprovalPolicy, LoopEventRecord,
-    PlanGoalRequest, PlannedGoal, ProviderBudgetReservation, ResumeReport, WorkClaim,
-    WorkItemRecord, WorkItemStatus, WorkOutcome, WorkflowSpec, WorkflowStep, hash_serializable,
+    MAX_PHASE_CONTINUES, PlanGoalRequest, PlannedGoal, ProviderBudgetReservation, ResumeReport,
+    WorkClaim, WorkContinuation, WorkItemRecord, WorkItemStatus, WorkOutcome, WorkPhaseProgress,
+    WorkflowSpec, WorkflowStep, hash_serializable,
 };
 use super::replay::{
     ReplayRun, TrajectoryFrame, TrajectoryFrameDraft, initialize_replay_schema, list_frames,
@@ -40,9 +42,28 @@ pub trait LoopStore: Send + Sync {
         actor: &str,
     ) -> anyhow::Result<GoalRecord>;
 
+    /// Like `create_goal`, but reports whether admission actually created a
+    /// goal. When `request.request_id` matches an existing goal the call is
+    /// idempotent: it returns `(existing, false)` without writing events.
+    async fn create_goal_admission(
+        &self,
+        request: CreateGoalRequest,
+        actor: &str,
+    ) -> anyhow::Result<(GoalRecord, bool)>;
+
     async fn get_goal(&self, goal_id: &str) -> anyhow::Result<Option<GoalRecord>>;
 
+    /// Goal lookup by the durable admission `request_id` — the idempotent
+    /// admission key stamped at creation.
+    async fn get_goal_by_request_id(&self, request_id: &str) -> anyhow::Result<Option<GoalRecord>>;
+
     async fn list_goals(&self, limit: usize) -> anyhow::Result<Vec<GoalRecord>>;
+
+    /// Fails goals whose execution deadline passed (`budget.started_at +
+    /// deadline_secs < now`) and emits a `goal.expired` event each. The clock
+    /// starts at the first provider reservation, so queued goals never
+    /// expire while waiting for a worker.
+    async fn expire_overdue_goals(&self, limit: usize) -> anyhow::Result<Vec<String>>;
 
     async fn list_goal_events(
         &self,
@@ -199,10 +220,15 @@ pub trait LoopStore: Send + Sync {
         external_write: &ExternalWritePolicy,
     ) -> anyhow::Result<Vec<WorkItemRecord>>;
 
+    /// `replay_safe` records the handler's declared crash semantics on the
+    /// prepared checkpoint: a `false` value parks the work item in
+    /// `waiting_confirmation` if the attempt dies before commit, instead of
+    /// re-running an ambiguous effect.
     async fn prepare_checkpoint(
         &self,
         claim: &WorkClaim,
         idempotency_key: &str,
+        replay_safe: bool,
         actor: &str,
     ) -> anyhow::Result<CheckpointRecord>;
 
@@ -237,6 +263,49 @@ pub trait LoopStore: Send + Sync {
     /// Lists durable work items for a goal (operator inspection surface).
     async fn list_work_items(&self, goal_id: &str) -> anyhow::Result<Vec<WorkItemRecord>>;
 
+    /// The goal's checkpoint trail (prepared/committed/reconciled/voided) —
+    /// the operator surface for auditing effect outcomes and `replay_safe`
+    /// declarations.
+    async fn list_checkpoints(&self, goal_id: &str) -> anyhow::Result<Vec<CheckpointRecord>>;
+
+    /// All attempts across the goal's work items — who claimed what, the
+    /// fencing token sequence, and which attempts burned budget vs. were
+    /// `void`/`abandoned`.
+    async fn list_attempts(&self, goal_id: &str) -> anyhow::Result<Vec<AttemptRecord>>;
+
+    /// Operator stop: cancels a non-terminal goal — in-flight attempts are
+    /// abandoned (their later commits fail `ensure_claim_current`), open
+    /// work items fail, and the goal lands `canceled` with an auditable
+    /// `goal.canceled` event carrying the operator's reason.
+    async fn cancel_goal(
+        &self,
+        goal_id: &str,
+        reason: &str,
+        actor: &str,
+    ) -> anyhow::Result<GoalRecord>;
+
+    /// Operator hold: pauses a live goal — new claims stop (paused is not a
+    /// dispatchable status) while in-flight attempts finish on their own.
+    /// `unpause_goal` returns it to `active`.
+    async fn pause_goal(
+        &self,
+        goal_id: &str,
+        reason: &str,
+        actor: &str,
+    ) -> anyhow::Result<GoalRecord>;
+    async fn unpause_goal(&self, goal_id: &str, actor: &str) -> anyhow::Result<GoalRecord>;
+
+    /// Replan entry: marks a dead-ended goal (`failed`/`canceled`/`rejected`/
+    /// `blocked`) `replan` and supersedes its open work items — a fresh
+    /// `plan_goal` + `approve` revision then reruns the goal with a clean
+    /// item set.
+    async fn mark_goal_for_replan(
+        &self,
+        goal_id: &str,
+        reason: &str,
+        actor: &str,
+    ) -> anyhow::Result<GoalRecord>;
+
     /// Operator verdict for a work item parked in `waiting_confirmation`.
     /// `confirmed` commits the prepared checkpoint with an operator-attested
     /// outcome; `retry` voids it and re-queues the item; `abandoned` voids it
@@ -249,6 +318,74 @@ pub trait LoopStore: Send + Sync {
         reason: &str,
         actor: &str,
     ) -> anyhow::Result<WorkItemRecord>;
+
+    /// Parks a claimed work item in `blocked` without consuming a failure:
+    /// the live attempt is abandoned and any prepared checkpoint voided.
+    /// Used when dispatch cannot proceed (e.g. the named handler is not
+    /// registered in this process); the item leaves `blocked` only through
+    /// `requeue_blocked_items` or an operator path, not through retries.
+    async fn block_work_item(
+        &self,
+        claim: &WorkClaim,
+        reason: &str,
+        actor: &str,
+    ) -> anyhow::Result<WorkItemRecord>;
+
+    /// Returns `blocked` work items to `ready` when their block reason
+    /// matches `reason_prefix` and their handler is in `handlers`. Lets a
+    /// worker re-queue items that were parked for a missing handler once the
+    /// handler exists in this process.
+    async fn requeue_blocked_items(
+        &self,
+        goal_id: &str,
+        reason_prefix: &str,
+        handlers: &[String],
+        actor: &str,
+    ) -> anyhow::Result<u64>;
+
+    /// Defers a claimed attempt: the attempt is abandoned, its prepared
+    /// checkpoints voided, and the work item returns to `ready` with
+    /// `next_attempt_at = until_unix`. The durable sleep holds no lease and
+    /// survives restarts.
+    async fn defer_attempt(
+        &self,
+        claim: &WorkClaim,
+        until_unix: i64,
+        actor: &str,
+    ) -> anyhow::Result<ResumeReport>;
+
+    /// Latest committed (or reconciled) outcome per declared dependency of
+    /// the work item, keyed by dependency step id — the DAG dataflow a
+    /// dependent handler reads through `WorkHandlerContext.upstream`.
+    async fn upstream_outcomes(
+        &self,
+        work_item_id: &str,
+    ) -> anyhow::Result<std::collections::BTreeMap<String, WorkOutcome>>;
+
+    /// The work item's own latest committed (or reconciled) outcome — the
+    /// terminal result a caller reads when a goal has run to completion.
+    async fn work_item_outcome(&self, work_item_id: &str) -> anyhow::Result<Option<WorkOutcome>>;
+
+    /// Commits a phase boundary on the claimed work item while the attempt
+    /// keeps running: the returned progress is injected into the next
+    /// phase's `ctx.resume` and survives attempt death (a later attempt
+    /// resumes from it). Errors once the per-item phase budget is spent.
+    async fn record_phase_progress(
+        &self,
+        claim: &WorkClaim,
+        continuation: &WorkContinuation,
+        actor: &str,
+    ) -> anyhow::Result<WorkPhaseProgress>;
+
+    /// Persists phase progress and yields the attempt: the work item becomes
+    /// claimable again after `continuation.delay_secs` (or immediately when
+    /// unset) with the progress carried forward.
+    async fn continue_attempt(
+        &self,
+        claim: &WorkClaim,
+        continuation: &WorkContinuation,
+        actor: &str,
+    ) -> anyhow::Result<ResumeReport>;
 }
 
 #[derive(Clone)]
@@ -271,6 +408,19 @@ impl SqliteLoopStore {
         self
     }
 
+    async fn get_goal_by_request_id(&self, request_id: &str) -> anyhow::Result<Option<GoalRecord>> {
+        let row = sqlx::query(
+            "SELECT id, objective, status, revision, source_signal_ids_json, created_by,
+                    created_at, updated_at
+             FROM harness_goals WHERE request_id = ?1",
+        )
+        .bind(request_id)
+        .fetch_optional(self.store.pool())
+        .await
+        .context("failed to load goal by request_id")?;
+        row.map(decode_goal).transpose()
+    }
+
     /// Shared claim path for `claim_goal_work` (ordinal order) and
     /// `claim_work_item` (targeted `step_id`). `step_id = None` picks the
     /// lowest-ordinal ready item.
@@ -284,160 +434,185 @@ impl SqliteLoopStore {
     ) -> anyhow::Result<Option<WorkClaim>> {
         ensure_valid_id(goal_id, "goal id")?;
         recover_goal_state(self.store.pool(), goal_id, actor).await?;
-        let now = unix_now();
-        let lease_until = now + i64::from(lease_secs);
-        let mut tx = self.store.pool().begin().await?;
-        let goal_status: Option<String> =
-            sqlx::query_scalar("SELECT status FROM harness_goals WHERE id = ?1")
+        // Several workers may race for the same ready row (the dispatch loop
+        // fans out goals across `max_parallel` workers). Losing the CAS used
+        // to return `None` even when other ready items existed; retry the
+        // select a few times so parallel claims actually fan out.
+        for _ in 0..3 {
+            let now = unix_now();
+            let lease_until = now + i64::from(lease_secs);
+            let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
+            let goal_status: Option<String> =
+                sqlx::query_scalar("SELECT status FROM harness_goals WHERE id = ?1")
+                    .bind(goal_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let goal_status = goal_status.context("goal not found")?;
+            ensure!(
+                matches!(goal_status.as_str(), "approved" | "active"),
+                "goal is not dispatchable"
+            );
+            let row = if let Some(step_id) = step_id {
+                sqlx::query(
+                    "SELECT id, goal_id, workflow_id, status, step_id, handler, effect_class,
+                            input_json, max_attempts, ordinal, fencing_token, created_at,
+                            progress_json
+                     FROM harness_work_items
+                     WHERE goal_id = ?1 AND step_id = ?2 AND status = 'ready'
+                       AND (next_attempt_at IS NULL OR next_attempt_at <= ?3)
+                       AND (SELECT COUNT(*) FROM harness_attempts a
+                            WHERE a.work_item_id = harness_work_items.id
+                              AND a.status != 'void') < max_attempts
+                     LIMIT 1",
+                )
                 .bind(goal_id)
+                .bind(step_id)
+                .bind(now)
                 .fetch_optional(&mut *tx)
-                .await?;
-        let goal_status = goal_status.context("goal not found")?;
-        ensure!(
-            matches!(goal_status.as_str(), "approved" | "active"),
-            "goal is not dispatchable"
-        );
-        let row = if let Some(step_id) = step_id {
+                .await?
+            } else {
+                sqlx::query(
+                    "SELECT id, goal_id, workflow_id, status, step_id, handler, effect_class,
+                            input_json, max_attempts, ordinal, fencing_token, created_at,
+                            progress_json
+                     FROM harness_work_items
+                     WHERE goal_id = ?1 AND status = 'ready'
+                       AND (next_attempt_at IS NULL OR next_attempt_at <= ?2)
+                       AND (SELECT COUNT(*) FROM harness_attempts a
+                            WHERE a.work_item_id = harness_work_items.id
+                              AND a.status != 'void') < max_attempts
+                     ORDER BY ordinal, id LIMIT 1",
+                )
+                .bind(goal_id)
+                .bind(now)
+                .fetch_optional(&mut *tx)
+                .await?
+            };
+            let Some(row) = row else {
+                tx.commit().await?;
+                return Ok(None);
+            };
+            let workflow_id: String = row.try_get("workflow_id")?;
+            let mut work_item = decode_work_item(row)?;
+            let workflow_json: String =
+                sqlx::query_scalar("SELECT workflow_json FROM harness_workflows WHERE id = ?1")
+                    .bind(&workflow_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let budget = serde_json::from_str::<WorkflowSpec>(&workflow_json)
+                .context("invalid claimed workflow")?
+                .budget;
+            let lease_token = new_loop_id("lease");
+            let updated = sqlx::query(
+                "UPDATE harness_work_items
+                 SET status = 'running', lease_token = ?1, lease_until = ?2,
+                     fencing_token = fencing_token + 1, updated_at = unixepoch()
+                 WHERE id = ?3 AND status = 'ready'",
+            )
+            .bind(&lease_token)
+            .bind(lease_until)
+            .bind(&work_item.id)
+            .execute(&mut *tx)
+            .await?;
+            if updated.rows_affected() != 1 {
+                tx.rollback().await?;
+                continue;
+            }
+            let fencing_token: i64 =
+                sqlx::query_scalar("SELECT fencing_token FROM harness_work_items WHERE id = ?1")
+                    .bind(&work_item.id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let attempt_number: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) + 1 FROM harness_attempts WHERE work_item_id = ?1",
+            )
+            .bind(&work_item.id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let attempt_id = new_loop_id("attempt");
             sqlx::query(
-                "SELECT id, goal_id, workflow_id, status, step_id, handler, effect_class,
-                        input_json, max_attempts, ordinal, fencing_token
-                 FROM harness_work_items
-                 WHERE goal_id = ?1 AND step_id = ?2 AND status = 'ready'
-                   AND (next_attempt_at IS NULL OR next_attempt_at <= ?3)
-                   AND (SELECT COUNT(*) FROM harness_attempts a
-                        WHERE a.work_item_id = harness_work_items.id) < max_attempts
-                 LIMIT 1",
+                "INSERT INTO harness_attempts
+                 (id, goal_id, work_item_id, attempt_number, status, worker_id,
+                  lease_token, fencing_token, started_at)
+                 VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6, ?7, ?8)",
+            )
+            .bind(&attempt_id)
+            .bind(goal_id)
+            .bind(&work_item.id)
+            .bind(attempt_number)
+            .bind(worker_id)
+            .bind(&lease_token)
+            .bind(fencing_token)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE harness_goals SET status = 'active', updated_at = unixepoch()
+                 WHERE id = ?1 AND status = 'approved'",
             )
             .bind(goal_id)
-            .bind(step_id)
-            .bind(now)
-            .fetch_optional(&mut *tx)
-            .await?
-        } else {
-            sqlx::query(
-                "SELECT id, goal_id, workflow_id, status, step_id, handler, effect_class,
-                        input_json, max_attempts, ordinal, fencing_token
-                 FROM harness_work_items
-                 WHERE goal_id = ?1 AND status = 'ready'
-                   AND (next_attempt_at IS NULL OR next_attempt_at <= ?2)
-                   AND (SELECT COUNT(*) FROM harness_attempts a
-                        WHERE a.work_item_id = harness_work_items.id) < max_attempts
-                 ORDER BY ordinal, id LIMIT 1",
+            .execute(&mut *tx)
+            .await?;
+            insert_event(
+                &mut tx,
+                goal_id,
+                "work.claimed",
+                actor,
+                &serde_json::json!({
+                    "work_item_id": &work_item.id,
+                    "attempt_id": &attempt_id,
+                    "worker_id": worker_id,
+                    "fencing_token": fencing_token,
+                })
+                .to_string(),
             )
-            .bind(goal_id)
-            .bind(now)
-            .fetch_optional(&mut *tx)
-            .await?
-        };
-        let Some(row) = row else {
+            .await?;
             tx.commit().await?;
-            return Ok(None);
-        };
-        let workflow_id: String = row.try_get("workflow_id")?;
-        let mut work_item = decode_work_item(row)?;
-        let workflow_json: String =
-            sqlx::query_scalar("SELECT workflow_json FROM harness_workflows WHERE id = ?1")
-                .bind(&workflow_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        let budget = serde_json::from_str::<WorkflowSpec>(&workflow_json)
-            .context("invalid claimed workflow")?
-            .budget;
-        let lease_token = new_loop_id("lease");
-        let updated = sqlx::query(
-            "UPDATE harness_work_items
-             SET status = 'running', lease_token = ?1, lease_until = ?2,
-                 fencing_token = fencing_token + 1, updated_at = unixepoch()
-             WHERE id = ?3 AND status = 'ready'",
-        )
-        .bind(&lease_token)
-        .bind(lease_until)
-        .bind(&work_item.id)
-        .execute(&mut *tx)
-        .await?;
-        if updated.rows_affected() != 1 {
-            tx.rollback().await?;
-            return Ok(None);
+            work_item.status = WorkItemStatus::Running;
+            let work_item_id = work_item.id.clone();
+            return Ok(Some(WorkClaim {
+                work_item,
+                attempt: AttemptRecord {
+                    id: attempt_id,
+                    goal_id: goal_id.to_string(),
+                    work_item_id,
+                    attempt_number: u8::try_from(attempt_number)
+                        .context("invalid attempt number")?,
+                    status: AttemptStatus::Running,
+                    worker_id: worker_id.to_string(),
+                    lease_token,
+                    fencing_token: u64::try_from(fencing_token).context("invalid fencing token")?,
+                    started_at_unix: now,
+                    finished_at_unix: None,
+                    error: None,
+                },
+                lease_until_unix: lease_until,
+                budget,
+            }));
         }
-        let fencing_token: i64 =
-            sqlx::query_scalar("SELECT fencing_token FROM harness_work_items WHERE id = ?1")
-                .bind(&work_item.id)
-                .fetch_one(&mut *tx)
-                .await?;
-        let attempt_number: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) + 1 FROM harness_attempts WHERE work_item_id = ?1")
-                .bind(&work_item.id)
-                .fetch_one(&mut *tx)
-                .await?;
-        let attempt_id = new_loop_id("attempt");
-        sqlx::query(
-            "INSERT INTO harness_attempts
-             (id, goal_id, work_item_id, attempt_number, status, worker_id,
-              lease_token, fencing_token, started_at)
-             VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6, ?7, ?8)",
-        )
-        .bind(&attempt_id)
-        .bind(goal_id)
-        .bind(&work_item.id)
-        .bind(attempt_number)
-        .bind(worker_id)
-        .bind(&lease_token)
-        .bind(fencing_token)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE harness_goals SET status = 'active', updated_at = unixepoch()
-             WHERE id = ?1 AND status = 'approved'",
-        )
-        .bind(goal_id)
-        .execute(&mut *tx)
-        .await?;
-        insert_event(
-            &mut tx,
-            goal_id,
-            "work.claimed",
-            actor,
-            &serde_json::json!({
-                "work_item_id": &work_item.id,
-                "attempt_id": &attempt_id,
-                "worker_id": worker_id,
-                "fencing_token": fencing_token,
-            })
-            .to_string(),
-        )
-        .await?;
-        tx.commit().await?;
-        work_item.status = WorkItemStatus::Running;
-        let work_item_id = work_item.id.clone();
-        Ok(Some(WorkClaim {
-            work_item,
-            attempt: AttemptRecord {
-                id: attempt_id,
-                goal_id: goal_id.to_string(),
-                work_item_id,
-                attempt_number: u8::try_from(attempt_number).context("invalid attempt number")?,
-                status: AttemptStatus::Running,
-                worker_id: worker_id.to_string(),
-                lease_token,
-                fencing_token: u64::try_from(fencing_token).context("invalid fencing token")?,
-                started_at_unix: now,
-                finished_at_unix: None,
-                error: None,
-            },
-            lease_until_unix: lease_until,
-            budget,
-        }))
+        Ok(None)
     }
 }
 
 #[async_trait]
 impl LoopStore for SqliteLoopStore {
+    async fn get_goal_by_request_id(&self, request_id: &str) -> anyhow::Result<Option<GoalRecord>> {
+        SqliteLoopStore::get_goal_by_request_id(self, request_id).await
+    }
+
     async fn create_goal(
         &self,
         request: CreateGoalRequest,
         actor: &str,
     ) -> anyhow::Result<GoalRecord> {
+        Ok(self.create_goal_admission(request, actor).await?.0)
+    }
+
+    async fn create_goal_admission(
+        &self,
+        request: CreateGoalRequest,
+        actor: &str,
+    ) -> anyhow::Result<(GoalRecord, bool)> {
         let id = new_loop_id("goal");
         let source_signal_ids = serde_json::to_string(&request.source_signal_ids)
             .context("failed to serialize goal source signals")?;
@@ -447,23 +622,52 @@ impl LoopStore for SqliteLoopStore {
             .begin()
             .await
             .context("failed to start goal transaction")?;
-        sqlx::query(
+        if let Some(request_id) = &request.request_id {
+            let existing: Option<String> =
+                sqlx::query_scalar("SELECT id FROM harness_goals WHERE request_id = ?1")
+                    .bind(request_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if let Some(existing_id) = existing {
+                tx.commit().await?;
+                let goal = self
+                    .get_goal(&existing_id)
+                    .await?
+                    .context("goal admitted under request_id disappeared")?;
+                return Ok((goal, false));
+            }
+        }
+        let inserted = sqlx::query(
             "INSERT INTO harness_goals
-             (id, objective, status, revision, source_signal_ids_json, created_by)
-             VALUES (?1, ?2, 'proposed', 1, ?3, ?4)",
+             (id, objective, status, revision, source_signal_ids_json, created_by,
+              request_id)
+             VALUES (?1, ?2, 'proposed', 1, ?3, ?4, ?5)",
         )
         .bind(&id)
         .bind(request.objective.trim())
         .bind(source_signal_ids)
         .bind(actor)
+        .bind(&request.request_id)
         .execute(&mut *tx)
-        .await
-        .context("failed to create goal")?;
+        .await;
+        if let Err(error) = inserted {
+            tx.rollback().await?;
+            // A concurrent admission with the same request_id may have won
+            // the unique-index race between our pre-check and the insert.
+            if let Some(request_id) = &request.request_id
+                && let Some(goal) = self.get_goal_by_request_id(request_id).await?
+            {
+                return Ok((goal, false));
+            }
+            return Err(error).context("failed to create goal");
+        }
         insert_event(&mut tx, &id, "goal.created", actor, "{}").await?;
         tx.commit().await.context("failed to commit goal")?;
-        self.get_goal(&id)
+        let goal = self
+            .get_goal(&id)
             .await?
-            .context("created goal disappeared")
+            .context("created goal disappeared")?;
+        Ok((goal, true))
     }
 
     async fn get_goal(&self, goal_id: &str) -> anyhow::Result<Option<GoalRecord>> {
@@ -496,6 +700,244 @@ impl LoopStore for SqliteLoopStore {
         .collect()
     }
 
+    async fn expire_overdue_goals(&self, limit: usize) -> anyhow::Result<Vec<String>> {
+        let limit = limit.clamp(1, 128);
+        let now = unix_now();
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let overdue: Vec<String> = sqlx::query_scalar(
+            "SELECT g.id FROM harness_goals g
+             JOIN harness_goal_budget_usage b ON b.goal_id = g.id
+             WHERE g.status IN ('approved', 'active', 'blocked', 'verifying')
+               AND b.started_at IS NOT NULL
+               AND b.started_at + b.deadline_secs < ?1
+             LIMIT ?2",
+        )
+        .bind(now)
+        .bind(i64::try_from(limit).context("expire limit exceeds sqlite range")?)
+        .fetch_all(&mut *tx)
+        .await
+        .context("failed to list overdue goals")?;
+        for goal_id in &overdue {
+            sqlx::query(
+                "UPDATE harness_goals SET status = 'failed', updated_at = unixepoch()
+                 WHERE id = ?1",
+            )
+            .bind(goal_id)
+            .execute(&mut *tx)
+            .await
+            .context("failed to expire goal")?;
+            sqlx::query(
+                "INSERT INTO harness_events (goal_id, event_type, actor, details_json)
+                 VALUES (?1, 'goal.expired', 'internal:janitor', ?2)",
+            )
+            .bind(goal_id)
+            .bind(serde_json::json!({"reason": "deadline_exceeded", "now": now}).to_string())
+            .execute(&mut *tx)
+            .await
+            .context("failed to record expiry event")?;
+        }
+        tx.commit().await?;
+        Ok(overdue)
+    }
+
+    async fn cancel_goal(
+        &self,
+        goal_id: &str,
+        reason: &str,
+        actor: &str,
+    ) -> anyhow::Result<GoalRecord> {
+        ensure_valid_id(goal_id, "goal id")?;
+        let reason = reason.trim();
+        ensure!(
+            !reason.is_empty() && reason.len() <= 512,
+            "cancel reason must be 1..=512 characters"
+        );
+        let now = unix_now();
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let status: String = sqlx::query_scalar("SELECT status FROM harness_goals WHERE id = ?1")
+            .bind(goal_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .context("goal not found")?;
+        ensure!(
+            matches!(
+                status.as_str(),
+                "proposed"
+                    | "planning"
+                    | "review_ready"
+                    | "approved"
+                    | "active"
+                    | "blocked"
+                    | "verifying"
+            ),
+            "goal is already terminal: {status}"
+        );
+        // In-flight attempts die now — their commits lose the
+        // `ensure_claim_current` check and become harmless errors.
+        sqlx::query(
+            "UPDATE harness_attempts
+             SET status = 'abandoned', finished_at = ?1, error = ?2
+             WHERE goal_id = ?3 AND status IN ('running', 'committing', 'waiting_confirmation')",
+        )
+        .bind(now)
+        .bind(format!("goal canceled: {reason}"))
+        .bind(goal_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE harness_work_items
+             SET status = 'failed', lease_token = NULL, lease_until = NULL,
+                 next_attempt_at = NULL, last_error = ?1, updated_at = ?2
+             WHERE goal_id = ?3 AND status NOT IN ('succeeded', 'failed')",
+        )
+        .bind(format!("goal canceled: {reason}"))
+        .bind(now)
+        .bind(goal_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE harness_goals SET status = 'canceled', updated_at = unixepoch()
+             WHERE id = ?1",
+        )
+        .bind(goal_id)
+        .execute(&mut *tx)
+        .await?;
+        insert_event(
+            &mut tx,
+            goal_id,
+            "goal.canceled",
+            actor,
+            &serde_json::json!({"reason": reason}).to_string(),
+        )
+        .await?;
+        tx.commit().await?;
+        let row = sqlx::query("SELECT * FROM harness_goals WHERE id = ?1")
+            .bind(goal_id)
+            .fetch_one(self.store.pool())
+            .await?;
+        decode_goal(row)
+    }
+
+    async fn list_attempts(&self, goal_id: &str) -> anyhow::Result<Vec<AttemptRecord>> {
+        ensure_valid_id(goal_id, "goal id")?;
+        sqlx::query(
+            "SELECT id, goal_id, work_item_id, attempt_number, status, worker_id,
+                    lease_token, fencing_token, started_at, finished_at, error
+             FROM harness_attempts
+             WHERE goal_id = ?1 ORDER BY attempt_number, id",
+        )
+        .bind(goal_id)
+        .fetch_all(self.store.pool())
+        .await
+        .context("failed to list attempts")?
+        .into_iter()
+        .map(decode_attempt)
+        .collect()
+    }
+
+    async fn list_checkpoints(&self, goal_id: &str) -> anyhow::Result<Vec<CheckpointRecord>> {
+        ensure_valid_id(goal_id, "goal id")?;
+        sqlx::query(
+            "SELECT id, goal_id, work_item_id, attempt_id, phase, idempotency_key,
+                    replay_safe, outcome_json, created_at, updated_at
+             FROM harness_checkpoints
+             WHERE goal_id = ?1 ORDER BY sequence, id",
+        )
+        .bind(goal_id)
+        .fetch_all(self.store.pool())
+        .await
+        .context("failed to list checkpoints")?
+        .into_iter()
+        .map(decode_checkpoint)
+        .collect()
+    }
+
+    async fn pause_goal(
+        &self,
+        goal_id: &str,
+        reason: &str,
+        actor: &str,
+    ) -> anyhow::Result<GoalRecord> {
+        self.set_goal_paused(goal_id, true, Some(reason), actor)
+            .await
+    }
+
+    async fn unpause_goal(&self, goal_id: &str, actor: &str) -> anyhow::Result<GoalRecord> {
+        self.set_goal_paused(goal_id, false, None, actor).await
+    }
+
+    async fn mark_goal_for_replan(
+        &self,
+        goal_id: &str,
+        reason: &str,
+        actor: &str,
+    ) -> anyhow::Result<GoalRecord> {
+        ensure_valid_id(goal_id, "goal id")?;
+        let reason = reason.trim();
+        ensure!(
+            !reason.is_empty() && reason.len() <= 512,
+            "replan reason must be 1..=512 characters"
+        );
+        let now = unix_now();
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let status: String = sqlx::query_scalar("SELECT status FROM harness_goals WHERE id = ?1")
+            .bind(goal_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .context("goal not found")?;
+        ensure!(
+            matches!(
+                status.as_str(),
+                "failed" | "canceled" | "rejected" | "blocked"
+            ),
+            "goal cannot be replanned from status '{status}'"
+        );
+        // The previous revision's open items are superseded — `canceled`
+        // keeps them auditable but out of every dispatch/aggregate path.
+        sqlx::query(
+            "UPDATE harness_attempts
+             SET status = 'abandoned', finished_at = ?1, error = ?2
+             WHERE goal_id = ?3 AND status IN ('running', 'committing', 'waiting_confirmation')",
+        )
+        .bind(now)
+        .bind("superseded by replan".to_string())
+        .bind(goal_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE harness_work_items
+             SET status = 'canceled', lease_token = NULL, lease_until = NULL,
+                 next_attempt_at = NULL, last_error = ?1, updated_at = ?2
+             WHERE goal_id = ?3 AND status NOT IN ('succeeded', 'failed', 'canceled')",
+        )
+        .bind(format!("superseded by replan: {reason}"))
+        .bind(now)
+        .bind(goal_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE harness_goals SET status = 'replan', updated_at = unixepoch()
+             WHERE id = ?1",
+        )
+        .bind(goal_id)
+        .execute(&mut *tx)
+        .await?;
+        insert_event(
+            &mut tx,
+            goal_id,
+            "goal.replan",
+            actor,
+            &serde_json::json!({"reason": reason}).to_string(),
+        )
+        .await?;
+        tx.commit().await?;
+        let row = sqlx::query("SELECT * FROM harness_goals WHERE id = ?1")
+            .bind(goal_id)
+            .fetch_one(self.store.pool())
+            .await?;
+        decode_goal(row)
+    }
+
     async fn list_goal_events(
         &self,
         goal_id: &str,
@@ -525,11 +967,18 @@ impl LoopStore for SqliteLoopStore {
     async fn list_dispatchable_goal_ids(&self, limit: usize) -> anyhow::Result<Vec<String>> {
         let limit = limit.clamp(1, 500);
         sqlx::query_scalar::<_, String>(
-            "SELECT id FROM harness_goals
-             WHERE status IN ('approved', 'active', 'verifying')
-             ORDER BY updated_at, id LIMIT ?1",
+            "SELECT g.id FROM harness_goals g
+             WHERE g.status IN ('approved', 'active', 'verifying')
+               AND NOT EXISTS (
+                   SELECT 1 FROM harness_goal_budget_usage b
+                    WHERE b.goal_id = g.id
+                      AND b.started_at IS NOT NULL
+                      AND b.started_at + b.deadline_secs < ?2
+               )
+             ORDER BY g.created_at, g.id LIMIT ?1",
         )
         .bind(i64::try_from(limit).context("goal limit exceeds sqlite range")?)
+        .bind(unix_now())
         .fetch_all(self.store.pool())
         .await
         .context("failed to list dispatchable goals")
@@ -635,7 +1084,7 @@ impl LoopStore for SqliteLoopStore {
         actor: &str,
     ) -> anyhow::Result<GoalVerificationReport> {
         ensure_valid_id(goal_id, "goal id")?;
-        let mut tx = self.store.pool().begin().await?;
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
         let status: String = sqlx::query_scalar("SELECT status FROM harness_goals WHERE id = ?1")
             .bind(goal_id)
             .fetch_optional(&mut *tx)
@@ -788,7 +1237,7 @@ impl LoopStore for SqliteLoopStore {
             !label.is_empty() && label.len() <= 160,
             "manual verification label must be 1..=160 bytes"
         );
-        let mut tx = self.store.pool().begin().await?;
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
         let status: String = sqlx::query_scalar("SELECT status FROM harness_goals WHERE id = ?1")
             .bind(goal_id)
             .fetch_optional(&mut *tx)
@@ -844,7 +1293,7 @@ impl LoopStore for SqliteLoopStore {
     ) -> anyhow::Result<ProviderBudgetReservation> {
         ensure_valid_id(goal_id, "goal id")?;
         let now = unix_now();
-        let mut tx = self.store.pool().begin().await?;
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query(
             "SELECT max_provider_calls, deadline_secs, max_response_bytes,
                     provider_calls, response_bytes, started_at
@@ -918,7 +1367,7 @@ impl LoopStore for SqliteLoopStore {
         let effect_manifest = request.effect_manifest();
         let effect_manifest_json = serde_json::to_string(&effect_manifest)?;
         let plan_id = new_loop_id("plan");
-        let mut tx = self.store.pool().begin().await?;
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
         let current = sqlx::query("SELECT status, revision FROM harness_goals WHERE id = ?1")
             .bind(goal_id)
             .fetch_optional(&mut *tx)
@@ -1033,7 +1482,7 @@ impl LoopStore for SqliteLoopStore {
             request.expected_plan_hash.starts_with("sha256:"),
             "expected plan hash must be sha256"
         );
-        let mut tx = self.store.pool().begin().await?;
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
         let goal_row = sqlx::query("SELECT status, revision FROM harness_goals WHERE id = ?1")
             .bind(goal_id)
             .fetch_optional(&mut *tx)
@@ -1108,7 +1557,9 @@ impl LoopStore for SqliteLoopStore {
         .await
         .context("failed to bind goal approval")?;
         sqlx::query(
-            "INSERT INTO harness_goal_budget_usage
+            // Replan issues a fresh revision — replace so the new budget
+            // clock (started_at, deadline) resets for the rerun.
+            "INSERT OR REPLACE INTO harness_goal_budget_usage
              (goal_id, max_provider_calls, deadline_secs, max_response_bytes)
              VALUES (?1, ?2, ?3, ?4)",
         )
@@ -1230,7 +1681,7 @@ impl LoopStore for SqliteLoopStore {
             "extend_workflow requires 1..=32 steps"
         );
 
-        let mut tx = self.store.pool().begin().await?;
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
         let goal_status: Option<String> =
             sqlx::query_scalar("SELECT status FROM harness_goals WHERE id = ?1")
                 .bind(goal_id)
@@ -1280,13 +1731,16 @@ impl LoopStore for SqliteLoopStore {
                 .get("max_nodes")
                 .and_then(serde_json::Value::as_u64)
                 .context("swarm root step is missing a max_nodes budget")? as usize;
-        let existing_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM harness_work_items WHERE goal_id = ?1")
-                .bind(goal_id)
-                .fetch_one(&mut *tx)
-                .await?;
+        let existing_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM harness_work_items
+                 WHERE goal_id = ?1 AND status != 'canceled'",
+        )
+        .bind(goal_id)
+        .fetch_one(&mut *tx)
+        .await?;
         let max_ordinal: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(ordinal), -1) FROM harness_work_items WHERE goal_id = ?1",
+            "SELECT COALESCE(MAX(ordinal), -1) FROM harness_work_items
+             WHERE goal_id = ?1 AND status != 'canceled'",
         )
         .bind(goal_id)
         .fetch_one(&mut *tx)
@@ -1296,14 +1750,16 @@ impl LoopStore for SqliteLoopStore {
             "workflow extension exceeds the approved expansion budget"
         );
 
-        let existing_step_ids: BTreeSet<String> =
-            sqlx::query_scalar("SELECT step_id FROM harness_work_items WHERE goal_id = ?1")
-                .bind(goal_id)
-                .fetch_all(&mut *tx)
-                .await?
-                .into_iter()
-                .collect();
-        let mut step_ids = existing_step_ids;
+        let existing_step_ids: BTreeSet<String> = sqlx::query_scalar(
+            "SELECT step_id FROM harness_work_items
+                 WHERE goal_id = ?1 AND status != 'canceled'",
+        )
+        .bind(goal_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .collect();
+        let mut step_ids = existing_step_ids.clone();
         for step in &steps {
             ensure!(
                 !step.id.trim().is_empty() && step.id.len() <= 96,
@@ -1340,15 +1796,55 @@ impl LoopStore for SqliteLoopStore {
             );
         }
 
+        // Declared dependencies: a step may carry `input.depends_on`
+        // ([step_ids]) — deps must name steps already materialized in the
+        // goal or earlier in this batch (acyclic by construction). A step
+        // with deps materializes `pending`; children without deps are
+        // `ready`.
+        let mut depends_on: Vec<Vec<String>> = Vec::with_capacity(steps.len());
+        let mut known = existing_step_ids;
+        for step in &steps {
+            let deps = step
+                .input
+                .get("depends_on")
+                .and_then(|value| value.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            ensure!(
+                deps.len() <= 16,
+                "a step may declare at most 16 dependencies"
+            );
+            for dep in &deps {
+                ensure!(
+                    known.contains(dep.as_str()),
+                    "depends_on references unknown step '{dep}'"
+                );
+                ensure!(dep != &step.id, "a step cannot depend on itself");
+            }
+            known.insert(step.id.clone());
+            depends_on.push(deps);
+        }
+
+        let mut work_ids = Vec::with_capacity(steps.len());
         let mut records = Vec::with_capacity(steps.len());
         for (offset, step) in steps.iter().enumerate() {
             let work_id = new_loop_id("work");
             let ordinal = max_ordinal + 1 + offset as i64;
+            let status = if depends_on[offset].is_empty() {
+                "ready"
+            } else {
+                "pending"
+            };
             sqlx::query(
                 "INSERT INTO harness_work_items
                  (id, goal_id, workflow_id, step_id, handler, effect_class, input_json,
                   status, max_attempts, backoff_secs, ordinal)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ready', ?8, ?9, ?10)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )
             .bind(&work_id)
             .bind(goal_id)
@@ -1357,15 +1853,21 @@ impl LoopStore for SqliteLoopStore {
             .bind(&step.handler)
             .bind(step.effect.as_str())
             .bind(serde_json::to_string(&step.input)?)
+            .bind(status)
             .bind(step.retry.max_attempts as i64)
             .bind(step.retry.backoff_secs as i64)
             .bind(ordinal)
             .execute(&mut *tx)
             .await?;
+            work_ids.push(work_id.clone());
             records.push(WorkItemRecord {
                 id: work_id,
                 goal_id: goal_id.to_string(),
-                status: WorkItemStatus::Ready,
+                status: if status == "ready" {
+                    WorkItemStatus::Ready
+                } else {
+                    WorkItemStatus::Pending
+                },
                 step_id: step.id.clone(),
                 handler: step.handler.clone(),
                 effect: step.effect,
@@ -1373,7 +1875,37 @@ impl LoopStore for SqliteLoopStore {
                 max_attempts: step.retry.max_attempts,
                 ordinal: u32::try_from(ordinal).context("invalid work item ordinal")?,
                 dependency_ids: Vec::new(),
+                created_at_unix: unix_now(),
+                progress: None,
             });
+        }
+        // Dep rows resolve step ids to the freshly materialized work ids —
+        // batch deps use the batch map, pre-existing deps a lookup.
+        for (offset, deps) in depends_on.iter().enumerate() {
+            for dep in deps {
+                let dep_work_id =
+                    if let Some(batch_pos) = steps.iter().position(|step| step.id == *dep) {
+                        work_ids[batch_pos].clone()
+                    } else {
+                        sqlx::query_scalar::<_, String>(
+                            "SELECT id FROM harness_work_items WHERE goal_id = ?1 AND step_id = ?2",
+                        )
+                        .bind(goal_id)
+                        .bind(dep)
+                        .fetch_one(&mut *tx)
+                        .await
+                        .context("failed to resolve depends_on step")?
+                    };
+                sqlx::query(
+                    "INSERT INTO harness_work_item_dependencies
+                     (work_item_id, depends_on_work_item_id) VALUES (?1, ?2)",
+                )
+                .bind(&work_ids[offset])
+                .bind(dep_work_id)
+                .execute(&mut *tx)
+                .await
+                .context("failed to materialize extended dependency")?;
+            }
         }
         insert_event(
             &mut tx,
@@ -1396,17 +1928,18 @@ impl LoopStore for SqliteLoopStore {
         &self,
         claim: &WorkClaim,
         idempotency_key: &str,
+        replay_safe: bool,
         actor: &str,
     ) -> anyhow::Result<CheckpointRecord> {
         ensure!(
             !idempotency_key.trim().is_empty() && idempotency_key.len() <= 200,
             "idempotency key must be 1..=200 bytes"
         );
-        let mut tx = self.store.pool().begin().await?;
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
         ensure_claim_current(&mut tx, claim).await?;
         if let Some(row) = sqlx::query(
             "SELECT id, goal_id, work_item_id, attempt_id, phase, idempotency_key,
-                    outcome_json, created_at, updated_at
+                    replay_safe, outcome_json, created_at, updated_at
              FROM harness_checkpoints
              WHERE work_item_id = ?1 AND idempotency_key = ?2",
         )
@@ -1426,14 +1959,16 @@ impl LoopStore for SqliteLoopStore {
         let checkpoint_id = new_loop_id("checkpoint");
         sqlx::query(
             "INSERT INTO harness_checkpoints
-             (id, goal_id, work_item_id, attempt_id, phase, idempotency_key)
-             VALUES (?1, ?2, ?3, ?4, 'prepared', ?5)",
+             (id, goal_id, work_item_id, attempt_id, phase, idempotency_key,
+              replay_safe)
+             VALUES (?1, ?2, ?3, ?4, 'prepared', ?5, ?6)",
         )
         .bind(&checkpoint_id)
         .bind(&claim.attempt.goal_id)
         .bind(&claim.work_item.id)
         .bind(&claim.attempt.id)
         .bind(idempotency_key)
+        .bind(replay_safe)
         .execute(&mut *tx)
         .await?;
         insert_event(
@@ -1485,7 +2020,7 @@ impl LoopStore for SqliteLoopStore {
     ) -> anyhow::Result<CheckpointRecord> {
         ensure_valid_id(checkpoint_id, "checkpoint id")?;
         let outcome_json = serde_json::to_string(&outcome)?;
-        let mut tx = self.store.pool().begin().await?;
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
         ensure_claim_current(&mut tx, claim).await?;
         let current = load_checkpoint_tx(&mut tx, checkpoint_id).await?;
         ensure!(
@@ -1544,7 +2079,7 @@ impl LoopStore for SqliteLoopStore {
         checkpoint_id: &str,
         actor: &str,
     ) -> anyhow::Result<ResumeReport> {
-        let mut tx = self.store.pool().begin().await?;
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
         ensure_claim_current(&mut tx, claim).await?;
         let checkpoint = load_checkpoint_tx(&mut tx, checkpoint_id).await?;
         ensure!(
@@ -1581,12 +2116,13 @@ impl LoopStore for SqliteLoopStore {
         actor: &str,
     ) -> anyhow::Result<ResumeReport> {
         let error = error.chars().take(2_000).collect::<String>();
-        let mut tx = self.store.pool().begin().await?;
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
         ensure_claim_current(&mut tx, claim).await?;
         let row = sqlx::query(
             "SELECT max_attempts, backoff_secs,
                     (SELECT COUNT(*) FROM harness_attempts a
-                     WHERE a.work_item_id = harness_work_items.id) AS attempt_count
+                     WHERE a.work_item_id = harness_work_items.id
+                       AND a.status != 'void') AS attempt_count
              FROM harness_work_items WHERE id = ?1",
         )
         .bind(&claim.work_item.id)
@@ -1680,7 +2216,7 @@ impl LoopStore for SqliteLoopStore {
         .collect::<anyhow::Result<Vec<_>>>()?;
         let checkpoint = sqlx::query(
             "SELECT id, goal_id, work_item_id, attempt_id, phase, idempotency_key,
-                    outcome_json, created_at, updated_at
+                    replay_safe, outcome_json, created_at, updated_at
              FROM harness_checkpoints WHERE goal_id = ?1
              ORDER BY sequence DESC LIMIT 1",
         )
@@ -1690,15 +2226,27 @@ impl LoopStore for SqliteLoopStore {
         .context("failed to load latest checkpoint")?
         .map(decode_checkpoint)
         .transpose()?;
-        sqlx::query(
-            "INSERT INTO harness_events (goal_id, event_type, actor, details_json)
-             VALUES (?1, 'goal.resumed', ?2, '{}')",
+        // Workers call `resume_goal` on every poll cycle; collapse
+        // consecutive identical resume events so the per-goal event log and
+        // its SSE stream are not flooded by no-op polls.
+        let latest_event: Option<String> = sqlx::query_scalar(
+            "SELECT event_type FROM harness_events
+             WHERE goal_id = ?1 ORDER BY sequence DESC LIMIT 1",
         )
         .bind(goal_id)
-        .bind(actor)
-        .execute(self.store.pool())
-        .await
-        .context("failed to record resume event")?;
+        .fetch_optional(self.store.pool())
+        .await?;
+        if latest_event.as_deref() != Some("goal.resumed") {
+            sqlx::query(
+                "INSERT INTO harness_events (goal_id, event_type, actor, details_json)
+                 VALUES (?1, 'goal.resumed', ?2, '{}')",
+            )
+            .bind(goal_id)
+            .bind(actor)
+            .execute(self.store.pool())
+            .await
+            .context("failed to record resume event")?;
+        }
         Ok(Some(ResumeReport {
             goal,
             work_items,
@@ -1727,10 +2275,10 @@ impl LoopStore for SqliteLoopStore {
             !reason.is_empty() && reason.len() <= 512,
             "confirmation reason must be 1..=512 characters"
         );
-        let mut tx = self.store.pool().begin().await?;
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
         let item_row = sqlx::query(
             "SELECT id, goal_id, status, step_id, handler, effect_class, input_json,
-                    max_attempts, ordinal
+                    max_attempts, ordinal, created_at, progress_json
              FROM harness_work_items WHERE id = ?1 AND goal_id = ?2",
         )
         .bind(work_item_id)
@@ -1742,10 +2290,6 @@ impl LoopStore for SqliteLoopStore {
         ensure!(
             item.status == WorkItemStatus::WaitingConfirmation,
             "work item is not awaiting confirmation"
-        );
-        ensure!(
-            item.effect == EffectClass::ExternalWrite,
-            "waiting_confirmation is only reachable for external_write work"
         );
         let attempt = sqlx::query(
             "SELECT id, goal_id, work_item_id, attempt_number, status, worker_id,
@@ -1762,7 +2306,7 @@ impl LoopStore for SqliteLoopStore {
         .context("no attempt is parked in waiting_confirmation")?;
         let checkpoint = sqlx::query(
             "SELECT id, goal_id, work_item_id, attempt_id, phase, idempotency_key,
-                    outcome_json, created_at, updated_at
+                    replay_safe, outcome_json, created_at, updated_at
              FROM harness_checkpoints
              WHERE attempt_id = ?1 AND phase = 'prepared'
              ORDER BY sequence DESC LIMIT 1",
@@ -1773,6 +2317,10 @@ impl LoopStore for SqliteLoopStore {
         .map(decode_checkpoint)
         .transpose()?
         .context("parked attempt has no prepared checkpoint")?;
+        ensure!(
+            item.effect == EffectClass::ExternalWrite || !checkpoint.replay_safe,
+            "waiting_confirmation requires an ambiguous effect"
+        );
 
         let now = unix_now();
         match resolution {
@@ -1785,6 +2333,8 @@ impl LoopStore for SqliteLoopStore {
                         "resolution": "confirmed",
                         "reason": reason,
                     }),
+                    sleep_until_unix: None,
+                    continuation: None,
                 };
                 sqlx::query(
                     "UPDATE harness_checkpoints
@@ -1848,7 +2398,8 @@ impl LoopStore for SqliteLoopStore {
                 .execute(&mut *tx)
                 .await?;
                 let attempt_count: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM harness_attempts WHERE work_item_id = ?1",
+                    "SELECT COUNT(*) FROM harness_attempts
+                     WHERE work_item_id = ?1 AND status != 'void'",
                 )
                 .bind(work_item_id)
                 .fetch_one(&mut *tx)
@@ -1932,15 +2483,391 @@ impl LoopStore for SqliteLoopStore {
         )
         .await?;
         tx.commit().await?;
+
+        // A resolved gate leaves no operator work behind — the confirmation
+        // signal emitted at park time is triaged out so `/signals` only shows
+        // gates still awaiting a verdict.
+        let pending_signal: Option<String> = sqlx::query_scalar(
+            "SELECT s.id FROM harness_signals s
+             WHERE s.source = 'internal:confirmation' AND s.external_id = ?1
+               AND COALESCE(
+                   (SELECT e.status FROM harness_signal_events e
+                     WHERE e.signal_id = s.id
+                     ORDER BY e.sequence DESC LIMIT 1),
+                   'observed'
+               ) IN ('observed', 'triaged')
+             ORDER BY s.created_at DESC LIMIT 1",
+        )
+        .bind(format!("confirm:{work_item_id}"))
+        .fetch_optional(self.store.pool())
+        .await?;
+        if let Some(signal_id) = pending_signal {
+            let _ = ignore_signal(
+                self.store.pool(),
+                &signal_id,
+                "confirmation resolved",
+                actor,
+            )
+            .await;
+        }
+
         let updated = sqlx::query(
             "SELECT id, goal_id, status, step_id, handler, effect_class, input_json,
-                    max_attempts, ordinal
+                    max_attempts, ordinal, created_at, progress_json
              FROM harness_work_items WHERE id = ?1",
         )
         .bind(work_item_id)
         .fetch_one(self.store.pool())
         .await?;
         decode_work_item(updated)
+    }
+
+    async fn block_work_item(
+        &self,
+        claim: &WorkClaim,
+        reason: &str,
+        actor: &str,
+    ) -> anyhow::Result<WorkItemRecord> {
+        let reason = reason.chars().take(2_000).collect::<String>();
+        let now = unix_now();
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
+        ensure_claim_current(&mut tx, claim).await?;
+        sqlx::query(
+            "UPDATE harness_checkpoints
+             SET phase = 'voided', updated_at = ?1
+             WHERE phase = 'prepared' AND attempt_id = ?2",
+        )
+        .bind(now)
+        .bind(&claim.attempt.id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE harness_attempts
+             SET status = 'void', finished_at = ?1, error = ?2
+             WHERE id = ?3 AND status IN ('running', 'committing')",
+        )
+        .bind(now)
+        .bind(&reason)
+        .bind(&claim.attempt.id)
+        .execute(&mut *tx)
+        .await?;
+        let updated = sqlx::query(
+            "UPDATE harness_work_items
+             SET status = 'blocked', lease_token = NULL, lease_until = NULL,
+                 next_attempt_at = NULL, last_error = ?1, updated_at = ?2
+             WHERE id = ?3 AND status = 'running'",
+        )
+        .bind(&reason)
+        .bind(now)
+        .bind(&claim.work_item.id)
+        .execute(&mut *tx)
+        .await?;
+        ensure!(updated.rows_affected() == 1, "work item is not running");
+        insert_event(
+            &mut tx,
+            &claim.attempt.goal_id,
+            "work.blocked",
+            actor,
+            &serde_json::json!({
+                "work_item_id": &claim.work_item.id,
+                "attempt_id": &claim.attempt.id,
+                "handler": &claim.work_item.handler,
+                "reason": &reason,
+            })
+            .to_string(),
+        )
+        .await?;
+        tx.commit().await?;
+        let row = sqlx::query(
+            "SELECT id, goal_id, status, step_id, handler, effect_class, input_json,
+                    max_attempts, ordinal, created_at, progress_json
+             FROM harness_work_items WHERE id = ?1",
+        )
+        .bind(&claim.work_item.id)
+        .fetch_one(self.store.pool())
+        .await?;
+        decode_work_item(row)
+    }
+
+    async fn requeue_blocked_items(
+        &self,
+        goal_id: &str,
+        reason_prefix: &str,
+        handlers: &[String],
+        actor: &str,
+    ) -> anyhow::Result<u64> {
+        ensure_valid_id(goal_id, "goal id")?;
+        ensure!(
+            reason_prefix.len() <= 120,
+            "block reason prefix cannot exceed 120 bytes"
+        );
+        if handlers.is_empty() {
+            return Ok(0);
+        }
+        ensure!(
+            handlers.len() <= 64,
+            "handler list cannot exceed 64 entries"
+        );
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let placeholders = handlers
+            .iter()
+            .enumerate()
+            .map(|(index, _)| format!("?{}", index + 3))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let requeue_sql = format!(
+            "UPDATE harness_work_items
+             SET status = 'ready', next_attempt_at = NULL, last_error = NULL,
+                 updated_at = unixepoch()
+             WHERE goal_id = ?1 AND status = 'blocked'
+               AND last_error LIKE ?2 ESCAPE '\\'
+               AND handler IN ({placeholders})"
+        );
+        let mut query = sqlx::query(&requeue_sql);
+        query = query
+            .bind(goal_id)
+            .bind(format!("{}%", escape_like(reason_prefix)));
+        for handler in handlers {
+            query = query.bind(handler);
+        }
+        let requeued = query.execute(&mut *tx).await?.rows_affected();
+        if requeued > 0 {
+            insert_event(
+                &mut tx,
+                goal_id,
+                "work.requeued",
+                actor,
+                &serde_json::json!({
+                    "requeued_work_items": requeued,
+                    "reason_prefix": reason_prefix,
+                })
+                .to_string(),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(requeued)
+    }
+
+    async fn defer_attempt(
+        &self,
+        claim: &WorkClaim,
+        until_unix: i64,
+        actor: &str,
+    ) -> anyhow::Result<ResumeReport> {
+        ensure!(until_unix > 0, "deferred wake time must be positive");
+        let now = unix_now();
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
+        ensure_claim_current(&mut tx, claim).await?;
+        sqlx::query(
+            "UPDATE harness_checkpoints
+             SET phase = 'voided', updated_at = ?1
+             WHERE phase = 'prepared' AND attempt_id = ?2",
+        )
+        .bind(now)
+        .bind(&claim.attempt.id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE harness_attempts
+             SET status = 'void', finished_at = ?1, error = ?2
+             WHERE id = ?3 AND status IN ('running', 'committing')",
+        )
+        .bind(now)
+        .bind(format!("deferred until {until_unix}"))
+        .bind(&claim.attempt.id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE harness_work_items
+             SET status = 'ready', lease_token = NULL, lease_until = NULL,
+                 next_attempt_at = ?1, last_error = NULL, updated_at = ?2
+             WHERE id = ?3 AND status = 'running'",
+        )
+        .bind(until_unix)
+        .bind(now)
+        .bind(&claim.work_item.id)
+        .execute(&mut *tx)
+        .await?;
+        insert_event(
+            &mut tx,
+            &claim.attempt.goal_id,
+            "attempt.deferred",
+            actor,
+            &serde_json::json!({
+                "work_item_id": &claim.work_item.id,
+                "attempt_id": &claim.attempt.id,
+                "until_unix": until_unix,
+            })
+            .to_string(),
+        )
+        .await?;
+        tx.commit().await?;
+        self.resume_goal(&claim.attempt.goal_id, actor)
+            .await?
+            .context("goal disappeared after attempt deferral")
+    }
+
+    async fn upstream_outcomes(
+        &self,
+        work_item_id: &str,
+    ) -> anyhow::Result<std::collections::BTreeMap<String, WorkOutcome>> {
+        let rows = sqlx::query(
+            "SELECT wi.step_id, ranked.outcome_json FROM (
+                SELECT dep.depends_on_work_item_id AS dep_id,
+                       c.outcome_json AS outcome_json,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY dep.depends_on_work_item_id
+                           ORDER BY c.updated_at DESC, c.id DESC
+                       ) AS rn
+                FROM harness_work_item_dependencies dep
+                JOIN harness_checkpoints c
+                  ON c.work_item_id = dep.depends_on_work_item_id
+                WHERE dep.work_item_id = ?1
+                  AND c.phase IN ('committed', 'reconciled')
+                  AND c.outcome_json IS NOT NULL
+            ) ranked
+            JOIN harness_work_items wi ON wi.id = ranked.dep_id
+            WHERE ranked.rn = 1",
+        )
+        .bind(work_item_id)
+        .fetch_all(self.store.pool())
+        .await
+        .context("failed to load upstream outcomes")?;
+        let mut outcomes = std::collections::BTreeMap::new();
+        for row in rows {
+            let step_id: String = row.get("step_id");
+            let outcome_json: String = row.get("outcome_json");
+            let outcome: WorkOutcome = serde_json::from_str(&outcome_json)
+                .with_context(|| format!("invalid upstream outcome for step '{step_id}'"))?;
+            outcomes.insert(step_id, outcome);
+        }
+        Ok(outcomes)
+    }
+
+    async fn work_item_outcome(&self, work_item_id: &str) -> anyhow::Result<Option<WorkOutcome>> {
+        let outcome_json = sqlx::query_scalar::<_, String>(
+            "SELECT outcome_json FROM harness_checkpoints
+             WHERE work_item_id = ?1 AND phase IN ('committed', 'reconciled')
+               AND outcome_json IS NOT NULL
+             ORDER BY updated_at DESC, id DESC LIMIT 1",
+        )
+        .bind(work_item_id)
+        .fetch_optional(self.store.pool())
+        .await
+        .context("failed to load work item outcome")?;
+        outcome_json
+            .map(|json| serde_json::from_str(&json).context("invalid stored work outcome"))
+            .transpose()
+    }
+
+    async fn record_phase_progress(
+        &self,
+        claim: &WorkClaim,
+        continuation: &WorkContinuation,
+        actor: &str,
+    ) -> anyhow::Result<WorkPhaseProgress> {
+        continuation.validate()?;
+        let now = unix_now();
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
+        ensure_claim_current(&mut tx, claim).await?;
+        let progress = next_phase_progress(&mut tx, &claim.work_item.id, continuation).await?;
+        sqlx::query(
+            "UPDATE harness_work_items SET progress_json = ?1, updated_at = ?2
+             WHERE id = ?3",
+        )
+        .bind(serde_json::to_string(&progress)?)
+        .bind(now)
+        .bind(&claim.work_item.id)
+        .execute(&mut *tx)
+        .await?;
+        insert_event(
+            &mut tx,
+            &claim.attempt.goal_id,
+            "attempt.phase_progressed",
+            actor,
+            &serde_json::json!({
+                "work_item_id": &claim.work_item.id,
+                "attempt_id": &claim.attempt.id,
+                "phase": &progress.phase,
+                "continues": progress.continues,
+            })
+            .to_string(),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(progress)
+    }
+
+    async fn continue_attempt(
+        &self,
+        claim: &WorkClaim,
+        continuation: &WorkContinuation,
+        actor: &str,
+    ) -> anyhow::Result<ResumeReport> {
+        continuation.validate()?;
+        let now = unix_now();
+        let until_unix = continuation
+            .delay_secs
+            .map(|delay| now.saturating_add(i64::from(delay)));
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
+        ensure_claim_current(&mut tx, claim).await?;
+        let progress = next_phase_progress(&mut tx, &claim.work_item.id, continuation).await?;
+        sqlx::query(
+            "UPDATE harness_checkpoints
+             SET phase = 'voided', updated_at = ?1
+             WHERE phase = 'prepared' AND attempt_id = ?2",
+        )
+        .bind(now)
+        .bind(&claim.attempt.id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE harness_attempts
+             SET status = 'void', finished_at = ?1, error = ?2
+             WHERE id = ?3 AND status IN ('running', 'committing')",
+        )
+        .bind(now)
+        .bind(format!("continued: {}", continuation.phase))
+        .bind(&claim.attempt.id)
+        .execute(&mut *tx)
+        .await?;
+        let requeued = sqlx::query(
+            "UPDATE harness_work_items
+             SET status = 'ready', lease_token = NULL, lease_until = NULL,
+                 next_attempt_at = ?1, progress_json = ?2,
+                 last_error = NULL, updated_at = ?3
+             WHERE id = ?4 AND status = 'running'",
+        )
+        .bind(until_unix)
+        .bind(serde_json::to_string(&progress)?)
+        .bind(now)
+        .bind(&claim.work_item.id)
+        .execute(&mut *tx)
+        .await?;
+        ensure!(
+            requeued.rows_affected() == 1,
+            "claimed work item is no longer running"
+        );
+        insert_event(
+            &mut tx,
+            &claim.attempt.goal_id,
+            "attempt.continued",
+            actor,
+            &serde_json::json!({
+                "work_item_id": &claim.work_item.id,
+                "attempt_id": &claim.attempt.id,
+                "phase": &progress.phase,
+                "continues": progress.continues,
+                "until_unix": until_unix,
+            })
+            .to_string(),
+        )
+        .await?;
+        tx.commit().await?;
+        self.resume_goal(&claim.attempt.goal_id, actor)
+            .await?
+            .context("goal disappeared after attempt continuation")
     }
 }
 
@@ -1957,12 +2884,15 @@ pub async fn initialize_loop_engine_schema(pool: &SqlitePool) -> anyhow::Result<
             status TEXT NOT NULL,
             revision INTEGER NOT NULL,
             source_signal_ids_json TEXT NOT NULL DEFAULT '[]',
+            request_id TEXT,
             created_by TEXT NOT NULL,
             created_at INTEGER NOT NULL DEFAULT (unixepoch()),
             updated_at INTEGER NOT NULL DEFAULT (unixepoch())
         )",
         "CREATE INDEX IF NOT EXISTS idx_harness_goals_status_updated
          ON harness_goals(status, updated_at, id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_harness_goals_request_id
+         ON harness_goals(request_id) WHERE request_id IS NOT NULL",
         "CREATE TABLE IF NOT EXISTS harness_workflows (
             id TEXT PRIMARY KEY,
             goal_id TEXT NOT NULL REFERENCES harness_goals(id),
@@ -2052,6 +2982,7 @@ pub async fn initialize_loop_engine_schema(pool: &SqlitePool) -> anyhow::Result<
             attempt_id TEXT NOT NULL,
             phase TEXT NOT NULL,
             idempotency_key TEXT NOT NULL,
+            replay_safe INTEGER NOT NULL DEFAULT 1,
             outcome_json TEXT,
             created_at INTEGER NOT NULL DEFAULT (unixepoch()),
             updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
@@ -2093,7 +3024,150 @@ pub async fn initialize_loop_engine_schema(pool: &SqlitePool) -> anyhow::Result<
     .execute(pool)
     .await
     .context("failed to record loop engine schema version")?;
+    // Version 2: replay-safety flag on prepared checkpoints (drives the
+    // waiting_confirmation park for handlers that may not be rerun after a
+    // crash) and idempotent goal admission via request_id. ALTERs are
+    // guarded by pragma_table_info so databases created by any earlier code
+    // revision converge to the same shape.
+    if !column_exists(pool, "harness_checkpoints", "replay_safe").await? {
+        sqlx::query(
+            "ALTER TABLE harness_checkpoints
+             ADD COLUMN replay_safe INTEGER NOT NULL DEFAULT 1",
+        )
+        .execute(pool)
+        .await
+        .context("failed to migrate harness_checkpoints.replay_safe")?;
+    }
+    if !column_exists(pool, "harness_goals", "request_id").await? {
+        sqlx::query("ALTER TABLE harness_goals ADD COLUMN request_id TEXT")
+            .execute(pool)
+            .await
+            .context("failed to migrate harness_goals.request_id")?;
+    }
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_harness_goals_request_id
+         ON harness_goals(request_id) WHERE request_id IS NOT NULL",
+    )
+    .execute(pool)
+    .await
+    .context("failed to create request_id index")?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO harness_schema_migrations (version, name)
+         VALUES (2, 'replay_safe_and_request_id')",
+    )
+    .execute(pool)
+    .await
+    .context("failed to record loop engine schema version 2")?;
+    // Version 3: committed phase progress on work items — a phase boundary
+    // a handler reports is persisted before the next phase runs, so a crash
+    // mid-attempt resumes from the last committed phase.
+    if !column_exists(pool, "harness_work_items", "progress_json").await? {
+        sqlx::query("ALTER TABLE harness_work_items ADD COLUMN progress_json TEXT")
+            .execute(pool)
+            .await
+            .context("failed to migrate harness_work_items.progress_json")?;
+    }
+    sqlx::query(
+        "INSERT OR IGNORE INTO harness_schema_migrations (version, name)
+         VALUES (3, 'work_item_phase_progress')",
+    )
+    .execute(pool)
+    .await
+    .context("failed to record loop engine schema version 3")?;
     Ok(())
+}
+
+/// Reads the work item's committed progress and returns the next boundary's
+/// progress with `continues` incremented — capped at `MAX_PHASE_CONTINUES`.
+async fn next_phase_progress(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    work_item_id: &str,
+    continuation: &WorkContinuation,
+) -> anyhow::Result<WorkPhaseProgress> {
+    let current_json: Option<String> =
+        sqlx::query_scalar("SELECT progress_json FROM harness_work_items WHERE id = ?1")
+            .bind(work_item_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    let continues = current_json
+        .map(|json| {
+            serde_json::from_str::<WorkPhaseProgress>(&json)
+                .context("invalid work item progress")
+                .map(|progress| progress.continues)
+        })
+        .transpose()?
+        .unwrap_or(0)
+        .saturating_add(1);
+    ensure!(
+        continues <= MAX_PHASE_CONTINUES,
+        "phase continuation budget exhausted ({MAX_PHASE_CONTINUES} committed boundaries)"
+    );
+    Ok(WorkPhaseProgress {
+        phase: continuation.phase.clone(),
+        state: continuation.state.clone(),
+        continues,
+    })
+}
+
+impl SqliteLoopStore {
+    async fn set_goal_paused(
+        &self,
+        goal_id: &str,
+        paused: bool,
+        reason: Option<&str>,
+        actor: &str,
+    ) -> anyhow::Result<GoalRecord> {
+        ensure_valid_id(goal_id, "goal id")?;
+        if let Some(reason) = reason {
+            ensure!(
+                !reason.trim().is_empty() && reason.trim().len() <= 512,
+                "pause reason must be 1..=512 characters"
+            );
+        }
+        let (to_status, event) = if paused {
+            ("paused", "goal.paused")
+        } else {
+            ("active", "goal.unpaused")
+        };
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let status: String = sqlx::query_scalar("SELECT status FROM harness_goals WHERE id = ?1")
+            .bind(goal_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .context("goal not found")?;
+        let allowed: Vec<&str> = if paused {
+            vec!["approved", "active", "blocked", "verifying"]
+        } else {
+            vec!["paused"]
+        };
+        ensure!(
+            allowed.contains(&status.as_str()),
+            "goal cannot {} from status '{status}'",
+            if paused { "pause" } else { "unpause" }
+        );
+        sqlx::query(
+            "UPDATE harness_goals SET status = ?1, updated_at = unixepoch()
+             WHERE id = ?2",
+        )
+        .bind(to_status)
+        .bind(goal_id)
+        .execute(&mut *tx)
+        .await?;
+        insert_event(
+            &mut tx,
+            goal_id,
+            event,
+            actor,
+            &serde_json::json!({"reason": reason.map(str::trim)}).to_string(),
+        )
+        .await?;
+        tx.commit().await?;
+        let row = sqlx::query("SELECT * FROM harness_goals WHERE id = ?1")
+            .bind(goal_id)
+            .fetch_one(self.store.pool())
+            .await?;
+        decode_goal(row)
+    }
 }
 
 fn decode_goal(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<GoalRecord> {
@@ -2128,6 +3202,12 @@ fn decode_work_item(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<WorkItemReco
     let ordinal: i64 = row.try_get("ordinal")?;
     let max_attempts: i64 = row.try_get("max_attempts")?;
     let input_json: String = row.try_get("input_json")?;
+    let progress_json: Option<String> = row.try_get("progress_json")?;
+    let progress = progress_json
+        .map(|json| {
+            serde_json::from_str::<WorkPhaseProgress>(&json).context("invalid work item progress")
+        })
+        .transpose()?;
     Ok(WorkItemRecord {
         id: row.try_get("id")?,
         goal_id: row.try_get("goal_id")?,
@@ -2139,11 +3219,14 @@ fn decode_work_item(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<WorkItemReco
         max_attempts: u8::try_from(max_attempts).context("invalid max attempts")?,
         ordinal: u32::try_from(ordinal).context("invalid work item ordinal")?,
         dependency_ids: Vec::new(),
+        created_at_unix: row.try_get("created_at")?,
+        progress,
     })
 }
 
 fn decode_checkpoint(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<CheckpointRecord> {
     let outcome_json: Option<String> = row.try_get("outcome_json")?;
+    let replay_safe: i64 = row.try_get("replay_safe")?;
     Ok(CheckpointRecord {
         id: row.try_get("id")?,
         goal_id: row.try_get("goal_id")?,
@@ -2151,6 +3234,7 @@ fn decode_checkpoint(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<CheckpointR
         attempt_id: row.try_get("attempt_id")?,
         phase: CheckpointPhase::from_db(row.try_get("phase")?)?,
         idempotency_key: row.try_get("idempotency_key")?,
+        replay_safe: replay_safe != 0,
         outcome: outcome_json
             .map(|value| serde_json::from_str(&value).context("invalid checkpoint outcome"))
             .transpose()?,
@@ -2211,7 +3295,7 @@ async fn load_checkpoint_tx(
     checkpoint_id: &str,
 ) -> anyhow::Result<CheckpointRecord> {
     let row = sqlx::query(
-        "SELECT id, goal_id, work_item_id, attempt_id, phase, idempotency_key,
+        "SELECT id, goal_id, work_item_id, attempt_id, phase, idempotency_key, replay_safe,
                 outcome_json, created_at, updated_at
          FROM harness_checkpoints WHERE id = ?1",
     )
@@ -2249,7 +3333,8 @@ async fn reconcile_checkpoint_tx(
     sqlx::query(
         "UPDATE harness_work_items
          SET status = 'succeeded', lease_token = NULL, lease_until = NULL,
-             next_attempt_at = NULL, last_error = NULL, updated_at = unixepoch()
+             next_attempt_at = NULL, progress_json = NULL,
+             last_error = NULL, updated_at = unixepoch()
          WHERE id = ?1 AND status = 'running'",
     )
     .bind(&checkpoint.work_item_id)
@@ -2290,7 +3375,16 @@ async fn refresh_goal_status_tx(
                 SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
                 SUM(CASE WHEN status IN ('running', 'succeeded', 'waiting_confirmation')
                          THEN 1 ELSE 0 END) AS progressed
-         FROM harness_work_items WHERE goal_id = ?1",
+         FROM harness_work_items
+         WHERE goal_id = ?1
+           AND workflow_id = (
+               SELECT w.id FROM harness_workflows w
+                WHERE w.goal_id = harness_work_items.goal_id
+                  AND w.goal_revision = (
+                      SELECT MAX(goal_revision) FROM harness_goal_approvals
+                      WHERE goal_id = harness_work_items.goal_id
+                  )
+           )",
     )
     .bind(goal_id)
     .fetch_one(&mut **tx)
@@ -2327,7 +3421,7 @@ async fn refresh_goal_status_tx(
 
 async fn recover_goal_state(pool: &SqlitePool, goal_id: &str, actor: &str) -> anyhow::Result<()> {
     ensure_valid_id(goal_id, "goal id")?;
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM harness_goals WHERE id = ?1")
         .bind(goal_id)
         .fetch_one(&mut *tx)
@@ -2337,7 +3431,7 @@ async fn recover_goal_state(pool: &SqlitePool, goal_id: &str, actor: &str) -> an
         return Ok(());
     }
     let committed = sqlx::query(
-        "SELECT id, goal_id, work_item_id, attempt_id, phase, idempotency_key,
+        "SELECT id, goal_id, work_item_id, attempt_id, phase, idempotency_key, replay_safe,
                 outcome_json, created_at, updated_at
          FROM harness_checkpoints
          WHERE goal_id = ?1 AND phase = 'committed'
@@ -2352,15 +3446,24 @@ async fn recover_goal_state(pool: &SqlitePool, goal_id: &str, actor: &str) -> an
         reconcile_checkpoint_tx(&mut tx, &checkpoint).await?;
         recovered += 1;
     }
+    let mut parked_items: Vec<String> = Vec::new();
 
     let now = unix_now();
     let expired = sqlx::query(
         "SELECT id, effect_class, max_attempts, backoff_secs,
                 (SELECT COUNT(*) FROM harness_attempts a
-                 WHERE a.work_item_id = harness_work_items.id) AS attempt_count,
+                 WHERE a.work_item_id = harness_work_items.id
+                   AND a.status != 'void') AS attempt_count,
                 EXISTS(SELECT 1 FROM harness_checkpoints c
+                       JOIN harness_attempts la ON la.id = c.attempt_id
                        WHERE c.work_item_id = harness_work_items.id
-                         AND c.phase = 'prepared') AS has_prepared
+                         AND c.phase = 'prepared'
+                         AND la.status IN ('running', 'committing')) AS has_prepared,
+                EXISTS(SELECT 1 FROM harness_checkpoints c
+                       JOIN harness_attempts la ON la.id = c.attempt_id
+                       WHERE c.work_item_id = harness_work_items.id
+                         AND c.phase = 'prepared' AND c.replay_safe = 0
+                         AND la.status IN ('running', 'committing')) AS has_unsafe_prepared
          FROM harness_work_items
          WHERE goal_id = ?1 AND status = 'running'
            AND lease_until IS NOT NULL AND lease_until < ?2",
@@ -2376,29 +3479,57 @@ async fn recover_goal_state(pool: &SqlitePool, goal_id: &str, actor: &str) -> an
         let attempt_count: i64 = row.try_get("attempt_count")?;
         let backoff_secs: i64 = row.try_get("backoff_secs")?;
         let has_prepared: i64 = row.try_get("has_prepared")?;
-        let (work_status, attempt_status, error, next_attempt_at) =
-            if effect == EffectClass::ExternalWrite && has_prepared != 0 {
-                (
-                    "waiting_confirmation",
-                    "waiting_confirmation",
-                    "external effect outcome requires confirmation",
-                    None,
-                )
-            } else if attempt_count >= max_attempts {
-                (
-                    "failed",
-                    "failed",
-                    "attempt budget exhausted after lease expiry",
-                    None,
-                )
-            } else {
-                (
-                    "ready",
-                    "abandoned",
-                    "worker lease expired before commit",
-                    Some(now + backoff_secs),
-                )
-            };
+        let has_unsafe_prepared: i64 = row.try_get("has_unsafe_prepared")?;
+        // A prepared-but-uncommitted checkpoint means the attempt's effect
+        // may or may not have landed. External writes always park for an
+        // operator verdict; other handlers park only when they declared the
+        // rerun unsafe (`replay_safe = 0` on the checkpoint).
+        let parked =
+            (effect == EffectClass::ExternalWrite && has_prepared != 0) || has_unsafe_prepared != 0;
+        if parked {
+            parked_items.push(work_item_id.clone());
+        }
+        let (work_status, attempt_status, error, next_attempt_at) = if parked {
+            (
+                "waiting_confirmation",
+                "waiting_confirmation",
+                "ambiguous effect outcome requires confirmation",
+                None,
+            )
+        } else if attempt_count >= max_attempts {
+            (
+                "failed",
+                "failed",
+                "attempt budget exhausted after lease expiry",
+                None,
+            )
+        } else {
+            (
+                "ready",
+                "abandoned",
+                "worker lease expired before commit",
+                Some(now + backoff_secs),
+            )
+        };
+        if !parked {
+            // Prepared checkpoints of the dying attempts are superseded:
+            // the work item either retries (a new attempt prepares its own)
+            // or fails outright. Void them so a later recovery never sees a
+            // stale 'prepared' row as live ambiguity.
+            sqlx::query(
+                "UPDATE harness_checkpoints
+                 SET phase = 'voided', updated_at = ?1
+                 WHERE phase = 'prepared'
+                   AND attempt_id IN (
+                     SELECT id FROM harness_attempts
+                     WHERE work_item_id = ?2
+                       AND status IN ('running', 'committing'))",
+            )
+            .bind(now)
+            .bind(&work_item_id)
+            .execute(&mut *tx)
+            .await?;
+        }
         sqlx::query(
             "UPDATE harness_attempts
              SET status = ?1, finished_at = ?2, error = ?3
@@ -2441,6 +3572,28 @@ async fn recover_goal_state(pool: &SqlitePool, goal_id: &str, actor: &str) -> an
         .await?;
     }
     tx.commit().await?;
+
+    // Operator visibility: a parked confirmation is invisible until somebody
+    // opens /goal list or the console. Emit a dedup'd signal per parked item
+    // so `/signals` triage surfaces pending gates on Telegram too.
+    for work_item_id in parked_items {
+        let request = CreateSignalRequest {
+            kind: super::signals::SignalKind::Manual,
+            trust: super::signals::SignalTrust::Internal,
+            source: "internal:confirmation".to_string(),
+            external_id: Some(format!("confirm:{work_item_id}")),
+            content: format!(
+                "goal {goal_id}: work item {work_item_id} parked awaiting confirmation — an external effect may or may not have landed before the crash"
+            ),
+            metadata: BTreeMap::from([
+                ("goal_id".to_string(), goal_id.to_string()),
+                ("work_item_id".to_string(), work_item_id.clone()),
+            ]),
+        };
+        if let Err(error) = ingest_signal(pool, request, actor).await {
+            warn!(error = %error, work_item_id, "confirmation signal ingest failed");
+        }
+    }
     Ok(())
 }
 
@@ -2450,7 +3603,7 @@ async fn load_goal_work_items(
 ) -> anyhow::Result<Vec<WorkItemRecord>> {
     let rows = sqlx::query(
         "SELECT id, goal_id, status, step_id, handler, effect_class, input_json,
-                max_attempts, ordinal
+                max_attempts, ordinal, created_at, progress_json
          FROM harness_work_items WHERE goal_id = ?1 ORDER BY ordinal, id",
     )
     .bind(goal_id)
@@ -2507,6 +3660,24 @@ fn ensure_valid_id(value: &str, label: &str) -> anyhow::Result<()> {
         "{label} must be 1..=160 bytes"
     );
     Ok(())
+}
+
+/// Escapes `LIKE` wildcards so a stored reason can be matched by prefix.
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+async fn column_exists(pool: &SqlitePool, table: &str, column: &str) -> anyhow::Result<bool> {
+    let count: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"
+    ))
+    .bind(column)
+    .fetch_one(pool)
+    .await?;
+    Ok(count > 0)
 }
 
 static LOOP_ID_COUNTER: AtomicU64 = AtomicU64::new(0);

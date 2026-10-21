@@ -151,6 +151,52 @@ pub(super) async fn process_telegram_update(
         return Ok(());
     }
 
+    // A reply-marker is bound to the run that produced the answered message
+    // and recorded as trajectory feedback — no model call needed. When the
+    // feature is unwired or no recent run exists, the marker falls through
+    // to normal processing.
+    if meta.replied_to_bot
+        && (meta.is_group || meta.is_private_chat)
+        && let Some(score) = feedback_marker_score(text)
+    {
+        let user_id = message
+            .from
+            .as_ref()
+            .map(|u| u.id.to_string())
+            .unwrap_or_else(|| meta.chat_id.to_string());
+        match ctx
+            .service
+            .record_evolution_reply_feedback(
+                meta.chat_id,
+                meta.reply_to_message_id,
+                &ctx.channel_name,
+                &user_id,
+                score,
+                None,
+            )
+            .await
+        {
+            Ok(true) => {
+                info!(
+                    chat_id = meta.chat_id,
+                    message_id = meta.message_id,
+                    score,
+                    "telegram reply-marker consumed as evolution feedback"
+                );
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    chat_id = meta.chat_id,
+                    message_id = meta.message_id,
+                    "failed to record telegram reply feedback; falling through"
+                );
+            }
+        }
+    }
+
     if meta.is_private_chat
         && should_send_initial_typing_before_scheduler_nl(&meta, &command_settings.scheduler)
     {
@@ -438,7 +484,7 @@ async fn dispatch_telegram_reply(config: ReplyDispatchConfig<'_>) -> anyhow::Res
 
     let incoming = IncomingMessage {
         channel: ctx.channel_name.clone(),
-        session_id,
+        session_id: session_id.clone(),
         user_id,
         text: model_input_text,
         reply_target: Some(ReplyTarget::Telegram {
@@ -478,7 +524,23 @@ async fn dispatch_telegram_reply(config: ReplyDispatchConfig<'_>) -> anyhow::Res
             .await
             .context("failed to process telegram streaming message")
         {
-            Ok(reply) => sink.finalize(&reply.text).await,
+            Ok(reply) => match sink.finalize(&reply.text).await {
+                Ok(()) => {
+                    // Bind each sent message to this session so a later
+                    // reply-marker resolves the exact producing run.
+                    for sent_id in sink.sent_message_ids() {
+                        if let Err(err) = ctx
+                            .service
+                            .record_telegram_outbound_message(meta.chat_id, sent_id, &session_id)
+                            .await
+                        {
+                            warn!(error = %err, "failed to record telegram outbound binding");
+                        }
+                    }
+                    Ok(())
+                }
+                Err(err) => Err(err),
+            },
             Err(err) => Err(err),
         }
     } else {
@@ -488,15 +550,39 @@ async fn dispatch_telegram_reply(config: ReplyDispatchConfig<'_>) -> anyhow::Res
             .await
             .context("failed to process telegram message")
         {
-            Ok(reply) => sender
-                .send_message(
-                    meta.chat_id,
-                    meta.message_thread_id,
-                    outbound_reply_to_message_id,
-                    &reply.text,
-                )
-                .await
-                .context("failed to send telegram response"),
+            Ok(reply) => {
+                if reply.text.trim().is_empty() {
+                    Ok(())
+                } else {
+                    match sender
+                        .send_message_with_ids(
+                            meta.chat_id,
+                            meta.message_thread_id,
+                            outbound_reply_to_message_id,
+                            &reply.text,
+                        )
+                        .await
+                    {
+                        Ok(sent_ids) => {
+                            for sent_id in sent_ids {
+                                if let Err(err) = ctx
+                                    .service
+                                    .record_telegram_outbound_message(
+                                        meta.chat_id,
+                                        sent_id,
+                                        &session_id,
+                                    )
+                                    .await
+                                {
+                                    warn!(error = %err, "failed to record telegram outbound binding");
+                                }
+                            }
+                            Ok(())
+                        }
+                        Err(err) => Err(err).context("failed to send telegram response"),
+                    }
+                }
+            }
             Err(err) => Err(err),
         }
     };

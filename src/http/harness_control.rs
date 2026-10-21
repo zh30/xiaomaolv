@@ -32,6 +32,23 @@ pub(super) fn router() -> Router<AppState> {
         .route("/v1/harness/goals/{id}/plan", post(post_goal_plan))
         .route("/v1/harness/goals/{id}/approve", post(post_goal_approve))
         .route("/v1/harness/goals/{id}/resume", post(post_goal_resume))
+        .route("/v1/harness/goals/{id}/cancel", post(post_goal_cancel))
+        .route("/v1/harness/goals/{id}/pause", post(post_goal_pause))
+        .route("/v1/harness/goals/{id}/unpause", post(post_goal_unpause))
+        .route("/v1/harness/goals/{id}/replan", post(post_goal_replan))
+        .route("/v1/harness/goals/{id}/attempts", get(get_goal_attempts))
+        .route(
+            "/v1/harness/goals/{id}/checkpoints",
+            get(get_goal_checkpoints),
+        )
+        .route(
+            "/v1/harness/goals/{id}/work-items",
+            get(get_goal_work_items),
+        )
+        .route(
+            "/v1/harness/goals/{goal_id}/work-items/{work_item_id}/resolve-confirmation",
+            post(post_work_item_resolve_confirmation),
+        )
         .route(
             "/v1/harness/goals/{id}/work-items",
             get(get_goal_work_items),
@@ -66,6 +83,11 @@ pub(super) fn router() -> Router<AppState> {
             get(list_artifacts).post(post_artifact),
         )
         .route("/v1/harness/artifacts/{id}", get(get_artifact))
+        .route("/v1/harness/swarm-runs", get(list_swarm_runs))
+        .route(
+            "/v1/harness/swarm-runs/{run_id}/nodes",
+            get(get_swarm_run_nodes),
+        )
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,6 +95,10 @@ struct GoalHttpRequest {
     objective: String,
     #[serde(default)]
     source_signal_ids: Vec<String>,
+    /// Idempotency key for admission: retrying with the same `request_id`
+    /// returns the already-created goal instead of duplicating it.
+    #[serde(default)]
+    request_id: Option<String>,
     #[serde(default = "default_auto_plan")]
     auto_plan: bool,
 }
@@ -94,6 +120,73 @@ fn default_list_limit() -> usize {
     100
 }
 
+#[derive(Debug, Deserialize)]
+struct SwarmRunQuery {
+    channel: String,
+    #[serde(default)]
+    user_id: Option<String>,
+    #[serde(default = "default_list_limit")]
+    limit: usize,
+}
+
+/// `/v1/harness/swarm-runs?channel=...` — the `/agents` audit table over
+/// HTTP, so the console and external dashboards see swarm runs.
+async fn list_swarm_runs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SwarmRunQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    operator_context(&state, &headers).await?;
+    let service = state.runtime.read().await.service.clone();
+    let runs = service
+        .list_agent_swarm_runs(query.channel.clone(), query.user_id, query.limit)
+        .await
+        .map_err(internal)?;
+    Ok(Json(serde_json::json!({"runs": runs})))
+}
+
+/// `/v1/harness/swarm-runs/{run_id}/nodes?channel=...` — per-node audit rows
+/// mirrored from the durable DAG.
+async fn get_swarm_run_nodes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(run_id): axum::extract::Path<String>,
+    Query(query): Query<SwarmRunQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    operator_context(&state, &headers).await?;
+    let service = state.runtime.read().await.service.clone();
+    let nodes = service
+        .load_agent_swarm_tree(query.channel.clone(), run_id)
+        .await
+        .map_err(internal)?;
+    Ok(Json(serde_json::json!({"nodes": nodes})))
+}
+
+/// `GET /goals/{id}/attempts` — who claimed what: worker ids, fencing
+/// tokens, retry counts, and which attempts were `void` vs `abandoned`.
+async fn get_goal_attempts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(goal_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (engine, _) = operator_context(&state, &headers).await?;
+    let attempts = engine.list_attempts(&goal_id).await.map_err(internal)?;
+    Ok(Json(serde_json::json!({"attempts": attempts})))
+}
+
+/// `GET /goals/{id}/checkpoints` — the effect-outcome audit trail:
+/// prepared/committed/reconciled/voided per attempt with idempotency keys
+/// and replay-safety declarations.
+async fn get_goal_checkpoints(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(goal_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (engine, _) = operator_context(&state, &headers).await?;
+    let checkpoints = engine.list_checkpoints(&goal_id).await.map_err(internal)?;
+    Ok(Json(serde_json::json!({"checkpoints": checkpoints})))
+}
+
 async fn list_goals(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -110,17 +203,21 @@ async fn post_goal(
     Json(request): Json<GoalHttpRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (engine, actor) = operator_context(&state, &headers).await?;
-    let goal = engine
-        .create_goal(
+    let (goal, created) = engine
+        .create_goal_admission(
             CreateGoalRequest {
                 objective: request.objective,
                 source_signal_ids: request.source_signal_ids,
+                request_id: request.request_id,
             },
             &actor,
         )
         .await
         .map_err(bad_request)?;
-    let value = if request.auto_plan {
+    // A deduplicated retry returns the already-admitted goal as-is: it was
+    // planned when it was first created, and re-planning would bump the
+    // revision the original caller approved against.
+    let value = if request.auto_plan && created {
         serde_json::to_value(
             engine
                 .plan_goal_recommended(&goal.id, &actor)
@@ -197,6 +294,10 @@ struct GoalEventStreamState {
     goal_id: String,
     cursor: i64,
     pending: VecDeque<crate::harness::loop_engine::LoopEventRecord>,
+    /// Committed-mutation notifications from the engine. The stream still
+    /// re-reads `harness_events` on every wake — the notification is only a
+    /// wake-up signal, the `sequence` cursor remains the source of truth.
+    notifications: tokio::sync::broadcast::Receiver<String>,
 }
 
 async fn get_goal_event_stream(
@@ -209,12 +310,16 @@ async fn get_goal_event_stream(
     if engine.get_goal(&goal_id).await.map_err(internal)?.is_none() {
         return Err(ApiError::NotFound(format!("goal not found: {goal_id}")));
     }
+    // Subscribe before the first backlog read so no commit is missed
+    // between the initial `list_goal_events` and the subscription.
+    let notifications = engine.subscribe_events();
     let stream = futures::stream::unfold(
         GoalEventStreamState {
             engine,
             goal_id,
             cursor: query.after,
             pending: VecDeque::new(),
+            notifications,
         },
         |mut state| async move {
             loop {
@@ -237,7 +342,24 @@ async fn get_goal_event_stream(
                     Ok(events) if !events.is_empty() => {
                         state.pending = events.into();
                     }
-                    Ok(_) => tokio::time::sleep(Duration::from_secs(1)).await,
+                    Ok(_) => {
+                        // Commit-driven wake on this goal's mutations, with
+                        // a slow fallback poll covering lagged or missed
+                        // notifications and writers outside the engine API.
+                        let wake = async {
+                            loop {
+                                match state.notifications.recv().await {
+                                    Ok(goal) if goal == state.goal_id => break,
+                                    Ok(_) => continue,
+                                    Err(
+                                        tokio::sync::broadcast::error::RecvError::Lagged(_)
+                                        | tokio::sync::broadcast::error::RecvError::Closed,
+                                    ) => break,
+                                }
+                            }
+                        };
+                        let _ = tokio::time::timeout(Duration::from_secs(5), wake).await;
+                    }
                     Err(error) => {
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         let sse = Event::default()
@@ -286,6 +408,104 @@ async fn post_goal_approve(
     Ok(Json(
         serde_json::to_value(approved).map_err(|error| ApiError::Internal(error.into()))?,
     ))
+}
+
+#[derive(Debug, Deserialize)]
+struct CancelGoalRequest {
+    reason: String,
+}
+
+/// `POST /goals/{id}/cancel` — operator stop for a live goal. In-flight
+/// attempts die via `ensure_claim_current` on their next commit, so a
+/// cancel never lets a stale worker finish the goal anyway.
+async fn post_goal_cancel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(goal_id): Path<String>,
+    Json(request): Json<CancelGoalRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (engine, actor) = operator_context(&state, &headers).await?;
+    let goal = engine
+        .cancel_goal(&goal_id, &request.reason, &actor)
+        .await
+        .map_err(|error| {
+            if error.to_string().contains("not found") {
+                ApiError::NotFound(error.to_string())
+            } else {
+                ApiError::Conflict(error.to_string())
+            }
+        })?;
+    Ok(Json(serde_json::json!({"goal": goal})))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct PauseGoalRequest {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// `POST /goals/{id}/pause` — operator hold; claims stop while in-flight
+/// attempts finish on their own.
+async fn post_goal_pause(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(goal_id): Path<String>,
+    Json(request): Json<PauseGoalRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (engine, actor) = operator_context(&state, &headers).await?;
+    let goal = engine
+        .pause_goal(&goal_id, request.reason.as_deref().unwrap_or(""), &actor)
+        .await
+        .map_err(|error| {
+            if error.to_string().contains("not found") {
+                ApiError::NotFound(error.to_string())
+            } else {
+                ApiError::Conflict(error.to_string())
+            }
+        })?;
+    Ok(Json(serde_json::json!({"goal": goal})))
+}
+
+async fn post_goal_unpause(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(goal_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (engine, actor) = operator_context(&state, &headers).await?;
+    let goal = engine
+        .unpause_goal(&goal_id, &actor)
+        .await
+        .map_err(|error| {
+            if error.to_string().contains("not found") {
+                ApiError::NotFound(error.to_string())
+            } else {
+                ApiError::Conflict(error.to_string())
+            }
+        })?;
+    Ok(Json(serde_json::json!({"goal": goal})))
+}
+
+/// `POST /goals/{id}/replan` — send a dead-ended goal back to planning;
+/// the existing `POST /plan` + `/approve` flow then issues a fresh
+/// revision on a clean item set.
+async fn post_goal_replan(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(goal_id): Path<String>,
+    Json(request): Json<CancelGoalRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (engine, actor) = operator_context(&state, &headers).await?;
+    let goal = engine
+        .mark_goal_for_replan(&goal_id, &request.reason, &actor)
+        .await
+        .map_err(|error| {
+            if error.to_string().contains("not found") {
+                ApiError::NotFound(error.to_string())
+            } else {
+                ApiError::Conflict(error.to_string())
+            }
+        })?;
+    Ok(Json(serde_json::json!({"goal": goal})))
 }
 
 async fn post_goal_resume(

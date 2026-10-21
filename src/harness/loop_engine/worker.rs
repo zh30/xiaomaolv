@@ -6,17 +6,31 @@ use anyhow::{Context, ensure};
 use async_trait::async_trait;
 
 use crate::domain::{MessageRole, StoredMessage};
-use crate::harness::evolution::EvolutionEngine;
+use crate::harness::evolution::{EvalStepOutcome, EvolutionEngine};
 use crate::provider::{ChatProvider, CompletionRequest};
 
 use super::{
     ArtifactKind, EffectClass, GoalStatus, LoopEngine, PublishArtifactRequest, ResumeReport,
-    TrajectoryFrameCapture, TrajectoryFrameDraft, WorkClaim, WorkOutcome,
+    TrajectoryFrameCapture, TrajectoryFrameDraft, WorkClaim, WorkContinuation, WorkItemStatus,
+    WorkOutcome,
 };
+
+/// `last_error` prefix marking a work item that was blocked because its
+/// handler was not registered in the claiming process. `requeue_blocked_items`
+/// matches on this prefix to distinguish deployment-transient blocks from
+/// dependency-failure cascades.
+pub(crate) const MISSING_HANDLER_REASON_PREFIX: &str = "unregistered workflow handler: ";
 
 pub struct WorkHandlerContext {
     pub engine: Arc<LoopEngine>,
     pub claim: WorkClaim,
+    /// Committed phase progress handed to this attempt — `None` on the
+    /// first phase, `Some` when resuming after a boundary or a crash.
+    pub resume: Option<crate::harness::loop_engine::WorkPhaseProgress>,
+    /// Latest committed outcome per declared dependency, keyed by step id —
+    /// the declared DAG dataflow. Only the work item's own dependencies are
+    /// visible; a handler cannot reach for undeclared step outputs.
+    pub upstream: std::collections::BTreeMap<String, WorkOutcome>,
 }
 
 #[async_trait]
@@ -25,6 +39,17 @@ pub trait WorkHandler: Send + Sync {
     fn effect_class(&self) -> EffectClass;
 
     fn retryable(&self, _error: &anyhow::Error) -> bool {
+        true
+    }
+
+    /// Declared crash semantics: `true` means a re-run after the attempt
+    /// died before its checkpoint commit is safe (the handler is idempotent
+    /// or effect-free). `false` means a crash between the effect and the
+    /// commit is ambiguous — the work item parks in `waiting_confirmation`
+    /// for an operator verdict instead of silently re-running. `true` by
+    /// default, matching the previous implicit behaviour for non-external
+    /// handlers; `external_write` handlers should declare `false`.
+    fn replay_safe(&self) -> bool {
         true
     }
 
@@ -44,6 +69,13 @@ pub trait OutboundSender: Send + Sync {
         text: &str,
         idempotency_key: &str,
     ) -> anyhow::Result<serde_json::Value>;
+
+    /// Whether this sender can deliver to `channel` — deferred swarm replies
+    /// gate on this so an unsupported channel never wedges `awaiting_reply`.
+    /// Defaults to `true` for backwards-compatible single-channel senders.
+    fn supports_channel(&self, _channel: &str) -> bool {
+        true
+    }
 }
 
 #[derive(Default)]
@@ -78,6 +110,13 @@ impl WorkHandlerRegistry {
     fn get(&self, name: &str) -> Option<Arc<dyn WorkHandler>> {
         self.handlers.get(name).cloned()
     }
+
+    /// Names of every handler registered in this process. The worker uses
+    /// the list to re-queue work items that were blocked only because their
+    /// handler was missing at dispatch time.
+    pub fn handler_names(&self) -> Vec<String> {
+        self.handlers.keys().cloned().collect()
+    }
 }
 
 pub struct LoopWorker {
@@ -101,6 +140,9 @@ impl LoopWorker {
             .with_external_write_allowlist(engine.external_write_policy().allowed_handlers.clone());
         handlers
             .register(Arc::new(GoalPlannerHandler))
+            .expect("built-in handler names are unique");
+        handlers
+            .register(Arc::new(WaitHandler))
             .expect("built-in handler names are unique");
         handlers
             .register(Arc::new(ProviderAnalysisHandler { provider }))
@@ -136,6 +178,17 @@ impl LoopWorker {
             worker_id: format!("loop-worker:{}", std::process::id()),
             lease_secs: 30,
         })
+    }
+
+    /// Registers an additional handler after construction. Subsystems that
+    /// own their provider/settings wiring (e.g. the durable swarm runner)
+    /// use this so runtime-picked goals — including ones orphaned by a
+    /// restart — can claim their items instead of parking them `blocked`.
+    pub fn with_extra_handler(mut self, handler: Arc<dyn WorkHandler>) -> anyhow::Result<Self> {
+        let handlers =
+            Arc::get_mut(&mut self.handlers).context("handler registry already shared")?;
+        handlers.register(handler)?;
+        Ok(self)
     }
 
     pub fn with_registry(
@@ -178,6 +231,12 @@ impl LoopWorker {
         self.engine.list_dispatchable_goal_ids(limit).await
     }
 
+    /// Fails goals whose execution deadline passed — see
+    /// `LoopEngine::expire_overdue_goals`.
+    pub async fn expire_overdue_goals(&self, limit: usize) -> anyhow::Result<Vec<String>> {
+        self.engine.expire_overdue_goals(limit).await
+    }
+
     pub async fn run_goal_until_idle(
         &self,
         goal_id: &str,
@@ -194,11 +253,46 @@ impl LoopWorker {
             if is_terminal(report.goal.status) {
                 return Ok(report);
             }
-            let Some(claim) = self
+            // A work item blocked solely because its handler was missing
+            // becomes ready again once the handler exists in this process
+            // (rolling deploys, late registration).
+            if let Err(error) = self
+                .engine
+                .requeue_blocked_items(
+                    goal_id,
+                    MISSING_HANDLER_REASON_PREFIX,
+                    &self.handlers.handler_names(),
+                    &actor,
+                )
+                .await
+            {
+                tracing::warn!(%error, %goal_id, "blocked work item requeue failed");
+            }
+            let claim = match self
                 .engine
                 .claim_goal_work(goal_id, &self.worker_id, self.lease_secs, &actor)
-                .await?
-            else {
+                .await
+            {
+                Ok(claim) => claim,
+                Err(error) => {
+                    // A mid-claim status flip (goal went verifying/canceled/
+                    // paused between polls) surfaces as "not dispatchable" —
+                    // that's a terminal signal, not a failure. Re-read and
+                    // return the report; keep propagating real errors.
+                    let report = self.engine.resume_goal(goal_id, &actor).await?;
+                    if is_terminal(report.goal.status)
+                        || report.goal.status == GoalStatus::Verifying
+                        || !error.to_string().contains("not dispatchable")
+                    {
+                        if !error.to_string().contains("not dispatchable") {
+                            return Err(error);
+                        }
+                        return Ok(report);
+                    }
+                    return Err(error);
+                }
+            };
+            let Some(claim) = claim else {
                 return self.engine.resume_goal(goal_id, &actor).await;
             };
             report = self.process_claim(claim, &actor).await?;
@@ -206,17 +300,144 @@ impl LoopWorker {
         self.engine.resume_goal(goal_id, &actor).await
     }
 
+    /// Drives a goal with `concurrency` claim loops racing on the same
+    /// leased-claim seam. At-least-once claims + fencing tokens make
+    /// duplicate claims safe; a worker whose claim comes back empty lingers
+    /// briefly while other items are still `running`/`ready` (a sibling
+    /// may unlock new work), and exits once the goal is terminal or nothing
+    /// remains in flight. Used by fan-out workloads like durable swarms.
+    pub async fn run_goal_concurrent(
+        &self,
+        goal_id: &str,
+        concurrency: usize,
+        max_steps: usize,
+    ) -> anyhow::Result<ResumeReport> {
+        let workers = concurrency.clamp(1, 8);
+        if workers <= 1 {
+            return self.run_goal_until_idle(goal_id, max_steps).await;
+        }
+        let mut handles = Vec::with_capacity(workers);
+        for index in 0..workers {
+            let child = LoopWorker {
+                engine: self.engine.clone(),
+                handlers: self.handlers.clone(),
+                worker_id: format!("{}:c{}", self.worker_id, index),
+                lease_secs: self.lease_secs,
+            };
+            let goal_id = goal_id.to_string();
+            handles.push(tokio::spawn(async move {
+                // `claim` errors on a non-dispatchable goal (verifying,
+                // terminal) are structural, not transient — after any
+                // error, re-read the goal and only retry while claimable
+                // work remains in flight.
+                let mut retries = 0u8;
+                loop {
+                    let outcome: anyhow::Result<ResumeReport> =
+                        match child.run_goal_until_idle(&goal_id, max_steps).await {
+                            Ok(report) => Ok(report),
+                            Err(_) => child
+                                .engine
+                                .resume_goal(&goal_id, "runtime:concurrent")
+                                .await
+                                .context("failed to inspect goal after worker error"),
+                        };
+                    match outcome {
+                        Ok(next) => {
+                            let in_flight = next.work_items.iter().any(|item| {
+                                matches!(
+                                    item.status,
+                                    WorkItemStatus::Running | WorkItemStatus::Ready
+                                )
+                            });
+                            if is_terminal(next.goal.status) || !in_flight {
+                                // Pending-alone (deps failed/parked) and
+                                // waiting_confirmation both need a
+                                // resolution path outside the worker loop.
+                                return Ok(next);
+                            }
+                        }
+                        Err(error) => {
+                            retries += 1;
+                            if retries > 10 {
+                                return Err(error);
+                            }
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                }
+            }));
+        }
+        // Join ALL workers: an erroring sibling must not strand attempts
+        // still executing under the others.
+        let mut best: Option<ResumeReport> = None;
+        let mut first_error: Option<anyhow::Error> = None;
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(report)) => {
+                    let dominated = best.as_ref().is_some_and(|current| {
+                        report
+                            .work_items
+                            .iter()
+                            .filter(|i| i.status == WorkItemStatus::Succeeded)
+                            .count()
+                            <= current
+                                .work_items
+                                .iter()
+                                .filter(|i| i.status == WorkItemStatus::Succeeded)
+                                .count()
+                    });
+                    if !dominated {
+                        best = Some(report);
+                    }
+                }
+                Ok(Err(error)) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+                Err(join) => {
+                    if first_error.is_none() {
+                        first_error = Some(
+                            anyhow::Error::new(join).context("concurrent worker task panicked"),
+                        );
+                    }
+                }
+            }
+        }
+        match best {
+            Some(report) => Ok(report),
+            None => Err(first_error
+                .unwrap_or_else(|| anyhow::anyhow!("no concurrent worker produced a report"))),
+        }
+    }
+
     async fn process_claim(&self, claim: WorkClaim, actor: &str) -> anyhow::Result<ResumeReport> {
-        let Some(handler) = self.handlers.get(&claim.work_item.handler) else {
+        // Dispatch-time gate: the flag can be turned off after a plan was
+        // approved, so admission at plan/approve time is not sufficient. A
+        // disabled `external_write` step fails loudly regardless of whether
+        // its handler is registered here — a policy decision, not a
+        // deployment gap.
+        if claim.work_item.effect == EffectClass::ExternalWrite
+            && !self.engine.external_write_policy().enabled
+        {
             return self
                 .engine
-                .fail_attempt(
+                .fail_attempt(&claim, "external_write is disabled", false, actor)
+                .await;
+        }
+        let Some(handler) = self.handlers.get(&claim.work_item.handler) else {
+            // A missing handler may be a deployment transient (rolling
+            // restart, handler registered later): park the item in `blocked`
+            // instead of failing it outright. `requeue_blocked_items` at the
+            // top of the loop brings it back once the handler exists.
+            self.engine
+                .block_work_item(
                     &claim,
-                    &format!("unregistered workflow handler: {}", claim.work_item.handler),
-                    false,
+                    &format!("{MISSING_HANDLER_REASON_PREFIX}{}", claim.work_item.handler),
                     actor,
                 )
-                .await;
+                .await?;
+            return self.engine.resume_goal(&claim.attempt.goal_id, actor).await;
         };
         if handler.effect_class() != claim.work_item.effect {
             return self
@@ -229,28 +450,15 @@ impl LoopWorker {
                 )
                 .await;
         }
-        // Dispatch-time gate: the flag can be turned off after a plan was
-        // approved, so admission at plan/approve time is not sufficient.
-        if claim.work_item.effect == EffectClass::ExternalWrite
-            && !self.engine.external_write_policy().enabled
-        {
-            return self
-                .engine
-                .fail_attempt(&claim, "external_write is disabled", false, actor)
-                .await;
-        }
         let checkpoint = self
             .engine
             .prepare_checkpoint(
                 &claim,
                 &format!("{}:{}:v1", claim.work_item.id, claim.attempt.id),
+                handler.replay_safe(),
                 actor,
             )
             .await?;
-        let context = WorkHandlerContext {
-            engine: self.engine.clone(),
-            claim: claim.clone(),
-        };
         let (heartbeat_stop, heartbeat_rx) = tokio::sync::watch::channel(false);
         let heartbeat_engine = self.engine.clone();
         let heartbeat_claim = claim.clone();
@@ -264,29 +472,105 @@ impl LoopWorker {
             )
             .await;
         });
-        let execution = tokio::time::timeout(
-            Duration::from_secs(u64::from(claim.budget.deadline_secs)),
-            handler.execute(&context),
-        )
-        .await;
-        let _ = heartbeat_stop.send(true);
-        let _ = heartbeat.await;
-        let outcome = match execution {
-            Ok(Ok(outcome)) => outcome,
-            Ok(Err(error)) => {
-                let retryable = handler.retryable(&error);
+        // Phase loop: a `Continue` outcome commits its progress before the
+        // next phase runs in the same attempt, so a crash mid-attempt resumes
+        // from the last committed phase instead of restarting. A `delay_secs`
+        // continuation yields the attempt entirely (durable sleep+progress).
+        let attempt_deadline = tokio::time::Instant::now()
+            + Duration::from_secs(u64::from(claim.budget.deadline_secs));
+        let mut resume = claim.work_item.progress.clone();
+        // Declared-dependency outcomes are loaded once per attempt — they
+        // are already committed before this item could be claimed, so the
+        // map is stable for the whole phase loop.
+        let upstream = self
+            .engine
+            .upstream_outcomes(&claim.work_item.id)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    work_item_id = %claim.work_item.id,
+                    "failed to load upstream outcomes; handler sees an empty map"
+                );
+                std::collections::BTreeMap::new()
+            });
+        let outcome = loop {
+            let context = WorkHandlerContext {
+                engine: self.engine.clone(),
+                claim: claim.clone(),
+                resume: resume.clone(),
+                upstream: upstream.clone(),
+            };
+            let execution =
+                tokio::time::timeout_at(attempt_deadline, handler.execute(&context)).await;
+            let outcome = match execution {
+                Ok(Ok(outcome)) => outcome,
+                Ok(Err(error)) => {
+                    let retryable = handler.retryable(&error);
+                    let _ = heartbeat_stop.send(true);
+                    let _ = heartbeat.await;
+                    return self
+                        .engine
+                        .fail_attempt(&claim, &format!("{error:#}"), retryable, actor)
+                        .await;
+                }
+                Err(_) => {
+                    let _ = heartbeat_stop.send(true);
+                    let _ = heartbeat.await;
+                    return self
+                        .engine
+                        .fail_attempt(&claim, "workflow handler deadline exceeded", true, actor)
+                        .await;
+                }
+            };
+            if let Err(error) = outcome.validate() {
+                let _ = heartbeat_stop.send(true);
+                let _ = heartbeat.await;
                 return self
                     .engine
-                    .fail_attempt(&claim, &format!("{error:#}"), retryable, actor)
+                    .fail_attempt(
+                        &claim,
+                        &format!("handler returned an invalid outcome: {error:#}"),
+                        false,
+                        actor,
+                    )
                     .await;
             }
-            Err(_) => {
-                return self
+            match outcome.continuation.clone() {
+                Some(continuation) if continuation.delay_secs.is_some() => {
+                    let _ = heartbeat_stop.send(true);
+                    let _ = heartbeat.await;
+                    return self
+                        .engine
+                        .continue_attempt(&claim, &continuation, actor)
+                        .await;
+                }
+                Some(continuation) => match self
                     .engine
-                    .fail_attempt(&claim, "workflow handler deadline exceeded", true, actor)
-                    .await;
+                    .record_phase_progress(&claim, &continuation, actor)
+                    .await
+                {
+                    Ok(progress) => resume = Some(progress),
+                    Err(error) => {
+                        let _ = heartbeat_stop.send(true);
+                        let _ = heartbeat.await;
+                        return self
+                            .engine
+                            .fail_attempt(&claim, &format!("{error:#}"), false, actor)
+                            .await;
+                    }
+                },
+                None => break outcome,
             }
         };
+        let _ = heartbeat_stop.send(true);
+        let _ = heartbeat.await;
+        // A `sleep_until` outcome is not an outcome: the attempt defers and
+        // the work item becomes claimable again at the stored wake time.
+        // The sleep survives restarts without holding a lease.
+        if let Some(until_unix) = outcome.sleep_until_unix {
+            return self.engine.defer_attempt(&claim, until_unix, actor).await;
+        }
         self.engine
             .commit_checkpoint(&claim, &checkpoint.id, outcome, actor)
             .await?;
@@ -345,6 +629,8 @@ impl WorkHandler for ProviderAnalysisHandler {
                 summary: "reused durable analysis artifact".to_string(),
                 artifact_ids: vec![existing.id],
                 evidence: serde_json::json!({"artifact_kind": "analysis_report"}),
+                sleep_until_unix: None,
+                continuation: None,
             });
         }
         let objective = context
@@ -425,6 +711,8 @@ impl WorkHandler for ProviderAnalysisHandler {
             summary: truncate_utf8(&response, 8_000),
             artifact_ids: vec![artifact.id],
             evidence: serde_json::json!({"artifact_kind": "analysis_report"}),
+            sleep_until_unix: None,
+            continuation: None,
         })
     }
 }
@@ -446,6 +734,13 @@ impl WorkHandler for ChannelSendHandler {
 
     fn effect_class(&self) -> EffectClass {
         EffectClass::ExternalWrite
+    }
+
+    /// A crash between send and commit cannot prove whether the message
+    /// went out: the item must park for operator confirmation, never
+    /// silently re-send.
+    fn replay_safe(&self) -> bool {
+        false
     }
 
     async fn execute(&self, context: &WorkHandlerContext) -> anyhow::Result<WorkOutcome> {
@@ -498,6 +793,67 @@ impl WorkHandler for ChannelSendHandler {
                 "session_id": session_id,
                 "send": evidence,
             }),
+            sleep_until_unix: None,
+            continuation: None,
+        })
+    }
+}
+
+/// `wait` — a durable timer step. `input.until_unix` sets an absolute
+/// deadline; `input.delay_secs` sets one relative to work-item creation.
+/// While the deadline is in the future the attempt defers: the work item
+/// holds no lease, the wake time is persisted, and a later claim completes
+/// the step. Effect-free and always safe to re-run.
+struct WaitHandler;
+
+#[async_trait]
+impl WorkHandler for WaitHandler {
+    fn name(&self) -> &'static str {
+        "wait"
+    }
+
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::Pure
+    }
+
+    async fn execute(&self, context: &WorkHandlerContext) -> anyhow::Result<WorkOutcome> {
+        let input = &context.claim.work_item.input;
+        let until = if let Some(until) = input.get("until_unix").and_then(serde_json::Value::as_i64)
+        {
+            until
+        } else {
+            let delay = input
+                .get("delay_secs")
+                .and_then(serde_json::Value::as_i64)
+                .context("wait requires input.until_unix or input.delay_secs")?;
+            ensure!(
+                (1..=2_592_000).contains(&delay),
+                "wait delay_secs must be 1..=2592000"
+            );
+            // Anchored to item creation so every attempt resolves the same
+            // absolute deadline instead of re-arming the clock.
+            context
+                .claim
+                .work_item
+                .created_at_unix
+                .saturating_add(delay)
+        };
+        ensure!(until > 0, "wait deadline must be positive");
+        if unix_now() < until {
+            return Ok(WorkOutcome {
+                summary: format!("sleeping until {until}"),
+                artifact_ids: Vec::new(),
+                evidence: serde_json::json!({"until_unix": until}),
+                sleep_until_unix: Some(until),
+                continuation: None,
+            });
+        }
+        Ok(WorkOutcome {
+            summary: format!("wait deadline {until} reached"),
+            artifact_ids: Vec::new(),
+            evidence: serde_json::json!({"until_unix": until}),
+            sleep_until_unix: None,
+            continuation: None,
         })
     }
 }
@@ -541,6 +897,8 @@ impl WorkHandler for SelfTestHandler {
                     "suite": suite,
                     "self_test_run_id": run_id,
                 }),
+                sleep_until_unix: None,
+                continuation: None,
             });
         }
         let run = context
@@ -573,6 +931,8 @@ impl WorkHandler for SelfTestHandler {
                 "suite": suite,
                 "self_test_run_id": run.id,
             }),
+            sleep_until_unix: None,
+            continuation: None,
         })
     }
 }
@@ -608,6 +968,8 @@ impl WorkHandler for SessionReplayHandler {
                 summary: "reused durable replay artifact".to_string(),
                 artifact_ids: vec![existing.id],
                 evidence: serde_json::json!({"trajectory_id": trajectory_id}),
+                sleep_until_unix: None,
+                continuation: None,
             });
         }
         let replay = context
@@ -633,6 +995,8 @@ impl WorkHandler for SessionReplayHandler {
             summary: format!("structural replay {} completed", replay.id),
             artifact_ids: vec![artifact.id],
             evidence: serde_json::json!({"trajectory_id": trajectory_id, "replay_id": replay.id}),
+            sleep_until_unix: None,
+            continuation: None,
         })
     }
 }
@@ -669,6 +1033,8 @@ impl WorkHandler for GoalPlannerHandler {
             summary: "goal plan artifact published".to_string(),
             artifact_ids: vec![artifact.id],
             evidence: serde_json::json!({"artifact_kind": "dynamic_workflow"}),
+            sleep_until_unix: None,
+            continuation: None,
         })
     }
 }
@@ -691,6 +1057,8 @@ impl WorkHandler for ManualGateHandler {
                 .to_string(),
             artifact_ids: Vec::new(),
             evidence: serde_json::json!({"manual_gate": "reached"}),
+            sleep_until_unix: None,
+            continuation: None,
         })
     }
 }
@@ -719,21 +1087,11 @@ impl WorkHandler for EvolutionEvaluateHandler {
             .get("candidate_id")
             .and_then(serde_json::Value::as_str)
             .context("evolution_evaluate requires input.candidate_id")?;
-        let eval_cases = self.evolution_engine.list_eval_cases(true).await?;
-        let required_calls = eval_cases
-            .len()
-            .checked_mul(2)
-            .context("evolution provider call count overflowed")?;
-        ensure!(required_calls > 0, "evolution eval suite is empty");
-        ensure!(
-            required_calls
-                <= usize::try_from(context.claim.budget.max_provider_calls)
-                    .context("invalid provider call budget")?,
-            "evolution evaluation requires {required_calls} provider calls but the workflow budget allows {}",
-            context.claim.budget.max_provider_calls
-        );
+        // Per-phase budget: one step evaluates exactly one case (baseline +
+        // candidate), so each phase reserves two provider calls — a crashed
+        // attempt no longer burns reservations for the whole suite.
         let mut deadline_at_unix = None;
-        for _ in 0..required_calls {
+        for _ in 0..2 {
             deadline_at_unix = Some(
                 context
                     .engine
@@ -751,14 +1109,40 @@ impl WorkHandler for EvolutionEvaluateHandler {
         .context("invalid evolution deadline")?;
         let max_response_bytes = usize::try_from(context.claim.budget.max_response_bytes)
             .context("invalid evolution response byte budget")?;
-        let (evaluation, response_bytes) = self
+        let step = self
             .evolution_engine
-            .evaluate_candidate_bounded_until(
+            .run_evaluation_step(
                 candidate_id,
                 max_response_bytes,
-                tokio::time::Instant::now() + Duration::from_secs(remaining_secs),
+                Some(tokio::time::Instant::now() + Duration::from_secs(remaining_secs)),
             )
             .await?;
+        let (evaluation, response_bytes) = match step {
+            EvalStepOutcome::Progress {
+                completed_cases,
+                total_cases,
+                ..
+            } => {
+                return Ok(WorkOutcome {
+                    summary: format!("evolution evaluation {completed_cases}/{total_cases} cases"),
+                    artifact_ids: Vec::new(),
+                    evidence: serde_json::Value::Null,
+                    sleep_until_unix: None,
+                    continuation: Some(WorkContinuation {
+                        phase: "evaluating".to_string(),
+                        state: serde_json::json!({
+                            "completed_cases": completed_cases,
+                            "total_cases": total_cases,
+                        }),
+                        delay_secs: None,
+                    }),
+                });
+            }
+            EvalStepOutcome::Completed {
+                evaluation,
+                response_bytes,
+            } => (*evaluation, response_bytes),
+        };
         context
             .engine
             .record_provider_response_bytes(
@@ -796,9 +1180,10 @@ impl WorkHandler for EvolutionEvaluateHandler {
             evidence: serde_json::json!({
                 "candidate_id": candidate_id,
                 "evaluation_id": evaluation.id,
-                "provider_calls": required_calls,
                 "response_bytes": response_bytes,
             }),
+            sleep_until_unix: None,
+            continuation: None,
         })
     }
 }

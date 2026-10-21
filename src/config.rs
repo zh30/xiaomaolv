@@ -425,6 +425,15 @@ pub struct AgentSwarmConfig {
     pub reply_summary_enabled: bool,
     #[serde(default = "default_agent_swarm_audit_retention_days")]
     pub audit_retention_days: u32,
+    /// Run swarm nodes as durable loop-engine work items (claims, attempts,
+    /// checkpoints, resumable delegation DAG) instead of in-process mirror.
+    #[serde(default = "default_agent_swarm_durable_engine")]
+    pub durable_engine: bool,
+    /// How long a chat turn waits synchronously for a swarm answer before
+    /// the reply is deferred (ack now, final answer delivered by the
+    /// janitor once the goal is terminal). `0` = always asynchronous.
+    #[serde(default = "default_agent_swarm_reply_sync_wait_ms")]
+    pub reply_sync_wait_ms: u64,
 }
 
 impl Default for AgentSwarmConfig {
@@ -439,6 +448,8 @@ impl Default for AgentSwarmConfig {
             max_run_timeout_ms: default_agent_swarm_max_run_timeout_ms(),
             reply_summary_enabled: default_agent_swarm_reply_summary_enabled(),
             audit_retention_days: default_agent_swarm_audit_retention_days(),
+            durable_engine: default_agent_swarm_durable_engine(),
+            reply_sync_wait_ms: default_agent_swarm_reply_sync_wait_ms(),
         }
     }
 }
@@ -961,6 +972,13 @@ fn default_agent_swarm_max_run_timeout_ms() -> u64 {
 
 fn default_agent_swarm_reply_summary_enabled() -> bool {
     true
+}
+
+fn default_agent_swarm_durable_engine() -> bool {
+    true
+}
+fn default_agent_swarm_reply_sync_wait_ms() -> u64 {
+    45_000
 }
 
 fn default_agent_swarm_audit_retention_days() -> u32 {

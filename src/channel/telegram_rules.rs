@@ -152,6 +152,24 @@ pub(super) fn is_reply_to_bot_message(
         .unwrap_or(false)
 }
 
+/// A message whose entire body is a feedback marker is recorded as
+/// trajectory feedback rather than model input. Returns the feedback score:
+/// +0.5 for approval, -0.5 for disapproval. Only unambiguous single-markers
+/// qualify — free-form text always goes to the model.
+pub(super) fn feedback_marker_score(text: &str) -> Option<f64> {
+    // Strip variation selectors so "❤️" and "❤" match the same marker.
+    let marker: String = text.trim().chars().filter(|ch| *ch != '\u{fe0f}').collect();
+    match marker.trim() {
+        "👍" | "👍🏻" | "👍🏽" | "❤" | "💯" | "🙏" | "👌" | "+1" | "好" | "很好" => {
+            Some(0.5)
+        }
+        "👎" | "👎🏻" | "👎🏽" | "💩" | "🤮" | "😡" | "🤬" | "👿" | "-1" | "差" | "垃圾" => {
+            Some(-0.5)
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn normalize_telegram_username(raw: Option<&str>) -> Option<String> {
     raw.map(|v| v.trim().trim_start_matches('@').to_string())
         .filter(|v| !v.is_empty())

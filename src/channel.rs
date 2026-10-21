@@ -12,7 +12,9 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::domain::{IncomingMessage, ReplyTarget};
-use crate::harness::loop_engine::{LoopEngine, OutboundSender};
+use crate::harness::loop_engine::{
+    CreateSignalRequest, LoopEngine, OutboundSender, SignalKind, SignalTrust,
+};
 use crate::mcp_commands::{
     discover_mcp_registry, execute_mcp_command, mcp_help_text, parse_telegram_mcp_command,
 };
@@ -296,23 +298,36 @@ impl TelegramSender {
         reply_to_message_id: Option<i64>,
         text: &str,
     ) -> anyhow::Result<()> {
+        self.send_message_with_ids(chat_id, message_thread_id, reply_to_message_id, text)
+            .await?;
+        Ok(())
+    }
+
+    /// Sends the full text (split into Telegram parts as needed) and returns
+    /// every sent message id — the binding anchors for later reply-markers.
+    pub async fn send_message_with_ids(
+        &self,
+        chat_id: i64,
+        message_thread_id: Option<i64>,
+        reply_to_message_id: Option<i64>,
+        text: &str,
+    ) -> anyhow::Result<Vec<i64>> {
         let parts = render_telegram_text_parts(text, TELEGRAM_MAX_TEXT_CHARS);
-        if parts.is_empty() {
-            return Ok(());
-        }
+        let mut ids = Vec::with_capacity(parts.len());
         for (idx, part) in parts.iter().enumerate() {
             let part_reply_to = if idx == 0 { reply_to_message_id } else { None };
-            let _ = self
-                .send_rendered_message_with_id(
+            ids.push(
+                self.send_rendered_message_with_id(
                     chat_id,
                     message_thread_id,
                     part_reply_to,
                     part,
                     None,
                 )
-                .await?;
+                .await?,
+            );
         }
-        Ok(())
+        Ok(ids)
     }
 
     pub async fn send_message_with_id(
@@ -764,6 +779,10 @@ impl OutboundSender for ChannelOutboundSender {
             evidence["idempotency_key"] = Value::String(idempotency_key.to_string());
             evidence
         })
+    }
+
+    fn supports_channel(&self, channel: &str) -> bool {
+        channel == "telegram" && self.telegram.is_some()
     }
 }
 
@@ -1581,6 +1600,7 @@ impl ChannelPlugin for TelegramChannelPlugin {
                 .build()
                 .expect("failed to build Telegram polling HTTP client");
             let mut offset: i64 = 0;
+            let mut last_admission_sweep = tokio::time::Instant::now();
             {
                 let mut diag = polling_diag_state.lock().await;
                 diag.worker_started_at_unix = Some(current_unix_timestamp());
@@ -1593,6 +1613,64 @@ impl ChannelPlugin for TelegramChannelPlugin {
             loop {
                 if *shutdown.borrow() {
                     break;
+                }
+
+                // Periodic sweep: in-flight admissions whose lease died long
+                // ago are updates the process crashed on — mark them failed
+                // and surface the loss instead of letting it stay silent.
+                if last_admission_sweep.elapsed() >= Duration::from_secs(60) {
+                    last_admission_sweep = tokio::time::Instant::now();
+                    match service.sweep_stale_telegram_admissions(300).await {
+                        Ok(lost) if !lost.is_empty() => {
+                            warn!(
+                                channel = %channel_name,
+                                count = lost.len(),
+                                update_ids = ?lost,
+                                "telegram updates lost mid-processing"
+                            );
+                            if let Some(engine) = loop_engine.as_ref() {
+                                let sweep_bucket = current_unix_timestamp() / 3_600;
+                                let lost_ids = lost
+                                    .iter()
+                                    .map(i64::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join(",");
+                                let _ = engine
+                                    .ingest_signal(
+                                        CreateSignalRequest {
+                                            kind: SignalKind::Trajectory,
+                                            trust: SignalTrust::Internal,
+                                            source: "telegram:admission-sweep".to_string(),
+                                            external_id: Some(format!(
+                                                "telegram-admission-sweep:{sweep_bucket}"
+                                            )),
+                                            content: format!(
+                                                "{} telegram update(s) lost mid-processing: {:?}",
+                                                lost.len(),
+                                                lost
+                                            ),
+                                            metadata: [
+                                                ("channel", channel_name.as_str()),
+                                                ("lost_update_ids", lost_ids.as_str()),
+                                            ]
+                                            .into_iter()
+                                            .map(|(key, value)| {
+                                                (key.to_string(), value.to_string())
+                                            })
+                                            .collect(),
+                                        },
+                                        "channel:telegram",
+                                    )
+                                    .await;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(err) => warn!(
+                            channel = %channel_name,
+                            error = %format!("{err:#}"),
+                            "telegram admission sweep failed"
+                        ),
+                    }
                 }
 
                 let updates_result = tokio::select! {
@@ -1619,6 +1697,60 @@ impl ChannelPlugin for TelegramChannelPlugin {
                         }
                         for update in updates {
                             offset = offset.max(update.update_id + 1);
+                            let update_id = update.update_id;
+                            let (admission_kind, admission_summary) =
+                                if let Some(message) = &update.message {
+                                    (
+                                        "message",
+                                        serde_json::json!({
+                                            "chat_id": message.chat.id,
+                                            "message_id": message.message_id,
+                                        }),
+                                    )
+                                } else if let Some(query) = &update.callback_query {
+                                    (
+                                        "callback_query",
+                                        serde_json::json!({
+                                            "query_id": query.id,
+                                            "from_user_id": query.from.id,
+                                        }),
+                                    )
+                                } else {
+                                    ("other", serde_json::json!({}))
+                                };
+                            // Durable admission: the first poll to see this
+                            // update_id owns it; re-deliveries (offset not
+                            // committed after a crash) reclaim a dead lease —
+                            // live/duplicate deliveries skip entirely. A
+                            // ledger failure fails open so messages keep
+                            // flowing.
+                            let owns_update = match service
+                                .admit_telegram_update(
+                                    update_id,
+                                    admission_kind,
+                                    &admission_summary.to_string(),
+                                    120,
+                                )
+                                .await
+                            {
+                                Ok(owns) => owns,
+                                Err(err) => {
+                                    warn!(
+                                        channel = %channel_name,
+                                        error = %format!("{err:#}"),
+                                        "telegram admission ledger failed; processing update anyway"
+                                    );
+                                    true
+                                }
+                            };
+                            if !owns_update {
+                                debug!(
+                                    channel = %channel_name,
+                                    update_id,
+                                    "duplicate telegram update admitted already; skipping"
+                                );
+                                continue;
+                            }
 
                             let payload = TelegramUpdate {
                                 message: update.message,
@@ -1633,7 +1765,7 @@ impl ChannelPlugin for TelegramChannelPlugin {
                             let bot_user_id =
                                 resolve_bot_user_id_with_cache(&sender, &bot_user_id_cache).await;
 
-                            if let Err(err) = process_telegram_update(
+                            match process_telegram_update(
                                 ChannelContext {
                                     service: service.clone(),
                                     channel_name: channel_name.clone(),
@@ -1655,11 +1787,29 @@ impl ChannelPlugin for TelegramChannelPlugin {
                             )
                             .await
                             {
-                                warn!(
-                                    channel = %channel_name,
-                                    error = %format!("{err:#}"),
-                                    "failed to process telegram update in polling mode"
-                                );
+                                Ok(()) => {
+                                    if let Err(err) = service
+                                        .finish_telegram_admission(update_id, "processed")
+                                        .await
+                                    {
+                                        warn!(
+                                            channel = %channel_name,
+                                            error = %format!("{err:#}"),
+                                            "failed to finish telegram admission"
+                                        );
+                                    }
+                                }
+                                Err(err) => {
+                                    let error_text = format!("{err:#}");
+                                    let _ = service
+                                        .fail_telegram_admission(update_id, &error_text)
+                                        .await;
+                                    warn!(
+                                        channel = %channel_name,
+                                        error = %error_text,
+                                        "failed to process telegram update in polling mode"
+                                    );
+                                }
                             }
                         }
                     }
