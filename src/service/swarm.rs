@@ -231,7 +231,7 @@ impl MessageService {
             settings: self.agent_swarm.clone(),
             semaphore: Arc::new(Semaphore::new(self.agent_swarm.max_parallel.max(1))),
             loop_projection: self
-                .start_swarm_loop_projection(&run_id, &incoming.text, history)
+                .start_swarm_loop_projection(&run_id, &incoming.text, history, incoming)
                 .await,
             agent_counter: Arc::new(AtomicUsize::new(0)),
             success_count: Arc::new(AtomicUsize::new(0)),
@@ -880,10 +880,11 @@ impl MessageService {
         run_id: &str,
         root_task: &str,
         history: &[StoredMessage],
+        incoming: &IncomingMessage,
     ) -> Option<SwarmLoopProjection> {
         let engine = self.loop_engine.clone()?;
         match self
-            .create_swarm_goal(&engine, run_id, root_task, history)
+            .create_swarm_goal(&engine, run_id, root_task, history, incoming)
             .await
         {
             Ok(goal_id) => Some(SwarmLoopProjection {
@@ -904,6 +905,7 @@ impl MessageService {
         run_id: &str,
         root_task: &str,
         history: &[StoredMessage],
+        incoming: &IncomingMessage,
     ) -> anyhow::Result<String> {
         let goal = engine
             .create_goal(
@@ -942,6 +944,9 @@ impl MessageService {
                                 "nickname": "Orchestrator",
                                 "depth": 0,
                                 "history": bounded_swarm_input_history(history),
+                                "channel": incoming.channel,
+                                "user_id": incoming.user_id,
+                                "session_id": incoming.session_id,
                             }),
                             retry: RetryPolicy {
                                 max_attempts: 1,
@@ -1369,6 +1374,102 @@ struct SwarmNodeInput {
     /// merged answer is the run's terminal deliverable.
     #[serde(default)]
     swarm_terminal: bool,
+    /// Provenance carried from the triggering message so node trajectories
+    /// land under the real channel/user.
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    user_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+/// Per-attempt trajectory recorder: one trajectory per work-item attempt
+/// (`swarm-node:{work}:{attempt}`), one frame per provider call. All writes
+/// are best-effort — recording never blocks a node.
+struct SwarmNodeTrajectory<'a> {
+    logger: Option<&'a crate::harness::trajectory::TrajectoryLogger>,
+    trajectory_id: String,
+    session_id: String,
+    channel: String,
+    user_id: String,
+    call_index: u32,
+}
+
+impl<'a> SwarmNodeTrajectory<'a> {
+    fn new(
+        logger: Option<&'a crate::harness::trajectory::TrajectoryLogger>,
+        claim: &WorkClaim,
+        input: &SwarmNodeInput,
+    ) -> Self {
+        Self {
+            logger,
+            trajectory_id: format!("swarm-node:{}:{}", claim.work_item.id, claim.attempt.id),
+            session_id: input
+                .session_id
+                .clone()
+                .unwrap_or_else(|| "swarm".to_string()),
+            channel: input.channel.clone().unwrap_or_else(|| "swarm".to_string()),
+            user_id: input.user_id.clone().unwrap_or_else(|| "swarm".to_string()),
+            call_index: 0,
+        }
+    }
+
+    async fn start(&self, model: &str) {
+        if let Some(logger) = self.logger
+            && let Err(error) = logger
+                .start_trajectory(
+                    &self.trajectory_id,
+                    &self.session_id,
+                    &self.channel,
+                    &self.user_id,
+                    model,
+                )
+                .await
+        {
+            warn!(error = %error, "swarm node trajectory start failed");
+        }
+    }
+
+    async fn log_frame(
+        &mut self,
+        request_messages: Vec<StoredMessage>,
+        json_mode: bool,
+        response: &str,
+        model: Option<&str>,
+    ) {
+        let Some(logger) = self.logger else {
+            return;
+        };
+        let draft = crate::harness::loop_engine::TrajectoryFrameDraft {
+            trajectory_id: self.trajectory_id.clone(),
+            call_index: self.call_index,
+            model: model.unwrap_or("unknown").to_string(),
+            provider_fingerprint: String::new(),
+            request_messages,
+            request_was_json: json_mode,
+            response: response.to_string(),
+            capture: crate::harness::loop_engine::TrajectoryFrameCapture::Full,
+        };
+        self.call_index += 1;
+        if let Err(error) = logger.log_provider_frame(draft).await {
+            warn!(error = %error, "swarm node trajectory frame failed");
+        }
+    }
+
+    async fn finish(
+        self,
+        answer: Option<String>,
+        exit: crate::harness::trajectory::TrajectoryExitReason,
+    ) {
+        if let Some(logger) = self.logger
+            && let Err(error) = logger
+                .finish_trajectory(&self.trajectory_id, answer, exit)
+                .await
+        {
+            warn!(error = %error, "swarm node trajectory finish failed");
+        }
+    }
 }
 
 /// Executes a `swarm_node` work item: decide -> answer|delegate (and the
@@ -1376,6 +1477,7 @@ struct SwarmNodeInput {
 pub struct SwarmNodeHandler {
     provider: Arc<dyn crate::provider::ChatProvider>,
     settings: AgentSwarmSettings,
+    trajectory: Option<crate::harness::trajectory::TrajectoryLogger>,
 }
 
 impl SwarmNodeHandler {
@@ -1383,7 +1485,19 @@ impl SwarmNodeHandler {
         provider: Arc<dyn crate::provider::ChatProvider>,
         settings: AgentSwarmSettings,
     ) -> Self {
-        Self { provider, settings }
+        Self {
+            provider,
+            settings,
+            trajectory: None,
+        }
+    }
+
+    /// Wires node-level trajectory recording — each attempt logs one
+    /// trajectory and every provider call a frame, so swarm runs feed the
+    /// same observation/scorecard loop as ordinary turns.
+    pub fn with_trajectory(mut self, logger: crate::harness::trajectory::TrajectoryLogger) -> Self {
+        self.trajectory = Some(logger);
+        self
     }
 
     /// Model call with the per-node timeout; returns the same error kind the
@@ -1392,13 +1506,14 @@ impl SwarmNodeHandler {
         &self,
         messages: Vec<StoredMessage>,
         json_mode: bool,
+        trajectory: &mut SwarmNodeTrajectory<'_>,
     ) -> Result<String, SwarmModelError> {
         let request = if json_mode {
-            CompletionRequest::json(messages)
+            CompletionRequest::json(messages.clone())
         } else {
-            CompletionRequest::from_messages(messages)
+            CompletionRequest::from_messages(messages.clone())
         };
-        match timeout(
+        let result = match timeout(
             Duration::from_millis(self.settings.max_node_timeout_ms.max(1)),
             self.provider.complete(request),
         )
@@ -1407,7 +1522,13 @@ impl SwarmNodeHandler {
             Ok(Ok(reply)) => Ok(reply),
             Ok(Err(err)) => Err(SwarmModelError::Failure(err)),
             Err(_) => Err(SwarmModelError::Timeout),
+        };
+        if let Ok(reply) = &result {
+            trajectory
+                .log_frame(messages, json_mode, reply, self.provider.model_name())
+                .await;
         }
+        result
     }
 
     /// The direct-answer leg: use the planner's seeded answer when present,
@@ -1420,6 +1541,7 @@ impl SwarmNodeHandler {
         role_name: &str,
         role_definition: &str,
         direct_answer: Option<String>,
+        traj: &mut SwarmNodeTrajectory<'_>,
     ) -> anyhow::Result<WorkOutcome> {
         let outcome = if let Some(answer) = direct_answer
             && !answer.trim().is_empty()
@@ -1432,7 +1554,7 @@ impl SwarmNodeHandler {
                 role_name,
                 role_definition,
             );
-            match self.complete(messages, false).await {
+            match self.complete(messages, false, traj).await {
                 Ok(answer) => swarm_node_outcome(&answer, "success", input),
                 Err(SwarmModelError::Timeout) => swarm_node_outcome("", "timeout", input),
                 Err(SwarmModelError::Failure(err)) => {
@@ -1498,6 +1620,7 @@ impl SwarmNodeHandler {
         ctx: &WorkHandlerContext,
         input: &SwarmNodeInput,
         role_name: &str,
+        traj: &mut SwarmNodeTrajectory<'_>,
     ) -> anyhow::Result<WorkOutcome> {
         let mut any_failed = false;
         let mut child_json = Vec::with_capacity(ctx.upstream.len());
@@ -1526,6 +1649,7 @@ impl SwarmNodeHandler {
             .complete(
                 build_swarm_merge_messages(&input.history, &input.task, role_name, &child_json),
                 false,
+                traj,
             )
             .await
         {
@@ -1587,6 +1711,42 @@ impl crate::harness::loop_engine::WorkHandler for SwarmNodeHandler {
     async fn execute(&self, ctx: &WorkHandlerContext) -> anyhow::Result<WorkOutcome> {
         let input: SwarmNodeInput = serde_json::from_value(ctx.claim.work_item.input.clone())
             .context("invalid swarm_node input")?;
+        let mut traj = SwarmNodeTrajectory::new(self.trajectory.as_ref(), &ctx.claim, &input);
+        traj.start(self.provider.model_name().unwrap_or("swarm"))
+            .await;
+        let outcome = self.execute_inner(ctx, &input, &mut traj).await;
+        let exit = match &outcome {
+            Ok(outcome) => match outcome
+                .evidence
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("success")
+            {
+                "timeout" => crate::harness::trajectory::TrajectoryExitReason::Timeout,
+                "failed" => crate::harness::trajectory::TrajectoryExitReason::ToolError,
+                _ => crate::harness::trajectory::TrajectoryExitReason::FinalAnswer,
+            },
+            Err(_) => crate::harness::trajectory::TrajectoryExitReason::InternalError,
+        };
+        let answer = outcome.as_ref().ok().and_then(|outcome| {
+            outcome
+                .evidence
+                .get("answer")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+        traj.finish(answer, exit).await;
+        outcome
+    }
+}
+
+impl SwarmNodeHandler {
+    async fn execute_inner(
+        &self,
+        ctx: &WorkHandlerContext,
+        input: &SwarmNodeInput,
+        traj: &mut SwarmNodeTrajectory<'_>,
+    ) -> anyhow::Result<WorkOutcome> {
         let role_name = input
             .role_name
             .clone()
@@ -1598,7 +1758,7 @@ impl crate::harness::loop_engine::WorkHandler for SwarmNodeHandler {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "负责当前子任务并输出可交付结果。".to_string());
         if input.mode.as_deref() == Some("aggregate") {
-            return self.aggregate_outcome(ctx, &input, &role_name).await;
+            return self.aggregate_outcome(ctx, input, &role_name, traj).await;
         }
 
         // Decide leg: planner picks answer|delegate unless depth forces a
@@ -1615,7 +1775,7 @@ impl crate::harness::loop_engine::WorkHandler for SwarmNodeHandler {
                 input.depth,
                 self.settings.max_depth,
             );
-            match self.complete(planner_messages, true).await {
+            match self.complete(planner_messages, true, traj).await {
                 Ok(reply) => {
                     if let Some(value) = parse_flexible_json_value(&reply)
                         && let Ok(plan) = serde_json::from_value::<SwarmNodePlanEnvelope>(value)
@@ -1644,7 +1804,7 @@ impl crate::harness::loop_engine::WorkHandler for SwarmNodeHandler {
                     }
                 }
                 Err(SwarmModelError::Timeout) => {
-                    return Ok(swarm_node_outcome("", "timeout", &input));
+                    return Ok(swarm_node_outcome("", "timeout", input));
                 }
                 Err(SwarmModelError::Failure(err)) => {
                     warn!(error = %err, "swarm planner failed, fallback to direct answer");
@@ -1654,7 +1814,14 @@ impl crate::harness::loop_engine::WorkHandler for SwarmNodeHandler {
         }
         if child_specs.is_empty() {
             return self
-                .answer_outcome(ctx, &input, &role_name, &role_definition, direct_answer)
+                .answer_outcome(
+                    ctx,
+                    input,
+                    &role_name,
+                    &role_definition,
+                    direct_answer,
+                    traj,
+                )
                 .await;
         }
 
@@ -1689,6 +1856,9 @@ impl crate::harness::loop_engine::WorkHandler for SwarmNodeHandler {
                     "parent_step_id": own_step,
                     "swarm_run_id": input.swarm_run_id,
                     "history": history,
+                    "channel": input.channel,
+                    "user_id": input.user_id,
+                    "session_id": input.session_id,
                 }),
                 retry: RetryPolicy {
                     max_attempts: 2,
@@ -1711,6 +1881,9 @@ impl crate::harness::loop_engine::WorkHandler for SwarmNodeHandler {
                 "history": history,
                 "depends_on": child_step_ids,
                 "swarm_terminal": input.swarm_root,
+                "channel": input.channel,
+                "user_id": input.user_id,
+                "session_id": input.session_id,
             }),
             retry: RetryPolicy {
                 max_attempts: 2,
@@ -1739,7 +1912,7 @@ impl crate::harness::loop_engine::WorkHandler for SwarmNodeHandler {
             }),
             Err(error) => {
                 warn!(error = %error, step_id = %own_step, "swarm DAG extension rejected; answering directly");
-                self.answer_outcome(ctx, &input, &role_name, &role_definition, None)
+                self.answer_outcome(ctx, input, &role_name, &role_definition, None, traj)
                     .await
             }
         }
@@ -1778,10 +1951,11 @@ impl MessageService {
         };
         let goal_id = goal_id.to_string();
         let mut registry = crate::harness::loop_engine::WorkHandlerRegistry::default();
-        if let Err(error) = registry.register(Arc::new(SwarmNodeHandler::new(
-            self.provider.clone(),
-            self.agent_swarm.clone(),
-        ))) {
+        let mut handler = SwarmNodeHandler::new(self.provider.clone(), self.agent_swarm.clone());
+        if let Some(logger) = &self.trajectory_logger {
+            handler = handler.with_trajectory(logger.clone());
+        }
+        if let Err(error) = registry.register(Arc::new(handler)) {
             return (
                 None,
                 AgentSwarmRunStatus::Failed,

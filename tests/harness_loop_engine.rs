@@ -3453,6 +3453,13 @@ async fn durable_swarm_service_run_achieves_goal_via_artifact() -> anyhow::Resul
             "merged swarm answer".to_string(),
         ])),
     });
+    let harness_store: Arc<dyn xiaomaolv::harness::store::HarnessStore> = Arc::new(
+        xiaomaolv::harness::store::SqliteHarnessStore::new(memory.clone()),
+    );
+    let harness_config = xiaomaolv::config::AgentHarnessConfig {
+        enable_trajectory: true,
+        ..Default::default()
+    };
     let service = MessageService::new(provider, memory, 8)
         // durable_engine defaults to true — this test exercises the real
         // production path end to end.
@@ -3462,6 +3469,8 @@ async fn durable_swarm_service_run_achieves_goal_via_artifact() -> anyhow::Resul
             reply_summary_enabled: false,
             ..Default::default()
         })
+        .with_harness_store(harness_store.clone())
+        .with_harness_config(&harness_config)
         .with_loop_engine(Some(engine.clone()));
 
     let reply = service
@@ -3498,6 +3507,33 @@ async fn durable_swarm_service_run_achieves_goal_via_artifact() -> anyhow::Resul
             .iter()
             .any(|a| a.name.starts_with("swarm-") && a.kind == ArtifactKind::AnalysisReport),
         "terminal artifact published"
+    );
+
+    // Node trajectories: every durable node attempt logged a trajectory
+    // under the real chat session — swarm runs now feed the scorecard /
+    // proposal-evidence loop like any other turn.
+    let trajectories = harness_store
+        .query_trajectories(xiaomaolv::harness::trajectory::TrajectoryFilter {
+            session_id: Some("tg:1".to_string()),
+            channel: None,
+            user_id: None,
+            exit_reason: None,
+            has_tool_errors: None,
+            limit: 100,
+        })
+        .await?;
+    let node_trajectories: Vec<_> = trajectories
+        .iter()
+        .filter(|t| t.id.starts_with("swarm-node:"))
+        .collect();
+    assert_eq!(
+        node_trajectories.len(),
+        4,
+        "each node attempt records a trajectory"
+    );
+    assert!(
+        node_trajectories.iter().all(|t| t.finished_at.is_some()),
+        "every node trajectory finished"
     );
     Ok(())
 }
