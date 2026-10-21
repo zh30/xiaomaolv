@@ -4649,3 +4649,88 @@ async fn cancel_goal_stops_live_work_and_is_auditable() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// Operator hold: pausing a live goal removes it from dispatch without
+/// destroying work — unpause returns it to the pool so claims resume.
+#[tokio::test]
+async fn paused_goal_stops_dispatching_until_unpaused() -> anyhow::Result<()> {
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let actor = "operator:test";
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "pause me".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            actor,
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![WorkflowStep {
+                        id: "linger".to_string(),
+                        handler: "wait".to_string(),
+                        effect: EffectClass::Pure,
+                        input: serde_json::json!({"until_unix": 4_000_000_000i64}),
+                        retry: RetryPolicy {
+                            max_attempts: 3,
+                            backoff_secs: 0,
+                        },
+                    }],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 0,
+                        deadline_secs: 3600,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+                    label: "gate".to_string(),
+                }],
+            },
+            actor,
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            actor,
+        )
+        .await?;
+
+    engine
+        .pause_goal(&goal.id, "hold for triage", actor)
+        .await?;
+    let held = engine.get_goal(&goal.id).await?.expect("goal");
+    assert_eq!(held.status, GoalStatus::Paused);
+    assert!(
+        !engine
+            .list_dispatchable_goal_ids(10)
+            .await?
+            .contains(&goal.id),
+        "paused goal leaves the dispatchable set"
+    );
+
+    let unpaused = engine.unpause_goal(&goal.id, actor).await?;
+    assert_eq!(unpaused.status, GoalStatus::Active);
+    assert!(
+        engine
+            .list_dispatchable_goal_ids(10)
+            .await?
+            .contains(&goal.id),
+        "unpaused goal re-enters dispatch"
+    );
+    let events = engine.list_goal_events(&goal.id, 0, 20).await?;
+    assert!(events.iter().any(|e| e.event_type == "goal.paused"));
+    assert!(events.iter().any(|e| e.event_type == "goal.unpaused"));
+    Ok(())
+}

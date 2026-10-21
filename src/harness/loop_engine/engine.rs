@@ -552,6 +552,21 @@ impl LoopEngine {
         Ok(report)
     }
 
+    /// Operator hold — new claims stop while the goal is paused;
+    /// `unpause_goal` returns it to `active`. See `LoopStore::pause_goal`.
+    pub async fn pause_goal(
+        &self,
+        goal_id: &str,
+        reason: &str,
+        actor: &str,
+    ) -> anyhow::Result<GoalRecord> {
+        self.store.pause_goal(goal_id, reason, actor).await
+    }
+
+    pub async fn unpause_goal(&self, goal_id: &str, actor: &str) -> anyhow::Result<GoalRecord> {
+        self.store.unpause_goal(goal_id, actor).await
+    }
+
     /// Operator stop for a live goal — see `LoopStore::cancel_goal`.
     pub async fn cancel_goal(
         &self,

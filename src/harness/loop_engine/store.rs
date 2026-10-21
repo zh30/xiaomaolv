@@ -274,6 +274,17 @@ pub trait LoopStore: Send + Sync {
         actor: &str,
     ) -> anyhow::Result<GoalRecord>;
 
+    /// Operator hold: pauses a live goal — new claims stop (paused is not a
+    /// dispatchable status) while in-flight attempts finish on their own.
+    /// `unpause_goal` returns it to `active`.
+    async fn pause_goal(
+        &self,
+        goal_id: &str,
+        reason: &str,
+        actor: &str,
+    ) -> anyhow::Result<GoalRecord>;
+    async fn unpause_goal(&self, goal_id: &str, actor: &str) -> anyhow::Result<GoalRecord>;
+
     /// Operator verdict for a work item parked in `waiting_confirmation`.
     /// `confirmed` commits the prepared checkpoint with an operator-attested
     /// outcome; `retry` voids it and re-queues the item; `abandoned` voids it
@@ -784,6 +795,20 @@ impl LoopStore for SqliteLoopStore {
             .fetch_one(self.store.pool())
             .await?;
         decode_goal(row)
+    }
+
+    async fn pause_goal(
+        &self,
+        goal_id: &str,
+        reason: &str,
+        actor: &str,
+    ) -> anyhow::Result<GoalRecord> {
+        self.set_goal_paused(goal_id, true, Some(reason), actor)
+            .await
+    }
+
+    async fn unpause_goal(&self, goal_id: &str, actor: &str) -> anyhow::Result<GoalRecord> {
+        self.set_goal_paused(goal_id, false, None, actor).await
     }
 
     async fn list_goal_events(
@@ -2948,6 +2973,67 @@ async fn next_phase_progress(
         state: continuation.state.clone(),
         continues,
     })
+}
+
+impl SqliteLoopStore {
+    async fn set_goal_paused(
+        &self,
+        goal_id: &str,
+        paused: bool,
+        reason: Option<&str>,
+        actor: &str,
+    ) -> anyhow::Result<GoalRecord> {
+        ensure_valid_id(goal_id, "goal id")?;
+        if let Some(reason) = reason {
+            ensure!(
+                !reason.trim().is_empty() && reason.trim().len() <= 512,
+                "pause reason must be 1..=512 characters"
+            );
+        }
+        let (to_status, event) = if paused {
+            ("paused", "goal.paused")
+        } else {
+            ("active", "goal.unpaused")
+        };
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let status: String = sqlx::query_scalar("SELECT status FROM harness_goals WHERE id = ?1")
+            .bind(goal_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .context("goal not found")?;
+        let allowed: Vec<&str> = if paused {
+            vec!["approved", "active", "blocked", "verifying"]
+        } else {
+            vec!["paused"]
+        };
+        ensure!(
+            allowed.contains(&status.as_str()),
+            "goal cannot {} from status '{status}'",
+            if paused { "pause" } else { "unpause" }
+        );
+        sqlx::query(
+            "UPDATE harness_goals SET status = ?1, updated_at = unixepoch()
+             WHERE id = ?2",
+        )
+        .bind(to_status)
+        .bind(goal_id)
+        .execute(&mut *tx)
+        .await?;
+        insert_event(
+            &mut tx,
+            goal_id,
+            event,
+            actor,
+            &serde_json::json!({"reason": reason.map(str::trim)}).to_string(),
+        )
+        .await?;
+        tx.commit().await?;
+        let row = sqlx::query("SELECT * FROM harness_goals WHERE id = ?1")
+            .bind(goal_id)
+            .fetch_one(self.store.pool())
+            .await?;
+        decode_goal(row)
+    }
 }
 
 fn decode_goal(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<GoalRecord> {
