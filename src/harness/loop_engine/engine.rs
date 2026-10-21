@@ -552,6 +552,14 @@ impl LoopEngine {
         Ok(report)
     }
 
+    /// All attempts across the goal's work items.
+    pub async fn list_attempts(
+        &self,
+        goal_id: &str,
+    ) -> anyhow::Result<Vec<super::domain::AttemptRecord>> {
+        self.store.list_attempts(goal_id).await
+    }
+
     /// The goal's checkpoint trail for operator inspection.
     pub async fn list_checkpoints(
         &self,

@@ -423,3 +423,27 @@ async fn goal_checkpoints_endpoint_is_operator_scoped() {
     let body: serde_json::Value = res.json();
     assert_eq!(body["checkpoints"], serde_json::json!([]));
 }
+
+/// `/v1/harness/goals/{id}/attempts` — the claim/fencing audit trail.
+#[tokio::test]
+async fn goal_attempts_endpoint_is_operator_scoped() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let database_url = format!(
+        "sqlite://{}",
+        temp.path().join("attempts-http.db").display()
+    );
+    let app = build_router(config(), &database_url, Some(Arc::new(HarnessHttpProvider)))
+        .await
+        .expect("router");
+    let server = TestServer::new(app).expect("server");
+
+    server
+        .get("/v1/harness/goals/goal_x/attempts")
+        .await
+        .assert_status_unauthorized();
+
+    let res = operator(server.get("/v1/harness/goals/goal_x/attempts")).await;
+    res.assert_status_ok();
+    let body: serde_json::Value = res.json();
+    assert_eq!(body["attempts"], serde_json::json!([]));
+}

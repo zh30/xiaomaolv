@@ -268,6 +268,11 @@ pub trait LoopStore: Send + Sync {
     /// declarations.
     async fn list_checkpoints(&self, goal_id: &str) -> anyhow::Result<Vec<CheckpointRecord>>;
 
+    /// All attempts across the goal's work items — who claimed what, the
+    /// fencing token sequence, and which attempts burned budget vs. were
+    /// `void`/`abandoned`.
+    async fn list_attempts(&self, goal_id: &str) -> anyhow::Result<Vec<AttemptRecord>>;
+
     /// Operator stop: cancels a non-terminal goal — in-flight attempts are
     /// abandoned (their later commits fail `ensure_claim_current`), open
     /// work items fail, and the goal lands `canceled` with an auditable
@@ -811,6 +816,23 @@ impl LoopStore for SqliteLoopStore {
             .fetch_one(self.store.pool())
             .await?;
         decode_goal(row)
+    }
+
+    async fn list_attempts(&self, goal_id: &str) -> anyhow::Result<Vec<AttemptRecord>> {
+        ensure_valid_id(goal_id, "goal id")?;
+        sqlx::query(
+            "SELECT id, goal_id, work_item_id, attempt_number, status, worker_id,
+                    lease_token, fencing_token, started_at, finished_at, error
+             FROM harness_attempts
+             WHERE goal_id = ?1 ORDER BY attempt_number, id",
+        )
+        .bind(goal_id)
+        .fetch_all(self.store.pool())
+        .await
+        .context("failed to list attempts")?
+        .into_iter()
+        .map(decode_attempt)
+        .collect()
     }
 
     async fn list_checkpoints(&self, goal_id: &str) -> anyhow::Result<Vec<CheckpointRecord>> {

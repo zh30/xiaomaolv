@@ -36,6 +36,7 @@ pub(super) fn router() -> Router<AppState> {
         .route("/v1/harness/goals/{id}/pause", post(post_goal_pause))
         .route("/v1/harness/goals/{id}/unpause", post(post_goal_unpause))
         .route("/v1/harness/goals/{id}/replan", post(post_goal_replan))
+        .route("/v1/harness/goals/{id}/attempts", get(get_goal_attempts))
         .route(
             "/v1/harness/goals/{id}/checkpoints",
             get(get_goal_checkpoints),
@@ -151,6 +152,18 @@ async fn get_swarm_run_nodes(
         .await
         .map_err(internal)?;
     Ok(Json(serde_json::json!({"nodes": nodes})))
+}
+
+/// `GET /goals/{id}/attempts` — who claimed what: worker ids, fencing
+/// tokens, retry counts, and which attempts were `void` vs `abandoned`.
+async fn get_goal_attempts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(goal_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (engine, _) = operator_context(&state, &headers).await?;
+    let attempts = engine.list_attempts(&goal_id).await.map_err(internal)?;
+    Ok(Json(serde_json::json!({"attempts": attempts})))
 }
 
 /// `GET /goals/{id}/checkpoints` — the effect-outcome audit trail:
