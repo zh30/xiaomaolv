@@ -50,6 +50,14 @@ pub(super) fn router() -> Router<AppState> {
             post(post_work_item_resolve_confirmation),
         )
         .route(
+            "/v1/harness/goals/{id}/work-items",
+            get(get_goal_work_items),
+        )
+        .route(
+            "/v1/harness/goals/{goal_id}/work-items/{work_item_id}/resolve-confirmation",
+            post(post_work_item_resolve_confirmation),
+        )
+        .route(
             "/v1/harness/goals/{id}/verify/manual",
             post(post_goal_manual_verification),
         )
