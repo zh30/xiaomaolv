@@ -1361,6 +1361,14 @@ struct SwarmNodeInput {
     swarm_run_id: Option<String>,
     #[serde(default)]
     history: Vec<StoredMessage>,
+    /// Root step marker — the run's terminal node publishes the
+    /// `analysis_report` artifact the goal's acceptance criterion checks.
+    #[serde(default)]
+    swarm_root: bool,
+    /// Set on the aggregate spawned by a `swarm_root` delegation — the
+    /// merged answer is the run's terminal deliverable.
+    #[serde(default)]
+    swarm_terminal: bool,
 }
 
 /// Executes a `swarm_node` work item: decide -> answer|delegate (and the
@@ -1407,26 +1415,81 @@ impl SwarmNodeHandler {
     /// outcomes, not attempt errors (see module note).
     async fn answer_outcome(
         &self,
+        ctx: &WorkHandlerContext,
         input: &SwarmNodeInput,
         role_name: &str,
         role_definition: &str,
         direct_answer: Option<String>,
     ) -> anyhow::Result<WorkOutcome> {
-        if let Some(answer) = direct_answer
+        let outcome = if let Some(answer) = direct_answer
             && !answer.trim().is_empty()
         {
-            return Ok(swarm_node_outcome(&answer, "success", input));
+            swarm_node_outcome(&answer, "success", input)
+        } else {
+            let messages = build_swarm_answer_messages(
+                &input.history,
+                &input.task,
+                role_name,
+                role_definition,
+            );
+            match self.complete(messages, false).await {
+                Ok(answer) => swarm_node_outcome(&answer, "success", input),
+                Err(SwarmModelError::Timeout) => swarm_node_outcome("", "timeout", input),
+                Err(SwarmModelError::Failure(err)) => {
+                    warn!(error = %err, "swarm node answer call failed");
+                    swarm_node_outcome("", "failed", input)
+                }
+            }
+        };
+        self.maybe_publish_terminal_artifact(ctx, input, outcome)
+            .await
+    }
+
+    /// The run's terminal node (direct root answer or root aggregate)
+    /// publishes its answer as the `analysis_report` artifact the goal's
+    /// `ArtifactExists` criterion verifies — the evidence trail keeps the
+    /// deliverable, not just the reply.
+    async fn maybe_publish_terminal_artifact(
+        &self,
+        ctx: &WorkHandlerContext,
+        input: &SwarmNodeInput,
+        mut outcome: WorkOutcome,
+    ) -> anyhow::Result<WorkOutcome> {
+        let is_terminal = input.swarm_root || input.swarm_terminal;
+        let answer = outcome
+            .evidence
+            .get("answer")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if !is_terminal || answer.trim().is_empty() {
+            return Ok(outcome);
         }
-        let messages =
-            build_swarm_answer_messages(&input.history, &input.task, role_name, role_definition);
-        match self.complete(messages, false).await {
-            Ok(answer) => Ok(swarm_node_outcome(&answer, "success", input)),
-            Err(SwarmModelError::Timeout) => Ok(swarm_node_outcome("", "timeout", input)),
-            Err(SwarmModelError::Failure(err)) => {
-                warn!(error = %err, "swarm node answer call failed");
-                Ok(swarm_node_outcome("", "failed", input))
+        let run_id = input.swarm_run_id.as_deref().unwrap_or("unknown");
+        match ctx
+            .engine
+            .publish_artifact(
+                PublishArtifactRequest {
+                    kind: ArtifactKind::AnalysisReport,
+                    name: format!("swarm-{run_id}"),
+                    version: "1".to_string(),
+                    content: serde_json::json!({
+                        "swarm_run_id": run_id,
+                        "answer": truncate_swarm_text(&answer, 4096),
+                    }),
+                    source_goal_id: Some(ctx.claim.work_item.goal_id.clone()),
+                    parent_artifact_id: None,
+                },
+                SWARM_LOOP_ACTOR,
+            )
+            .await
+        {
+            Ok(published) => outcome.artifact_ids.push(published.artifact.id),
+            Err(error) => {
+                warn!(error = %error, "swarm terminal artifact publish failed");
             }
         }
+        Ok(outcome)
     }
 
     /// Aggregation leg: merge declared upstream outcomes into one answer.
@@ -1482,7 +1545,9 @@ impl SwarmNodeHandler {
                 .join("\n\n"),
         };
         let status = if any_failed { "partial" } else { "success" };
-        Ok(swarm_node_outcome(&merged, status, input))
+        let outcome = swarm_node_outcome(&merged, status, input);
+        self.maybe_publish_terminal_artifact(ctx, input, outcome)
+            .await
     }
 }
 
@@ -1589,7 +1654,7 @@ impl crate::harness::loop_engine::WorkHandler for SwarmNodeHandler {
         }
         if child_specs.is_empty() {
             return self
-                .answer_outcome(&input, &role_name, &role_definition, direct_answer)
+                .answer_outcome(ctx, &input, &role_name, &role_definition, direct_answer)
                 .await;
         }
 
@@ -1645,6 +1710,7 @@ impl crate::harness::loop_engine::WorkHandler for SwarmNodeHandler {
                 "swarm_run_id": input.swarm_run_id,
                 "history": history,
                 "depends_on": child_step_ids,
+                "swarm_terminal": input.swarm_root,
             }),
             retry: RetryPolicy {
                 max_attempts: 2,
@@ -1673,7 +1739,7 @@ impl crate::harness::loop_engine::WorkHandler for SwarmNodeHandler {
             }),
             Err(error) => {
                 warn!(error = %error, step_id = %own_step, "swarm DAG extension rejected; answering directly");
-                self.answer_outcome(&input, &role_name, &role_definition, None)
+                self.answer_outcome(ctx, &input, &role_name, &role_definition, None)
                     .await
             }
         }
