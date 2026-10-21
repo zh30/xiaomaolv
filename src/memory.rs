@@ -362,6 +362,34 @@ impl SqliteMemoryStore {
         .context("failed to initialize trajectory channel index")?;
 
         sqlx::query(
+            "CREATE TABLE IF NOT EXISTS mcp_trajectory_scorecards (
+                trajectory_id TEXT PRIMARY KEY REFERENCES mcp_trajectories(id),
+                score INTEGER NOT NULL,
+                completion REAL NOT NULL,
+                answer_quality REAL NOT NULL,
+                tool_health REAL NOT NULL,
+                speed REAL NOT NULL,
+                tool_calls INTEGER NOT NULL,
+                failed_tool_calls INTEGER NOT NULL,
+                verification_failures INTEGER NOT NULL,
+                iterations INTEGER NOT NULL,
+                latency_ms INTEGER NOT NULL,
+                computed_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize mcp_trajectory_scorecards table")?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_trajectory_scorecards_computed
+             ON mcp_trajectory_scorecards(computed_at);",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize trajectory scorecard time index")?;
+
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS compaction_summaries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
@@ -1528,6 +1556,413 @@ impl SqliteMemoryStore {
         .execute(&self.pool)
         .await
         .context("failed to finish trajectory")?;
+        // Persist the deterministic fitness scorecard next to the finished
+        // run: deployments and proposal evidence are judged against these
+        // numbers rather than a binary failure flag.
+        if let Some(record) = self.get_trajectory(trajectory_id).await? {
+            let scorecard = crate::harness::trajectory::compute_run_scorecard(&record, unix_ts());
+            self.upsert_run_scorecard(&scorecard).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn upsert_run_scorecard(
+        &self,
+        scorecard: &crate::harness::trajectory::RunScorecard,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO mcp_trajectory_scorecards
+             (trajectory_id, score, completion, answer_quality, tool_health,
+              speed, tool_calls, failed_tool_calls, verification_failures,
+              iterations, latency_ms, computed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT(trajectory_id) DO UPDATE SET
+               score = excluded.score,
+               completion = excluded.completion,
+               answer_quality = excluded.answer_quality,
+               tool_health = excluded.tool_health,
+               speed = excluded.speed,
+               tool_calls = excluded.tool_calls,
+               failed_tool_calls = excluded.failed_tool_calls,
+               verification_failures = excluded.verification_failures,
+               iterations = excluded.iterations,
+               latency_ms = excluded.latency_ms,
+               computed_at = excluded.computed_at",
+        )
+        .bind(&scorecard.trajectory_id)
+        .bind(scorecard.score)
+        .bind(scorecard.completion)
+        .bind(scorecard.answer_quality)
+        .bind(scorecard.tool_health)
+        .bind(scorecard.speed)
+        .bind(scorecard.tool_calls)
+        .bind(scorecard.failed_tool_calls)
+        .bind(scorecard.verification_failures)
+        .bind(scorecard.iterations)
+        .bind(scorecard.latency_ms)
+        .bind(scorecard.computed_at_unix)
+        .execute(&self.pool)
+        .await
+        .context("failed to upsert trajectory scorecard")?;
+        Ok(())
+    }
+
+    /// Computes and persists scorecards for finished trajectories that
+    /// predate the scorecard table (self-healing backfill).
+    pub async fn backfill_run_scorecards(&self, limit: i64) -> anyhow::Result<usize> {
+        let missing = sqlx::query_scalar::<_, String>(
+            "SELECT t.id FROM mcp_trajectories t
+             LEFT JOIN mcp_trajectory_scorecards s ON s.trajectory_id = t.id
+             WHERE t.finished_at IS NOT NULL AND s.trajectory_id IS NULL
+             ORDER BY t.finished_at DESC LIMIT ?1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to find trajectories missing scorecards")?;
+        let mut filled = 0_usize;
+        for trajectory_id in missing {
+            if let Some(record) = self.get_trajectory(&trajectory_id).await? {
+                let finished = record
+                    .finished_at
+                    .map(|finished| finished.timestamp())
+                    .unwrap_or_else(unix_ts);
+                self.upsert_run_scorecard(&crate::harness::trajectory::compute_run_scorecard(
+                    &record, finished,
+                ))
+                .await?;
+                filled += 1;
+            }
+        }
+        Ok(filled)
+    }
+
+    pub async fn get_run_scorecard(
+        &self,
+        trajectory_id: &str,
+    ) -> anyhow::Result<Option<crate::harness::trajectory::RunScorecard>> {
+        let row = sqlx::query(
+            "SELECT trajectory_id, score, completion, answer_quality, tool_health,
+                    speed, tool_calls, failed_tool_calls, verification_failures,
+                    iterations, latency_ms, computed_at
+             FROM mcp_trajectory_scorecards WHERE trajectory_id = ?1",
+        )
+        .bind(trajectory_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to get trajectory scorecard")?;
+        if let Some(row) = row {
+            return Ok(Some(run_scorecard_from_row(&row)?));
+        }
+        // Lazy backfill for runs that finished before the table existed.
+        let Some(record) = self.get_trajectory(trajectory_id).await? else {
+            return Ok(None);
+        };
+        if record.finished_at.is_none() {
+            return Ok(None);
+        }
+        let computed = record
+            .finished_at
+            .map(|finished| finished.timestamp())
+            .unwrap_or_else(unix_ts);
+        let scorecard = crate::harness::trajectory::compute_run_scorecard(&record, computed);
+        self.upsert_run_scorecard(&scorecard).await?;
+        Ok(Some(scorecard))
+    }
+
+    pub async fn query_run_scorecards(
+        &self,
+        filter: crate::harness::trajectory::RunScorecardFilter,
+    ) -> anyhow::Result<Vec<crate::harness::trajectory::RunScorecard>> {
+        type RowTuple = (
+            String,
+            i64,
+            f64,
+            f64,
+            f64,
+            f64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        );
+        let limit = crate::harness::trajectory::clamp_trajectory_query_limit(filter.limit) as i64;
+        let mut builder = QueryBuilder::<Sqlite>::new(
+            "SELECT s.trajectory_id, s.score, s.completion, s.answer_quality,
+                    s.tool_health, s.speed, s.tool_calls, s.failed_tool_calls,
+                    s.verification_failures, s.iterations, s.latency_ms, s.computed_at
+             FROM mcp_trajectory_scorecards s
+             JOIN mcp_trajectories t ON t.id = s.trajectory_id",
+        );
+        let mut has_where = false;
+        macro_rules! push_condition {
+            ($sql:expr) => {{
+                if has_where {
+                    builder.push(" AND ");
+                } else {
+                    builder.push(" WHERE ");
+                    has_where = true;
+                }
+                builder.push($sql);
+            }};
+        }
+        if let Some(channel) = &filter.channel {
+            push_condition!("t.channel = ");
+            builder.push_bind(channel);
+        }
+        if let Some(model) = &filter.model {
+            push_condition!("t.model = ");
+            builder.push_bind(model);
+        }
+        if let Some(since) = filter.since_unix {
+            push_condition!("t.finished_at >= ");
+            builder.push_bind(since);
+        }
+        if let Some(until) = filter.until_unix {
+            push_condition!("t.finished_at < ");
+            builder.push_bind(until);
+        }
+        if let Some(min_score) = filter.min_score {
+            push_condition!("s.score >= ");
+            builder.push_bind(min_score);
+        }
+        if let Some(max_score) = filter.max_score {
+            push_condition!("s.score <= ");
+            builder.push_bind(max_score);
+        }
+        let _ = has_where;
+        if filter.ascending {
+            builder.push(" ORDER BY t.finished_at ASC, s.trajectory_id ASC LIMIT ");
+        } else {
+            builder.push(" ORDER BY t.finished_at DESC, s.trajectory_id DESC LIMIT ");
+        }
+        builder.push_bind(limit);
+        let rows = builder
+            .build_query_as::<RowTuple>()
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to query trajectory scorecards")?;
+        rows.into_iter()
+            .map(
+                |(
+                    trajectory_id,
+                    score,
+                    completion,
+                    answer_quality,
+                    tool_health,
+                    speed,
+                    tool_calls,
+                    failed_tool_calls,
+                    verification_failures,
+                    iterations,
+                    latency_ms,
+                    computed_at,
+                )| {
+                    anyhow::Ok(crate::harness::trajectory::RunScorecard {
+                        trajectory_id,
+                        score,
+                        completion,
+                        answer_quality,
+                        tool_health,
+                        speed,
+                        tool_calls,
+                        failed_tool_calls,
+                        verification_failures,
+                        iterations,
+                        latency_ms,
+                        computed_at_unix: computed_at,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    pub async fn run_scorecard_summary(
+        &self,
+        since_unix: i64,
+        until_unix: i64,
+    ) -> anyhow::Result<crate::harness::trajectory::ScorecardSummary> {
+        // Backfill so windows that predate the scorecard table still score.
+        self.backfill_run_scorecards(512).await?;
+        let rows = sqlx::query(
+            "SELECT s.score, s.failed_tool_calls, s.verification_failures, t.exit_reason
+             FROM mcp_trajectory_scorecards s
+             JOIN mcp_trajectories t ON t.id = s.trajectory_id
+             WHERE t.finished_at >= ?1 AND t.finished_at < ?2",
+        )
+        .bind(since_unix)
+        .bind(until_unix)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to summarize trajectory scorecards")?;
+        let mut summary = crate::harness::trajectory::ScorecardSummary {
+            window_start_unix: since_unix,
+            window_end_unix: until_unix,
+            run_count: rows.len() as i64,
+            mean_score: None,
+            low_count: 0,
+            mid_count: 0,
+            high_count: 0,
+            failed_tool_calls: 0,
+            verification_failures: 0,
+            exit_reasons: std::collections::BTreeMap::new(),
+        };
+        let mut total = 0_f64;
+        for row in &rows {
+            let score: i64 = row.get("score");
+            total += score as f64;
+            match score {
+                0..=49 => summary.low_count += 1,
+                50..=79 => summary.mid_count += 1,
+                _ => summary.high_count += 1,
+            }
+            summary.failed_tool_calls += row.get::<i64, _>("failed_tool_calls");
+            summary.verification_failures += row.get::<i64, _>("verification_failures");
+            let exit_reason: String = row.get("exit_reason");
+            *summary.exit_reasons.entry(exit_reason).or_insert(0) += 1;
+        }
+        if summary.run_count > 0 {
+            summary.mean_score = Some(total / summary.run_count as f64);
+        }
+        Ok(summary)
+    }
+
+    /// Most recent finished trajectory whose `session_id` starts with
+    /// `session_prefix` (e.g. `tg:{chat_id}`), finished at or after
+    /// `min_finished_unix`. Binds lightweight reply-feedback to the run
+    /// that produced the answer being rated.
+    pub async fn latest_finished_trajectory(
+        &self,
+        session_prefix: &str,
+        min_finished_unix: i64,
+    ) -> anyhow::Result<Option<crate::harness::trajectory::TrajectoryRecord>> {
+        let escaped = session_prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let row = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM mcp_trajectories
+             WHERE session_id LIKE ?1 ESCAPE '\\'
+               AND finished_at IS NOT NULL AND finished_at >= ?2
+             ORDER BY finished_at DESC, id DESC LIMIT 1",
+        )
+        .bind(format!("{escaped}%"))
+        .bind(min_finished_unix)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to query latest finished trajectory")?;
+        let Some(trajectory_id) = row else {
+            return Ok(None);
+        };
+        self.get_trajectory(&trajectory_id).await
+    }
+
+    /// The user input that started a recorded run: the last user message in
+    /// the earliest captured provider request frame. Returns `None` when no
+    /// request frame was captured.
+    pub async fn trajectory_first_user_input(
+        &self,
+        trajectory_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let json = sqlx::query_scalar::<_, String>(
+            "SELECT request_messages_json FROM harness_trajectory_frames
+             WHERE trajectory_id = ?1 ORDER BY call_index ASC LIMIT 1",
+        )
+        .bind(trajectory_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load trajectory request frame")?;
+        let Some(json) = json else {
+            return Ok(None);
+        };
+        let messages: Vec<StoredMessage> =
+            serde_json::from_str(&json).context("failed to parse trajectory request messages")?;
+        Ok(messages
+            .iter()
+            .rev()
+            .find(|message| matches!(message.role, MessageRole::User))
+            .map(|message| message.content.clone()))
+    }
+
+    /// Inserts or replaces a fully-formed trajectory including its tool calls
+    /// and the computed scorecard. Repairs, imports, and deterministic tests
+    /// use this path; live runs go through `start_trajectory` /
+    /// `finish_trajectory`.
+    pub async fn record_finished_trajectory(
+        &self,
+        record: &crate::harness::trajectory::TrajectoryRecord,
+    ) -> anyhow::Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to begin finished-trajectory transaction")?;
+        sqlx::query(
+            "INSERT INTO mcp_trajectories
+             (id, session_id, channel, user_id, started_at, finished_at,
+              final_answer, exit_reason, model, total_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(id) DO UPDATE SET
+               session_id = excluded.session_id,
+               channel = excluded.channel,
+               user_id = excluded.user_id,
+               started_at = excluded.started_at,
+               finished_at = excluded.finished_at,
+               final_answer = excluded.final_answer,
+               exit_reason = excluded.exit_reason,
+               model = excluded.model,
+               total_tokens = excluded.total_tokens",
+        )
+        .bind(&record.id)
+        .bind(&record.session_id)
+        .bind(&record.channel)
+        .bind(&record.user_id)
+        .bind(record.started_at.timestamp())
+        .bind(record.finished_at.map(|finished| finished.timestamp()))
+        .bind(&record.final_answer)
+        .bind(record.exit_reason.as_str())
+        .bind(&record.model)
+        .bind(record.total_tokens.map(|value| value as i64))
+        .execute(&mut *tx)
+        .await
+        .context("failed to upsert finished trajectory")?;
+        sqlx::query("DELETE FROM mcp_trajectory_tool_calls WHERE trajectory_id = ?1")
+            .bind(&record.id)
+            .execute(&mut *tx)
+            .await
+            .context("failed to clear replaced trajectory tool calls")?;
+        for call in &record.tool_calls {
+            sqlx::query(
+                "INSERT INTO mcp_trajectory_tool_calls
+                 (trajectory_id, call_index, iteration, server, tool,
+                  arguments, result, ok, duration_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )
+            .bind(&record.id)
+            .bind(call.call_index as i64)
+            .bind(call.iteration as i64)
+            .bind(&call.server)
+            .bind(&call.tool)
+            .bind(serde_json::to_string(&call.arguments).unwrap_or_default())
+            .bind(serde_json::to_string(&call.result).unwrap_or_default())
+            .bind(call.ok)
+            .bind(call.duration_ms as i64)
+            .execute(&mut *tx)
+            .await
+            .context("failed to insert replaced trajectory tool call")?;
+        }
+        tx.commit()
+            .await
+            .context("failed to commit finished trajectory")?;
+        if let Some(finished) = record.finished_at {
+            self.upsert_run_scorecard(&crate::harness::trajectory::compute_run_scorecard(
+                record,
+                finished.timestamp(),
+            ))
+            .await?;
+        }
         Ok(())
     }
 
@@ -4251,6 +4686,25 @@ fn unix_ts() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+fn run_scorecard_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> anyhow::Result<crate::harness::trajectory::RunScorecard> {
+    Ok(crate::harness::trajectory::RunScorecard {
+        trajectory_id: row.try_get("trajectory_id")?,
+        score: row.try_get("score")?,
+        completion: row.try_get("completion")?,
+        answer_quality: row.try_get("answer_quality")?,
+        tool_health: row.try_get("tool_health")?,
+        speed: row.try_get("speed")?,
+        tool_calls: row.try_get("tool_calls")?,
+        failed_tool_calls: row.try_get("failed_tool_calls")?,
+        verification_failures: row.try_get("verification_failures")?,
+        iterations: row.try_get("iterations")?,
+        latency_ms: row.try_get("latency_ms")?,
+        computed_at_unix: row.try_get("computed_at")?,
+    })
 }
 
 fn unix_ts_nanos() -> u128 {

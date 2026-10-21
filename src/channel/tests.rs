@@ -7,7 +7,7 @@ use super::{
     detect_scheduler_job_operation_keyword, detect_vocative_learned_alias_prefix,
     evaluate_group_decision, evaluate_mcp_command_access, evaluate_private_chat_access,
     extract_dynamic_alias_candidates, extract_realtime_name_correction, extract_scheduler_job_id,
-    extract_vocative_alias_candidate, format_agent_swarm_node_detail_text,
+    extract_vocative_alias_candidate, feedback_marker_score, format_agent_swarm_node_detail_text,
     format_agent_swarm_tree_text, is_reply_to_bot_message, looks_like_scheduler_list_text,
     message_mentions_bot, parse_admin_user_ids, parse_telegram_slash_command,
     render_telegram_text_parts, scheduler_confirm_inline_keyboard, send_message_draft_payload,
@@ -924,4 +924,19 @@ fn scheduler_reminder_text_in_private_chat_keeps_payload() {
         "2分钟后喝水",
     );
     assert_eq!(text, "2分钟后喝水");
+}
+
+#[test]
+fn feedback_marker_scores_only_unambiguous_markers() {
+    assert_eq!(feedback_marker_score("👍"), Some(0.5));
+    assert_eq!(feedback_marker_score("👎"), Some(-0.5));
+    assert_eq!(feedback_marker_score("❤️"), Some(0.5));
+    assert_eq!(feedback_marker_score("+1"), Some(0.5));
+    assert_eq!(feedback_marker_score("-1"), Some(-0.5));
+    assert_eq!(feedback_marker_score("差"), Some(-0.5));
+    assert_eq!(feedback_marker_score("  👍  "), Some(0.5));
+    // Free-form text is never feedback — it reaches the model.
+    assert_eq!(feedback_marker_score("这个回答不对"), None);
+    assert_eq!(feedback_marker_score("👍👍"), None);
+    assert_eq!(feedback_marker_score(""), None);
 }

@@ -878,6 +878,9 @@ impl MessageService {
                         truncate_swarm_text(root_task, 480)
                     ),
                     source_signal_ids: Vec::new(),
+                    // Swarm retries of the same run admit the same goal
+                    // instead of forking a second projection.
+                    request_id: Some(format!("swarm:{run_id}")),
                 },
                 SWARM_LOOP_ACTOR,
             )
@@ -1046,8 +1049,11 @@ impl MessageService {
                 artifact_ids.push(published.artifact.id);
             }
             let idempotency_key = format!("{}:{}:v1", claim.work_item.id, claim.attempt.id);
+            // The real node already executed in-process; this projection is
+            // a durable record only, so a crash mid-projection is always
+            // safe to re-run — never park for operator confirmation.
             let checkpoint = engine
-                .prepare_checkpoint(claim, &idempotency_key, SWARM_LOOP_ACTOR)
+                .prepare_checkpoint(claim, &idempotency_key, true, SWARM_LOOP_ACTOR)
                 .await?;
             engine
                 .commit_checkpoint(
@@ -1063,6 +1069,8 @@ impl MessageService {
                             "status": outcome.status.as_str(),
                             "partial": outcome.partial,
                         }),
+                        sleep_until_unix: None,
+                        continuation: None,
                     },
                     SWARM_LOOP_ACTOR,
                 )

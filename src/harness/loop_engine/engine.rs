@@ -20,13 +20,20 @@ use super::{
 pub struct LoopEngine {
     store: Arc<dyn LoopStore>,
     external_write_policy: ExternalWritePolicy,
+    /// Best-effort wake-up for event consumers (SSE streams): carries the
+    /// `goal_id` of a committed mutation so watchers re-read instead of
+    /// polling. Losing a notification is harmless — consumers keep a slow
+    /// fallback poll and the monotonic `sequence` cursor still drives them.
+    event_tx: tokio::sync::broadcast::Sender<String>,
 }
 
 impl LoopEngine {
     pub fn new(store: Arc<dyn LoopStore>) -> Self {
+        let (event_tx, _) = tokio::sync::broadcast::channel(1024);
         Self {
             store,
             external_write_policy: ExternalWritePolicy::default(),
+            event_tx,
         }
     }
 
@@ -41,14 +48,41 @@ impl LoopEngine {
         &self.external_write_policy
     }
 
+    /// Subscribes to goal-mutation notifications. Receivers get the affected
+    /// `goal_id` for every committed change that may have produced events;
+    /// lagged receivers should fall back to a bounded poll.
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<String> {
+        self.event_tx.subscribe()
+    }
+
+    fn notify(&self, goal_id: &str) {
+        // No receivers (or a full channel) is not an error.
+        let _ = self.event_tx.send(goal_id.to_string());
+    }
+
     pub async fn create_goal(
         &self,
         request: CreateGoalRequest,
         actor: &str,
     ) -> anyhow::Result<GoalRecord> {
+        Ok(self.create_goal_admission(request, actor).await?.0)
+    }
+
+    /// `request.request_id` makes admission idempotent: the same key returns
+    /// the already-admitted goal with `created = false`, so a retried submit
+    /// cannot duplicate a goal.
+    pub async fn create_goal_admission(
+        &self,
+        request: CreateGoalRequest,
+        actor: &str,
+    ) -> anyhow::Result<(GoalRecord, bool)> {
         request.validate()?;
         validate_actor(actor)?;
-        self.store.create_goal(request, actor).await
+        let (goal, created) = self.store.create_goal_admission(request, actor).await?;
+        if created {
+            self.notify(&goal.id);
+        }
+        Ok((goal, created))
     }
 
     pub async fn get_goal(&self, goal_id: &str) -> anyhow::Result<Option<GoalRecord>> {
@@ -126,11 +160,14 @@ impl LoopEngine {
             "signal cannot be proposed from status '{}'",
             signal.status.as_str()
         );
+        // The request_id makes the create+mark pair idempotent: a crash or
+        // retry between them finds the same goal instead of duplicating it.
         let goal = self
             .create_goal(
                 CreateGoalRequest {
                     objective: objective.to_string(),
                     source_signal_ids: vec![signal_id.to_string()],
+                    request_id: Some(format!("signal:{signal_id}")),
                 },
                 actor,
             )
@@ -214,7 +251,9 @@ impl LoopEngine {
     ) -> anyhow::Result<PlannedGoal> {
         request.validate_with_policy(&self.external_write_policy)?;
         validate_actor(actor)?;
-        self.store.plan_goal(goal_id, request, actor).await
+        let planned = self.store.plan_goal(goal_id, request, actor).await?;
+        self.notify(goal_id);
+        Ok(planned)
     }
 
     /// Latest planned workflow for a goal — approval surfaces use this to
@@ -289,9 +328,12 @@ impl LoopEngine {
         actor: &str,
     ) -> anyhow::Result<ResumeReport> {
         validate_actor(actor)?;
-        self.store
+        let report = self
+            .store
             .approve_goal(goal_id, request, actor, &self.external_write_policy)
-            .await
+            .await?;
+        self.notify(goal_id);
+        Ok(report)
     }
 
     pub async fn claim_goal_work(
@@ -307,9 +349,14 @@ impl LoopEngine {
             (1..=3600).contains(&lease_secs),
             "lease must be 1..=3600 seconds"
         );
-        self.store
+        let claim = self
+            .store
             .claim_goal_work(goal_id, worker_id, lease_secs, actor)
-            .await
+            .await?;
+        if claim.is_some() {
+            self.notify(goal_id);
+        }
+        Ok(claim)
     }
 
     /// Targeted claim for in-process subsystems (e.g. the agent swarm) that
@@ -329,9 +376,14 @@ impl LoopEngine {
             (1..=3600).contains(&lease_secs),
             "lease must be 1..=3600 seconds"
         );
-        self.store
+        let claim = self
+            .store
             .claim_work_item(goal_id, step_id, worker_id, lease_secs, actor)
-            .await
+            .await?;
+        if claim.is_some() {
+            self.notify(goal_id);
+        }
+        Ok(claim)
     }
 
     /// Append steps to an `approved`/`active` goal. Restricted to `internal:`
@@ -345,9 +397,12 @@ impl LoopEngine {
         actor: &str,
     ) -> anyhow::Result<Vec<WorkItemRecord>> {
         validate_actor(actor)?;
-        self.store
+        let items = self
+            .store
             .extend_workflow(goal_id, steps, actor, &self.external_write_policy)
-            .await
+            .await?;
+        self.notify(goal_id);
+        Ok(items)
     }
 
     pub async fn publish_artifact(
@@ -357,7 +412,12 @@ impl LoopEngine {
     ) -> anyhow::Result<ArtifactPublishResult> {
         request.validate()?;
         validate_actor(actor)?;
-        self.store.publish_artifact(request, actor).await
+        let source_goal_id = request.source_goal_id.clone();
+        let result = self.store.publish_artifact(request, actor).await?;
+        if let Some(goal_id) = source_goal_id {
+            self.notify(&goal_id);
+        }
+        Ok(result)
     }
 
     pub async fn get_artifact(&self, artifact_id: &str) -> anyhow::Result<Option<ArtifactRecord>> {
@@ -383,7 +443,9 @@ impl LoopEngine {
         actor: &str,
     ) -> anyhow::Result<GoalVerificationReport> {
         validate_actor(actor)?;
-        self.store.verify_goal(goal_id, actor).await
+        let report = self.store.verify_goal(goal_id, actor).await?;
+        self.notify(goal_id);
+        Ok(report)
     }
 
     pub async fn record_manual_verification(
@@ -393,9 +455,12 @@ impl LoopEngine {
         actor: &str,
     ) -> anyhow::Result<GoalRecord> {
         validate_actor(actor)?;
-        self.store
+        let goal = self
+            .store
             .record_manual_verification(goal_id, label, actor)
-            .await
+            .await?;
+        self.notify(goal_id);
+        Ok(goal)
     }
 
     pub async fn reserve_provider_call(
@@ -415,16 +480,24 @@ impl LoopEngine {
             .await
     }
 
+    /// `replay_safe` is the handler's declared crash semantics (see
+    /// `WorkHandler::replay_safe`): `false` means a crash between the effect
+    /// and this checkpoint's commit must park for operator confirmation
+    /// rather than re-run blindly.
     pub async fn prepare_checkpoint(
         &self,
         claim: &WorkClaim,
         idempotency_key: &str,
+        replay_safe: bool,
         actor: &str,
     ) -> anyhow::Result<CheckpointRecord> {
         validate_actor(actor)?;
-        self.store
-            .prepare_checkpoint(claim, idempotency_key, actor)
-            .await
+        let checkpoint = self
+            .store
+            .prepare_checkpoint(claim, idempotency_key, replay_safe, actor)
+            .await?;
+        self.notify(&claim.attempt.goal_id);
+        Ok(checkpoint)
     }
 
     pub async fn renew_claim(&self, claim: &WorkClaim, lease_secs: u32) -> anyhow::Result<i64> {
@@ -440,9 +513,12 @@ impl LoopEngine {
     ) -> anyhow::Result<CheckpointRecord> {
         validate_actor(actor)?;
         outcome.validate()?;
-        self.store
+        let checkpoint = self
+            .store
             .commit_checkpoint(claim, checkpoint_id, outcome, actor)
-            .await
+            .await?;
+        self.notify(&claim.attempt.goal_id);
+        Ok(checkpoint)
     }
 
     pub async fn finish_attempt(
@@ -452,7 +528,12 @@ impl LoopEngine {
         actor: &str,
     ) -> anyhow::Result<ResumeReport> {
         validate_actor(actor)?;
-        self.store.finish_attempt(claim, checkpoint_id, actor).await
+        let report = self
+            .store
+            .finish_attempt(claim, checkpoint_id, actor)
+            .await?;
+        self.notify(&claim.attempt.goal_id);
+        Ok(report)
     }
 
     pub async fn fail_attempt(
@@ -463,22 +544,65 @@ impl LoopEngine {
         actor: &str,
     ) -> anyhow::Result<ResumeReport> {
         validate_actor(actor)?;
-        self.store
+        let report = self
+            .store
             .fail_attempt(claim, error, retryable, actor)
-            .await
+            .await?;
+        self.notify(&claim.attempt.goal_id);
+        Ok(report)
     }
 
     pub async fn resume_goal(&self, goal_id: &str, actor: &str) -> anyhow::Result<ResumeReport> {
         validate_actor(actor)?;
-        self.store
+        let report = self
+            .store
             .resume_goal(goal_id, actor)
             .await?
-            .with_context(|| format!("goal not found: {goal_id}"))
+            .with_context(|| format!("goal not found: {goal_id}"))?;
+        self.notify(goal_id);
+        Ok(report)
     }
 
     /// Lists durable work items for a goal (operator inspection surface).
     pub async fn list_work_items(&self, goal_id: &str) -> anyhow::Result<Vec<WorkItemRecord>> {
         self.store.list_work_items(goal_id).await
+    }
+
+    /// Commits a phase boundary while the attempt keeps running. The
+    /// persisted progress is injected into the next phase's `ctx.resume` and
+    /// survives attempt death — a crash after this call resumes from the
+    /// committed phase rather than restarting.
+    pub async fn record_phase_progress(
+        &self,
+        claim: &WorkClaim,
+        continuation: &crate::harness::loop_engine::WorkContinuation,
+        actor: &str,
+    ) -> anyhow::Result<crate::harness::loop_engine::WorkPhaseProgress> {
+        validate_actor(actor)?;
+        let progress = self
+            .store
+            .record_phase_progress(claim, continuation, actor)
+            .await?;
+        self.notify(&claim.attempt.goal_id);
+        Ok(progress)
+    }
+
+    /// Persists phase progress and yields the attempt — the work item
+    /// becomes claimable after `continuation.delay_secs` (immediately when
+    /// unset) with the progress carried forward.
+    pub async fn continue_attempt(
+        &self,
+        claim: &WorkClaim,
+        continuation: &crate::harness::loop_engine::WorkContinuation,
+        actor: &str,
+    ) -> anyhow::Result<ResumeReport> {
+        validate_actor(actor)?;
+        let report = self
+            .store
+            .continue_attempt(claim, continuation, actor)
+            .await?;
+        self.notify(&claim.attempt.goal_id);
+        Ok(report)
     }
 
     /// Operator verdict for a `waiting_confirmation` work item. The operator
@@ -494,8 +618,64 @@ impl LoopEngine {
         actor: &str,
     ) -> anyhow::Result<WorkItemRecord> {
         validate_actor(actor)?;
-        self.store
+        let item = self
+            .store
             .resolve_waiting_confirmation(goal_id, work_item_id, resolution, reason, actor)
-            .await
+            .await?;
+        self.notify(goal_id);
+        Ok(item)
+    }
+
+    /// Parks a claimed work item in `blocked`: dispatch could not proceed in
+    /// this process (for example the named handler is not registered). The
+    /// item stays blocked — retries do not consume its attempt budget beyond
+    /// the attempt already abandoned here — until `requeue_blocked_items`
+    /// sees the handler exist.
+    pub async fn block_work_item(
+        &self,
+        claim: &WorkClaim,
+        reason: &str,
+        actor: &str,
+    ) -> anyhow::Result<WorkItemRecord> {
+        validate_actor(actor)?;
+        let item = self.store.block_work_item(claim, reason, actor).await?;
+        self.notify(&claim.attempt.goal_id);
+        Ok(item)
+    }
+
+    /// Re-queues work items that were blocked because their handler was not
+    /// registered, once `handlers` contains that handler again. Returns the
+    /// number of items moved back to `ready`.
+    pub async fn requeue_blocked_items(
+        &self,
+        goal_id: &str,
+        reason_prefix: &str,
+        handlers: &[String],
+        actor: &str,
+    ) -> anyhow::Result<u64> {
+        validate_actor(actor)?;
+        let requeued = self
+            .store
+            .requeue_blocked_items(goal_id, reason_prefix, handlers, actor)
+            .await?;
+        if requeued > 0 {
+            self.notify(goal_id);
+        }
+        Ok(requeued)
+    }
+
+    /// Durable sleep: the claimed attempt ends without an outcome and the
+    /// work item becomes claimable again at `until_unix`. The sleep is
+    /// persisted, holds no lease, and survives process restarts.
+    pub async fn defer_attempt(
+        &self,
+        claim: &WorkClaim,
+        until_unix: i64,
+        actor: &str,
+    ) -> anyhow::Result<ResumeReport> {
+        validate_actor(actor)?;
+        let report = self.store.defer_attempt(claim, until_unix, actor).await?;
+        self.notify(&claim.attempt.goal_id);
+        Ok(report)
     }
 }

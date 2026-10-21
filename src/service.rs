@@ -229,6 +229,7 @@ pub struct MessageService {
     output_verification_max_prompt_chars: usize,
     output_verification_max_result_chars: usize,
     evolution_policy_runtime: Option<EvolutionPolicyRuntime>,
+    evolution_store: Option<Arc<dyn crate::harness::store::EvolutionStore>>,
 }
 
 struct CompletionOutcome {
@@ -334,6 +335,7 @@ impl MessageService {
             output_verification_max_prompt_chars: 6000,
             output_verification_max_result_chars: 2000,
             evolution_policy_runtime: None,
+            evolution_store: None,
         }
     }
 
@@ -401,6 +403,16 @@ impl MessageService {
 
     pub fn with_evolution_policy_runtime(mut self, runtime: EvolutionPolicyRuntime) -> Self {
         self.evolution_policy_runtime = Some(runtime);
+        self
+    }
+
+    /// Enables in-band user feedback: reply-markers in channels are recorded
+    /// as trajectory feedback the proposal engine consumes as evidence.
+    pub fn with_evolution_store(
+        mut self,
+        store: Arc<dyn crate::harness::store::EvolutionStore>,
+    ) -> Self {
+        self.evolution_store = Some(store);
         self
     }
 

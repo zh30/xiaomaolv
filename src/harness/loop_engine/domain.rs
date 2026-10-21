@@ -214,6 +214,7 @@ pub(crate) const ALLOWED_WORKFLOW_HANDLERS: &[&str] = &[
     "evolution_evaluate",
     "manual_gate",
     "channel_send",
+    "wait",
 ];
 
 /// Actor prefix reserved for subsystem-driven (non-operator) loop-engine
@@ -537,6 +538,11 @@ pub struct CreateGoalRequest {
     pub objective: String,
     #[serde(default)]
     pub source_signal_ids: Vec<String>,
+    /// Optional idempotency key for admission: a retry with the same
+    /// `request_id` returns the already-admitted goal instead of creating a
+    /// duplicate.
+    #[serde(default)]
+    pub request_id: Option<String>,
 }
 
 impl CreateGoalRequest {
@@ -555,6 +561,12 @@ impl CreateGoalRequest {
             ensure!(
                 !signal_id.trim().is_empty() && signal_id.len() <= 160,
                 "source signal id must be 1..=160 bytes"
+            );
+        }
+        if let Some(request_id) = &self.request_id {
+            ensure!(
+                !request_id.trim().is_empty() && request_id.len() <= 160,
+                "request_id must be 1..=160 bytes"
             );
         }
         Ok(())
@@ -585,6 +597,11 @@ pub struct WorkItemRecord {
     pub max_attempts: u8,
     pub ordinal: u32,
     pub dependency_ids: Vec<String>,
+    pub created_at_unix: i64,
+    /// Committed phase progress for multi-phase work items; the worker
+    /// injects it into `WorkHandlerContext.resume` on the next attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<WorkPhaseProgress>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -610,6 +627,60 @@ pub struct WorkClaim {
     pub budget: ExecutionBudget,
 }
 
+/// A phase boundary inside a work item: the handler reports "not done yet"
+/// and hands durable progress to the next phase. The worker persists it
+/// before running the next phase, so a crash mid-attempt resumes from the
+/// last committed phase instead of restarting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkContinuation {
+    /// Bounded phase tag the handler dispatches on (e.g. "gathered").
+    pub phase: String,
+    /// Durable progress payload handed back through `ctx.resume`.
+    #[serde(default)]
+    pub state: serde_json::Value,
+    /// When set, the attempt yields instead of continuing in-process: the
+    /// item becomes claimable again after this many seconds with the
+    /// progress carried forward (durable sleep + progress in one).
+    #[serde(default)]
+    pub delay_secs: Option<u32>,
+}
+
+/// Persisted on the work item between phases; `continues` counts committed
+/// phase boundaries and bounds runaway phase loops.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkPhaseProgress {
+    pub phase: String,
+    #[serde(default)]
+    pub state: serde_json::Value,
+    #[serde(default)]
+    pub continues: u32,
+}
+
+/// Upper bound on committed phase boundaries per work item — a handler that
+/// never produces a terminal outcome is bounded rather than looping forever.
+pub const MAX_PHASE_CONTINUES: u32 = 64;
+
+impl WorkContinuation {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            !self.phase.trim().is_empty() && self.phase.chars().count() <= 64,
+            "continuation phase must contain between 1 and 64 characters"
+        );
+        ensure!(
+            serde_json::to_string(&self.state)
+                .map(|json| json.len() <= 16_384)
+                .unwrap_or(false),
+            "continuation state cannot exceed 16384 bytes"
+        );
+        ensure!(
+            self.delay_secs
+                .is_none_or(|delay| (1..=86_400).contains(&delay)),
+            "continuation delay must be between 1 and 86400 seconds"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkOutcome {
     pub summary: String,
@@ -617,10 +688,28 @@ pub struct WorkOutcome {
     pub artifact_ids: Vec<String>,
     #[serde(default)]
     pub evidence: serde_json::Value,
+    /// When set, the worker does not commit an outcome: the attempt is
+    /// deferred instead and the work item becomes claimable again at this
+    /// unix timestamp (durable sleep — the hold survives restarts and holds
+    /// no lease meanwhile).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sleep_until_unix: Option<i64>,
+    /// When set, the attempt is not done: without `delay_secs` the next
+    /// phase runs in the same attempt after the progress is persisted;
+    /// with `delay_secs` the attempt yields until the deadline passes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<WorkContinuation>,
 }
 
 impl WorkOutcome {
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            !(self.sleep_until_unix.is_some() && self.continuation.is_some()),
+            "work outcome cannot hold both sleep_until and a continuation"
+        );
+        if let Some(continuation) = &self.continuation {
+            continuation.validate()?;
+        }
         ensure!(
             self.summary.chars().count() <= 8192,
             "work outcome summary cannot exceed 8192 characters"
@@ -651,6 +740,11 @@ pub struct CheckpointRecord {
     pub attempt_id: String,
     pub phase: CheckpointPhase,
     pub idempotency_key: String,
+    /// Whether the handler that prepared this checkpoint declared a rerun
+    /// after a crash to be safe. When `false` and the attempt dies between
+    /// the external/local effect and the commit, the work item parks in
+    /// `waiting_confirmation` instead of silently re-running.
+    pub replay_safe: bool,
     pub outcome: Option<WorkOutcome>,
     pub created_at_unix: i64,
     pub updated_at_unix: i64,

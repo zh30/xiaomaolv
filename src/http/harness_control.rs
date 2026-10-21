@@ -73,6 +73,10 @@ struct GoalHttpRequest {
     objective: String,
     #[serde(default)]
     source_signal_ids: Vec<String>,
+    /// Idempotency key for admission: retrying with the same `request_id`
+    /// returns the already-created goal instead of duplicating it.
+    #[serde(default)]
+    request_id: Option<String>,
     #[serde(default = "default_auto_plan")]
     auto_plan: bool,
 }
@@ -110,17 +114,21 @@ async fn post_goal(
     Json(request): Json<GoalHttpRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (engine, actor) = operator_context(&state, &headers).await?;
-    let goal = engine
-        .create_goal(
+    let (goal, created) = engine
+        .create_goal_admission(
             CreateGoalRequest {
                 objective: request.objective,
                 source_signal_ids: request.source_signal_ids,
+                request_id: request.request_id,
             },
             &actor,
         )
         .await
         .map_err(bad_request)?;
-    let value = if request.auto_plan {
+    // A deduplicated retry returns the already-admitted goal as-is: it was
+    // planned when it was first created, and re-planning would bump the
+    // revision the original caller approved against.
+    let value = if request.auto_plan && created {
         serde_json::to_value(
             engine
                 .plan_goal_recommended(&goal.id, &actor)
@@ -197,6 +205,10 @@ struct GoalEventStreamState {
     goal_id: String,
     cursor: i64,
     pending: VecDeque<crate::harness::loop_engine::LoopEventRecord>,
+    /// Committed-mutation notifications from the engine. The stream still
+    /// re-reads `harness_events` on every wake — the notification is only a
+    /// wake-up signal, the `sequence` cursor remains the source of truth.
+    notifications: tokio::sync::broadcast::Receiver<String>,
 }
 
 async fn get_goal_event_stream(
@@ -209,12 +221,16 @@ async fn get_goal_event_stream(
     if engine.get_goal(&goal_id).await.map_err(internal)?.is_none() {
         return Err(ApiError::NotFound(format!("goal not found: {goal_id}")));
     }
+    // Subscribe before the first backlog read so no commit is missed
+    // between the initial `list_goal_events` and the subscription.
+    let notifications = engine.subscribe_events();
     let stream = futures::stream::unfold(
         GoalEventStreamState {
             engine,
             goal_id,
             cursor: query.after,
             pending: VecDeque::new(),
+            notifications,
         },
         |mut state| async move {
             loop {
@@ -237,7 +253,24 @@ async fn get_goal_event_stream(
                     Ok(events) if !events.is_empty() => {
                         state.pending = events.into();
                     }
-                    Ok(_) => tokio::time::sleep(Duration::from_secs(1)).await,
+                    Ok(_) => {
+                        // Commit-driven wake on this goal's mutations, with
+                        // a slow fallback poll covering lagged or missed
+                        // notifications and writers outside the engine API.
+                        let wake = async {
+                            loop {
+                                match state.notifications.recv().await {
+                                    Ok(goal) if goal == state.goal_id => break,
+                                    Ok(_) => continue,
+                                    Err(
+                                        tokio::sync::broadcast::error::RecvError::Lagged(_)
+                                        | tokio::sync::broadcast::error::RecvError::Closed,
+                                    ) => break,
+                                }
+                            }
+                        };
+                        let _ = tokio::time::timeout(Duration::from_secs(5), wake).await;
+                    }
                     Err(error) => {
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         let sse = Event::default()

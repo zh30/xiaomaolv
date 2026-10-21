@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -70,6 +71,133 @@ impl TrajectoryExitReason {
     }
 }
 
+/// Deterministic fitness score for a finished trajectory. The scorecard is
+/// the measurable half of the self-improvement loop: proposals and
+/// deployments are judged against the same persisted numbers, so a rollout
+/// can be compared to its own baseline rather than to a binary failure flag.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunScorecard {
+    pub trajectory_id: String,
+    /// Composite score in `0..=100` — higher is better.
+    pub score: i64,
+    /// Exit-reason weight: `final_answer` = 1.0, `max_iterations` = 0.4,
+    /// `tool_error`/`timeout` = 0.1, `internal_error` = 0.0.
+    pub completion: f64,
+    /// 1.0 when a non-empty final answer was produced.
+    pub answer_quality: f64,
+    /// Share of tool calls that succeeded (1.0 when no tools ran).
+    pub tool_health: f64,
+    /// Wall-clock band: <10s = 1.0, <60s = 0.6, <300s = 0.3, otherwise 0.0.
+    pub speed: f64,
+    pub tool_calls: i64,
+    pub failed_tool_calls: i64,
+    pub verification_failures: i64,
+    pub iterations: i64,
+    pub latency_ms: i64,
+    pub computed_at_unix: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RunScorecardFilter {
+    pub channel: Option<String>,
+    pub model: Option<String>,
+    pub since_unix: Option<i64>,
+    pub until_unix: Option<i64>,
+    pub min_score: Option<i64>,
+    pub max_score: Option<i64>,
+    /// Most recent first when false.
+    pub ascending: bool,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScorecardSummary {
+    pub window_start_unix: i64,
+    pub window_end_unix: i64,
+    pub run_count: i64,
+    pub mean_score: Option<f64>,
+    /// Distribution of runs across 0-49, 50-79 and 80-100 score bands.
+    pub low_count: i64,
+    pub mid_count: i64,
+    pub high_count: i64,
+    pub failed_tool_calls: i64,
+    pub verification_failures: i64,
+    pub exit_reasons: BTreeMap<String, i64>,
+}
+
+/// The composite is a documented contract: it must stay deterministic and
+/// explainable because deployment reviews and proposal evidence consume it.
+/// `60 * completion + 10 * answer + 15 * tool_health + 15 * speed
+///  - 4 * failed_tool_calls (cap 20) - 5 * verification_failures (cap 15)`,
+/// clamped to `0..=100`.
+pub fn compute_run_scorecard(record: &TrajectoryRecord, computed_at_unix: i64) -> RunScorecard {
+    let completion = match record.exit_reason {
+        TrajectoryExitReason::FinalAnswer => 1.0,
+        TrajectoryExitReason::MaxIterations => 0.4,
+        TrajectoryExitReason::ToolError | TrajectoryExitReason::Timeout => 0.1,
+        TrajectoryExitReason::InternalError => 0.0,
+    };
+    let answer_quality = f64::from(
+        record
+            .final_answer
+            .as_deref()
+            .is_some_and(|answer| !answer.trim().is_empty()),
+    );
+    let tool_calls = record.tool_calls.len() as i64;
+    let failed_tool_calls = record.tool_calls.iter().filter(|call| !call.ok).count() as i64;
+    let verification_failures = record
+        .tool_calls
+        .iter()
+        .filter(|call| {
+            call.result
+                .get("verification_failed")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        })
+        .count() as i64;
+    let tool_health = if tool_calls == 0 {
+        1.0
+    } else {
+        ((tool_calls - failed_tool_calls) as f64 / tool_calls as f64).clamp(0.0, 1.0)
+    };
+    let latency_ms = record
+        .finished_at
+        .map(|finished| (finished - record.started_at).num_milliseconds().max(0))
+        .unwrap_or(0);
+    let speed = if latency_ms < 10_000 {
+        1.0
+    } else if latency_ms < 60_000 {
+        0.6
+    } else if latency_ms < 300_000 {
+        0.3
+    } else {
+        0.0
+    };
+    let iterations = record
+        .tool_calls
+        .iter()
+        .map(|call| call.iteration)
+        .max()
+        .map_or(0, |max| max.saturating_add(1)) as i64;
+    let raw = completion * 60.0 + answer_quality * 10.0 + tool_health * 15.0 + speed * 15.0
+        - (failed_tool_calls.min(5) as f64) * 4.0
+        - (verification_failures.min(3) as f64) * 5.0;
+    RunScorecard {
+        trajectory_id: record.id.clone(),
+        score: raw.round().clamp(0.0, 100.0) as i64,
+        completion,
+        answer_quality,
+        tool_health,
+        speed,
+        tool_calls,
+        failed_tool_calls,
+        verification_failures,
+        iterations,
+        latency_ms,
+        computed_at_unix,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TrajectoryFilter {
     pub session_id: Option<String>,
@@ -79,6 +207,10 @@ pub struct TrajectoryFilter {
     pub has_tool_errors: Option<bool>,
     pub limit: usize,
 }
+
+/// Runs scoring below this composite value are treated as self-reported
+/// failures: they surface as triage signals and as proposal evidence.
+pub const LOW_RUN_SCORE: i64 = 40;
 
 pub const DEFAULT_TRAJECTORY_QUERY_LIMIT: usize = 100;
 pub const MAX_TRAJECTORY_QUERY_LIMIT: usize = 500;

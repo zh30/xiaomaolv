@@ -255,6 +255,105 @@ impl MessageService {
         store.query_trajectories(filter).await
     }
 
+    pub async fn get_run_scorecard(
+        &self,
+        trajectory_id: &str,
+    ) -> anyhow::Result<Option<crate::harness::trajectory::RunScorecard>> {
+        let Some(store) = &self.harness_store else {
+            return Ok(None);
+        };
+        store.get_run_scorecard(trajectory_id).await
+    }
+
+    pub async fn query_run_scorecards(
+        &self,
+        filter: crate::harness::trajectory::RunScorecardFilter,
+    ) -> anyhow::Result<Vec<crate::harness::trajectory::RunScorecard>> {
+        let Some(store) = &self.harness_store else {
+            return Ok(Vec::new());
+        };
+        store.query_run_scorecards(filter).await
+    }
+
+    pub async fn run_scorecard_summary(
+        &self,
+        since_unix: i64,
+        until_unix: i64,
+    ) -> anyhow::Result<crate::harness::trajectory::ScorecardSummary> {
+        let Some(store) = &self.harness_store else {
+            return Ok(crate::harness::trajectory::ScorecardSummary {
+                window_start_unix: since_unix,
+                window_end_unix: until_unix,
+                run_count: 0,
+                mean_score: None,
+                low_count: 0,
+                mid_count: 0,
+                high_count: 0,
+                failed_tool_calls: 0,
+                verification_failures: 0,
+                exit_reasons: std::collections::BTreeMap::new(),
+            });
+        };
+        store.run_scorecard_summary(since_unix, until_unix).await
+    }
+
+    /// Max age of the run a lightweight reply-marker may attach to.
+    const REPLY_FEEDBACK_MAX_AGE_SECS: i64 = 2 * 3_600;
+
+    /// Binds a channel reply-marker to the most recent finished run under
+    /// `session_prefix` (e.g. `tg:{chat_id}`) and records it as trajectory
+    /// feedback the proposal engine consumes. Returns `false` when the
+    /// feature is unwired or no recent run exists — callers then treat the
+    /// marker as a normal message.
+    pub async fn record_evolution_reply_feedback(
+        &self,
+        session_prefix: &str,
+        channel: &str,
+        user_id: &str,
+        score: f64,
+        comment: Option<String>,
+    ) -> anyhow::Result<bool> {
+        let (Some(evolution_store), Some(harness_store)) =
+            (self.evolution_store.as_ref(), self.harness_store.as_ref())
+        else {
+            return Ok(false);
+        };
+        let min_finished_unix = chrono::Utc::now().timestamp() - Self::REPLY_FEEDBACK_MAX_AGE_SECS;
+        let Some(trajectory) = harness_store
+            .latest_finished_trajectory(session_prefix, min_finished_unix)
+            .await?
+        else {
+            return Ok(false);
+        };
+        if trajectory.channel != channel {
+            return Ok(false);
+        }
+        evolution_store
+            .record_feedback(
+                crate::harness::evolution::EvolutionFeedbackDraft {
+                    trajectory_id: trajectory.id.clone(),
+                    score,
+                    tags: vec!["telegram-reply".to_string()],
+                    comment: comment.map(|text| {
+                        let mut chars = text.chars();
+                        let mut clipped: String = chars.by_ref().take(200).collect();
+                        if chars.next().is_some() {
+                            clipped.push('…');
+                        }
+                        clipped
+                    }),
+                },
+                &format!("telegram:{user_id}"),
+            )
+            .await?;
+        info!(
+            trajectory_id = %trajectory.id,
+            score,
+            "recorded user reply-marker as trajectory feedback"
+        );
+        Ok(true)
+    }
+
     pub async fn detect_telegram_scheduler_intent(
         &self,
         text: &str,

@@ -151,6 +151,51 @@ pub(super) async fn process_telegram_update(
         return Ok(());
     }
 
+    // A reply-marker is bound to the run that produced the answered message
+    // and recorded as trajectory feedback — no model call needed. When the
+    // feature is unwired or no recent run exists, the marker falls through
+    // to normal processing.
+    if meta.replied_to_bot
+        && (meta.is_group || meta.is_private_chat)
+        && let Some(score) = feedback_marker_score(text)
+    {
+        let user_id = message
+            .from
+            .as_ref()
+            .map(|u| u.id.to_string())
+            .unwrap_or_else(|| meta.chat_id.to_string());
+        match ctx
+            .service
+            .record_evolution_reply_feedback(
+                &format!("tg:{}", meta.chat_id),
+                &ctx.channel_name,
+                &user_id,
+                score,
+                None,
+            )
+            .await
+        {
+            Ok(true) => {
+                info!(
+                    chat_id = meta.chat_id,
+                    message_id = meta.message_id,
+                    score,
+                    "telegram reply-marker consumed as evolution feedback"
+                );
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    chat_id = meta.chat_id,
+                    message_id = meta.message_id,
+                    "failed to record telegram reply feedback; falling through"
+                );
+            }
+        }
+    }
+
     if meta.is_private_chat
         && should_send_initial_typing_before_scheduler_nl(&meta, &command_settings.scheduler)
     {

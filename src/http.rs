@@ -692,9 +692,11 @@ async fn build_runtime_handles(
                 interval_secs: evolution_config.cycle_interval_secs,
                 initial_delay_secs: evolution_config.cycle_initial_delay_secs,
             });
+    let mut evolution_feedback_store: Option<Arc<dyn EvolutionStore>> = None;
     let evolution_engine = if evolution_config.enabled {
         let evolution_store: Arc<dyn EvolutionStore> =
             Arc::new(SqliteEvolutionStore::new(memory_store.clone()));
+        evolution_feedback_store = Some(evolution_store.clone());
         let engine = EvolutionEngine::new(
             evolution_store,
             provider.clone(),
@@ -789,6 +791,9 @@ async fn build_runtime_handles(
     .with_loop_engine(loop_config.enabled.then(|| loop_engine.clone()));
     if let Some(engine) = &evolution_engine {
         service = service.with_evolution_policy_runtime(engine.policy_runtime());
+    }
+    if let Some(store) = evolution_feedback_store {
+        service = service.with_evolution_store(store);
     }
     if let Some(metrics) = trajectory_metrics {
         service = service.with_trajectory_metrics(metrics);
@@ -901,6 +906,8 @@ fn build_axum_router(state: AppState, http_enabled: bool) -> Router {
         )
         .route("/v1/harness/trajectories", get(list_trajectories))
         .route("/v1/harness/trajectories/{id}", get(get_trajectory))
+        .route("/v1/harness/scorecards", get(list_run_scorecards))
+        .route("/v1/harness/scorecards/summary", get(run_scorecard_summary))
         .route("/v1/harness/evolution/status", get(get_evolution_status))
         .route(
             "/v1/harness/evolution/candidates",
@@ -929,6 +936,10 @@ fn build_axum_router(state: AppState, http_enabled: bool) -> Router {
         .route(
             "/v1/harness/evolution/eval-cases",
             get(list_evolution_eval_cases).post(post_evolution_eval_case),
+        )
+        .route(
+            "/v1/harness/evolution/eval-cases/from-trajectory",
+            post(post_seed_eval_case),
         )
         .route("/v1/harness/evolution/audit", get(list_evolution_audit))
         .route(
@@ -2826,6 +2837,30 @@ struct TrajectoryListResponse {
 #[derive(Debug, Serialize)]
 struct TrajectoryDetailResponse {
     trajectory: Option<crate::harness::trajectory::TrajectoryRecord>,
+    #[serde(default)]
+    scorecard: Option<crate::harness::trajectory::RunScorecard>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RunScorecardQuery {
+    channel: Option<String>,
+    model: Option<String>,
+    /// Restrict to runs finished within the last `hours` hours.
+    hours: Option<u64>,
+    min_score: Option<i64>,
+    max_score: Option<i64>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct RunScorecardListResponse {
+    scorecards: Vec<crate::harness::trajectory::RunScorecard>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RunScorecardSummaryQuery {
+    /// Window size in hours; defaults to 24.
+    hours: Option<u64>,
 }
 
 async fn list_trajectories(
@@ -2867,10 +2902,64 @@ async fn get_trajectory(
     let runtime_state = state.runtime.read().await;
     let trajectory = runtime_state
         .service
-        .get_trajectory_detail(id)
+        .get_trajectory_detail(id.clone())
         .await
         .map_err(internal_err("failed to get trajectory"))?;
-    Ok(Json(TrajectoryDetailResponse { trajectory }))
+    let scorecard = runtime_state
+        .service
+        .get_run_scorecard(&id)
+        .await
+        .map_err(internal_err("failed to get trajectory scorecard"))?;
+    Ok(Json(TrajectoryDetailResponse {
+        trajectory,
+        scorecard,
+    }))
+}
+
+async fn list_run_scorecards(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<RunScorecardQuery>,
+) -> Result<Json<RunScorecardListResponse>, ApiError> {
+    verify_api_key(&state, &headers)?;
+    check_rate_limit(&state, &headers)?;
+    let since_unix = params
+        .hours
+        .map(|hours| chrono::Utc::now().timestamp() - hours.min(24 * 90) as i64 * 3_600);
+    let runtime_state = state.runtime.read().await;
+    let scorecards = runtime_state
+        .service
+        .query_run_scorecards(crate::harness::trajectory::RunScorecardFilter {
+            channel: params.channel,
+            model: params.model,
+            since_unix,
+            until_unix: None,
+            min_score: params.min_score,
+            max_score: params.max_score,
+            ascending: false,
+            limit: params.limit.unwrap_or(100),
+        })
+        .await
+        .map_err(internal_err("failed to query run scorecards"))?;
+    Ok(Json(RunScorecardListResponse { scorecards }))
+}
+
+async fn run_scorecard_summary(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<RunScorecardSummaryQuery>,
+) -> Result<Json<crate::harness::trajectory::ScorecardSummary>, ApiError> {
+    verify_api_key(&state, &headers)?;
+    check_rate_limit(&state, &headers)?;
+    let until_unix = chrono::Utc::now().timestamp();
+    let since_unix = until_unix - params.hours.unwrap_or(24).min(24 * 90) as i64 * 3_600;
+    let runtime_state = state.runtime.read().await;
+    let summary = runtime_state
+        .service
+        .run_scorecard_summary(since_unix, until_unix)
+        .await
+        .map_err(internal_err("failed to summarize run scorecards"))?;
+    Ok(Json(summary))
 }
 
 fn parse_trajectory_exit_reason(
@@ -3153,6 +3242,52 @@ async fn post_evolution_eval_case(
     let engine = evolution_engine(&state).await?;
     engine
         .upsert_eval_case(eval_case.clone(), &actor)
+        .await
+        .map_err(evolution_bad_request)?;
+    Ok(Json(EvolutionEvalCaseResponse { eval_case }))
+}
+
+/// Operator-facing request body for turning a failed production run into a
+/// disabled eval case. `input` defaults to the run's recorded first user
+/// message when omitted.
+#[derive(Debug, Deserialize)]
+struct SeedEvalCaseRequest {
+    trajectory_id: String,
+    name: String,
+    input: Option<String>,
+    #[serde(default)]
+    required_substrings: Vec<String>,
+    #[serde(default)]
+    forbidden_substrings: Vec<String>,
+    #[serde(default)]
+    require_json: bool,
+    #[serde(default)]
+    max_output_chars: Option<u32>,
+    weight: Option<f64>,
+}
+
+async fn post_seed_eval_case(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<SeedEvalCaseRequest>,
+) -> Result<Json<EvolutionEvalCaseResponse>, ApiError> {
+    guard_evolution_access(&state, &headers)?;
+    let actor = evolution_human_actor(&headers)?;
+    let engine = evolution_engine(&state).await?;
+    let eval_case = engine
+        .seed_eval_case_from_trajectory(
+            &request.trajectory_id,
+            &request.name,
+            request.input,
+            crate::harness::evolution::EvolutionCaseAssertions {
+                required_substrings: request.required_substrings,
+                forbidden_substrings: request.forbidden_substrings,
+                require_json: request.require_json,
+                max_output_chars: request.max_output_chars,
+            },
+            request.weight.unwrap_or(1.0),
+            &actor,
+        )
         .await
         .map_err(evolution_bad_request)?;
     Ok(Json(EvolutionEvalCaseResponse { eval_case }))

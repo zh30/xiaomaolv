@@ -310,6 +310,7 @@ async fn work_item_confirmation_resolve_over_http() {
             .prepare_checkpoint(
                 &claim,
                 &format!("{}:{}:v1", claim.work_item.id, claim.attempt.id),
+                false,
                 "worker:ext",
             )
             .await

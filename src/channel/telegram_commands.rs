@@ -722,6 +722,7 @@ async fn handle_telegram_goal_command(
             CreateGoalRequest {
                 objective: objective.to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             &actor,
         )

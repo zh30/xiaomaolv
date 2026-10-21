@@ -13,8 +13,9 @@ use xiaomaolv::harness::loop_engine::{
     CreateGoalRequest, CreateSignalRequest, EffectClass, ExecutionBudget, ExternalWritePolicy,
     GoalStatus, LoopEngine, LoopWorker, OutboundSender, PlanGoalRequest, PublishArtifactRequest,
     ReplayStatus, RetryPolicy, SelfTestStatus, SignalKind, SignalStatus, SignalTrust,
-    SqliteLoopStore, TrajectoryFrameCapture, TrajectoryFrameDraft, WorkHandler, WorkHandlerContext,
-    WorkHandlerRegistry, WorkItemStatus, WorkOutcome, WorkflowEdge, WorkflowSpec, WorkflowStep,
+    SqliteLoopStore, TrajectoryFrameCapture, TrajectoryFrameDraft, WorkContinuation, WorkHandler,
+    WorkHandlerContext, WorkHandlerRegistry, WorkItemStatus, WorkOutcome, WorkflowEdge,
+    WorkflowSpec, WorkflowStep,
 };
 use xiaomaolv::harness::store::SqliteEvolutionStore;
 use xiaomaolv::memory::SqliteMemoryStore;
@@ -45,6 +46,7 @@ async fn built_in_worker_dispatches_the_approved_dag_and_verifies_the_goal() -> 
             CreateGoalRequest {
                 objective: "Make loop recovery observable".to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             "operator:test",
         )
@@ -131,6 +133,7 @@ async fn built_in_worker_runs_evolution_evaluation_with_persisted_budgets() -> a
             CreateGoalRequest {
                 objective: "Evaluate a prompt candidate safely".to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             "operator:test",
         )
@@ -326,6 +329,7 @@ async fn goal_survives_engine_restart_and_can_be_resumed() -> anyhow::Result<()>
             CreateGoalRequest {
                 objective: "Make recovery observable".to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             "operator:henry",
         )
@@ -393,6 +397,7 @@ async fn resume_reconciles_a_committed_checkpoint_without_replaying_the_effect()
             CreateGoalRequest {
                 objective: "Recover an interrupted evolution evaluation".to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             "operator:henry",
         )
@@ -460,6 +465,7 @@ async fn resume_reconciles_a_committed_checkpoint_without_replaying_the_effect()
         .prepare_checkpoint(
             &claim,
             &format!("effect:{}:v1", claim.work_item.id),
+            true,
             "runtime:loop",
         )
         .await?;
@@ -471,6 +477,8 @@ async fn resume_reconciles_a_committed_checkpoint_without_replaying_the_effect()
                 summary: "analysis persisted".to_string(),
                 artifact_ids: vec!["artifact_analysis_1".to_string()],
                 evidence: serde_json::Value::Null,
+                sleep_until_unix: None,
+                continuation: None,
             },
             "runtime:loop",
         )
@@ -495,6 +503,8 @@ async fn resume_reconciles_a_committed_checkpoint_without_replaying_the_effect()
                 summary: "stale overwrite".to_string(),
                 artifact_ids: Vec::new(),
                 evidence: serde_json::Value::Null,
+                sleep_until_unix: None,
+                continuation: None,
             },
             "runtime:stale-worker",
         )
@@ -514,6 +524,7 @@ async fn approval_is_bound_to_the_reviewed_workflow_hash() -> anyhow::Result<()>
             CreateGoalRequest {
                 objective: "Continuously self-test the harness".to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             "operator:henry",
         )
@@ -586,6 +597,7 @@ async fn manual_acceptance_requires_explicit_operator_evidence() -> anyhow::Resu
             CreateGoalRequest {
                 objective: "Require a human release decision".to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             "operator:test",
         )
@@ -634,7 +646,7 @@ async fn manual_acceptance_requires_explicit_operator_evidence() -> anyhow::Resu
         .await?
         .expect("manual gate should be claimable");
     let checkpoint = engine
-        .prepare_checkpoint(&claim, "manual-gate:v1", "runtime:test")
+        .prepare_checkpoint(&claim, "manual-gate:v1", true, "runtime:test")
         .await?;
     engine
         .commit_checkpoint(
@@ -644,6 +656,8 @@ async fn manual_acceptance_requires_explicit_operator_evidence() -> anyhow::Resu
                 summary: "manual gate reached".to_string(),
                 artifact_ids: Vec::new(),
                 evidence: serde_json::json!({"manual_gate": "reached"}),
+                sleep_until_unix: None,
+                continuation: None,
             },
             "runtime:test",
         )
@@ -823,6 +837,7 @@ async fn swarm_crash_leaves_resumable_durable_state() -> anyhow::Result<()> {
             CreateGoalRequest {
                 objective: "agent swarm run run-crash: root task".to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             "internal:swarm",
         )
@@ -882,7 +897,7 @@ async fn swarm_crash_leaves_resumable_durable_state() -> anyhow::Result<()> {
         .await?
         .expect("root step should be claimable");
     let root_checkpoint = engine
-        .prepare_checkpoint(&root_claim, "root:v1", "internal:swarm")
+        .prepare_checkpoint(&root_claim, "root:v1", true, "internal:swarm")
         .await?;
     engine
         .commit_checkpoint(
@@ -892,6 +907,8 @@ async fn swarm_crash_leaves_resumable_durable_state() -> anyhow::Result<()> {
                 summary: "root finished before crash".to_string(),
                 artifact_ids: Vec::new(),
                 evidence: serde_json::json!({"status": "success"}),
+                sleep_until_unix: None,
+                continuation: None,
             },
             "internal:swarm",
         )
@@ -965,6 +982,7 @@ async fn extend_workflow_enforces_internal_actor_manifest_and_budget() -> anyhow
             CreateGoalRequest {
                 objective: "Bounded dynamic expansion".to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             "internal:swarm",
         )
@@ -1100,6 +1118,7 @@ async fn internal_auto_approval_is_bounded_by_policy() -> anyhow::Result<()> {
                 CreateGoalRequest {
                     objective: objective.to_string(),
                     source_signal_ids: Vec::new(),
+                    request_id: None,
                 },
                 actor,
             )
@@ -1277,6 +1296,7 @@ async fn external_write_plan_rejected_when_disabled() -> anyhow::Result<()> {
             CreateGoalRequest {
                 objective: "Notify me externally".to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             "operator:test",
         )
@@ -1300,6 +1320,7 @@ async fn external_write_plan_rejected_when_handler_not_allowlisted() -> anyhow::
             CreateGoalRequest {
                 objective: "Notify me externally".to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             "operator:test",
         )
@@ -1336,6 +1357,8 @@ impl WorkHandler for ChannelSendProbe {
             summary: "probe".to_string(),
             artifact_ids: Vec::new(),
             evidence: serde_json::Value::Null,
+            sleep_until_unix: None,
+            continuation: None,
         })
     }
 }
@@ -1351,6 +1374,7 @@ async fn channel_send_executes_and_commits_with_evidence() -> anyhow::Result<()>
             CreateGoalRequest {
                 objective: "Notify me externally".to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             "operator:test",
         )
@@ -1425,6 +1449,7 @@ async fn channel_send_crash_before_commit_parks_item_without_resend() -> anyhow:
             CreateGoalRequest {
                 objective: "Notify me externally".to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             "operator:test",
         )
@@ -1454,7 +1479,7 @@ async fn channel_send_crash_before_commit_parks_item_without_resend() -> anyhow:
         .expect("channel_send work item should be claimable");
     let idempotency_key = format!("{}:{}:v1", claim.work_item.id, claim.attempt.id);
     let checkpoint = engine
-        .prepare_checkpoint(&claim, &idempotency_key, "worker:ext")
+        .prepare_checkpoint(&claim, &idempotency_key, false, "worker:ext")
         .await?;
     assert_eq!(checkpoint.phase, CheckpointPhase::Prepared);
     sends
@@ -1500,6 +1525,7 @@ async fn channel_send_dispatch_blocked_when_flag_off_on_worker() -> anyhow::Resu
             CreateGoalRequest {
                 objective: "Notify me externally".to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             "operator:test",
         )
@@ -1746,6 +1772,7 @@ async fn parked_channel_send(
             CreateGoalRequest {
                 objective: "Notify me externally".to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             "operator:test",
         )
@@ -1772,6 +1799,7 @@ async fn parked_channel_send(
         .prepare_checkpoint(
             &claim,
             &format!("{}:{}:v1", claim.work_item.id, claim.attempt.id),
+            false,
             "worker:ext",
         )
         .await?;
@@ -1930,6 +1958,7 @@ async fn resolve_rejects_non_parked_and_cross_goal_items() -> anyhow::Result<()>
             CreateGoalRequest {
                 objective: "Notify me externally".to_string(),
                 source_signal_ids: Vec::new(),
+                request_id: None,
             },
             "operator:test",
         )
@@ -1988,6 +2017,763 @@ async fn resolve_rejects_non_parked_and_cross_goal_items() -> anyhow::Result<()>
             )
             .await
             .is_err()
+    );
+    Ok(())
+}
+
+// ---- Durable-execution semantics (replay safety, blocked handlers,
+// durable sleep, idempotent admission, commit notifications) ----
+
+fn local_write_plan_request(
+    step_id: &str,
+    handler: &str,
+    input: serde_json::Value,
+) -> PlanGoalRequest {
+    PlanGoalRequest {
+        workflow: WorkflowSpec {
+            steps: vec![WorkflowStep {
+                id: step_id.to_string(),
+                handler: handler.to_string(),
+                effect: EffectClass::LocalWrite,
+                input,
+                retry: RetryPolicy {
+                    max_attempts: 3,
+                    backoff_secs: 0,
+                },
+            }],
+            edges: Vec::new(),
+            budget: ExecutionBudget {
+                max_provider_calls: 0,
+                deadline_secs: 60,
+                max_response_bytes: 1024,
+            },
+        },
+        acceptance_criteria: vec![AcceptanceCriterion::SelfTestSuite {
+            suite: "core".to_string(),
+        }],
+    }
+}
+
+/// A `replay_safe = false` prepared checkpoint on a non-external step parks
+/// in `waiting_confirmation` after a crash: the operator verdict covers any
+/// ambiguous effect, not only external writes.
+#[tokio::test]
+async fn unsafe_replay_prepared_checkpoint_parks_without_external_write() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("unsafe-park.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Probe ambiguous local effect".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            "operator:test",
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            local_write_plan_request(
+                "probe",
+                "self_test_suite",
+                serde_json::json!({"suite": "core"}),
+            ),
+            "planner:test",
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+    let claim = engine
+        .claim_work_item(&goal.id, "probe", "worker:test", 1, "operator:test")
+        .await?
+        .expect("probe work item should be claimable");
+    let work_item_id = claim.work_item.id.clone();
+    // The handler ran its ambiguous effect and died before the commit.
+    engine
+        .prepare_checkpoint(&claim, "probe:v1", false, "worker:test")
+        .await?;
+    drop(engine);
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+
+    let reopened = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(
+        SqliteMemoryStore::new(&database_url).await?,
+    ))));
+    let report = reopened.resume_goal(&goal.id, "operator:test").await?;
+    let item = report
+        .work_items
+        .iter()
+        .find(|item| item.id == work_item_id)
+        .expect("probe work item");
+    assert_eq!(item.status, WorkItemStatus::WaitingConfirmation);
+
+    // The non-external park resolves through the same operator verdict path.
+    let item = reopened
+        .resolve_waiting_confirmation(
+            &goal.id,
+            &work_item_id,
+            ConfirmationResolution::Retry,
+            "effect never ran",
+            "operator:test",
+        )
+        .await?;
+    assert_eq!(item.status, WorkItemStatus::Ready);
+
+    let worker = LoopWorker::with_builtins(reopened, Arc::new(WorkerProvider), None, None)?;
+    let report = worker.run_goal_until_idle(&goal.id, 8).await?;
+    let item = report
+        .work_items
+        .iter()
+        .find(|item| item.id == work_item_id)
+        .expect("probe work item");
+    assert_eq!(item.status, WorkItemStatus::Succeeded);
+    Ok(())
+}
+
+/// A `replay_safe = true` prepared checkpoint under a dead lease retries
+/// automatically: no park, and the superseded prepared row is voided so a
+/// later recovery never mistakes it for live ambiguity.
+#[tokio::test]
+async fn safe_replay_prepared_checkpoint_retries_without_parking() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("safe-retry.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Probe safe replay".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            "operator:test",
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            local_write_plan_request(
+                "probe",
+                "self_test_suite",
+                serde_json::json!({"suite": "core"}),
+            ),
+            "planner:test",
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+    let claim = engine
+        .claim_work_item(&goal.id, "probe", "worker:test", 1, "operator:test")
+        .await?
+        .expect("probe work item should be claimable");
+    let work_item_id = claim.work_item.id.clone();
+    let checkpoint = engine
+        .prepare_checkpoint(&claim, "probe:v1", true, "worker:test")
+        .await?;
+    drop(engine);
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+
+    let reopened = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(
+        SqliteMemoryStore::new(&database_url).await?,
+    ))));
+    let report = reopened.resume_goal(&goal.id, "operator:test").await?;
+    let item = report
+        .work_items
+        .iter()
+        .find(|item| item.id == work_item_id)
+        .expect("probe work item");
+    assert_eq!(item.status, WorkItemStatus::Ready);
+    let stale = report
+        .latest_checkpoint
+        .as_ref()
+        .expect("prepared checkpoint remains in the log");
+    assert_eq!(stale.id, checkpoint.id);
+    assert_eq!(stale.phase, CheckpointPhase::Voided);
+    Ok(())
+}
+
+/// Dispatch against a registry missing the work item's handler blocks the
+/// item instead of failing it; once a worker holding the handler polls, the
+/// item requeues itself and the goal completes.
+#[tokio::test]
+async fn missing_handler_blocks_then_requeues_when_registered() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("blocked.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Run a blocked then requeued plan".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            "operator:test",
+        )
+        .await?;
+    let plan = engine
+        .plan_goal_recommended(&goal.id, "planner:test")
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+
+    // A worker that knows no handlers at all: rolling-deploy window where
+    // the registry for this process has not installed the handler yet.
+    let empty = LoopWorker::with_registry(
+        engine.clone(),
+        WorkHandlerRegistry::default(),
+        "worker:missing",
+        30,
+    )?;
+    let report = empty.run_goal_until_idle(&goal.id, 4).await?;
+    assert!(
+        report
+            .work_items
+            .iter()
+            .any(|item| item.status == WorkItemStatus::Blocked),
+        "a work item should be blocked on the missing handler"
+    );
+    assert!(
+        report.attempts.iter().any(|attempt| attempt
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("unregistered workflow handler:"))),
+        "the blocked attempt should record the missing-handler reason"
+    );
+
+    // A later poll from a worker whose registry has the handler requeues the
+    // item and the goal runs to completion.
+    let worker = LoopWorker::with_builtins(engine.clone(), Arc::new(WorkerProvider), None, None)?;
+    let report = worker.run_goal_until_idle(&goal.id, 8).await?;
+    assert_eq!(report.goal.status, GoalStatus::Achieved);
+    assert!(
+        report
+            .work_items
+            .iter()
+            .all(|item| item.status == WorkItemStatus::Succeeded)
+    );
+    Ok(())
+}
+
+/// The `wait` handler turns `sleep_until` into a durable deferral: the
+/// attempt ends, the work item holds no lease, and the stored wake time
+/// survives the "restart".
+#[tokio::test]
+async fn wait_step_defers_until_the_stored_deadline() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("wait.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let until = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs(),
+    )? + 2;
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Wait for a durable deadline".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            "operator:test",
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![
+                        WorkflowStep {
+                            id: "hold".to_string(),
+                            handler: "wait".to_string(),
+                            effect: EffectClass::Pure,
+                            input: serde_json::json!({"until_unix": until}),
+                            retry: RetryPolicy {
+                                max_attempts: 3,
+                                backoff_secs: 0,
+                            },
+                        },
+                        WorkflowStep {
+                            id: "self-test".to_string(),
+                            handler: "self_test_suite".to_string(),
+                            effect: EffectClass::LocalWrite,
+                            input: serde_json::json!({"suite": "core"}),
+                            retry: RetryPolicy {
+                                max_attempts: 3,
+                                backoff_secs: 0,
+                            },
+                        },
+                    ],
+                    edges: vec![WorkflowEdge {
+                        from: "hold".to_string(),
+                        to: "self-test".to_string(),
+                    }],
+                    budget: ExecutionBudget {
+                        max_provider_calls: 0,
+                        deadline_secs: 60,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::SelfTestSuite {
+                    suite: "core".to_string(),
+                }],
+            },
+            "planner:test",
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+    let worker = LoopWorker::with_builtins(engine.clone(), Arc::new(WorkerProvider), None, None)?;
+
+    // First poll: the deadline is in the future, so the attempt defers —
+    // the item is ready but not yet due, no checkpoint is committed.
+    let report = worker.run_goal_until_idle(&goal.id, 4).await?;
+    let item = report.work_items.first().expect("wait work item");
+    assert_eq!(item.status, WorkItemStatus::Ready);
+    assert!(
+        report.attempts.iter().any(|attempt| attempt
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("deferred until"))),
+        "the deferred attempt should record its wake time"
+    );
+    let events = engine.list_goal_events(&goal.id, 0, 50).await?;
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == "attempt.deferred")
+    );
+
+    // After the stored deadline a second poll completes the deferred step,
+    // runs the dependent self-test, and verifies the goal to achieved.
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    let report = worker.run_goal_until_idle(&goal.id, 8).await?;
+    assert!(
+        report
+            .work_items
+            .iter()
+            .all(|item| item.status == WorkItemStatus::Succeeded)
+    );
+    assert_eq!(report.goal.status, GoalStatus::Achieved);
+    Ok(())
+}
+
+/// `request_id` makes goal admission idempotent — a retried submit returns
+/// the originally admitted goal — and a committed mutation wakes subscribed
+/// event consumers without polling.
+#[tokio::test]
+async fn goal_admission_deduplicates_request_id_and_notifies() -> anyhow::Result<()> {
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = LoopEngine::new(Arc::new(SqliteLoopStore::new(memory)));
+    let mut notifications = engine.subscribe_events();
+
+    let request = |objective: &str| CreateGoalRequest {
+        objective: objective.to_string(),
+        source_signal_ids: Vec::new(),
+        request_id: Some("submission:goal-1".to_string()),
+    };
+    let (goal, created) = engine
+        .create_goal_admission(request("Idempotent admission"), "operator:test")
+        .await?;
+    assert!(created);
+    let (again, created_again) = engine
+        .create_goal_admission(request("A different objective"), "operator:test")
+        .await?;
+    assert!(!created_again);
+    assert_eq!(again.id, goal.id);
+    assert_eq!(again.objective, "Idempotent admission");
+    assert_eq!(engine.list_goals(10).await?.len(), 1);
+
+    // Only the real admission wrote an event.
+    let events = engine.list_goal_events(&goal.id, 0, 20).await?;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "goal.created")
+            .count(),
+        1
+    );
+    // The commit notified subscribers carrying the goal id.
+    let notified = notifications.recv().await?;
+    assert_eq!(notified, goal.id);
+    Ok(())
+}
+
+/// Workers call `resume_goal` every poll cycle; consecutive no-op resumes
+/// must not flood the per-goal event log.
+#[tokio::test]
+async fn consecutive_resumes_emit_a_single_event() -> anyhow::Result<()> {
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = LoopEngine::new(Arc::new(SqliteLoopStore::new(memory)));
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Observe resume dedup".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            "operator:test",
+        )
+        .await?;
+    engine.resume_goal(&goal.id, "runtime:test").await?;
+    engine.resume_goal(&goal.id, "runtime:test").await?;
+    engine.resume_goal(&goal.id, "runtime:test").await?;
+    let events = engine.list_goal_events(&goal.id, 0, 20).await?;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "goal.resumed")
+            .count(),
+        1
+    );
+    // Any number of consecutive no-op resumes still collapse to one event.
+    engine.resume_goal(&goal.id, "runtime:test").await?;
+    let events = engine.list_goal_events(&goal.id, 0, 20).await?;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "goal.resumed")
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+/// A handler whose work spans two committed phases: phase one reports a
+/// boundary, phase two finishes — resuming from `ctx.resume` rather than
+/// restarting. Registered under the allowed `provider_analysis` name so the
+/// plan/approve path accepts it while the registry maps it to this probe.
+struct TwoPhaseProbe;
+
+#[async_trait]
+impl WorkHandler for TwoPhaseProbe {
+    fn name(&self) -> &'static str {
+        "provider_analysis"
+    }
+
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::LocalWrite
+    }
+
+    async fn execute(&self, context: &WorkHandlerContext) -> anyhow::Result<WorkOutcome> {
+        match context
+            .resume
+            .as_ref()
+            .map(|progress| progress.phase.as_str())
+        {
+            None => Ok(WorkOutcome {
+                summary: "phase one committed".to_string(),
+                artifact_ids: Vec::new(),
+                evidence: serde_json::Value::Null,
+                sleep_until_unix: None,
+                continuation: Some(WorkContinuation {
+                    phase: "gathered".to_string(),
+                    state: serde_json::json!({"seed": 42}),
+                    delay_secs: None,
+                }),
+            }),
+            Some("gathered") => {
+                let progress = context.resume.as_ref().expect("resume progress");
+                anyhow::ensure!(
+                    progress.state["seed"] == 42 && progress.continues == 1,
+                    "resume progress lost its committed state"
+                );
+                Ok(WorkOutcome {
+                    summary: "resumed and finished".to_string(),
+                    artifact_ids: Vec::new(),
+                    evidence: serde_json::Value::Null,
+                    sleep_until_unix: None,
+                    continuation: None,
+                })
+            }
+            Some(other) => anyhow::bail!("unexpected resume phase: {other}"),
+        }
+    }
+}
+
+fn two_phase_probe_worker(
+    engine: Arc<LoopEngine>,
+    worker_id: &str,
+    lease_secs: u32,
+) -> anyhow::Result<LoopWorker> {
+    let mut registry = WorkHandlerRegistry::default();
+    registry.register(Arc::new(TwoPhaseProbe))?;
+    LoopWorker::with_registry(engine, registry, worker_id, lease_secs)
+}
+
+fn two_phase_plan() -> PlanGoalRequest {
+    PlanGoalRequest {
+        workflow: WorkflowSpec {
+            steps: vec![WorkflowStep {
+                id: "probe".to_string(),
+                handler: "provider_analysis".to_string(),
+                effect: EffectClass::LocalWrite,
+                input: serde_json::json!({}),
+                retry: RetryPolicy {
+                    max_attempts: 3,
+                    backoff_secs: 0,
+                },
+            }],
+            edges: Vec::new(),
+            budget: ExecutionBudget {
+                max_provider_calls: 0,
+                deadline_secs: 60,
+                max_response_bytes: 65_536,
+            },
+        },
+        acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+            label: "operator review".to_string(),
+        }],
+    }
+}
+
+/// A `Continue` outcome commits its phase boundary durably, then the next
+/// phase runs inside the same attempt — `ctx.resume` carries the persisted
+/// progress and the item succeeds with its progress cleared.
+#[tokio::test]
+async fn phase_boundaries_commit_progress_then_continue_in_place() -> anyhow::Result<()> {
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Run a two-phase probe".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            "operator:test",
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(&goal.id, two_phase_plan(), "planner:test")
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+
+    let worker = two_phase_probe_worker(engine.clone(), "worker:phase", 30)?;
+    // The goal parks in `verifying` on the ManualApproval criterion once the
+    // probe succeeds — the idle loop reports that as non-dispatchable, which
+    // is expected; assert on durable state instead.
+    let _ = worker.run_goal_until_idle(&goal.id, 4).await;
+
+    let report = engine.resume_goal(&goal.id, "operator:test").await?;
+    let item = report
+        .work_items
+        .iter()
+        .find(|item| item.step_id == "probe")
+        .expect("probe work item");
+    assert_eq!(item.status, WorkItemStatus::Succeeded);
+    assert!(
+        item.progress.is_none(),
+        "terminal success clears the phase progress"
+    );
+    let events = engine.list_goal_events(&goal.id, 0, 50).await?;
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == "attempt.phase_progressed"),
+        "the committed boundary should be in the event log"
+    );
+    Ok(())
+}
+
+/// Committed phase progress is what survives a crash: the attempt dies after
+/// the boundary commit, and the next attempt's `ctx.resume` carries the last
+/// committed phase — no restart from scratch.
+#[tokio::test]
+async fn committed_phase_progress_resumes_after_attempt_crash() -> anyhow::Result<()> {
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Resume a crashed phase run".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            "operator:test",
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(&goal.id, two_phase_plan(), "planner:test")
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+
+    // Commit a phase boundary as if the worker had finished phase one, then
+    // let the 1s lease lapse — the "crash" leaves progress committed but the
+    // attempt abandoned.
+    let claim = engine
+        .claim_work_item(&goal.id, "probe", "worker:doomed", 1, "operator:test")
+        .await?
+        .expect("probe step should be claimable");
+    engine
+        .record_phase_progress(
+            &claim,
+            &WorkContinuation {
+                phase: "gathered".to_string(),
+                state: serde_json::json!({"seed": 42}),
+                delay_secs: None,
+            },
+            "operator:test",
+        )
+        .await?;
+    // Lease expiry is compared in whole seconds; wait past the boundary.
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+
+    let worker = two_phase_probe_worker(engine.clone(), "worker:resume", 30)?;
+    let _ = worker.run_goal_until_idle(&goal.id, 4).await;
+    let report = engine.resume_goal(&goal.id, "operator:test").await?;
+    let item = report
+        .work_items
+        .iter()
+        .find(|item| item.step_id == "probe")
+        .expect("probe work item");
+    // The probe's `Some("gathered")` branch ran — the resume saw the
+    // committed phase and the seed it carried (the handler errors out on
+    // any other phase), and the item reached a terminal state.
+    assert_eq!(item.status, WorkItemStatus::Succeeded);
+    assert!(
+        report.attempts.iter().any(|attempt| attempt
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("crash")
+                || error.contains("abandoned")
+                || error.contains("expired"))),
+        "the crashed attempt should be recorded"
+    );
+    Ok(())
+}
+
+/// A handler that never produces a terminal outcome is bounded by the
+/// committed-phase budget rather than looping forever.
+#[tokio::test]
+async fn phase_loop_is_bounded_by_continuation_budget() -> anyhow::Result<()> {
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Bound a runaway phase loop".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            "operator:test",
+        )
+        .await?;
+
+    struct EndlessProbe;
+    #[async_trait]
+    impl WorkHandler for EndlessProbe {
+        fn name(&self) -> &'static str {
+            "provider_analysis"
+        }
+        fn effect_class(&self) -> EffectClass {
+            EffectClass::LocalWrite
+        }
+        async fn execute(&self, context: &WorkHandlerContext) -> anyhow::Result<WorkOutcome> {
+            let next = context
+                .resume
+                .as_ref()
+                .map(|progress| progress.continues + 1)
+                .unwrap_or(1);
+            Ok(WorkOutcome {
+                summary: format!("phase {next} committed"),
+                artifact_ids: Vec::new(),
+                evidence: serde_json::Value::Null,
+                sleep_until_unix: None,
+                continuation: Some(WorkContinuation {
+                    phase: format!("p{next}"),
+                    state: serde_json::Value::Null,
+                    delay_secs: None,
+                }),
+            })
+        }
+    }
+    let mut registry = WorkHandlerRegistry::default();
+    registry.register(Arc::new(EndlessProbe))?;
+    let worker = LoopWorker::with_registry(engine.clone(), registry, "worker:loop", 30)?;
+
+    let plan = engine
+        .plan_goal(&goal.id, two_phase_plan(), "planner:test")
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+
+    worker.run_goal_until_idle(&goal.id, 4).await?;
+    let report = engine.resume_goal(&goal.id, "operator:test").await?;
+    let item = report
+        .work_items
+        .iter()
+        .find(|item| item.step_id == "probe")
+        .expect("probe work item");
+    assert_eq!(item.status, WorkItemStatus::Failed);
+    assert!(
+        report.attempts.iter().any(|attempt| attempt
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("continuation budget"))),
+        "the failure should name the exhausted continuation budget"
     );
     Ok(())
 }

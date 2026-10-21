@@ -76,6 +76,47 @@ fail on a benchmark case) is always fatal to promotion: `benchmark_regressions >
 candidate regardless of `max_regressions`, which bounds only operator-case regressions. An
 operator eval case whose id collides with a benchmark case fails the evaluation closed.
 
+Every finished trajectory also produces a persisted, deterministic `RunScorecard`
+(`mcp_trajectory_scorecards`): a composite `0..=100` fitness score built from exit-reason
+completion weight, answer presence, tool health, wall-clock band, failed-tool penalties, and
+verification-failure penalties — each component stored alongside for audit. Scorecards are the
+fitness function of the self-improvement loop: `propose_from_trajectories` attaches each
+failure's score to the proposal evidence, and each cycle runs a **deployment outcome review**
+before proposing — it compares the mean run score of the 32 runs before the active
+deployment's `activated_at` against the first 8..64 runs after it. A drop of 12+ points writes
+a `deployment_regressed` audit event and emits one deduplicated `deployment_outcome` signal
+into the operator triage pipeline (`evolution:deployment-review`, external id
+`deployment:{id}:regression`). The rollback decision itself stays human-gated. Scorecards are
+readable via `GET /v1/harness/scorecards` (filters: channel/model/hours/min/max score) and
+`GET /v1/harness/scorecards/summary` (hour-windowed bands and failure totals); each trajectory
+detail response embeds its scorecard. Runs that predate the table are backfilled lazily on
+read and in bounded batches inside summaries. A run scoring below 40 also self-reports at
+finish time as a deduplicated `trajectory` signal (`trajectory:scorecard`), so chat-quality
+failures enter the same operator triage pipeline as self-test regressions — identical failure
+shapes collapse into one signal via near-duplicate dedup. Every proposal additionally carries
+the loop's failed-intervention memory (`prior_interventions`: rejected/failed candidates and
+rolled-back deployments), so evidence fingerprints change when an intervention is buried and
+the model is instructed not to resurface it.
+
+Real users feed the same loop without operator ceremony: when a Telegram message is a reply
+to a bot answer and its entire body is an unambiguous marker (`👍`/`❤`/`+1`/`好` for +0.5,
+`👎`/`-1`/`差` for -0.5), the channel records it as trajectory feedback bound to the most
+recent finished run under that chat's session prefix (`tg:{chat_id}%`, max 2h old) instead of
+invoking the model. Free-form text, multi-emoji bodies, replies to non-bot messages, and
+chats with no recent run all fall through to normal processing. The feature activates only
+when evolution is enabled and trajectory logging records runs. Feedback aggregates too:
+three or more distinct runs flagged negative inside six hours emits one deduplicated
+hourly-bucket `user_feedback` signal (`evolution:feedback-spike`), so sustained user
+displeasure surfaces as triage work while a lone complaint stays evidence-only.
+
+The eval suite itself grows from production: `POST /v1/harness/evolution/eval-cases/
+from-trajectory` turns a recorded run into a **disabled** eval case — the operator supplies
+a name and at least one assertion; the input defaults to the run's first user message
+extracted from its earliest captured provider request frame (or an explicit override when
+no frame was captured). Seeding is human-actor-gated and audited (`eval_case_seeded`); the
+case only enters shadow evaluation after a second deliberate enable via the eval-cases
+endpoint.
+
 ## Durable loop
 
 The persisted hierarchy is:
@@ -93,6 +134,42 @@ token. A handler writes a `prepared` checkpoint before work and a `committed` ou
 `/resume` reconciles committed outcomes without replaying the effect, expires stale leases, and
 unlocks dependency-ready work. A stale worker cannot heartbeat, checkpoint, finish, or fail an
 attempt after another claim has taken ownership.
+
+Each handler declares crash semantics with `WorkHandler::replay_safe()`. When a stale lease
+expires with a `prepared`-but-uncommitted checkpoint, a `replay_safe` handler's work item simply
+re-queues for a fresh attempt (and the superseded prepared checkpoint is voided); a handler that
+declares `replay_safe = false` parks in `waiting_confirmation` for the same operator verdict
+path as `external_write` ambiguity, because re-running might double-apply an effect that may
+already have landed. `channel_send` declares `replay_safe = false`; built-in idempotent
+handlers declare `true`.
+
+A work item whose handler is not registered in the claiming process becomes `blocked` with a
+missing-handler reason instead of failing permanently — rolling deploys and late registration
+no longer kill in-flight goals. On each poll the worker re-queues such items whose handler now
+exists in its registry. Dependency-failure cascades also use `blocked` but carry a different
+reason and are never auto-requeued.
+
+A handler may also return a `sleep_until` outcome: the attempt defers without committing an
+outcome and the work item becomes claimable again at the stored unix timestamp. The deferral
+persists in the database, holds no lease, and survives process restarts — this is how the `wait`
+handler implements a durable timer.
+
+Work items can also span **multiple committed phases**. A handler returns
+`Outcome.continuation = {phase, state, delay_secs}` instead of finishing: the worker commits
+the boundary to `harness_work_items.progress_json` *before* the next phase runs, then invokes
+the handler again inside the same attempt (same lease, same deadline budget). A crash between
+boundaries abandons the attempt — the next claim injects the persisted progress via
+`WorkHandlerContext.resume` and the handler continues from the last committed phase rather
+than restarting. With `delay_secs` set, the attempt yields instead: the item becomes
+claimable again after the delay with progress carried forward (durable sleep + progress).
+Committed boundaries per item are capped at `MAX_PHASE_CONTINUES` (64) so a handler that
+never produces a terminal outcome is bounded, and a successful finish clears the progress.
+
+Goal admission is idempotent on an optional `request_id` (1..=160 bytes, unique per
+`harness_goals`): retrying a create with the same key returns the already-admitted goal without
+writing a second `goal.created` event or re-planning. The signal-propose path uses
+`signal:{signal_id}` and swarm projection uses `swarm:{run_id}` so crash/retry windows cannot
+duplicate goals.
 
 Provider calls occur outside SQLite transactions. Approved workflows persist maximum provider
 calls, a wall-clock deadline, and maximum response bytes. The worker reserves these budgets before
@@ -123,6 +200,7 @@ Registered handlers:
 | `manual_gate` | Produces evidence that a manual gate was reached |
 | `evolution_evaluate` | Bounded adapter to an existing prompt candidate evaluation |
 | `channel_send` | Sends `{channel, session_id, text}` through the configured outbound channel; `external_write`, registered only when the feature flag is on and the handler is allowlisted |
+| `wait` | Durable timer step; defers until `input.until_unix` (absolute) or `input.delay_secs` after item creation, then completes on the next claim |
 
 `evolution_evaluate` is registered as unavailable unless
 `[agent.harness.evolution].enabled = true`. When enabled, it reserves exactly two provider calls
@@ -156,7 +234,7 @@ they require a configured operator key and `loop_engine.enabled = true`.
 
 | Method | Route | Purpose |
 |---|---|---|
-| `GET/POST` | `/v1/harness/goals` | List goals or create/auto-plan one |
+| `GET/POST` | `/v1/harness/goals` | List goals or create/auto-plan one; optional `request_id` makes admission idempotent |
 | `GET` | `/v1/harness/goals/{id}` | Read durable goal state |
 | `POST` | `/v1/harness/goals/{id}/plan` | Store a validated Dynamic Workflow revision |
 | `POST` | `/v1/harness/goals/{id}/approve` | Approve the immutable revision/hash |
@@ -164,7 +242,7 @@ they require a configured operator key and `loop_engine.enabled = true`.
 | `GET` | `/v1/harness/goals/{id}/work-items` | List durable work items for a goal |
 | `POST` | `/v1/harness/goals/{goal_id}/work-items/{work_item_id}/resolve-confirmation` | Operator verdict for a `waiting_confirmation` item |
 | `GET` | `/v1/harness/goals/{id}/events` | Cursor-based durable event snapshot |
-| `GET` | `/v1/harness/goals/{id}/events/stream` | SSE event stream for Desktop |
+| `GET` | `/v1/harness/goals/{id}/events/stream` | SSE event stream for Desktop; commit-driven push with monotonic `sequence` cursor (5 s fallback poll) |
 | `POST` | `/v1/harness/goals/{id}/verify/manual` | Record a named manual criterion and re-verify |
 | `GET` | `/v1/harness/signals` | List signals; `?status=observed|triaged|proposed|ignored` filters by triage state |
 | `POST` | `/v1/harness/signals` | Ingest one external/authenticated signal with the scoped key |

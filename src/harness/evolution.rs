@@ -10,8 +10,11 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::domain::{MessageRole, StoredMessage};
+use crate::harness::loop_engine::{CreateSignalRequest, SignalKind, SignalTrust};
 use crate::harness::store::{EvolutionStore, HarnessStore, new_evolution_id};
-use crate::harness::trajectory::{TrajectoryExitReason, TrajectoryFilter, TrajectoryRecord};
+use crate::harness::trajectory::{
+    RunScorecardFilter, TrajectoryExitReason, TrajectoryFilter, TrajectoryRecord,
+};
 use crate::provider::{ChatProvider, CompletionRequest};
 
 pub const ABSOLUTE_MAX_PROMPT_PATCH_CHARS: usize = 16_000;
@@ -20,6 +23,17 @@ const MAX_EVAL_OUTPUT_EXCERPT_CHARS: usize = 2_000;
 const MAX_EVAL_CASE_INPUT_CHARS: usize = 8_000;
 const MAX_PROPOSAL_RESPONSE_CHARS: usize = 20_000;
 const MAX_CANDIDATE_RATIONALE_CHARS: usize = 4_000;
+
+/// Post-activation outcome review: the review only fires once at least this
+/// many scored production runs have landed after the activation.
+const DEPLOYMENT_REVIEW_MIN_POST_SAMPLES: usize = 8;
+/// Post-activation means are computed over at most this many earliest runs.
+const DEPLOYMENT_REVIEW_MAX_POST_SAMPLES: usize = 64;
+/// Baseline window: the most recent scored runs strictly before activation.
+const DEPLOYMENT_REVIEW_BASELINE_SAMPLES: usize = 32;
+/// A deployment regresses when its post-activation mean run score is at
+/// least this many points below the baseline mean.
+const DEPLOYMENT_REVIEW_REGRESSION_DROP: f64 = 12.0;
 
 const RESERVED_HARNESS_MARKERS: &[&str] = &[
     "MCP_TOOL_RESULT_JSON",
@@ -905,6 +919,78 @@ impl EvolutionEngine {
             .await
     }
 
+    /// Seeds a disabled eval case from a real production run — the
+    /// human-authored assertions turn an observed failure into a permanent
+    /// regression test the shadow evaluation scores from then on. The case
+    /// arrives disabled: enabling it is a deliberate second operator action.
+    pub async fn seed_eval_case_from_trajectory(
+        &self,
+        trajectory_id: &str,
+        name: &str,
+        input_override: Option<String>,
+        assertions: EvolutionCaseAssertions,
+        weight: f64,
+        actor: &EvolutionActor,
+    ) -> anyhow::Result<EvolutionEvalCase> {
+        ensure!(
+            actor.is_human(),
+            "seeding an eval case requires a human actor"
+        );
+        let actor = actor.audit_label()?;
+        let harness_store = self
+            .harness_store
+            .as_ref()
+            .context("eval-case seeding requires a harness store")?;
+        ensure!(
+            harness_store.get_trajectory(trajectory_id).await?.is_some(),
+            "trajectory '{trajectory_id}' does not exist"
+        );
+        let input = match input_override.filter(|v| !v.trim().is_empty()) {
+            Some(value) => value.trim().to_string(),
+            None => harness_store
+                .trajectory_first_user_input(trajectory_id)
+                .await?
+                .context("trajectory has no captured request frame; supply an explicit input")?,
+        };
+        let assertive = assertions.require_json
+            || assertions.max_output_chars.is_some()
+            || assertions
+                .required_substrings
+                .iter()
+                .any(|value| !value.trim().is_empty())
+            || assertions
+                .forbidden_substrings
+                .iter()
+                .any(|value| !value.trim().is_empty());
+        ensure!(assertive, "seeded eval case needs at least one assertion");
+        let eval_case = EvolutionEvalCase {
+            id: new_evolution_id("evcase"),
+            name: name.trim().to_string(),
+            input,
+            assertions,
+            weight,
+            enabled: false,
+        };
+        eval_case.validate()?;
+        self.store
+            .upsert_eval_case(eval_case.clone(), &actor)
+            .await?;
+        self.store
+            .record_audit_event(
+                None,
+                None,
+                "eval_case_seeded",
+                &actor,
+                serde_json::json!({
+                    "eval_case_id": eval_case.id,
+                    "trajectory_id": trajectory_id,
+                    "name": eval_case.name,
+                }),
+            )
+            .await?;
+        Ok(eval_case)
+    }
+
     pub async fn list_eval_cases(
         &self,
         enabled_only: bool,
@@ -1426,8 +1512,61 @@ impl EvolutionEngine {
             .active()
             .await
             .map(|policy| policy.candidate_id);
-        let evidence =
-            build_failure_evidence(&failures, &feedback_by_trajectory, self.max_evidence_chars);
+        let mut scores = BTreeMap::<String, i64>::new();
+        for trajectory in &failures {
+            if let Ok(Some(scorecard)) = harness_store.get_run_scorecard(&trajectory.id).await {
+                scores.insert(trajectory.id.clone(), scorecard.score);
+            }
+        }
+        // Failure memory: interventions that were rejected, failed, or
+        // rolled back are attached so the proposal does not resurface an
+        // idea the loop already tried and buried.
+        let prior_candidates = self
+            .store
+            .list_candidates(32)
+            .await?
+            .into_iter()
+            .filter(|candidate| {
+                matches!(
+                    candidate.status,
+                    EvolutionCandidateStatus::Rejected | EvolutionCandidateStatus::Failed
+                )
+            })
+            .take(12)
+            .map(|candidate| {
+                serde_json::json!({
+                    "candidate_id": candidate.id,
+                    "status": candidate.status.as_str(),
+                    "prompt_patch": truncate_chars(candidate.prompt_patch.as_str(), 400),
+                    "rationale": truncate_chars(&candidate.rationale, 300),
+                })
+            })
+            .collect::<Vec<_>>();
+        let rollbacks = self
+            .store
+            .list_recent_rollbacks(10)
+            .await?
+            .into_iter()
+            .map(|deployment| {
+                serde_json::json!({
+                    "deployment_id": deployment.id,
+                    "candidate_id": deployment.candidate_id,
+                    "rolled_back_at": deployment.rolled_back_at.map(|at| at.timestamp()),
+                    "rollback_reason": deployment
+                        .rollback_reason
+                        .as_deref()
+                        .map(|reason| truncate_chars(reason, 300)),
+                })
+            })
+            .collect::<Vec<_>>();
+        let evidence = build_failure_evidence(
+            &failures,
+            &feedback_by_trajectory,
+            &scores,
+            &prior_candidates,
+            &rollbacks,
+            self.max_evidence_chars,
+        );
         let fingerprint = evidence_fingerprint(&evidence);
         if let Some(existing) = self.store.find_candidate_by_evidence(&fingerprint).await? {
             if existing.status == EvolutionCandidateStatus::Draft {
@@ -1473,6 +1612,7 @@ impl EvolutionEngine {
                         "Propose one bounded replacement system-prompt patch that addresses the observed failures.",
                         "Return only JSON with schema: {\"prompt_patch\":\"string\",\"rationale\":\"string\"}.",
                         "Do not include MCP/code-mode control markers, secrets, tool permissions, or instructions to edit files.",
+                        "prior_interventions lists patches already rejected, failed, or rolled back; do not resurface the same approach.",
                     ]
                     .join("\n"),
                 },
@@ -1602,7 +1742,109 @@ impl EvolutionEngine {
         result
     }
 
+    /// Closes the self-improvement loop's "measure after" half: compares the
+    /// mean run scorecard before and after the active deployment. A
+    /// regression writes a durable audit event and emits one deduplicated
+    /// internal signal into the operator triage pipeline — the rollback
+    /// decision itself stays human-gated.
+    pub async fn review_deployment_outcome(&self) -> anyhow::Result<()> {
+        let Some(harness_store) = &self.harness_store else {
+            return Ok(());
+        };
+        let Some(deployment) = self.store.active_deployment().await? else {
+            return Ok(());
+        };
+        let activated_unix = deployment.activated_at.timestamp();
+        let post = harness_store
+            .query_run_scorecards(RunScorecardFilter {
+                since_unix: Some(activated_unix),
+                ascending: true,
+                limit: DEPLOYMENT_REVIEW_MAX_POST_SAMPLES,
+                ..Default::default()
+            })
+            .await?;
+        if post.len() < DEPLOYMENT_REVIEW_MIN_POST_SAMPLES {
+            return Ok(());
+        }
+        let baseline = harness_store
+            .query_run_scorecards(RunScorecardFilter {
+                until_unix: Some(activated_unix),
+                ascending: false,
+                limit: DEPLOYMENT_REVIEW_BASELINE_SAMPLES,
+                ..Default::default()
+            })
+            .await?;
+        if baseline.is_empty() {
+            return Ok(());
+        }
+        let post_mean = post.iter().map(|card| card.score as f64).sum::<f64>() / post.len() as f64;
+        let baseline_mean =
+            baseline.iter().map(|card| card.score as f64).sum::<f64>() / baseline.len() as f64;
+        let drop = baseline_mean - post_mean;
+        if drop < DEPLOYMENT_REVIEW_REGRESSION_DROP {
+            return Ok(());
+        }
+        let actor = "system:evolution-engine";
+        let details = serde_json::json!({
+            "deployment_id": deployment.id,
+            "candidate_id": deployment.candidate_id,
+            "baseline_mean_score": baseline_mean,
+            "post_mean_score": post_mean,
+            "score_drop": drop,
+            "baseline_samples": baseline.len(),
+            "post_samples": post.len(),
+            "regression_threshold": DEPLOYMENT_REVIEW_REGRESSION_DROP,
+        });
+        self.store
+            .record_audit_event(
+                Some(&deployment.candidate_id),
+                Some(&deployment.id),
+                "deployment_regressed",
+                actor,
+                details.clone(),
+            )
+            .await?;
+        self.store
+            .emit_internal_signal(
+                CreateSignalRequest {
+                    kind: SignalKind::DeploymentOutcome,
+                    trust: SignalTrust::Internal,
+                    source: "evolution:deployment-review".to_string(),
+                    external_id: Some(format!(
+                        "deployment:{}:regression",
+                        deployment.id
+                    )),
+                    content: format!(
+                        "Active evolution deployment {} (candidate {}) regressed: mean run score dropped {:.1} -> {:.1} across {} post-activation runs (baseline n={}). Consider an operator rollback.",
+                        deployment.id,
+                        deployment.candidate_id,
+                        baseline_mean,
+                        post_mean,
+                        post.len(),
+                        baseline.len(),
+                    ),
+                    metadata: details
+                        .as_object()
+                        .map(|object| {
+                            object
+                                .iter()
+                                .map(|(key, value)| (key.clone(), value.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                },
+                actor,
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn run_cycle_inner(&self) -> anyhow::Result<EvolutionCycleResult> {
+        // The outcome review is advisory: a broken review must never block a
+        // proposal cycle.
+        if let Err(error) = self.review_deployment_outcome().await {
+            tracing::warn!(%error, "deployment outcome review failed");
+        }
         let enabled_eval_cases = self.store.list_eval_cases(true).await?.len();
         if enabled_eval_cases > MAX_ENABLED_EVOLUTION_EVAL_CASES {
             bail!("enabled eval cases exceed the maximum of {MAX_ENABLED_EVOLUTION_EVAL_CASES}");
@@ -1675,6 +1917,9 @@ fn trajectory_has_failure_signal(trajectory: &TrajectoryRecord) -> bool {
 fn build_failure_evidence(
     trajectories: &[TrajectoryRecord],
     feedback_by_trajectory: &BTreeMap<String, Vec<EvolutionFeedbackRecord>>,
+    scores: &BTreeMap<String, i64>,
+    prior_candidates: &[serde_json::Value],
+    rollbacks: &[serde_json::Value],
     max_chars: usize,
 ) -> String {
     let rows = trajectories
@@ -1698,6 +1943,7 @@ fn build_failure_evidence(
                 "channel": trajectory.channel,
                 "model": trajectory.model,
                 "exit_reason": trajectory.exit_reason.as_str(),
+                "run_score": scores.get(&trajectory.id),
                 "failed_tools": failed_tools,
                 "feedback": feedback_by_trajectory
                     .get(&trajectory.id)
@@ -1715,7 +1961,14 @@ fn build_failure_evidence(
         })
         .collect::<Vec<_>>();
     truncate_chars(
-        &serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string()),
+        &serde_json::to_string(&serde_json::json!({
+            "failed_runs": rows,
+            "prior_interventions": {
+                "rejected_or_failed_candidates": prior_candidates,
+                "rolled_back_deployments": rollbacks,
+            },
+        }))
+        .unwrap_or_else(|_| "{}".to_string()),
         max_chars,
     )
 }

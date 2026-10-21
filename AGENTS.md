@@ -25,6 +25,11 @@ cargo test --test harness_evolution_engine -- --nocapture
 cargo build --release
 ```
 
+## Workflow
+
+- After completing each feature block, commit it and open a pull request for
+  review — do not accumulate multiple features in one unreviewed branch.
+
 ## Architecture
 
 xiaomaolv is an AI gateway service that routes messages through AI providers, manages conversation memory, and supports extensible plugin architectures.
@@ -106,6 +111,7 @@ Capability metadata filters MCP access before execution. `subprocess` is not an 
 - `EvolutionEngine` owns the discover/propose/evaluate/approve/activate/rollback state machine
 - Evolution is disabled by default and only evolves a bounded replacement system-prompt patch
 - Automatic cycles consume failed trajectories or negative feedback and stop at `ready`
+- Finished trajectories persist a deterministic `RunScorecard` (composite 0-100 fitness); each cycle runs a deployment outcome review comparing pre/post-activation mean scores — a 12+ point regression emits an audit event plus one deduplicated `deployment_outcome` signal, with rollback staying human-gated; runs scoring <40 self-report as deduplicated `trajectory:scorecard` signals, and proposals carry `prior_interventions` (rejected/failed candidates + rolled-back deployments) so buried ideas are not resurfaced; replying to a bot answer with a bare 👍/👎/±1/好/差 marker records ±0.5 trajectory feedback bound to the chat's most recent finished run (2h window); 3+ flagged runs in 6h emit one hourly-deduped `user_feedback` spike signal; `POST .../eval-cases/from-trajectory` seeds a disabled eval case from a real run (frame-derived input, human-gated, `eval_case_seeded` audit)
 - Shadow evaluation calls the provider directly and cannot execute tools, write memory, or send messages
 - Shadow evaluation scores operator eval cases plus the versioned benchmark suite (`harness/benchmark.rs`, `id@version`); benchmark regressions are always fatal regardless of `max_regressions`
 - Human approval and activation are separate authenticated operations; rollback restores the prior deployment
@@ -118,7 +124,7 @@ Capability metadata filters MCP access before execution. `subprocess` is not an 
 - Planning never dispatches work; approval binds the exact goal revision, plan hash, effect manifest, acceptance criteria, and execution budget
 - `LoopWorker` uses at-least-once claims, expiring leases, monotonically increasing fencing tokens, and prepared/committed/reconciled checkpoints
 - `/resume` expires stale leases and reconciles committed outcomes without replaying their effects
-- Registered handlers are `goal_planner`, `provider_analysis`, `self_test_suite`, `session_replay`, `manual_gate`, `evolution_evaluate`, and — only behind `external_write_enabled` plus a handler allowlist — `channel_send`; unlisted `external_write` handlers are rejected at plan/approve/register/dispatch; `waiting_confirmation` parks are resolved via the goal-scoped `resolve-confirmation` route (`confirmed`/`retry`/`abandoned` + audit reason)
+- Registered handlers are `goal_planner`, `provider_analysis`, `self_test_suite`, `session_replay`, `manual_gate`, `evolution_evaluate`, `wait` (durable sleep via `sleep_until` deferral), and — only behind `external_write_enabled` plus a handler allowlist — `channel_send`; unlisted `external_write` handlers are rejected at plan/approve/register/dispatch; `waiting_confirmation` parks are resolved via the goal-scoped `resolve-confirmation` route (`confirmed`/`retry`/`abandoned` + audit reason); handlers declare `replay_safe` crash semantics — unsafe prepared checkpoints park for operator verdict instead of blind re-runs, and a missing handler blocks the work item until a registry holding it polls again; `WorkOutcome.continuation` commits a durable phase boundary (`progress_json` on the work item) before the next phase runs in the same attempt, so a crash resumes mid-work via `ctx.resume` (cap: `MAX_PHASE_CONTINUES`)
 - Multi-source `EvolutionSignal` records preserve source/trust/deduplication metadata; ingestion dedups on exact keys, normalized content, and token-set near-duplicates; only an operator route can convert `observed`/`triaged` signals into `proposed` goals or mark them `ignored` (HTTP + Telegram `/signals`)
 - Production `core` self-tests are read-only; repeated identical failure sets produce one deduplicated internal signal
 - Provider frames are recorded for main plain, Code Mode, and MCP completion paths when trajectory logging is enabled; structural replay executes zero live tools

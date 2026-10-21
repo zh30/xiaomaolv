@@ -629,10 +629,19 @@ async fn new_feedback_changes_the_evidence_snapshot_for_the_same_trajectory() {
         )
         .await
         .expect("finish first proposal");
-    engine
+    // The rejection lands in prior_interventions, so the evidence changed:
+    // a fresh proposal is allowed (it must not resurface the rejected idea).
+    let after_reject = engine
         .propose_from_trajectories()
         .await
-        .expect_err("unchanged evidence must be skipped");
+        .expect("rejection changes the intervention memory");
+    assert_ne!(after_reject.id, first.id);
+    // With nothing else changed, a repeated proposal resumes the same draft.
+    let resumed = engine
+        .propose_from_trajectories()
+        .await
+        .expect("unchanged evidence resumes the draft");
+    assert_eq!(resumed.id, after_reject.id);
     store
         .record_feedback(
             EvolutionFeedbackDraft {
@@ -654,7 +663,7 @@ async fn new_feedback_changes_the_evidence_snapshot_for_the_same_trajectory() {
     assert_ne!(first.evidence_fingerprint, second.evidence_fingerprint);
     assert_eq!(
         store.list_candidates(10).await.expect("candidates").len(),
-        2
+        3
     );
 }
 

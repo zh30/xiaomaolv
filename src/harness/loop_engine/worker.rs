@@ -14,9 +14,18 @@ use super::{
     TrajectoryFrameCapture, TrajectoryFrameDraft, WorkClaim, WorkOutcome,
 };
 
+/// `last_error` prefix marking a work item that was blocked because its
+/// handler was not registered in the claiming process. `requeue_blocked_items`
+/// matches on this prefix to distinguish deployment-transient blocks from
+/// dependency-failure cascades.
+pub(crate) const MISSING_HANDLER_REASON_PREFIX: &str = "unregistered workflow handler: ";
+
 pub struct WorkHandlerContext {
     pub engine: Arc<LoopEngine>,
     pub claim: WorkClaim,
+    /// Committed phase progress handed to this attempt — `None` on the
+    /// first phase, `Some` when resuming after a boundary or a crash.
+    pub resume: Option<crate::harness::loop_engine::WorkPhaseProgress>,
 }
 
 #[async_trait]
@@ -25,6 +34,17 @@ pub trait WorkHandler: Send + Sync {
     fn effect_class(&self) -> EffectClass;
 
     fn retryable(&self, _error: &anyhow::Error) -> bool {
+        true
+    }
+
+    /// Declared crash semantics: `true` means a re-run after the attempt
+    /// died before its checkpoint commit is safe (the handler is idempotent
+    /// or effect-free). `false` means a crash between the effect and the
+    /// commit is ambiguous — the work item parks in `waiting_confirmation`
+    /// for an operator verdict instead of silently re-running. `true` by
+    /// default, matching the previous implicit behaviour for non-external
+    /// handlers; `external_write` handlers should declare `false`.
+    fn replay_safe(&self) -> bool {
         true
     }
 
@@ -78,6 +98,13 @@ impl WorkHandlerRegistry {
     fn get(&self, name: &str) -> Option<Arc<dyn WorkHandler>> {
         self.handlers.get(name).cloned()
     }
+
+    /// Names of every handler registered in this process. The worker uses
+    /// the list to re-queue work items that were blocked only because their
+    /// handler was missing at dispatch time.
+    pub fn handler_names(&self) -> Vec<String> {
+        self.handlers.keys().cloned().collect()
+    }
 }
 
 pub struct LoopWorker {
@@ -101,6 +128,9 @@ impl LoopWorker {
             .with_external_write_allowlist(engine.external_write_policy().allowed_handlers.clone());
         handlers
             .register(Arc::new(GoalPlannerHandler))
+            .expect("built-in handler names are unique");
+        handlers
+            .register(Arc::new(WaitHandler))
             .expect("built-in handler names are unique");
         handlers
             .register(Arc::new(ProviderAnalysisHandler { provider }))
@@ -194,6 +224,21 @@ impl LoopWorker {
             if is_terminal(report.goal.status) {
                 return Ok(report);
             }
+            // A work item blocked solely because its handler was missing
+            // becomes ready again once the handler exists in this process
+            // (rolling deploys, late registration).
+            if let Err(error) = self
+                .engine
+                .requeue_blocked_items(
+                    goal_id,
+                    MISSING_HANDLER_REASON_PREFIX,
+                    &self.handlers.handler_names(),
+                    &actor,
+                )
+                .await
+            {
+                tracing::warn!(%error, %goal_id, "blocked work item requeue failed");
+            }
             let Some(claim) = self
                 .engine
                 .claim_goal_work(goal_id, &self.worker_id, self.lease_secs, &actor)
@@ -207,16 +252,32 @@ impl LoopWorker {
     }
 
     async fn process_claim(&self, claim: WorkClaim, actor: &str) -> anyhow::Result<ResumeReport> {
-        let Some(handler) = self.handlers.get(&claim.work_item.handler) else {
+        // Dispatch-time gate: the flag can be turned off after a plan was
+        // approved, so admission at plan/approve time is not sufficient. A
+        // disabled `external_write` step fails loudly regardless of whether
+        // its handler is registered here — a policy decision, not a
+        // deployment gap.
+        if claim.work_item.effect == EffectClass::ExternalWrite
+            && !self.engine.external_write_policy().enabled
+        {
             return self
                 .engine
-                .fail_attempt(
+                .fail_attempt(&claim, "external_write is disabled", false, actor)
+                .await;
+        }
+        let Some(handler) = self.handlers.get(&claim.work_item.handler) else {
+            // A missing handler may be a deployment transient (rolling
+            // restart, handler registered later): park the item in `blocked`
+            // instead of failing it outright. `requeue_blocked_items` at the
+            // top of the loop brings it back once the handler exists.
+            self.engine
+                .block_work_item(
                     &claim,
-                    &format!("unregistered workflow handler: {}", claim.work_item.handler),
-                    false,
+                    &format!("{MISSING_HANDLER_REASON_PREFIX}{}", claim.work_item.handler),
                     actor,
                 )
-                .await;
+                .await?;
+            return self.engine.resume_goal(&claim.attempt.goal_id, actor).await;
         };
         if handler.effect_class() != claim.work_item.effect {
             return self
@@ -229,28 +290,15 @@ impl LoopWorker {
                 )
                 .await;
         }
-        // Dispatch-time gate: the flag can be turned off after a plan was
-        // approved, so admission at plan/approve time is not sufficient.
-        if claim.work_item.effect == EffectClass::ExternalWrite
-            && !self.engine.external_write_policy().enabled
-        {
-            return self
-                .engine
-                .fail_attempt(&claim, "external_write is disabled", false, actor)
-                .await;
-        }
         let checkpoint = self
             .engine
             .prepare_checkpoint(
                 &claim,
                 &format!("{}:{}:v1", claim.work_item.id, claim.attempt.id),
+                handler.replay_safe(),
                 actor,
             )
             .await?;
-        let context = WorkHandlerContext {
-            engine: self.engine.clone(),
-            claim: claim.clone(),
-        };
         let (heartbeat_stop, heartbeat_rx) = tokio::sync::watch::channel(false);
         let heartbeat_engine = self.engine.clone();
         let heartbeat_claim = claim.clone();
@@ -264,29 +312,89 @@ impl LoopWorker {
             )
             .await;
         });
-        let execution = tokio::time::timeout(
-            Duration::from_secs(u64::from(claim.budget.deadline_secs)),
-            handler.execute(&context),
-        )
-        .await;
-        let _ = heartbeat_stop.send(true);
-        let _ = heartbeat.await;
-        let outcome = match execution {
-            Ok(Ok(outcome)) => outcome,
-            Ok(Err(error)) => {
-                let retryable = handler.retryable(&error);
+        // Phase loop: a `Continue` outcome commits its progress before the
+        // next phase runs in the same attempt, so a crash mid-attempt resumes
+        // from the last committed phase instead of restarting. A `delay_secs`
+        // continuation yields the attempt entirely (durable sleep+progress).
+        let attempt_deadline = tokio::time::Instant::now()
+            + Duration::from_secs(u64::from(claim.budget.deadline_secs));
+        let mut resume = claim.work_item.progress.clone();
+        let outcome = loop {
+            let context = WorkHandlerContext {
+                engine: self.engine.clone(),
+                claim: claim.clone(),
+                resume: resume.clone(),
+            };
+            let execution =
+                tokio::time::timeout_at(attempt_deadline, handler.execute(&context)).await;
+            let outcome = match execution {
+                Ok(Ok(outcome)) => outcome,
+                Ok(Err(error)) => {
+                    let retryable = handler.retryable(&error);
+                    let _ = heartbeat_stop.send(true);
+                    let _ = heartbeat.await;
+                    return self
+                        .engine
+                        .fail_attempt(&claim, &format!("{error:#}"), retryable, actor)
+                        .await;
+                }
+                Err(_) => {
+                    let _ = heartbeat_stop.send(true);
+                    let _ = heartbeat.await;
+                    return self
+                        .engine
+                        .fail_attempt(&claim, "workflow handler deadline exceeded", true, actor)
+                        .await;
+                }
+            };
+            if let Err(error) = outcome.validate() {
+                let _ = heartbeat_stop.send(true);
+                let _ = heartbeat.await;
                 return self
                     .engine
-                    .fail_attempt(&claim, &format!("{error:#}"), retryable, actor)
+                    .fail_attempt(
+                        &claim,
+                        &format!("handler returned an invalid outcome: {error:#}"),
+                        false,
+                        actor,
+                    )
                     .await;
             }
-            Err(_) => {
-                return self
+            match outcome.continuation.clone() {
+                Some(continuation) if continuation.delay_secs.is_some() => {
+                    let _ = heartbeat_stop.send(true);
+                    let _ = heartbeat.await;
+                    return self
+                        .engine
+                        .continue_attempt(&claim, &continuation, actor)
+                        .await;
+                }
+                Some(continuation) => match self
                     .engine
-                    .fail_attempt(&claim, "workflow handler deadline exceeded", true, actor)
-                    .await;
+                    .record_phase_progress(&claim, &continuation, actor)
+                    .await
+                {
+                    Ok(progress) => resume = Some(progress),
+                    Err(error) => {
+                        let _ = heartbeat_stop.send(true);
+                        let _ = heartbeat.await;
+                        return self
+                            .engine
+                            .fail_attempt(&claim, &format!("{error:#}"), false, actor)
+                            .await;
+                    }
+                },
+                None => break outcome,
             }
         };
+        let _ = heartbeat_stop.send(true);
+        let _ = heartbeat.await;
+        // A `sleep_until` outcome is not an outcome: the attempt defers and
+        // the work item becomes claimable again at the stored wake time.
+        // The sleep survives restarts without holding a lease.
+        if let Some(until_unix) = outcome.sleep_until_unix {
+            return self.engine.defer_attempt(&claim, until_unix, actor).await;
+        }
         self.engine
             .commit_checkpoint(&claim, &checkpoint.id, outcome, actor)
             .await?;
@@ -345,6 +453,8 @@ impl WorkHandler for ProviderAnalysisHandler {
                 summary: "reused durable analysis artifact".to_string(),
                 artifact_ids: vec![existing.id],
                 evidence: serde_json::json!({"artifact_kind": "analysis_report"}),
+                sleep_until_unix: None,
+                continuation: None,
             });
         }
         let objective = context
@@ -425,6 +535,8 @@ impl WorkHandler for ProviderAnalysisHandler {
             summary: truncate_utf8(&response, 8_000),
             artifact_ids: vec![artifact.id],
             evidence: serde_json::json!({"artifact_kind": "analysis_report"}),
+            sleep_until_unix: None,
+            continuation: None,
         })
     }
 }
@@ -446,6 +558,13 @@ impl WorkHandler for ChannelSendHandler {
 
     fn effect_class(&self) -> EffectClass {
         EffectClass::ExternalWrite
+    }
+
+    /// A crash between send and commit cannot prove whether the message
+    /// went out: the item must park for operator confirmation, never
+    /// silently re-send.
+    fn replay_safe(&self) -> bool {
+        false
     }
 
     async fn execute(&self, context: &WorkHandlerContext) -> anyhow::Result<WorkOutcome> {
@@ -498,6 +617,67 @@ impl WorkHandler for ChannelSendHandler {
                 "session_id": session_id,
                 "send": evidence,
             }),
+            sleep_until_unix: None,
+            continuation: None,
+        })
+    }
+}
+
+/// `wait` — a durable timer step. `input.until_unix` sets an absolute
+/// deadline; `input.delay_secs` sets one relative to work-item creation.
+/// While the deadline is in the future the attempt defers: the work item
+/// holds no lease, the wake time is persisted, and a later claim completes
+/// the step. Effect-free and always safe to re-run.
+struct WaitHandler;
+
+#[async_trait]
+impl WorkHandler for WaitHandler {
+    fn name(&self) -> &'static str {
+        "wait"
+    }
+
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::Pure
+    }
+
+    async fn execute(&self, context: &WorkHandlerContext) -> anyhow::Result<WorkOutcome> {
+        let input = &context.claim.work_item.input;
+        let until = if let Some(until) = input.get("until_unix").and_then(serde_json::Value::as_i64)
+        {
+            until
+        } else {
+            let delay = input
+                .get("delay_secs")
+                .and_then(serde_json::Value::as_i64)
+                .context("wait requires input.until_unix or input.delay_secs")?;
+            ensure!(
+                (1..=2_592_000).contains(&delay),
+                "wait delay_secs must be 1..=2592000"
+            );
+            // Anchored to item creation so every attempt resolves the same
+            // absolute deadline instead of re-arming the clock.
+            context
+                .claim
+                .work_item
+                .created_at_unix
+                .saturating_add(delay)
+        };
+        ensure!(until > 0, "wait deadline must be positive");
+        if unix_now() < until {
+            return Ok(WorkOutcome {
+                summary: format!("sleeping until {until}"),
+                artifact_ids: Vec::new(),
+                evidence: serde_json::json!({"until_unix": until}),
+                sleep_until_unix: Some(until),
+                continuation: None,
+            });
+        }
+        Ok(WorkOutcome {
+            summary: format!("wait deadline {until} reached"),
+            artifact_ids: Vec::new(),
+            evidence: serde_json::json!({"until_unix": until}),
+            sleep_until_unix: None,
+            continuation: None,
         })
     }
 }
@@ -541,6 +721,8 @@ impl WorkHandler for SelfTestHandler {
                     "suite": suite,
                     "self_test_run_id": run_id,
                 }),
+                sleep_until_unix: None,
+                continuation: None,
             });
         }
         let run = context
@@ -573,6 +755,8 @@ impl WorkHandler for SelfTestHandler {
                 "suite": suite,
                 "self_test_run_id": run.id,
             }),
+            sleep_until_unix: None,
+            continuation: None,
         })
     }
 }
@@ -608,6 +792,8 @@ impl WorkHandler for SessionReplayHandler {
                 summary: "reused durable replay artifact".to_string(),
                 artifact_ids: vec![existing.id],
                 evidence: serde_json::json!({"trajectory_id": trajectory_id}),
+                sleep_until_unix: None,
+                continuation: None,
             });
         }
         let replay = context
@@ -633,6 +819,8 @@ impl WorkHandler for SessionReplayHandler {
             summary: format!("structural replay {} completed", replay.id),
             artifact_ids: vec![artifact.id],
             evidence: serde_json::json!({"trajectory_id": trajectory_id, "replay_id": replay.id}),
+            sleep_until_unix: None,
+            continuation: None,
         })
     }
 }
@@ -669,6 +857,8 @@ impl WorkHandler for GoalPlannerHandler {
             summary: "goal plan artifact published".to_string(),
             artifact_ids: vec![artifact.id],
             evidence: serde_json::json!({"artifact_kind": "dynamic_workflow"}),
+            sleep_until_unix: None,
+            continuation: None,
         })
     }
 }
@@ -691,6 +881,8 @@ impl WorkHandler for ManualGateHandler {
                 .to_string(),
             artifact_ids: Vec::new(),
             evidence: serde_json::json!({"manual_gate": "reached"}),
+            sleep_until_unix: None,
+            continuation: None,
         })
     }
 }
@@ -799,6 +991,8 @@ impl WorkHandler for EvolutionEvaluateHandler {
                 "provider_calls": required_calls,
                 "response_bytes": response_bytes,
             }),
+            sleep_until_unix: None,
+            continuation: None,
         })
     }
 }
