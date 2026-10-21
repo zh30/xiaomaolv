@@ -97,6 +97,23 @@ impl SqliteMemoryStore {
         .await
         .context("failed to initialize telegram admission status index")?;
 
+        // Outbound message ledger: which bot message came from which
+        // session at which time. A user's reply-marker resolves the exact
+        // bot message it answered → the session + send timestamp, then the
+        // run that produced it — no recency-window guessing.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS telegram_outbound_messages (
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                session_id TEXT NOT NULL,
+                sent_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                PRIMARY KEY (chat_id, message_id)
+            );",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize telegram_outbound_messages table")?;
+
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS memory_chunks (
                 chunk_id TEXT PRIMARY KEY,
@@ -547,6 +564,74 @@ impl SqliteMemoryStore {
         .await
         .context("failed to fail telegram admission")?;
         Ok(())
+    }
+
+    /// Records that the bot sent `message_id` in `chat_id` on behalf of
+    /// `session_id` — the anchor a later reply-marker binds to exactly.
+    pub async fn record_telegram_outbound_message(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        session_id: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO telegram_outbound_messages
+             (chat_id, message_id, session_id)
+             VALUES (?1, ?2, ?3)",
+        )
+        .bind(chat_id)
+        .bind(message_id)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to record telegram outbound message")?;
+        Ok(())
+    }
+
+    /// Same record with an explicit send time — callers that learned the
+    /// send timestamp out-of-band (and tests) use it to pin the binding.
+    pub async fn record_telegram_outbound_message_at(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        session_id: &str,
+        sent_at_unix: i64,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO telegram_outbound_messages
+             (chat_id, message_id, session_id, sent_at)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(chat_id)
+        .bind(message_id)
+        .bind(session_id)
+        .bind(sent_at_unix)
+        .execute(&self.pool)
+        .await
+        .context("failed to record telegram outbound message")?;
+        Ok(())
+    }
+
+    /// Resolves the session + send time a bot message belongs to — the
+    /// inputs to the exact trajectory lookup.
+    pub async fn telegram_outbound_ref(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+    ) -> anyhow::Result<Option<TelegramOutboundRef>> {
+        let row = sqlx::query_as::<_, (String, i64)>(
+            "SELECT session_id, sent_at FROM telegram_outbound_messages
+             WHERE chat_id = ?1 AND message_id = ?2",
+        )
+        .bind(chat_id)
+        .bind(message_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to look up telegram outbound message")?;
+        Ok(row.map(|(session_id, sent_at_unix)| TelegramOutboundRef {
+            session_id,
+            sent_at_unix,
+        }))
     }
 
     /// Turns long-dead `processing` rows — updates the process died on — into
@@ -1992,6 +2077,29 @@ impl SqliteMemoryStore {
         .fetch_optional(&self.pool)
         .await
         .context("failed to query latest finished trajectory")?;
+        let Some(trajectory_id) = row else {
+            return Ok(None);
+        };
+        self.get_trajectory(&trajectory_id).await
+    }
+
+    /// Most recent trajectory finished for exactly `session_id` at or before
+    /// `before_unix` — the run that produced a specific outbound message.
+    pub async fn latest_finished_trajectory_before(
+        &self,
+        session_id: &str,
+        before_unix: i64,
+    ) -> anyhow::Result<Option<crate::harness::trajectory::TrajectoryRecord>> {
+        let row = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM mcp_trajectories
+             WHERE session_id = ?1 AND finished_at IS NOT NULL AND finished_at <= ?2
+             ORDER BY finished_at DESC, id DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .bind(before_unix)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to query trajectory before timestamp")?;
         let Some(trajectory_id) = row else {
             return Ok(None);
         };
@@ -4866,6 +4974,42 @@ pub trait TelegramAdmissionStore: Send + Sync {
 /// this, re-deliveries are treated as duplicates so a poison update cannot
 /// retry forever.
 pub const TELEGRAM_ADMISSION_MAX_ATTEMPTS: u32 = 3;
+
+/// What a bot message was sent from — session plus send timestamp, the
+/// exact lookup inputs for the run that produced it.
+#[derive(Debug, Clone)]
+pub struct TelegramOutboundRef {
+    pub session_id: String,
+    pub sent_at_unix: i64,
+}
+
+/// Durable outbound-message ledger so a user's reply-marker can be bound to
+/// the exact bot message it answered (and thereby the exact run).
+#[async_trait]
+pub trait TelegramOutboundStore: Send + Sync {
+    async fn record(&self, chat_id: i64, message_id: i64, session_id: &str) -> anyhow::Result<()>;
+    async fn session_for(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+    ) -> anyhow::Result<Option<TelegramOutboundRef>>;
+}
+
+#[async_trait]
+impl TelegramOutboundStore for SqliteMemoryStore {
+    async fn record(&self, chat_id: i64, message_id: i64, session_id: &str) -> anyhow::Result<()> {
+        self.record_telegram_outbound_message(chat_id, message_id, session_id)
+            .await
+    }
+
+    async fn session_for(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+    ) -> anyhow::Result<Option<TelegramOutboundRef>> {
+        self.telegram_outbound_ref(chat_id, message_id).await
+    }
+}
 
 #[async_trait]
 impl TelegramAdmissionStore for SqliteMemoryStore {

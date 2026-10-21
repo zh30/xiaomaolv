@@ -186,6 +186,13 @@ attempt counter. A periodic sweep fails long-dead in-flight rows and emits one
 hourly-deduplicated `telegram:admission-sweep` signal so a lost message is always a visible
 record, never a silent drop.
 
+The matching outbound ledger is `telegram_outbound_messages`: every message the bot sends is
+recorded as `(chat_id, message_id) -> (session_id, sent_at)` on both the streaming and
+non-streaming paths. A user's reply-marker (`👎`, `+1`, bare markers only) resolves the exact
+answered message → its session + send time → the trajectory that finished right before it —
+so feedback binds to the run that actually produced the rated answer instead of the most
+recent one under the chat prefix (which remains the fallback).
+
 Provider calls occur outside SQLite transactions. Approved workflows persist maximum provider
 calls, a wall-clock deadline, and maximum response bytes. The worker reserves these budgets before
 calling a provider.

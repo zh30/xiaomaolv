@@ -627,7 +627,7 @@ async fn reply_feedback_binds_to_latest_finished_run() -> anyhow::Result<()> {
         .await?;
 
     let recorded = service
-        .record_evolution_reply_feedback("tg:42", "telegram", "777", -0.5, None)
+        .record_evolution_reply_feedback(42, None, "telegram", "777", -0.5, None)
         .await?;
     assert!(recorded);
 
@@ -640,14 +640,14 @@ async fn reply_feedback_binds_to_latest_finished_run() -> anyhow::Result<()> {
     // A second 👎 on the same run dedups? It does not — repeated user
     // signals are distinct records; the evidence layer bounds their volume.
     let recorded_again = service
-        .record_evolution_reply_feedback("tg:42", "telegram", "777", -0.5, None)
+        .record_evolution_reply_feedback(42, None, "telegram", "777", -0.5, None)
         .await?;
     assert!(recorded_again);
 
     // Unknown chat prefixes and missing evolution wiring both decline.
     assert!(
         !service
-            .record_evolution_reply_feedback("tg:777", "telegram", "777", 0.5, None)
+            .record_evolution_reply_feedback(777, None, "telegram", "777", 0.5, None)
             .await?
     );
     let bare_service = MessageService::new_with_backend(
@@ -661,7 +661,7 @@ async fn reply_feedback_binds_to_latest_finished_run() -> anyhow::Result<()> {
     );
     assert!(
         !bare_service
-            .record_evolution_reply_feedback("tg:42", "telegram", "777", 0.5, None)
+            .record_evolution_reply_feedback(42, None, "telegram", "777", 0.5, None)
             .await?
     );
     Ok(())
@@ -851,5 +851,82 @@ async fn negative_feedback_spike_emits_one_deduped_signal() -> anyhow::Result<()
         "the same-hour bucket dedups repeated spike emissions"
     );
     assert!(spikes[0].content.contains("negative feedback spike"));
+    Ok(())
+}
+
+/// A reply-marker bound via the recorded outbound message resolves the
+/// exact producing run — a later unrelated run in the same session cannot
+/// steal the feedback, and replies to unrecorded messages still fall back
+/// to the recency heuristic.
+#[tokio::test]
+async fn reply_marker_binds_exactly_to_the_answered_run() -> anyhow::Result<()> {
+    use xiaomaolv::memory::{MemoryBackend, SqliteMemoryBackend};
+    use xiaomaolv::service::{AgentMcpSettings, MessageService};
+
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let harness: Arc<dyn HarnessStore> = Arc::new(SqliteHarnessStore::new(memory.clone()));
+    let evolution: Arc<dyn EvolutionStore> = Arc::new(SqliteEvolutionStore::new(memory.clone()));
+    let backend: Arc<dyn MemoryBackend> = Arc::new(SqliteMemoryBackend::new(memory.clone()));
+    let service = MessageService::new_with_backend(
+        Arc::new(ScoreProvider),
+        backend,
+        None,
+        AgentMcpSettings::default(),
+        20,
+        0,
+        0,
+    )
+    .with_harness_store(harness)
+    .with_evolution_store(evolution.clone())
+    .with_telegram_outbound_store(Arc::new(memory.clone()));
+
+    let now = chrono::Utc::now().timestamp();
+    // The run that produced the answered message finished at T.
+    memory
+        .record_finished_trajectory(&trajectory_in_session(
+            "tg:42",
+            "tg-answer",
+            now - 120,
+            now - 90,
+            TrajectoryExitReason::FinalAnswer,
+            Some("answer"),
+            vec![],
+        ))
+        .await?;
+    // Bot message 500 was sent right after that finish.
+    memory
+        .record_telegram_outbound_message_at(42, 500, "tg:42", now - 85)
+        .await?;
+    // A NEWER unrelated run finished in the same session — the recency
+    // heuristic alone would pick this one and be wrong.
+    memory
+        .record_finished_trajectory(&trajectory_in_session(
+            "tg:42",
+            "tg-newer",
+            now - 60,
+            now - 30,
+            TrajectoryExitReason::FinalAnswer,
+            Some("newer"),
+            vec![],
+        ))
+        .await?;
+
+    // Exact: replying to message 500 binds the producing run.
+    let recorded = service
+        .record_evolution_reply_feedback(42, Some(500), "telegram", "777", -0.5, None)
+        .await?;
+    assert!(recorded);
+    let feedback = evolution.list_feedback(false, 20).await?;
+    assert_eq!(feedback.len(), 1);
+    assert_eq!(feedback[0].trajectory_id, "tg-answer");
+
+    // Fallback: a reply to an unrecorded message still binds heuristically.
+    let recorded = service
+        .record_evolution_reply_feedback(42, Some(999), "telegram", "777", 0.5, None)
+        .await?;
+    assert!(recorded);
+    let feedback = evolution.list_feedback(false, 20).await?;
+    assert_eq!(feedback.len(), 2);
+    assert_eq!(feedback[0].trajectory_id, "tg-newer");
     Ok(())
 }

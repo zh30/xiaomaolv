@@ -300,14 +300,32 @@ impl MessageService {
     /// Max age of the run a lightweight reply-marker may attach to.
     const REPLY_FEEDBACK_MAX_AGE_SECS: i64 = 2 * 3_600;
 
-    /// Binds a channel reply-marker to the most recent finished run under
-    /// `session_prefix` (e.g. `tg:{chat_id}`) and records it as trajectory
-    /// feedback the proposal engine consumes. Returns `false` when the
-    /// feature is unwired or no recent run exists — callers then treat the
+    /// Records that bot message `message_id` in `chat_id` belongs to
+    /// `session_id` — the anchor for exact reply-marker binding.
+    pub async fn record_telegram_outbound_message(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        session_id: &str,
+    ) -> anyhow::Result<()> {
+        if let Some(store) = self.telegram_outbound_store.as_ref() {
+            store.record(chat_id, message_id, session_id).await?;
+        }
+        Ok(())
+    }
+
+    /// Binds a channel reply-marker to the run that produced the answered
+    /// message and records it as trajectory feedback the proposal engine
+    /// consumes. Exact path first: `reply_to_message_id` resolves the
+    /// recorded outbound message → its session + send time → the trajectory
+    /// finished right before it. Falls back to the most recent finished run
+    /// under `tg:{chat_id}` when no outbound record exists. Returns `false`
+    /// when the feature is unwired or no run binds — callers then treat the
     /// marker as a normal message.
     pub async fn record_evolution_reply_feedback(
         &self,
-        session_prefix: &str,
+        chat_id: i64,
+        reply_to_message_id: Option<i64>,
         channel: &str,
         user_id: &str,
         score: f64,
@@ -318,13 +336,56 @@ impl MessageService {
         else {
             return Ok(false);
         };
+        // Exact binding: the answered message is a recorded outbound of ours
+        // → the run that finished most recently before it was sent.
+        if let (Some(outbound_store), Some(reply_id)) =
+            (self.telegram_outbound_store.as_ref(), reply_to_message_id)
+            && let Some(outbound) = outbound_store.session_for(chat_id, reply_id).await?
+            && let Some(trajectory) = harness_store
+                .latest_finished_trajectory_before(&outbound.session_id, outbound.sent_at_unix)
+                .await?
+        {
+            return self
+                .record_bound_feedback(
+                    evolution_store.as_ref(),
+                    trajectory,
+                    channel,
+                    user_id,
+                    score,
+                    comment,
+                )
+                .await;
+        }
         let min_finished_unix = chrono::Utc::now().timestamp() - Self::REPLY_FEEDBACK_MAX_AGE_SECS;
         let Some(trajectory) = harness_store
-            .latest_finished_trajectory(session_prefix, min_finished_unix)
+            .latest_finished_trajectory(&format!("tg:{chat_id}"), min_finished_unix)
             .await?
         else {
             return Ok(false);
         };
+        if trajectory.channel != channel {
+            return Ok(false);
+        }
+        self.record_bound_feedback(
+            evolution_store.as_ref(),
+            trajectory,
+            channel,
+            user_id,
+            score,
+            comment,
+        )
+        .await
+    }
+
+    async fn record_bound_feedback(
+        &self,
+        evolution_store: &dyn crate::harness::store::EvolutionStore,
+        trajectory: crate::harness::trajectory::TrajectoryRecord,
+        channel: &str,
+        user_id: &str,
+        score: f64,
+        comment: Option<String>,
+    ) -> anyhow::Result<bool> {
         if trajectory.channel != channel {
             return Ok(false);
         }

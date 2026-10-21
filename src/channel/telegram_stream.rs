@@ -45,6 +45,25 @@ impl<'a> TelegramStreamSink<'a> {
         }
     }
 
+    /// First sent id becomes the primary message; the rest are continuation
+    /// tails — replies to any of them bind to this run.
+    fn note_sent_message_ids(&mut self, mut ids: Vec<i64>) {
+        if self.message_id.is_none() && !ids.is_empty() {
+            self.message_id = Some(ids.remove(0));
+        }
+        self.tail_message_ids.extend(ids);
+    }
+
+    /// All message ids this sink sent (primary + continuation parts) — used
+    /// to bind later reply-markers to the run that produced them.
+    pub(super) fn sent_message_ids(&self) -> Vec<i64> {
+        self.message_id
+            .iter()
+            .copied()
+            .chain(self.tail_message_ids.iter().copied())
+            .collect()
+    }
+
     pub(super) async fn finalize(&mut self, full_text: &str) -> anyhow::Result<()> {
         if full_text.is_empty() {
             return Ok(());
@@ -59,9 +78,9 @@ impl<'a> TelegramStreamSink<'a> {
         }
 
         if self.prefer_draft && self.draft_supported && self.message_id.is_none() {
-            if let Err(err) = self
+            match self
                 .sender
-                .send_message(
+                .send_message_with_ids(
                     self.chat_id,
                     self.message_thread_id,
                     self.reply_to_message_id,
@@ -69,19 +88,24 @@ impl<'a> TelegramStreamSink<'a> {
                 )
                 .await
             {
-                warn!(error = %err, "telegram stream final send after draft failed, fallback to send/edit");
-                self.draft_supported = false;
-            } else {
-                self.rendered_parts = parts;
-                self.last_push = Some(Instant::now());
-                return Ok(());
+                Ok(sent_ids) => {
+                    self.note_sent_message_ids(sent_ids);
+                    self.rendered_parts = parts;
+                    self.last_push = Some(Instant::now());
+                    return Ok(());
+                }
+                Err(err) => {
+                    warn!(error = %err, "telegram stream final send after draft failed, fallback to send/edit");
+                    self.draft_supported = false;
+                }
             }
         }
 
         if let Err(err) = self.flush(true).await {
             warn!(error = %err, "telegram stream finalize failed, fallback to sendMessage");
-            self.sender
-                .send_message(
+            let sent_ids = self
+                .sender
+                .send_message_with_ids(
                     self.chat_id,
                     self.message_thread_id,
                     self.reply_to_message_id,
@@ -89,6 +113,7 @@ impl<'a> TelegramStreamSink<'a> {
                 )
                 .await
                 .context("telegram stream fallback sendMessage failed")?;
+            self.note_sent_message_ids(sent_ids);
             self.rendered_parts =
                 render_telegram_text_parts(&self.pending_text, TELEGRAM_MAX_TEXT_CHARS);
             self.last_push = Some(Instant::now());
