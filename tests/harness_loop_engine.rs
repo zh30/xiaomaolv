@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -11,13 +11,13 @@ use xiaomaolv::harness::evolution::{
     EvolutionGateConfig,
 };
 use xiaomaolv::harness::loop_engine::{
-    AcceptanceCriterion, ApproveGoalRequest, ArtifactKind, CheckpointPhase, ConfirmationResolution,
-    CreateGoalRequest, CreateSignalRequest, EffectClass, ExecutionBudget, ExternalWritePolicy,
-    GoalStatus, LoopEngine, LoopWorker, OutboundSender, PlanGoalRequest, PublishArtifactRequest,
-    ReplayStatus, RetryPolicy, SelfTestStatus, SignalKind, SignalStatus, SignalTrust,
-    SqliteLoopStore, TrajectoryFrameCapture, TrajectoryFrameDraft, WorkContinuation, WorkHandler,
-    WorkHandlerContext, WorkHandlerRegistry, WorkItemStatus, WorkOutcome, WorkflowEdge,
-    WorkflowSpec, WorkflowStep,
+    AcceptanceCriterion, ApproveGoalRequest, ArtifactKind, AttemptStatus, CheckpointPhase,
+    ConfirmationResolution, CreateGoalRequest, CreateSignalRequest, EffectClass, ExecutionBudget,
+    ExternalWritePolicy, GoalStatus, LoopEngine, LoopWorker, OutboundSender, PlanGoalRequest,
+    PublishArtifactRequest, ReplayStatus, RetryPolicy, SelfTestStatus, SignalKind, SignalStatus,
+    SignalTrust, SqliteLoopStore, TrajectoryFrameCapture, TrajectoryFrameDraft, WorkContinuation,
+    WorkHandler, WorkHandlerContext, WorkHandlerRegistry, WorkItemStatus, WorkOutcome,
+    WorkflowEdge, WorkflowSpec, WorkflowStep,
 };
 use xiaomaolv::harness::store::SqliteEvolutionStore;
 use xiaomaolv::memory::SqliteMemoryStore;
@@ -3769,5 +3769,194 @@ async fn orphaned_swarm_goal_resumes_once_swarm_handler_registers() -> anyhow::R
         .await?
         .expect("outcome");
     assert_eq!(outcome.evidence["answer"], "orphan-answer");
+    Ok(())
+}
+
+/// A defer is a reschedule, not a failed attempt: `void` attempts don't
+/// consume the retry budget, so a `max_attempts = 1` wait step still
+/// completes after its deadline passes.
+#[tokio::test]
+async fn deferred_attempts_do_not_consume_the_attempt_budget() -> anyhow::Result<()> {
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let until = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64
+        + 1;
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "wait once".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            "operator:test",
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![WorkflowStep {
+                        id: "wait".to_string(),
+                        handler: "wait".to_string(),
+                        effect: EffectClass::Pure,
+                        input: serde_json::json!({"until_unix": until}),
+                        retry: RetryPolicy {
+                            max_attempts: 1,
+                            backoff_secs: 0,
+                        },
+                    }],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 0,
+                        deadline_secs: 60,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+                    label: "review".to_string(),
+                }],
+            },
+            "planner:test",
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+    let worker = LoopWorker::with_builtins(engine.clone(), Arc::new(WorkerProvider), None, None)?;
+
+    // Defer once, then the same single-attempt budget must still claim and
+    // finish — before `void`, the defer burned the only attempt.
+    let _ = worker.run_goal_until_idle(&goal.id, 4).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let _ = worker.run_goal_until_idle(&goal.id, 4).await;
+    let report = engine.resume_goal(&goal.id, "operator:test").await?;
+    assert_eq!(report.work_items[0].status, WorkItemStatus::Succeeded);
+    assert!(
+        report
+            .attempts
+            .iter()
+            .any(|a| a.status == AttemptStatus::Void),
+        "the defer is a void attempt"
+    );
+    Ok(())
+}
+
+/// A `continue` with `delay_secs` is the same reschedule shape — the
+/// yielding attempt is `void` and the next claim still fits a one-attempt
+/// budget.
+#[tokio::test]
+async fn delayed_continuation_does_not_consume_the_attempt_budget() -> anyhow::Result<()> {
+    struct DelayOnce {
+        fired: AtomicUsize,
+    }
+    #[async_trait]
+    impl WorkHandler for DelayOnce {
+        fn name(&self) -> &'static str {
+            "provider_analysis"
+        }
+        fn effect_class(&self) -> EffectClass {
+            EffectClass::LocalWrite
+        }
+        async fn execute(&self, ctx: &WorkHandlerContext) -> anyhow::Result<WorkOutcome> {
+            if ctx.resume.is_none() && self.fired.swap(1, Ordering::Relaxed) == 0 {
+                return Ok(WorkOutcome {
+                    summary: "delay".to_string(),
+                    artifact_ids: Vec::new(),
+                    evidence: serde_json::json!({}),
+                    sleep_until_unix: None,
+                    continuation: Some(xiaomaolv::harness::loop_engine::WorkContinuation {
+                        phase: "later".to_string(),
+                        state: serde_json::json!({}),
+                        delay_secs: Some(1),
+                    }),
+                });
+            }
+            Ok(WorkOutcome {
+                summary: "resumed-done".to_string(),
+                artifact_ids: Vec::new(),
+                evidence: serde_json::json!({"resumed": ctx.resume.is_some()}),
+                sleep_until_unix: None,
+                continuation: None,
+            })
+        }
+    }
+
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "delay once".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            "operator:test",
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![WorkflowStep {
+                        id: "delay".to_string(),
+                        handler: "provider_analysis".to_string(),
+                        effect: EffectClass::LocalWrite,
+                        input: serde_json::json!({}),
+                        retry: RetryPolicy {
+                            max_attempts: 1,
+                            backoff_secs: 0,
+                        },
+                    }],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 0,
+                        deadline_secs: 60,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+                    label: "review".to_string(),
+                }],
+            },
+            "planner:test",
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+    let mut registry = WorkHandlerRegistry::default();
+    registry.register(Arc::new(DelayOnce {
+        fired: AtomicUsize::new(0),
+    }))?;
+    let worker = LoopWorker::with_registry(engine.clone(), registry, "delay-worker", 30)?;
+    let _ = worker.run_goal_until_idle(&goal.id, 4).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let _ = worker.run_goal_until_idle(&goal.id, 4).await;
+    let report = engine.resume_goal(&goal.id, "operator:test").await?;
+    assert_eq!(report.work_items[0].status, WorkItemStatus::Succeeded);
+    let outcome = engine
+        .work_item_outcome(&report.work_items[0].id)
+        .await?
+        .expect("outcome");
+    assert_eq!(outcome.summary, "resumed-done");
+    assert_eq!(outcome.evidence["resumed"], true);
     Ok(())
 }
