@@ -4350,3 +4350,116 @@ async fn slow_swarm_reply_defers_then_janitor_delivers() -> anyhow::Result<()> {
     assert!(sent[0].contains("deferred final answer"));
     Ok(())
 }
+
+/// Execution-deadline enforcement: a goal whose budget clock started
+/// (first provider reservation) and then exceeded `deadline_secs` is
+/// failed by the sweep — it stops occupying the dispatchable set and
+/// records a `goal.expired` event instead of looping forever.
+#[tokio::test]
+async fn goal_past_execution_deadline_expires_and_stops_dispatching() -> anyhow::Result<()> {
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let actor = "internal:swarm";
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "expire me".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            actor,
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![
+                        WorkflowStep {
+                            id: "analyze".to_string(),
+                            handler: "provider_analysis".to_string(),
+                            effect: EffectClass::LocalWrite,
+                            input: serde_json::json!({"objective": "o"}),
+                            retry: RetryPolicy {
+                                max_attempts: 1,
+                                backoff_secs: 0,
+                            },
+                        },
+                        WorkflowStep {
+                            id: "linger".to_string(),
+                            handler: "wait".to_string(),
+                            effect: EffectClass::Pure,
+                            // Far-future wake: the goal stays `active` after
+                            // the analysis step completes.
+                            input: serde_json::json!({"until_unix": 4_000_000_000i64}),
+                            retry: RetryPolicy {
+                                max_attempts: 1,
+                                backoff_secs: 0,
+                            },
+                        },
+                    ],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 4,
+                        deadline_secs: 1, // expires ~1s after the clock starts
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+                    label: "review".to_string(),
+                }],
+            },
+            actor,
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            actor,
+        )
+        .await?;
+
+    // Drive one claim: `provider_analysis` reserves a call — the budget
+    // clock starts — and the `wait` item defers, leaving the goal `active`.
+    let provider = Arc::new(SwarmQueueProvider {
+        replies: Mutex::new(VecDeque::from(["analysis".to_string()])),
+    });
+    let worker = LoopWorker::with_builtins(engine.clone(), provider, None, None)?;
+    let _ = worker.run_goal_until_idle(&goal.id, 4).await;
+    let goal_after = engine.get_goal(&goal.id).await?.expect("goal");
+    assert_eq!(goal_after.status, GoalStatus::Active, "wait item parked it");
+
+    // Cross the deadline boundary so started_at + 1 < now.
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    // Overdue-but-unswept: the dispatchable listing already filters it, so
+    // the runtime poll stops claiming the goal before expiry lands.
+    assert!(
+        !engine
+            .list_dispatchable_goal_ids(10)
+            .await?
+            .contains(&goal.id),
+        "overdue goal filtered from dispatchable"
+    );
+    let expired = engine.expire_overdue_goals(64).await?;
+    assert_eq!(expired, vec![goal.id.clone()]);
+    let goal_final = engine.get_goal(&goal.id).await?.expect("goal");
+    assert_eq!(goal_final.status, GoalStatus::Failed);
+    let events = engine.list_goal_events(&goal.id, 0, 20).await?;
+    assert!(
+        events.iter().any(|e| e.event_type == "goal.expired"),
+        "expiry is auditable"
+    );
+    assert!(
+        !engine
+            .list_dispatchable_goal_ids(10)
+            .await?
+            .contains(&goal.id),
+        "expired goal leaves the dispatchable set"
+    );
+    Ok(())
+}

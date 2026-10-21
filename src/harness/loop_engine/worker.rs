@@ -224,6 +224,12 @@ impl LoopWorker {
         self.engine.list_dispatchable_goal_ids(limit).await
     }
 
+    /// Fails goals whose execution deadline passed — see
+    /// `LoopEngine::expire_overdue_goals`.
+    pub async fn expire_overdue_goals(&self, limit: usize) -> anyhow::Result<Vec<String>> {
+        self.engine.expire_overdue_goals(limit).await
+    }
+
     pub async fn run_goal_until_idle(
         &self,
         goal_id: &str,

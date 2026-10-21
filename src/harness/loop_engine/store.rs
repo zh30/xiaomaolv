@@ -58,6 +58,12 @@ pub trait LoopStore: Send + Sync {
 
     async fn list_goals(&self, limit: usize) -> anyhow::Result<Vec<GoalRecord>>;
 
+    /// Fails goals whose execution deadline passed (`budget.started_at +
+    /// deadline_secs < now`) and emits a `goal.expired` event each. The clock
+    /// starts at the first provider reservation, so queued goals never
+    /// expire while waiting for a worker.
+    async fn expire_overdue_goals(&self, limit: usize) -> anyhow::Result<Vec<String>>;
+
     async fn list_goal_events(
         &self,
         goal_id: &str,
@@ -650,6 +656,46 @@ impl LoopStore for SqliteLoopStore {
         .collect()
     }
 
+    async fn expire_overdue_goals(&self, limit: usize) -> anyhow::Result<Vec<String>> {
+        let limit = limit.clamp(1, 128);
+        let now = unix_now();
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let overdue: Vec<String> = sqlx::query_scalar(
+            "SELECT g.id FROM harness_goals g
+             JOIN harness_goal_budget_usage b ON b.goal_id = g.id
+             WHERE g.status IN ('approved', 'active', 'blocked', 'verifying')
+               AND b.started_at IS NOT NULL
+               AND b.started_at + b.deadline_secs < ?1
+             LIMIT ?2",
+        )
+        .bind(now)
+        .bind(i64::try_from(limit).context("expire limit exceeds sqlite range")?)
+        .fetch_all(&mut *tx)
+        .await
+        .context("failed to list overdue goals")?;
+        for goal_id in &overdue {
+            sqlx::query(
+                "UPDATE harness_goals SET status = 'failed', updated_at = unixepoch()
+                 WHERE id = ?1",
+            )
+            .bind(goal_id)
+            .execute(&mut *tx)
+            .await
+            .context("failed to expire goal")?;
+            sqlx::query(
+                "INSERT INTO harness_events (goal_id, event_type, actor, details_json)
+                 VALUES (?1, 'goal.expired', 'internal:janitor', ?2)",
+            )
+            .bind(goal_id)
+            .bind(serde_json::json!({"reason": "deadline_exceeded", "now": now}).to_string())
+            .execute(&mut *tx)
+            .await
+            .context("failed to record expiry event")?;
+        }
+        tx.commit().await?;
+        Ok(overdue)
+    }
+
     async fn list_goal_events(
         &self,
         goal_id: &str,
@@ -679,11 +725,18 @@ impl LoopStore for SqliteLoopStore {
     async fn list_dispatchable_goal_ids(&self, limit: usize) -> anyhow::Result<Vec<String>> {
         let limit = limit.clamp(1, 500);
         sqlx::query_scalar::<_, String>(
-            "SELECT id FROM harness_goals
-             WHERE status IN ('approved', 'active', 'verifying')
-             ORDER BY updated_at, id LIMIT ?1",
+            "SELECT g.id FROM harness_goals g
+             WHERE g.status IN ('approved', 'active', 'verifying')
+               AND NOT EXISTS (
+                   SELECT 1 FROM harness_goal_budget_usage b
+                    WHERE b.goal_id = g.id
+                      AND b.started_at IS NOT NULL
+                      AND b.started_at + b.deadline_secs < ?2
+               )
+             ORDER BY g.updated_at, g.id LIMIT ?1",
         )
         .bind(i64::try_from(limit).context("goal limit exceeds sqlite range")?)
+        .bind(unix_now())
         .fetch_all(self.store.pool())
         .await
         .context("failed to list dispatchable goals")
