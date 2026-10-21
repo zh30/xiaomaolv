@@ -2332,7 +2332,7 @@ impl LoopStore for SqliteLoopStore {
         .await?;
         sqlx::query(
             "UPDATE harness_attempts
-             SET status = 'abandoned', finished_at = ?1, error = ?2
+             SET status = 'void', finished_at = ?1, error = ?2
              WHERE id = ?3 AND status IN ('running', 'committing')",
         )
         .bind(now)
@@ -2486,7 +2486,7 @@ impl LoopStore for SqliteLoopStore {
         .await?;
         sqlx::query(
             "UPDATE harness_attempts
-             SET status = 'abandoned', finished_at = ?1, error = ?2
+             SET status = 'void', finished_at = ?1, error = ?2
              WHERE id = ?3 AND status IN ('running', 'committing')",
         )
         .bind(now)

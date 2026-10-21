@@ -83,9 +83,10 @@ pub enum AttemptStatus {
     Failed,
     Abandoned,
     WaitingConfirmation,
-    /// Claimed but never executed (e.g. parked because the handler was not
-    /// registered). Does not consume attempt budget — unlike `Abandoned`,
-    /// which marks attempts that died mid-execution.
+    /// Claimed but rescheduled before completing — a missing-handler park,
+    /// a durable sleep, or a delayed continuation. Does not consume attempt
+    /// budget — unlike `Abandoned`, which marks attempts that died
+    /// mid-execution.
     Void,
 }
 
