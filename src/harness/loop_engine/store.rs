@@ -931,7 +931,7 @@ impl LoopStore for SqliteLoopStore {
                       AND b.started_at IS NOT NULL
                       AND b.started_at + b.deadline_secs < ?2
                )
-             ORDER BY g.updated_at, g.id LIMIT ?1",
+             ORDER BY g.created_at, g.id LIMIT ?1",
         )
         .bind(i64::try_from(limit).context("goal limit exceeds sqlite range")?)
         .bind(unix_now())
