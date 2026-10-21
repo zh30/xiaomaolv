@@ -1122,6 +1122,44 @@ async fn start_channel_workers(
         });
     }
 
+    // Swarm orphan janitor: durable swarm goals can outlive the process —
+    // the runtime worker resumes them, but the `agent_swarm_runs` audit row
+    // would stay `running` forever. Close it once the goal is terminal.
+    // `reap_orphaned_swarm_runs` self-gates on the loop engine and the
+    // goal's request id, so this is a cheap no-op when swarm is off.
+    if runtime.loop_engine_enabled {
+        let service = runtime.service.clone();
+        let mut shutdown = shutdown_rx.clone();
+        let task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            break;
+                        }
+                    }
+                    _ = ticker.tick() => {
+                        match service.reap_orphaned_swarm_runs().await {
+                            Ok(n) if n > 0 => {
+                                info!(reaped = n, "reaped orphaned swarm run rows")
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                warn!(%error, "swarm orphan sweep failed")
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        workers.push(ChannelWorker {
+            name: "swarm-janitor".to_string(),
+            task,
+        });
+    }
+
     if runtime.loop_self_test_interval_secs > 0 {
         let engine = runtime.loop_engine.clone();
         let interval_secs = runtime.loop_self_test_interval_secs;

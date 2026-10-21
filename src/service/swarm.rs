@@ -2,8 +2,8 @@ use super::*;
 
 use crate::harness::loop_engine::{
     AcceptanceCriterion, ApproveGoalRequest, ArtifactKind, CreateGoalRequest, EffectClass,
-    ExecutionBudget, PlanGoalRequest, PublishArtifactRequest, ResumeReport, RetryPolicy, WorkClaim,
-    WorkHandlerContext, WorkOutcome, WorkflowSpec, WorkflowStep,
+    ExecutionBudget, GoalStatus, PlanGoalRequest, PublishArtifactRequest, ResumeReport,
+    RetryPolicy, WorkClaim, WorkHandlerContext, WorkOutcome, WorkflowSpec, WorkflowStep,
 };
 
 /// Actor used for Loop Engine records created by the swarm projection. The
@@ -2031,7 +2031,7 @@ impl MessageService {
             None => outcome_for(&format!("{run_id}:1")).await,
         };
 
-        self.mirror_durable_swarm_audit(run_id, incoming, &report)
+        self.mirror_durable_swarm_audit(run_id, &incoming.channel, &report)
             .await;
 
         // Summary counters mirror the in-process path's semantics: every
@@ -2105,14 +2105,74 @@ impl MessageService {
         (answer_text, status, run_error)
     }
 
+    /// Reaps swarm runs orphaned by a crash: the run row is still `running`
+    /// but its durable goal already reached a terminal status — mirror the
+    /// final audit rows and close the run so `/agents` reflects reality.
+    pub async fn reap_orphaned_swarm_runs(&self) -> anyhow::Result<usize> {
+        let Some(engine) = self.loop_engine.clone() else {
+            return Ok(0);
+        };
+        let mut reaped = 0usize;
+        for run in self
+            .memory
+            .list_running_agent_swarm_runs(32)
+            .await
+            .context("failed to list running swarm runs")?
+        {
+            let Some(goal) = engine
+                .get_goal_by_request_id(&format!("swarm:{}", run.run_id))
+                .await
+                .ok()
+                .flatten()
+            else {
+                continue; // projection never landed — leave for TTL/audit
+            };
+            if !matches!(
+                goal.status,
+                GoalStatus::Achieved
+                    | GoalStatus::Failed
+                    | GoalStatus::Blocked
+                    | GoalStatus::Canceled
+                    | GoalStatus::Rejected
+            ) {
+                continue; // still dispatchable — a live worker may be mid-run
+            }
+            let report = match engine.resume_goal(&goal.id, SWARM_LOOP_ACTOR).await {
+                Ok(report) => report,
+                Err(error) => {
+                    warn!(error = %error, run_id = %run.run_id, "orphan swarm resume failed");
+                    continue;
+                }
+            };
+            self.mirror_durable_swarm_audit(&run.run_id, &run.channel, &report)
+                .await;
+            let status = if goal.status == GoalStatus::Achieved {
+                AgentSwarmRunStatus::Completed
+            } else {
+                AgentSwarmRunStatus::Failed
+            };
+            let _ = self
+                .memory
+                .finish_agent_swarm_run(FinishAgentSwarmRunRequest {
+                    run_id: run.run_id.clone(),
+                    channel: run.channel.clone(),
+                    status,
+                    finished_at_unix: current_unix_timestamp_i64(),
+                    error: if goal.status == GoalStatus::Achieved {
+                        None
+                    } else {
+                        Some(format!("process restart: goal {}", goal.status.as_str()))
+                    },
+                })
+                .await;
+            reaped += 1;
+        }
+        Ok(reaped)
+    }
+
     /// Rebuilds the `/agents` audit rows from the durable goal tree — each
     /// work item maps to a node row keyed by its step id.
-    async fn mirror_durable_swarm_audit(
-        &self,
-        run_id: &str,
-        incoming: &IncomingMessage,
-        report: &ResumeReport,
-    ) {
+    async fn mirror_durable_swarm_audit(&self, run_id: &str, channel: &str, report: &ResumeReport) {
         for item in &report.work_items {
             let input: SwarmNodeInput = match serde_json::from_value(item.input.clone()) {
                 Ok(input) => input,
@@ -2135,7 +2195,7 @@ impl MessageService {
                 .upsert_agent_swarm_node(UpsertAgentSwarmNodeRequest {
                     agent_id: item.step_id.clone(),
                     run_id: run_id.to_string(),
-                    channel: incoming.channel.clone(),
+                    channel: channel.to_string(),
                     parent_agent_id: input.parent_step_id.clone(),
                     depth: input.depth,
                     nickname: input.nickname.clone().unwrap_or_else(|| {
