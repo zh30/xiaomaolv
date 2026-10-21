@@ -263,6 +263,17 @@ pub trait LoopStore: Send + Sync {
     /// Lists durable work items for a goal (operator inspection surface).
     async fn list_work_items(&self, goal_id: &str) -> anyhow::Result<Vec<WorkItemRecord>>;
 
+    /// Operator stop: cancels a non-terminal goal — in-flight attempts are
+    /// abandoned (their later commits fail `ensure_claim_current`), open
+    /// work items fail, and the goal lands `canceled` with an auditable
+    /// `goal.canceled` event carrying the operator's reason.
+    async fn cancel_goal(
+        &self,
+        goal_id: &str,
+        reason: &str,
+        actor: &str,
+    ) -> anyhow::Result<GoalRecord>;
+
     /// Operator verdict for a work item parked in `waiting_confirmation`.
     /// `confirmed` commits the prepared checkpoint with an operator-attested
     /// outcome; `retry` voids it and re-queues the item; `abandoned` voids it
@@ -695,6 +706,84 @@ impl LoopStore for SqliteLoopStore {
         }
         tx.commit().await?;
         Ok(overdue)
+    }
+
+    async fn cancel_goal(
+        &self,
+        goal_id: &str,
+        reason: &str,
+        actor: &str,
+    ) -> anyhow::Result<GoalRecord> {
+        ensure_valid_id(goal_id, "goal id")?;
+        let reason = reason.trim();
+        ensure!(
+            !reason.is_empty() && reason.len() <= 512,
+            "cancel reason must be 1..=512 characters"
+        );
+        let now = unix_now();
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let status: String = sqlx::query_scalar("SELECT status FROM harness_goals WHERE id = ?1")
+            .bind(goal_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .context("goal not found")?;
+        ensure!(
+            matches!(
+                status.as_str(),
+                "proposed"
+                    | "planning"
+                    | "review_ready"
+                    | "approved"
+                    | "active"
+                    | "blocked"
+                    | "verifying"
+            ),
+            "goal is already terminal: {status}"
+        );
+        // In-flight attempts die now — their commits lose the
+        // `ensure_claim_current` check and become harmless errors.
+        sqlx::query(
+            "UPDATE harness_attempts
+             SET status = 'abandoned', finished_at = ?1, error = ?2
+             WHERE goal_id = ?3 AND status IN ('running', 'committing', 'waiting_confirmation')",
+        )
+        .bind(now)
+        .bind(format!("goal canceled: {reason}"))
+        .bind(goal_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE harness_work_items
+             SET status = 'failed', lease_token = NULL, lease_until = NULL,
+                 next_attempt_at = NULL, last_error = ?1, updated_at = ?2
+             WHERE goal_id = ?3 AND status NOT IN ('succeeded', 'failed')",
+        )
+        .bind(format!("goal canceled: {reason}"))
+        .bind(now)
+        .bind(goal_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE harness_goals SET status = 'canceled', updated_at = unixepoch()
+             WHERE id = ?1",
+        )
+        .bind(goal_id)
+        .execute(&mut *tx)
+        .await?;
+        insert_event(
+            &mut tx,
+            goal_id,
+            "goal.canceled",
+            actor,
+            &serde_json::json!({"reason": reason}).to_string(),
+        )
+        .await?;
+        tx.commit().await?;
+        let row = sqlx::query("SELECT * FROM harness_goals WHERE id = ?1")
+            .bind(goal_id)
+            .fetch_one(self.store.pool())
+            .await?;
+        decode_goal(row)
     }
 
     async fn list_goal_events(

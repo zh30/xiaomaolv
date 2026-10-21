@@ -4556,3 +4556,96 @@ async fn deferred_reply_skips_channels_the_sender_cannot_reach() -> anyhow::Resu
     );
     Ok(())
 }
+
+/// Operator stop: canceling a live goal fails open items, abandons
+/// in-flight attempts, records `goal.canceled`, and the canceled goal
+/// leaves the dispatchable set.
+#[tokio::test]
+async fn cancel_goal_stops_live_work_and_is_auditable() -> anyhow::Result<()> {
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let actor = "operator:test";
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "cancel me".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            actor,
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![WorkflowStep {
+                        id: "linger".to_string(),
+                        handler: "wait".to_string(),
+                        effect: EffectClass::Pure,
+                        input: serde_json::json!({"until_unix": 4_000_000_000i64}),
+                        retry: RetryPolicy {
+                            max_attempts: 3,
+                            backoff_secs: 0,
+                        },
+                    }],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 0,
+                        deadline_secs: 3600,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+                    label: "gate".to_string(),
+                }],
+            },
+            actor,
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            actor,
+        )
+        .await?;
+    assert!(
+        engine
+            .list_dispatchable_goal_ids(10)
+            .await?
+            .contains(&goal.id)
+    );
+
+    let canceled = engine
+        .cancel_goal(&goal.id, "no longer needed", actor)
+        .await?;
+    assert_eq!(canceled.status, GoalStatus::Canceled);
+    let items = engine.list_work_items(&goal.id).await?;
+    assert!(
+        items.iter().all(|i| i.status == WorkItemStatus::Failed),
+        "open items fail on cancel"
+    );
+    let events = engine.list_goal_events(&goal.id, 0, 20).await?;
+    assert!(
+        events.iter().any(|e| e.event_type == "goal.canceled"),
+        "cancel is auditable"
+    );
+    assert!(
+        !engine
+            .list_dispatchable_goal_ids(10)
+            .await?
+            .contains(&goal.id),
+        "canceled goal leaves the dispatchable set"
+    );
+    // Terminal goals refuse cancel.
+    assert!(
+        engine.cancel_goal(&goal.id, "again", actor).await.is_err(),
+        "terminal goals cannot be canceled"
+    );
+    Ok(())
+}
