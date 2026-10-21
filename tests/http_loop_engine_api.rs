@@ -399,3 +399,27 @@ async fn swarm_runs_http_surface_is_operator_scoped() {
     let body: serde_json::Value = nodes.json();
     assert_eq!(body["nodes"], serde_json::json!([]));
 }
+
+/// `/v1/harness/goals/{id}/checkpoints` — the effect-audit trail over the
+/// operator-authenticated surface.
+#[tokio::test]
+async fn goal_checkpoints_endpoint_is_operator_scoped() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let database_url = format!("sqlite://{}", temp.path().join("ckpt-http.db").display());
+    let app = build_router(config(), &database_url, Some(Arc::new(HarnessHttpProvider)))
+        .await
+        .expect("router");
+    let server = TestServer::new(app).expect("server");
+
+    let unauth = server.get("/v1/harness/goals/goal_x/checkpoints").await;
+    unauth.assert_status_unauthorized();
+
+    let res = operator(server.get("/v1/harness/goals/goal_x/checkpoints")).await;
+    let status = res.status_code();
+    if status != 200 {
+        eprintln!("status {status} body {}", res.text());
+    }
+    res.assert_status_ok();
+    let body: serde_json::Value = res.json();
+    assert_eq!(body["checkpoints"], serde_json::json!([]));
+}

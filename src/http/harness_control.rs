@@ -37,6 +37,10 @@ pub(super) fn router() -> Router<AppState> {
         .route("/v1/harness/goals/{id}/unpause", post(post_goal_unpause))
         .route("/v1/harness/goals/{id}/replan", post(post_goal_replan))
         .route(
+            "/v1/harness/goals/{id}/checkpoints",
+            get(get_goal_checkpoints),
+        )
+        .route(
             "/v1/harness/goals/{id}/work-items",
             get(get_goal_work_items),
         )
@@ -147,6 +151,19 @@ async fn get_swarm_run_nodes(
         .await
         .map_err(internal)?;
     Ok(Json(serde_json::json!({"nodes": nodes})))
+}
+
+/// `GET /goals/{id}/checkpoints` — the effect-outcome audit trail:
+/// prepared/committed/reconciled/voided per attempt with idempotency keys
+/// and replay-safety declarations.
+async fn get_goal_checkpoints(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(goal_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (engine, _) = operator_context(&state, &headers).await?;
+    let checkpoints = engine.list_checkpoints(&goal_id).await.map_err(internal)?;
+    Ok(Json(serde_json::json!({"checkpoints": checkpoints})))
 }
 
 async fn list_goals(
