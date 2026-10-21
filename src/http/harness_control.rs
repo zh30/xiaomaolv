@@ -36,6 +36,7 @@ pub(super) fn router() -> Router<AppState> {
         .route("/v1/harness/goals/{id}/pause", post(post_goal_pause))
         .route("/v1/harness/goals/{id}/unpause", post(post_goal_unpause))
         .route("/v1/harness/goals/{id}/replan", post(post_goal_replan))
+        .route("/v1/harness/goals/{id}/reject", post(post_goal_reject))
         .route("/v1/harness/goals/{id}/attempts", get(get_goal_attempts))
         .route(
             "/v1/harness/goals/{id}/checkpoints",
@@ -474,6 +475,28 @@ async fn post_goal_unpause(
     let (engine, actor) = operator_context(&state, &headers).await?;
     let goal = engine
         .unpause_goal(&goal_id, &actor)
+        .await
+        .map_err(|error| {
+            if error.to_string().contains("not found") {
+                ApiError::NotFound(error.to_string())
+            } else {
+                ApiError::Conflict(error.to_string())
+            }
+        })?;
+    Ok(Json(serde_json::json!({"goal": goal})))
+}
+
+/// `POST /goals/{id}/reject` — decline a pre-dispatch goal
+/// (`proposed`/`planning`/`review_ready`); terminal until replan.
+async fn post_goal_reject(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(goal_id): Path<String>,
+    Json(request): Json<CancelGoalRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (engine, actor) = operator_context(&state, &headers).await?;
+    let goal = engine
+        .reject_goal(&goal_id, &request.reason, &actor)
         .await
         .map_err(|error| {
             if error.to_string().contains("not found") {

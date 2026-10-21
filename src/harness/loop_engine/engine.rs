@@ -583,6 +583,16 @@ impl LoopEngine {
         self.store.unpause_goal(goal_id, actor).await
     }
 
+    /// Reject a pre-dispatch goal — `rejected` is terminal until replan.
+    pub async fn reject_goal(
+        &self,
+        goal_id: &str,
+        reason: &str,
+        actor: &str,
+    ) -> anyhow::Result<GoalRecord> {
+        self.store.reject_goal(goal_id, reason, actor).await
+    }
+
     /// Send a dead-ended goal back to planning — `plan_goal` accepts the
     /// `replan` status and issues a fresh revision. `LoopStore::mark_goal_for_replan`.
     pub async fn mark_goal_for_replan(

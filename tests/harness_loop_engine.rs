@@ -4868,3 +4868,41 @@ async fn failed_goal_replans_into_a_fresh_revision() -> anyhow::Result<()> {
     assert_eq!(fresh.status, WorkItemStatus::Succeeded);
     Ok(())
 }
+
+/// Reject: a pre-dispatch goal declines cleanly and is terminal until
+/// replan opens a fresh revision.
+#[tokio::test]
+async fn proposed_goal_can_be_rejected_then_replanned() -> anyhow::Result<()> {
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let actor = "operator:test";
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "maybe not".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            actor,
+        )
+        .await?;
+    let rejected = engine.reject_goal(&goal.id, "not worth it", actor).await?;
+    assert_eq!(rejected.status, GoalStatus::Rejected);
+    assert!(
+        !engine
+            .list_dispatchable_goal_ids(10)
+            .await?
+            .contains(&goal.id)
+    );
+    // Rejected goals are replannable — the operator can change their mind.
+    let replanned = engine
+        .mark_goal_for_replan(&goal.id, "actually do it", actor)
+        .await?;
+    assert_eq!(replanned.status, GoalStatus::Replan);
+    let events = engine.list_goal_events(&goal.id, 0, 10).await?;
+    assert!(
+        events.iter().any(|e| e.event_type == "goal.rejected"),
+        "reject lands an auditable event"
+    );
+    Ok(())
+}
