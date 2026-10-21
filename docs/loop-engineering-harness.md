@@ -179,6 +179,13 @@ writing a second `goal.created` event or re-planning. The signal-propose path us
 `signal:{signal_id}` and swarm projection uses `swarm:{run_id}` so crash/retry windows cannot
 duplicate goals.
 
+Telegram updates cross the same kind of boundary via `telegram_admissions`: the poller admits
+each `update_id` before processing (`INSERT OR IGNORE`), so a re-delivered update is skipped
+while a lease-expired `processing` row — a crash mid-update — is reclaimed under a bounded
+attempt counter. A periodic sweep fails long-dead in-flight rows and emits one
+hourly-deduplicated `telegram:admission-sweep` signal so a lost message is always a visible
+record, never a silent drop.
+
 Provider calls occur outside SQLite transactions. Approved workflows persist maximum provider
 calls, a wall-clock deadline, and maximum response bytes. The worker reserves these budgets before
 calling a provider.

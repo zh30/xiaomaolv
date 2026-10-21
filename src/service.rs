@@ -230,6 +230,7 @@ pub struct MessageService {
     output_verification_max_result_chars: usize,
     evolution_policy_runtime: Option<EvolutionPolicyRuntime>,
     evolution_store: Option<Arc<dyn crate::harness::store::EvolutionStore>>,
+    telegram_admission_store: Option<Arc<dyn crate::memory::TelegramAdmissionStore>>,
 }
 
 struct CompletionOutcome {
@@ -336,6 +337,7 @@ impl MessageService {
             output_verification_max_result_chars: 2000,
             evolution_policy_runtime: None,
             evolution_store: None,
+            telegram_admission_store: None,
         }
     }
 
@@ -413,6 +415,17 @@ impl MessageService {
         store: Arc<dyn crate::harness::store::EvolutionStore>,
     ) -> Self {
         self.evolution_store = Some(store);
+        self
+    }
+
+    /// Enables the durable Telegram update-admission ledger: dedup on
+    /// `update_id`, lease-based crash reclaim, and a stale-processing sweep
+    /// that turns silent message loss into visible `failed` records.
+    pub fn with_telegram_admission_store(
+        mut self,
+        store: Arc<dyn crate::memory::TelegramAdmissionStore>,
+    ) -> Self {
+        self.telegram_admission_store = Some(store);
         self
     }
 

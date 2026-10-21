@@ -272,3 +272,95 @@ async fn sqlite_memory_context_includes_time_dimension_for_yesterday_queries() {
         "memory snippet should carry explicit time dimension, got: {content}"
     );
 }
+
+/// Telegram update admission is the dedup boundary at the channel: the
+/// first poll to see an `update_id` owns it under a lease; re-deliveries
+/// while the lease lives (or after the record settles) are duplicates; a
+/// dead lease can be reclaimed a bounded number of times.
+#[tokio::test]
+async fn telegram_admission_dedupes_and_reclaims_dead_leases() {
+    use xiaomaolv::memory::TelegramAdmissionStore;
+
+    let store = SqliteMemoryStore::new("sqlite::memory:")
+        .await
+        .expect("init store");
+
+    // Fresh admission owns the update; a live duplicate does not.
+    assert!(
+        store
+            .admit(7_001, "message", r#"{"chat_id":1}"#, 120)
+            .await
+            .expect("admit")
+    );
+    assert!(
+        !store
+            .admit(7_001, "message", r#"{"chat_id":1}"#, 120)
+            .await
+            .expect("duplicate")
+    );
+
+    // Finished records are terminal — a re-delivery stays skipped.
+    store
+        .finish(7_001, "processed")
+        .await
+        .expect("finish admission");
+    assert!(
+        !store
+            .admit(7_001, "message", "{}", 120)
+            .await
+            .expect("done dup")
+    );
+
+    // A dead lease (crashed attempt) is reclaimable — bounded by attempts.
+    // `lease_secs = -1` keeps the held lease expired so each re-delivery
+    // immediately reclaims; after the third attempt the cap locks it out.
+    for _ in 0..3 {
+        assert!(
+            store
+                .admit(7_002, "message", "{}", -1)
+                .await
+                .expect("bounded reclaim")
+        );
+    }
+    assert!(
+        !store
+            .admit(7_002, "message", "{}", -1)
+            .await
+            .expect("attempts bounded")
+    );
+}
+
+/// The sweep turns stale in-flight admissions into failed records and
+/// reports the lost update ids; settled and live rows are untouched.
+#[tokio::test]
+async fn telegram_admission_sweep_fails_dead_leases() {
+    use xiaomaolv::memory::TelegramAdmissionStore;
+
+    let store = SqliteMemoryStore::new("sqlite::memory:")
+        .await
+        .expect("init store");
+
+    store
+        .admit(8_001, "message", "{}", -1)
+        .await
+        .expect("stale in-flight");
+    store
+        .admit(8_002, "message", "{}", 120)
+        .await
+        .expect("live in-flight");
+    store
+        .admit(8_003, "message", "{}", 120)
+        .await
+        .expect("settled");
+    store.finish(8_003, "processed").await.expect("finish");
+
+    let lost = store.sweep_stale(0).await.expect("sweep");
+    assert_eq!(lost, vec![8_001]);
+
+    // The swept row is failed — a re-delivery no longer reclaims it.
+    assert!(!store.admit(8_001, "message", "{}", 120).await.expect("dup"));
+    // The live row still processes normally.
+    store.finish(8_002, "processed").await.expect("finish 8002");
+    // Re-sweeping is quiet.
+    assert!(store.sweep_stale(0).await.expect("resweep").is_empty());
+}

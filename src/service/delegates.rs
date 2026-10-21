@@ -354,6 +354,54 @@ impl MessageService {
         Ok(true)
     }
 
+    /// Durable Telegram update admission: `true` when the caller owns this
+    /// `update_id` (fresh insert, or a lease-expired in-flight row reclaimed
+    /// under a bounded new attempt). `false` marks a duplicate delivery that
+    /// must not be processed again. When no admission store is wired the
+    /// gate is fail-open — updates always process.
+    pub async fn admit_telegram_update(
+        &self,
+        update_id: i64,
+        kind: &str,
+        summary_json: &str,
+        lease_secs: i64,
+    ) -> anyhow::Result<bool> {
+        match self.telegram_admission_store.as_ref() {
+            Some(store) => store.admit(update_id, kind, summary_json, lease_secs).await,
+            None => Ok(true),
+        }
+    }
+
+    pub async fn finish_telegram_admission(
+        &self,
+        update_id: i64,
+        detail: &str,
+    ) -> anyhow::Result<()> {
+        if let Some(store) = self.telegram_admission_store.as_ref() {
+            store.finish(update_id, detail).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn fail_telegram_admission(&self, update_id: i64, error: &str) -> anyhow::Result<()> {
+        if let Some(store) = self.telegram_admission_store.as_ref() {
+            store.fail(update_id, error).await?;
+        }
+        Ok(())
+    }
+
+    /// Marks long-dead in-flight admissions as failed and returns their ids
+    /// so the channel can surface the loss.
+    pub async fn sweep_stale_telegram_admissions(
+        &self,
+        older_than_secs: i64,
+    ) -> anyhow::Result<Vec<i64>> {
+        match self.telegram_admission_store.as_ref() {
+            Some(store) => store.sweep_stale(older_than_secs).await,
+            None => Ok(Vec::new()),
+        }
+    }
+
     pub async fn detect_telegram_scheduler_intent(
         &self,
         text: &str,

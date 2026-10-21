@@ -798,6 +798,7 @@ async fn build_runtime_handles(
     if let Some(metrics) = trajectory_metrics {
         service = service.with_trajectory_metrics(metrics);
     }
+    service = service.with_telegram_admission_store(Arc::new(memory_store.clone()));
     let service = Arc::new(service);
 
     let channel_plugins = load_channel_plugins(config, channel_registry)?;

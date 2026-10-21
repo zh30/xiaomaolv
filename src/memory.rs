@@ -68,6 +68,35 @@ impl SqliteMemoryStore {
         .await
         .context("failed to initialize messages session index")?;
 
+        // Durable update admission ledger: dedup boundary at the channel.
+        // A row means "we saw this update_id"; `processing` holds a lease so
+        // a crash mid-processing can be reclaimed by a re-delivery (bounded
+        // attempts) or swept into a visible `failed` record.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS telegram_admissions (
+                update_id INTEGER PRIMARY KEY,
+                status TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                summary_json TEXT NOT NULL,
+                detail TEXT,
+                attempts INTEGER NOT NULL DEFAULT 1,
+                lease_until INTEGER NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize telegram_admissions table")?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_telegram_admissions_status_lease
+             ON telegram_admissions(status, lease_until);",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize telegram admission status index")?;
+
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS memory_chunks (
                 chunk_id TEXT PRIMARY KEY,
@@ -438,6 +467,116 @@ impl SqliteMemoryStore {
             .await
             .context("failed to insert message")?;
         Ok(())
+    }
+
+    /// Durable admission gate: the first caller to see an `update_id` owns
+    /// it. A re-delivery while the original attempt still holds a live lease
+    /// (or already finished/failed permanently) is a duplicate and must not
+    /// be processed again; a lease-expired `processing` row — a crash —
+    /// can be reclaimed under a fresh lease while attempts remain.
+    pub async fn admit_telegram_update(
+        &self,
+        update_id: i64,
+        kind: &str,
+        summary_json: &str,
+        lease_secs: i64,
+    ) -> anyhow::Result<bool> {
+        let now = unix_ts();
+        let mut tx = self.pool.begin().await?;
+        let inserted = sqlx::query(
+            "INSERT OR IGNORE INTO telegram_admissions
+             (update_id, status, kind, summary_json, attempts, lease_until)
+             VALUES (?1, 'processing', ?2, ?3, 1, ?4)",
+        )
+        .bind(update_id)
+        .bind(kind)
+        .bind(summary_json)
+        .bind(now + lease_secs)
+        .execute(&mut *tx)
+        .await
+        .context("failed to admit telegram update")?;
+        if inserted.rows_affected() == 1 {
+            tx.commit().await?;
+            return Ok(true);
+        }
+        let reclaimed = sqlx::query(
+            "UPDATE telegram_admissions
+             SET status = 'processing', lease_until = ?1, attempts = attempts + 1,
+                 detail = NULL, updated_at = ?2
+             WHERE update_id = ?3 AND status = 'processing' AND lease_until < ?2
+               AND attempts < ?4",
+        )
+        .bind(now + lease_secs)
+        .bind(now)
+        .bind(update_id)
+        .bind(i64::from(TELEGRAM_ADMISSION_MAX_ATTEMPTS))
+        .execute(&mut *tx)
+        .await
+        .context("failed to reclaim telegram admission")?;
+        tx.commit().await?;
+        Ok(reclaimed.rows_affected() == 1)
+    }
+
+    pub async fn finish_telegram_admission(
+        &self,
+        update_id: i64,
+        detail: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE telegram_admissions
+             SET status = 'done', detail = ?1, updated_at = unixepoch()
+             WHERE update_id = ?2 AND status = 'processing'",
+        )
+        .bind(detail)
+        .bind(update_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to finish telegram admission")?;
+        Ok(())
+    }
+
+    pub async fn fail_telegram_admission(&self, update_id: i64, error: &str) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE telegram_admissions
+             SET status = 'failed', detail = ?1, updated_at = unixepoch()
+             WHERE update_id = ?2 AND status = 'processing'",
+        )
+        .bind(error.chars().take(2_000).collect::<String>())
+        .bind(update_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to fail telegram admission")?;
+        Ok(())
+    }
+
+    /// Turns long-dead `processing` rows — updates the process died on — into
+    /// visible `failed` records; returns the lost update ids so the caller
+    /// can surface them to operators.
+    pub async fn sweep_stale_telegram_admissions(
+        &self,
+        older_than_secs: i64,
+    ) -> anyhow::Result<Vec<i64>> {
+        let stale_before = unix_ts() - older_than_secs;
+        let mut tx = self.pool.begin().await?;
+        let stale: Vec<i64> = sqlx::query_scalar(
+            "SELECT update_id FROM telegram_admissions
+             WHERE status = 'processing' AND lease_until < ?1",
+        )
+        .bind(stale_before)
+        .fetch_all(&mut *tx)
+        .await
+        .context("failed to find stale telegram admissions")?;
+        sqlx::query(
+            "UPDATE telegram_admissions
+             SET status = 'failed', detail = 'lost mid-processing', updated_at = unixepoch()
+             WHERE status = 'processing' AND lease_until < ?1",
+        )
+        .bind(stale_before)
+        .execute(&mut *tx)
+        .await
+        .context("failed to sweep stale telegram admissions")?;
+        tx.commit().await?;
+        Ok(stale)
     }
 
     pub async fn load_recent(
@@ -4701,6 +4840,56 @@ impl SidecarMemoryHit {
 
     fn resolved_created_at(&self) -> Option<i64> {
         self.created_at.or(self.timestamp).or(self.ts)
+    }
+}
+
+/// Durable admission ledger at the Telegram channel boundary. `admit` is
+/// the idempotent gate; `finish`/`fail` close the record; `sweep` turns
+/// stale in-flight rows into operator-visible losses. Implemented by
+/// `SqliteMemoryStore`; the service keeps an optional handle so a missing
+/// store never blocks message processing.
+#[async_trait]
+pub trait TelegramAdmissionStore: Send + Sync {
+    async fn admit(
+        &self,
+        update_id: i64,
+        kind: &str,
+        summary_json: &str,
+        lease_secs: i64,
+    ) -> anyhow::Result<bool>;
+    async fn finish(&self, update_id: i64, detail: &str) -> anyhow::Result<()>;
+    async fn fail(&self, update_id: i64, error: &str) -> anyhow::Result<()>;
+    async fn sweep_stale(&self, older_than_secs: i64) -> anyhow::Result<Vec<i64>>;
+}
+
+/// Maximum number of processing attempts an admission may consume; past
+/// this, re-deliveries are treated as duplicates so a poison update cannot
+/// retry forever.
+pub const TELEGRAM_ADMISSION_MAX_ATTEMPTS: u32 = 3;
+
+#[async_trait]
+impl TelegramAdmissionStore for SqliteMemoryStore {
+    async fn admit(
+        &self,
+        update_id: i64,
+        kind: &str,
+        summary_json: &str,
+        lease_secs: i64,
+    ) -> anyhow::Result<bool> {
+        self.admit_telegram_update(update_id, kind, summary_json, lease_secs)
+            .await
+    }
+
+    async fn finish(&self, update_id: i64, detail: &str) -> anyhow::Result<()> {
+        self.finish_telegram_admission(update_id, detail).await
+    }
+
+    async fn fail(&self, update_id: i64, error: &str) -> anyhow::Result<()> {
+        self.fail_telegram_admission(update_id, error).await
+    }
+
+    async fn sweep_stale(&self, older_than_secs: i64) -> anyhow::Result<Vec<i64>> {
+        self.sweep_stale_telegram_admissions(older_than_secs).await
     }
 }
 
