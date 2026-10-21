@@ -295,6 +295,16 @@ pub trait LoopStore: Send + Sync {
     ) -> anyhow::Result<GoalRecord>;
     async fn unpause_goal(&self, goal_id: &str, actor: &str) -> anyhow::Result<GoalRecord>;
 
+    /// Operator rejection of a pre-dispatch goal (`proposed`/`planning`/
+    /// `review_ready`) — `rejected` is terminal; the goal can only come
+    /// back through `mark_goal_for_replan`.
+    async fn reject_goal(
+        &self,
+        goal_id: &str,
+        reason: &str,
+        actor: &str,
+    ) -> anyhow::Result<GoalRecord>;
+
     /// Replan entry: marks a dead-ended goal (`failed`/`canceled`/`rejected`/
     /// `blocked`) `replan` and supersedes its open work items — a fresh
     /// `plan_goal` + `approve` revision then reruns the goal with a clean
@@ -864,6 +874,51 @@ impl LoopStore for SqliteLoopStore {
 
     async fn unpause_goal(&self, goal_id: &str, actor: &str) -> anyhow::Result<GoalRecord> {
         self.set_goal_paused(goal_id, false, None, actor).await
+    }
+
+    async fn reject_goal(
+        &self,
+        goal_id: &str,
+        reason: &str,
+        actor: &str,
+    ) -> anyhow::Result<GoalRecord> {
+        ensure_valid_id(goal_id, "goal id")?;
+        let reason = reason.trim();
+        ensure!(
+            !reason.is_empty() && reason.len() <= 512,
+            "rejection reason must be 1..=512 characters"
+        );
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let status: String = sqlx::query_scalar("SELECT status FROM harness_goals WHERE id = ?1")
+            .bind(goal_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .context("goal not found")?;
+        ensure!(
+            matches!(status.as_str(), "proposed" | "planning" | "review_ready"),
+            "goal cannot be rejected from status '{status}'"
+        );
+        sqlx::query(
+            "UPDATE harness_goals SET status = 'rejected', updated_at = unixepoch()
+             WHERE id = ?1",
+        )
+        .bind(goal_id)
+        .execute(&mut *tx)
+        .await?;
+        insert_event(
+            &mut tx,
+            goal_id,
+            "goal.rejected",
+            actor,
+            &serde_json::json!({"reason": reason}).to_string(),
+        )
+        .await?;
+        tx.commit().await?;
+        let row = sqlx::query("SELECT * FROM harness_goals WHERE id = ?1")
+            .bind(goal_id)
+            .fetch_one(self.store.pool())
+            .await?;
+        decode_goal(row)
     }
 
     async fn mark_goal_for_replan(
