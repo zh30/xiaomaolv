@@ -407,7 +407,8 @@ impl SqliteLoopStore {
                      WHERE goal_id = ?1 AND step_id = ?2 AND status = 'ready'
                        AND (next_attempt_at IS NULL OR next_attempt_at <= ?3)
                        AND (SELECT COUNT(*) FROM harness_attempts a
-                            WHERE a.work_item_id = harness_work_items.id) < max_attempts
+                            WHERE a.work_item_id = harness_work_items.id
+                              AND a.status != 'void') < max_attempts
                      LIMIT 1",
                 )
                 .bind(goal_id)
@@ -424,7 +425,8 @@ impl SqliteLoopStore {
                      WHERE goal_id = ?1 AND status = 'ready'
                        AND (next_attempt_at IS NULL OR next_attempt_at <= ?2)
                        AND (SELECT COUNT(*) FROM harness_attempts a
-                            WHERE a.work_item_id = harness_work_items.id) < max_attempts
+                            WHERE a.work_item_id = harness_work_items.id
+                              AND a.status != 'void') < max_attempts
                      ORDER BY ordinal, id LIMIT 1",
                 )
                 .bind(goal_id)
@@ -1809,7 +1811,8 @@ impl LoopStore for SqliteLoopStore {
         let row = sqlx::query(
             "SELECT max_attempts, backoff_secs,
                     (SELECT COUNT(*) FROM harness_attempts a
-                     WHERE a.work_item_id = harness_work_items.id) AS attempt_count
+                     WHERE a.work_item_id = harness_work_items.id
+                       AND a.status != 'void') AS attempt_count
              FROM harness_work_items WHERE id = ?1",
         )
         .bind(&claim.work_item.id)
@@ -2085,7 +2088,8 @@ impl LoopStore for SqliteLoopStore {
                 .execute(&mut *tx)
                 .await?;
                 let attempt_count: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM harness_attempts WHERE work_item_id = ?1",
+                    "SELECT COUNT(*) FROM harness_attempts
+                     WHERE work_item_id = ?1 AND status != 'void'",
                 )
                 .bind(work_item_id)
                 .fetch_one(&mut *tx)
@@ -2201,7 +2205,7 @@ impl LoopStore for SqliteLoopStore {
         .await?;
         sqlx::query(
             "UPDATE harness_attempts
-             SET status = 'abandoned', finished_at = ?1, error = ?2
+             SET status = 'void', finished_at = ?1, error = ?2
              WHERE id = ?3 AND status IN ('running', 'committing')",
         )
         .bind(now)
@@ -3039,7 +3043,8 @@ async fn recover_goal_state(pool: &SqlitePool, goal_id: &str, actor: &str) -> an
     let expired = sqlx::query(
         "SELECT id, effect_class, max_attempts, backoff_secs,
                 (SELECT COUNT(*) FROM harness_attempts a
-                 WHERE a.work_item_id = harness_work_items.id) AS attempt_count,
+                 WHERE a.work_item_id = harness_work_items.id
+                   AND a.status != 'void') AS attempt_count,
                 EXISTS(SELECT 1 FROM harness_checkpoints c
                        JOIN harness_attempts la ON la.id = c.attempt_id
                        WHERE c.work_item_id = harness_work_items.id

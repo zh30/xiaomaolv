@@ -83,6 +83,10 @@ pub enum AttemptStatus {
     Failed,
     Abandoned,
     WaitingConfirmation,
+    /// Claimed but never executed (e.g. parked because the handler was not
+    /// registered). Does not consume attempt budget — unlike `Abandoned`,
+    /// which marks attempts that died mid-execution.
+    Void,
 }
 
 impl AttemptStatus {
@@ -94,6 +98,7 @@ impl AttemptStatus {
             "failed" => Ok(Self::Failed),
             "abandoned" => Ok(Self::Abandoned),
             "waiting_confirmation" => Ok(Self::WaitingConfirmation),
+            "void" => Ok(Self::Void),
             other => bail!("unknown attempt status: {other}"),
         }
     }

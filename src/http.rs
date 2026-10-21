@@ -39,6 +39,7 @@ use crate::harness::observability::TrajectoryMetrics;
 use crate::harness::store::{
     EvolutionStore, HarnessStore, SqliteEvolutionStore, SqliteHarnessStore,
 };
+use crate::harness::trajectory::TrajectoryLogger;
 use crate::mcp::{McpConfigPaths, McpRegistry, McpRuntime};
 use crate::memory::{
     HybridRetrievalOptions, HybridSqliteZvecMemoryBackend, MemoryBackend, SqliteMemoryBackend,
@@ -721,15 +722,41 @@ async fn build_runtime_handles(
         None
     };
     let loop_worker = if loop_config.enabled && loop_config.worker_enabled {
-        Some(Arc::new(
-            LoopWorker::with_builtins(
-                loop_engine.clone(),
+        let mut worker = LoopWorker::with_builtins(
+            loop_engine.clone(),
+            provider.clone(),
+            evolution_engine.clone(),
+            outbound_sender,
+        )?;
+        // Register the durable swarm handler so goals orphaned by a restart
+        // (or simply still queued) can be claimed by the runtime sweep
+        // instead of parking `blocked` on a missing handler.
+        if config.agent.swarm.enabled && config.agent.swarm.durable_engine {
+            let mut swarm_handler = crate::service::swarm::SwarmNodeHandler::new(
                 provider.clone(),
-                evolution_engine.clone(),
-                outbound_sender,
-            )?
-            .with_runtime_options("loop-worker:runtime", loop_config.worker_lease_secs)?,
-        ))
+                AgentSwarmSettings {
+                    enabled: config.agent.swarm.enabled,
+                    auto_detect: config.agent.swarm.auto_detect,
+                    max_depth: config.agent.swarm.max_depth,
+                    max_agents: config.agent.swarm.max_agents,
+                    max_parallel: config.agent.swarm.max_parallel,
+                    max_node_timeout_ms: config.agent.swarm.max_node_timeout_ms,
+                    max_run_timeout_ms: config.agent.swarm.max_run_timeout_ms,
+                    reply_summary_enabled: config.agent.swarm.reply_summary_enabled,
+                    audit_retention_days: config.agent.swarm.audit_retention_days,
+                    durable_engine: config.agent.swarm.durable_engine,
+                },
+            );
+            if config.agent.harness.enable_trajectory {
+                swarm_handler = swarm_handler
+                    .with_trajectory(TrajectoryLogger::new(harness_store.clone(), true));
+            }
+            worker = worker.with_extra_handler(Arc::new(swarm_handler))?;
+        }
+        Some(Arc::new(worker.with_runtime_options(
+            "loop-worker:runtime",
+            loop_config.worker_lease_secs,
+        )?))
     } else {
         None
     };
