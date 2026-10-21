@@ -2122,6 +2122,25 @@ async fn unsafe_replay_prepared_checkpoint_parks_without_external_write() -> any
         .expect("probe work item");
     assert_eq!(item.status, WorkItemStatus::WaitingConfirmation);
 
+    // The park surfaces as a dedup'd signal — Telegram `/signals` triage
+    // sees pending gates without anyone opening the console.
+    let signals = reopened.list_signals(20, None).await?;
+    let confirm_signals: Vec<_> = signals
+        .iter()
+        .filter(|s| {
+            s.source == "internal:confirmation"
+                && s.external_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with("confirm:"))
+        })
+        .collect();
+    assert_eq!(
+        confirm_signals.len(),
+        1,
+        "parked item emitted exactly one confirmation signal"
+    );
+    assert!(confirm_signals[0].content.contains(&work_item_id));
+
     // The non-external park resolves through the same operator verdict path.
     let item = reopened
         .resolve_waiting_confirmation(
@@ -2134,6 +2153,17 @@ async fn unsafe_replay_prepared_checkpoint_parks_without_external_write() -> any
         .await?;
     assert_eq!(item.status, WorkItemStatus::Ready);
 
+    // Resolving the gate triages the confirmation signal out of /signals.
+    let signals = reopened.list_signals(20, None).await?;
+    let resolved_signal = signals
+        .iter()
+        .find(|s| s.source == "internal:confirmation")
+        .expect("confirmation signal");
+    assert_eq!(
+        resolved_signal.status,
+        xiaomaolv::harness::loop_engine::SignalStatus::Ignored,
+        "resolved gate no longer occupies triage"
+    );
     let worker = LoopWorker::with_builtins(reopened, Arc::new(WorkerProvider), None, None)?;
     let report = worker.run_goal_until_idle(&goal.id, 8).await?;
     let item = report
