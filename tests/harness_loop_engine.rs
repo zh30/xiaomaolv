@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tempfile::tempdir;
@@ -3066,6 +3068,436 @@ async fn durable_swarm_run_delegates_and_merges_through_the_dag() -> anyhow::Res
             .work_items
             .iter()
             .all(|item| item.status == WorkItemStatus::Succeeded)
+    );
+    Ok(())
+}
+
+async fn durable_swarm_engine(
+    provider: Arc<dyn ChatProvider>,
+    settings: xiaomaolv::service::swarm::AgentSwarmSettings,
+) -> (Arc<LoopEngine>, xiaomaolv::harness::loop_engine::GoalRecord) {
+    use xiaomaolv::service::swarm::SwarmNodeHandler;
+
+    let memory = SqliteMemoryStore::new("sqlite::memory:")
+        .await
+        .expect("memory store");
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let actor = "internal:swarm";
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "ROOT TASK".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            actor,
+        )
+        .await
+        .expect("create goal");
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![WorkflowStep {
+                        id: "root".to_string(),
+                        handler: "swarm_node".to_string(),
+                        effect: EffectClass::LocalWrite,
+                        input: serde_json::json!({
+                            "swarm_root": true,
+                            "max_nodes": 8,
+                            "swarm_run_id": "t",
+                            "task": "ROOT TASK",
+                            "role_name": "orchestrator",
+                            "depth": 0,
+                            "history": [],
+                        }),
+                        retry: RetryPolicy {
+                            max_attempts: 2,
+                            backoff_secs: 0,
+                        },
+                    }],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 0,
+                        deadline_secs: 120,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ArtifactExists {
+                    artifact_type: "analysis_report".to_string(),
+                }],
+            },
+            actor,
+        )
+        .await
+        .expect("plan goal");
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            actor,
+        )
+        .await
+        .expect("approve goal");
+    let mut registry = WorkHandlerRegistry::default();
+    registry
+        .register(Arc::new(SwarmNodeHandler::new(provider, settings)))
+        .expect("register swarm handler");
+    let worker =
+        LoopWorker::with_registry(engine.clone(), registry, "swarm:t", 60).expect("worker");
+    let _ = worker.run_goal_until_idle(&goal.id, 32).await;
+    (engine, goal)
+}
+
+/// A child whose model call times out lands `status:"timeout"` evidence —
+/// the item still succeeds, the aggregate merges the degraded set and marks
+/// the merged outcome `partial` instead of stalling the goal.
+#[tokio::test]
+async fn durable_swarm_child_timeout_merges_partial_in_aggregate() -> anyhow::Result<()> {
+    struct TimeoutB;
+    #[async_trait]
+    impl ChatProvider for TimeoutB {
+        async fn complete(&self, req: CompletionRequest) -> anyhow::Result<String> {
+            let transcript = req
+                .messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if transcript.contains("subtask B") && transcript.contains("direct deliverable") {
+                // Simulate a hang beyond the node timeout.
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+            if transcript.contains("hierarchical task planner") {
+                if transcript.contains("ROOT TASK") {
+                    return Ok(serde_json::json!({
+                        "mode": "delegate",
+                        "children": [
+                            {"task": "subtask A", "role_name": "a"},
+                            {"task": "subtask B", "role_name": "b"}
+                        ]
+                    })
+                    .to_string());
+                }
+                return Ok(serde_json::json!({"mode":"answer","answer":""}).to_string());
+            }
+            if transcript.contains("Merge child results") {
+                return Ok("partial-merged".to_string());
+            }
+            Ok("answer-A".to_string())
+        }
+        fn model_name(&self) -> Option<&str> {
+            Some("timeout-b")
+        }
+    }
+
+    let settings = xiaomaolv::service::swarm::AgentSwarmSettings {
+        max_node_timeout_ms: 50,
+        ..Default::default()
+    };
+    let (engine, goal) = durable_swarm_engine(Arc::new(TimeoutB), settings).await;
+    let report = engine.resume_goal(&goal.id, "operator:test").await?;
+    let b_item = report
+        .work_items
+        .iter()
+        .find(|item| item.step_id == "root.c2")
+        .expect("subtask B item");
+    assert_eq!(b_item.status, WorkItemStatus::Succeeded);
+    let b_outcome = engine
+        .work_item_outcome(&b_item.id)
+        .await?
+        .expect("B outcome");
+    assert_eq!(b_outcome.evidence["status"], "timeout");
+    let agg = report
+        .work_items
+        .iter()
+        .find(|item| item.step_id == "root.agg")
+        .expect("aggregate");
+    let agg_outcome = engine
+        .work_item_outcome(&agg.id)
+        .await?
+        .expect("aggregate outcome");
+    assert_eq!(agg_outcome.summary, "partial-merged");
+    assert_eq!(agg_outcome.evidence["status"], "partial");
+    Ok(())
+}
+
+/// The approved `max_nodes` budget rejecting a delegation is not fatal —
+/// the node falls back to answering directly.
+#[tokio::test]
+async fn durable_swarm_extension_budget_rejection_answers_directly() -> anyhow::Result<()> {
+    struct DelegateThenAnswer;
+    #[async_trait]
+    impl ChatProvider for DelegateThenAnswer {
+        async fn complete(&self, req: CompletionRequest) -> anyhow::Result<String> {
+            let transcript = req
+                .messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if transcript.contains("hierarchical task planner") {
+                return Ok(serde_json::json!({
+                    "mode": "delegate",
+                    "children": [{"task": "child", "role_name": "r"}]
+                })
+                .to_string());
+            }
+            Ok("direct-root-answer".to_string())
+        }
+        fn model_name(&self) -> Option<&str> {
+            Some("budget")
+        }
+    }
+
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let actor = "internal:swarm";
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "ROOT".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            actor,
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![WorkflowStep {
+                        id: "root".to_string(),
+                        handler: "swarm_node".to_string(),
+                        effect: EffectClass::LocalWrite,
+                        input: serde_json::json!({
+                            "swarm_root": true,
+                            // Budget for exactly the root — any extension is
+                            // rejected.
+                            "max_nodes": 1,
+                            "swarm_run_id": "t",
+                            "task": "ROOT",
+                            "depth": 0,
+                            "history": [],
+                        }),
+                        retry: RetryPolicy {
+                            max_attempts: 2,
+                            backoff_secs: 0,
+                        },
+                    }],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 0,
+                        deadline_secs: 60,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+                    label: "review".to_string(),
+                }],
+            },
+            actor,
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            actor,
+        )
+        .await?;
+    let mut registry = WorkHandlerRegistry::default();
+    registry.register(Arc::new(xiaomaolv::service::swarm::SwarmNodeHandler::new(
+        Arc::new(DelegateThenAnswer),
+        xiaomaolv::service::swarm::AgentSwarmSettings::default(),
+    )))?;
+    let worker = LoopWorker::with_registry(engine.clone(), registry, "swarm:t", 30)?;
+    let _ = worker.run_goal_until_idle(&goal.id, 8).await;
+    let report = engine.resume_goal(&goal.id, "operator:test").await?;
+    assert_eq!(report.work_items.len(), 1, "extension must be rejected");
+    let root = &report.work_items[0];
+    assert_eq!(root.status, WorkItemStatus::Succeeded);
+    let outcome = engine.work_item_outcome(&root.id).await?.expect("outcome");
+    assert_eq!(outcome.evidence["answer"], "direct-root-answer");
+    Ok(())
+}
+
+/// Depth at the limit skips the planner call entirely — the node answers
+/// directly (no LLM decide, no children).
+#[tokio::test]
+async fn durable_swarm_depth_limit_forces_direct_answer() -> anyhow::Result<()> {
+    struct CountingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl ChatProvider for CountingProvider {
+        async fn complete(&self, _req: CompletionRequest) -> anyhow::Result<String> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok("depth-forced-answer".to_string())
+        }
+        fn model_name(&self) -> Option<&str> {
+            Some("counting")
+        }
+    }
+    let provider = Arc::new(CountingProvider {
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let calls = provider.calls.clone();
+
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let actor = "internal:swarm";
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "ROOT".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            actor,
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![WorkflowStep {
+                        id: "deep".to_string(),
+                        handler: "swarm_node".to_string(),
+                        effect: EffectClass::LocalWrite,
+                        input: serde_json::json!({
+                            "task": "deep task",
+                            "depth": 99,
+                            "history": [],
+                        }),
+                        retry: RetryPolicy {
+                            max_attempts: 2,
+                            backoff_secs: 0,
+                        },
+                    }],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 0,
+                        deadline_secs: 60,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+                    label: "review".to_string(),
+                }],
+            },
+            actor,
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            actor,
+        )
+        .await?;
+    let mut registry = WorkHandlerRegistry::default();
+    registry.register(Arc::new(xiaomaolv::service::swarm::SwarmNodeHandler::new(
+        provider,
+        xiaomaolv::service::swarm::AgentSwarmSettings::default(),
+    )))?;
+    let worker = LoopWorker::with_registry(engine.clone(), registry, "swarm:t", 30)?;
+    // ManualApproval parks the finished goal in `verifying` — assert the
+    // durable state directly.
+    let _ = worker.run_goal_until_idle(&goal.id, 4).await;
+    let report = engine.resume_goal(&goal.id, "operator:test").await?;
+    // Exactly one provider call (the answer leg — no planner, no merge).
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    let outcome = engine
+        .work_item_outcome(&report.work_items[0].id)
+        .await?
+        .expect("outcome");
+    assert_eq!(outcome.evidence["answer"], "depth-forced-answer");
+    Ok(())
+}
+
+/// Service-level durable run: handle_swarm drives the projected goal
+/// end-to-end — activation, delegation, aggregation, terminal artifact —
+/// and the goal verifies to `achieved` via the published analysis_report.
+#[tokio::test]
+async fn durable_swarm_service_run_achieves_goal_via_artifact() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!(
+        "sqlite://{}",
+        temp.path().join("swarm-durable.db").display()
+    );
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(
+        memory.clone(),
+    ))));
+    let provider = Arc::new(SwarmQueueProvider {
+        replies: Mutex::new(VecDeque::from([
+            "{\"use_swarm\":true}".to_string(),
+            "{\"mode\":\"delegate\",\"children\":[{\"task\":\"outline frontend work\",\"role_name\":\"frontend\"},{\"task\":\"outline backend work\",\"role_name\":\"backend\"}]}".to_string(),
+            "{\"mode\":\"answer\",\"answer\":\"frontend plan\"}".to_string(),
+            "{\"mode\":\"answer\",\"answer\":\"backend plan\"}".to_string(),
+            "merged swarm answer".to_string(),
+        ])),
+    });
+    let service = MessageService::new(provider, memory, 8)
+        // durable_engine defaults to true — this test exercises the real
+        // production path end to end.
+        .with_agent_swarm(AgentSwarmSettings {
+            enabled: true,
+            auto_detect: true,
+            reply_summary_enabled: false,
+            ..Default::default()
+        })
+        .with_loop_engine(Some(engine.clone()));
+
+    let reply = service
+        .handle(IncomingMessage {
+            channel: "telegram".to_string(),
+            session_id: "tg:1".to_string(),
+            user_id: "42".to_string(),
+            text: "请拆分前后端任务并协作完成".to_string(),
+            reply_target: None,
+        })
+        .await?;
+    assert!(reply.text.contains("merged swarm answer"));
+
+    let goals = engine.list_goals(10).await?;
+    assert_eq!(goals.len(), 1);
+    let goal = &goals[0];
+    assert_eq!(goal.created_by, "internal:swarm");
+    // The aggregate published the analysis_report artifact → acceptance
+    // criterion satisfied → goal achieved without operator involvement.
+    assert_eq!(goal.status, GoalStatus::Achieved);
+
+    let resumed = engine.resume_goal(&goal.id, "operator:test").await?;
+    // root + c1 + c2 + agg
+    assert_eq!(resumed.work_items.len(), 4);
+    assert!(
+        resumed
+            .work_items
+            .iter()
+            .all(|item| item.status == WorkItemStatus::Succeeded)
+    );
+    let artifacts = engine.list_artifacts(10).await?;
+    assert!(
+        artifacts
+            .iter()
+            .any(|a| a.name.starts_with("swarm-") && a.kind == ArtifactKind::AnalysisReport),
+        "terminal artifact published"
     );
     Ok(())
 }
