@@ -205,9 +205,11 @@ async function goalsList() {
     <table><tr><th>id</th><th>status</th><th>rev</th><th>objective</th><th>updated</th></tr>${rows || `<tr><td colspan="5" class="muted">none</td></tr>`}</table>`;
 }
 async function goalDetail(id) {
-  const [g, wi] = await Promise.all([
+  const [g, wi, at, ck] = await Promise.all([
     api("/v1/harness/goals/" + encodeURIComponent(id)),
     api(`/v1/harness/goals/${encodeURIComponent(id)}/work-items`).catch(() => ({ work_items: [] })),
+    api(`/v1/harness/goals/${encodeURIComponent(id)}/attempts`).catch(() => ({ attempts: [] })),
+    api(`/v1/harness/goals/${encodeURIComponent(id)}/checkpoints`).catch(() => ({ checkpoints: [] })),
   ]);
   const plan = g.plan;
   const parked = (wi.work_items || []).filter((w) => w.status === "waiting_confirmation");
@@ -227,6 +229,24 @@ async function goalDetail(id) {
     (wi.work_items || []).map((w) => `
       <tr><td>${esc(w.step_id)}</td><td class="muted">${esc(w.handler)}</td>
       <td>${esc(w.effect)}</td><td>${chip(w.status)}</td></tr>`).join("") +
+    `</table>` : "";
+  const atHtml = (at.attempts || []).length ? `<h2>attempts</h2>
+    <table><tr><th>item</th><th>#</th><th>status</th><th>worker</th><th>fence</th><th>error</th></tr>` +
+    (at.attempts || []).map((a) => `
+      <tr><td class="muted small">${esc(short(a.work_item_id))}</td>
+      <td>${esc(String(a.attempt_number))}</td><td>${chip(a.status)}</td>
+      <td class="muted small">${esc(a.worker_id)}</td>
+      <td class="muted">${esc(String(a.fencing_token))}</td>
+      <td class="muted small">${esc((a.error || "").slice(0, 80))}</td></tr>`).join("") +
+    `</table>` : "";
+  const ckHtml = (ck.checkpoints || []).length ? `<h2>checkpoints</h2>
+    <table><tr><th>item</th><th>phase</th><th>idempotency</th><th>replay_safe</th><th>outcome</th></tr>` +
+    (ck.checkpoints || []).map((c) => `
+      <tr><td class="muted small">${esc(short(c.work_item_id))}</td>
+      <td>${chip(c.phase)}</td>
+      <td class="muted small">${esc(c.idempotency_key.slice(0, 32))}</td>
+      <td>${esc(String(c.replay_safe))}</td>
+      <td class="muted small">${esc((c.outcome?.summary || "").slice(0, 90))}</td></tr>`).join("") +
     `</table>` : "";
   let planHtml = "";
   if (plan) {
@@ -261,12 +281,22 @@ async function goalDetail(id) {
       <input id="verifyLabel" placeholder="verify label" />
       <button data-act="verify">manual verify</button>
     </div>
+    <div class="toolbar">
+      <input id="lifeReason" placeholder="reason (cancel/reject/replan)" />
+      <button data-act="pause">pause</button>
+      <button data-act="unpause">unpause</button>
+      <button data-act="reject">reject</button>
+      <button data-act="replan">replan</button>
+      <button data-act="cancel" class="danger">cancel</button>
+    </div>
     <details><summary class="muted small">submit plan (JSON)</summary>
       <textarea id="planJson">${esc(pretty(planTemplate(g.objective)))}</textarea>
       <button data-act="plan">POST plan</button></details>
     ${planHtml}
     ${parkedHtml}
     ${wiHtml}
+    ${atHtml}
+    ${ckHtml}
     <h2>events</h2>
     <div class="toolbar">
       <button data-act="events">load events</button>
@@ -698,6 +728,15 @@ async function act(id, action, btn) {
   btn.disabled = true;
   try {
     switch (action) {
+      case "pause": case "unpause": case "reject": case "replan": case "cancel": {
+        const reason = ($("#lifeReason")?.value.trim() || (action === "cancel" ? "console cancel" : ""));
+        if (["reject", "replan", "cancel"].includes(action) && !reason)
+          return (btn.disabled = false, toast(`${action} needs a reason`, true));
+        await api(`/v1/harness/goals/${encodeURIComponent(id)}/${action}`, {
+          method: "POST", body: { reason: reason || "console" },
+        });
+        toast(action + " ok"); break;
+      }
       case "approve": {
         const g = await api("/v1/harness/goals/" + encodeURIComponent(id));
         await api(`/v1/harness/goals/${encodeURIComponent(id)}/approve`, {
