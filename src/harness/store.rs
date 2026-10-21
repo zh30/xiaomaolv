@@ -8,7 +8,7 @@ use tracing::warn;
 use crate::harness::evolution::{
     ABSOLUTE_MAX_PROMPT_PATCH_CHARS, ActiveEvolutionPolicy, EvolutionAuditEvent,
     EvolutionCandidateDraft, EvolutionCandidateRecord, EvolutionCandidateStatus,
-    EvolutionDeploymentRecord, EvolutionEvalCase, EvolutionEvaluationDraft,
+    EvolutionDeploymentRecord, EvolutionEvalCase, EvolutionEvalRun, EvolutionEvaluationDraft,
     EvolutionEvaluationRecord, EvolutionFeedbackDraft, EvolutionFeedbackRecord,
     EvolutionPromotionDecision, EvolutionRollbackResult, MAX_ENABLED_EVOLUTION_EVAL_CASES,
     PromptPatch,
@@ -375,6 +375,23 @@ pub trait EvolutionStore: Send + Sync {
         negative_only: bool,
         limit: usize,
     ) -> anyhow::Result<Vec<EvolutionFeedbackRecord>>;
+
+    /// Upserts the durable shadow-evaluation cursor for a candidate —
+    /// creating a run replaces any stale in-flight run for the same
+    /// candidate so a retried evaluation starts clean.
+    async fn upsert_eval_run(&self, _run: &EvolutionEvalRun) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn get_eval_run(&self, _candidate_id: &str) -> anyhow::Result<Option<EvolutionEvalRun>> {
+        Ok(None)
+    }
+
+    /// Drops the evaluation cursor once the suite finalized (or is being
+    /// restarted).
+    async fn clear_eval_run(&self, _candidate_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     async fn activate_candidate(
         &self,
@@ -951,6 +968,61 @@ impl EvolutionStore for SqliteEvolutionStore {
         rows.into_iter().map(feedback_from_row).collect()
     }
 
+    async fn upsert_eval_run(&self, run: &EvolutionEvalRun) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO evolution_eval_runs
+             (id, candidate_id, cases_json, benchmark_tail, baseline_json,
+              case_index, baseline_outputs_json, candidate_outputs_json,
+              response_bytes, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, unixepoch())
+             ON CONFLICT(candidate_id) DO UPDATE SET
+              id = excluded.id, cases_json = excluded.cases_json,
+              benchmark_tail = excluded.benchmark_tail,
+              baseline_json = excluded.baseline_json,
+              case_index = excluded.case_index,
+              baseline_outputs_json = excluded.baseline_outputs_json,
+              candidate_outputs_json = excluded.candidate_outputs_json,
+              response_bytes = excluded.response_bytes,
+              updated_at = unixepoch()",
+        )
+        .bind(&run.id)
+        .bind(&run.candidate_id)
+        .bind(serde_json::to_string(&run.cases)?)
+        .bind(run.benchmark_tail as i64)
+        .bind(serde_json::to_string(&run.baseline)?)
+        .bind(run.case_index as i64)
+        .bind(serde_json::to_string(&run.baseline_outputs)?)
+        .bind(serde_json::to_string(&run.candidate_outputs)?)
+        .bind(run.response_bytes as i64)
+        .execute(self.store.pool())
+        .await
+        .context("failed to persist evolution eval run")?;
+        Ok(())
+    }
+
+    async fn get_eval_run(&self, candidate_id: &str) -> anyhow::Result<Option<EvolutionEvalRun>> {
+        let row = sqlx::query(
+            "SELECT id, candidate_id, cases_json, benchmark_tail, baseline_json,
+                    case_index, baseline_outputs_json, candidate_outputs_json,
+                    response_bytes
+             FROM evolution_eval_runs WHERE candidate_id = ?1",
+        )
+        .bind(candidate_id)
+        .fetch_optional(self.store.pool())
+        .await
+        .context("failed to load evolution eval run")?;
+        row.map(eval_run_from_row).transpose()
+    }
+
+    async fn clear_eval_run(&self, candidate_id: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM evolution_eval_runs WHERE candidate_id = ?1")
+            .bind(candidate_id)
+            .execute(self.store.pool())
+            .await
+            .context("failed to clear evolution eval run")?;
+        Ok(())
+    }
+
     async fn activate_candidate(
         &self,
         candidate_id: &str,
@@ -1421,6 +1493,31 @@ fn feedback_from_row(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<EvolutionFe
         comment: row.get("comment"),
         actor: row.get("actor"),
         created_at: evolution_timestamp(row.get("created_at")),
+    })
+}
+
+fn eval_run_from_row(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<EvolutionEvalRun> {
+    let cases_json: String = row.get("cases_json");
+    let baseline_json: String = row.get("baseline_json");
+    let baseline_outputs_json: String = row.get("baseline_outputs_json");
+    let candidate_outputs_json: String = row.get("candidate_outputs_json");
+    let benchmark_tail: i64 = row.get("benchmark_tail");
+    let case_index: i64 = row.get("case_index");
+    let response_bytes: i64 = row.get("response_bytes");
+    Ok(EvolutionEvalRun {
+        id: row.get("id"),
+        candidate_id: row.get("candidate_id"),
+        cases: serde_json::from_str(&cases_json).context("failed to deserialize eval run cases")?,
+        benchmark_tail: usize::try_from(benchmark_tail).context("invalid benchmark tail")?,
+        baseline: serde_json::from_str(&baseline_json)
+            .context("failed to deserialize eval run baseline")?,
+        case_index: usize::try_from(case_index).context("invalid eval run case index")?,
+        baseline_outputs: serde_json::from_str(&baseline_outputs_json)
+            .context("failed to deserialize eval run baseline outputs")?,
+        candidate_outputs: serde_json::from_str(&candidate_outputs_json)
+            .context("failed to deserialize eval run candidate outputs")?,
+        response_bytes: usize::try_from(response_bytes)
+            .context("invalid eval run response bytes")?,
     })
 }
 

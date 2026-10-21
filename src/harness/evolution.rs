@@ -42,7 +42,7 @@ const RESERVED_HARNESS_MARKERS: &[&str] = &[
     "MCP_TOOLS_JSON",
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct PromptPatch(String);
 
@@ -661,6 +661,51 @@ impl EvolutionFeedbackDraft {
     }
 }
 
+/// Durable cursor for an in-flight shadow evaluation. The frozen suite and
+/// baseline keep an evaluation self-consistent even when the operator
+/// enables new cases or a new deployment lands mid-run; `case_index` and the
+/// output maps commit per case so a crash resumes mid-suite.
+#[derive(Debug, Clone)]
+pub struct EvolutionEvalRun {
+    pub id: String,
+    pub candidate_id: String,
+    /// Frozen ordered suite: operator cases first, then benchmark cases.
+    pub cases: Vec<EvolutionEvalCase>,
+    /// How many trailing `cases` entries came from the benchmark suite.
+    pub benchmark_tail: usize,
+    /// Frozen active policy `(candidate_id, deployment_id, patch)` at run
+    /// start — `None` evaluates against the unpatched baseline.
+    pub baseline: Option<(String, String, PromptPatch)>,
+    pub case_index: usize,
+    pub baseline_outputs: std::collections::BTreeMap<String, String>,
+    pub candidate_outputs: std::collections::BTreeMap<String, String>,
+    pub response_bytes: usize,
+}
+
+/// Committed per-case outputs fed to the scorer at finalization — kept as
+/// one struct so `finalize_shadow_evaluation` stays readable.
+struct ShadowEvalOutputs {
+    baseline_outputs: BTreeMap<String, String>,
+    candidate_outputs: BTreeMap<String, String>,
+    baseline_candidate_id: Option<String>,
+    response_bytes: usize,
+}
+
+/// Outcome of one `run_evaluation_step` call: either more cases remain, or
+/// the suite finished and the evaluation was recorded.
+#[derive(Debug)]
+pub enum EvalStepOutcome {
+    Progress {
+        completed_cases: usize,
+        total_cases: usize,
+        response_bytes: usize,
+    },
+    Completed {
+        evaluation: Box<EvolutionEvaluationRecord>,
+        response_bytes: usize,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct EvolutionFeedbackRecord {
     pub id: i64,
@@ -1249,11 +1294,35 @@ impl EvolutionEngine {
             candidate_outputs.insert(case.id.clone(), candidate_output);
         }
 
-        let scorecard = EvolutionScorer::score_with_benchmark(
+        self.finalize_shadow_evaluation(
+            candidate,
             &cases,
             benchmark_suite.as_ref(),
-            &baseline_outputs,
-            &candidate_outputs,
+            ShadowEvalOutputs {
+                baseline_outputs,
+                candidate_outputs,
+                baseline_candidate_id: active.map(|policy| policy.candidate_id),
+                response_bytes,
+            },
+        )
+        .await
+    }
+
+    /// Scores committed case outputs, records the evaluation, and moves the
+    /// candidate out of `evaluating` — shared tail of the monolithic and
+    /// resumable evaluation paths.
+    async fn finalize_shadow_evaluation(
+        &self,
+        candidate: &EvolutionCandidateRecord,
+        cases: &[EvolutionEvalCase],
+        benchmark_suite: Option<&EvolutionBenchmarkSuite>,
+        outputs: ShadowEvalOutputs,
+    ) -> anyhow::Result<(EvolutionEvaluationRecord, usize)> {
+        let scorecard = EvolutionScorer::score_with_benchmark(
+            cases,
+            benchmark_suite,
+            &outputs.baseline_outputs,
+            &outputs.candidate_outputs,
         )?;
         let decision = self.gate_config.decide(&scorecard);
         let evaluation = self
@@ -1261,7 +1330,7 @@ impl EvolutionEngine {
             .record_evaluation(EvolutionEvaluationDraft {
                 id: new_evolution_id("evaluation"),
                 candidate_id: candidate.id.clone(),
-                baseline_candidate_id: active.map(|policy| policy.candidate_id),
+                baseline_candidate_id: outputs.baseline_candidate_id,
                 scorecard,
                 decision: decision.clone(),
                 gate_config: self.gate_config.clone(),
@@ -1294,7 +1363,223 @@ impl EvolutionEngine {
                 details,
             )
             .await?;
-        Ok((evaluation, response_bytes))
+        Ok((evaluation, outputs.response_bytes))
+    }
+
+    /// Advances a durable shadow-evaluation run by exactly one case. The
+    /// loop-engine `evolution_evaluate` handler drives this per phase: the
+    /// first call freezes the suite and baseline into a committed run row,
+    /// each call appends one case's outputs, and the last call finalizes and
+    /// clears the cursor. A crashed attempt resumes at `case_index`.
+    pub async fn run_evaluation_step(
+        &self,
+        candidate_id: &str,
+        max_response_bytes: usize,
+        deadline: Option<tokio::time::Instant>,
+    ) -> anyhow::Result<EvalStepOutcome> {
+        ensure!(
+            max_response_bytes > 0,
+            "evolution response byte budget must be positive"
+        );
+        let _evaluation_guard = self.evaluation_lock.lock().await;
+        let mut run = match self.store.get_eval_run(candidate_id).await? {
+            Some(run) => run,
+            None => {
+                let candidate =
+                    self.store
+                        .get_candidate(candidate_id)
+                        .await?
+                        .with_context(|| {
+                            format!("evolution candidate '{candidate_id}' does not exist")
+                        })?;
+                if candidate.status == EvolutionCandidateStatus::Evaluating {
+                    // A crashed evaluation left the candidate parked without a
+                    // run cursor — reset it to failed so a fresh run starts.
+                    self.store
+                        .transition_candidate(
+                            candidate_id,
+                            EvolutionCandidateStatus::Evaluating,
+                            EvolutionCandidateStatus::Failed,
+                            "system:evolution-engine",
+                            serde_json::json!({"error": "stale evaluation reset"}),
+                        )
+                        .await?;
+                }
+                let candidate = if candidate.status == EvolutionCandidateStatus::Evaluating {
+                    self.store
+                        .get_candidate(candidate_id)
+                        .await?
+                        .context("candidate disappeared mid-reset")?
+                } else {
+                    candidate
+                };
+                let expected_status = match candidate.status {
+                    EvolutionCandidateStatus::Draft
+                    | EvolutionCandidateStatus::Ready
+                    | EvolutionCandidateStatus::Rejected
+                    | EvolutionCandidateStatus::Failed
+                    | EvolutionCandidateStatus::Approved => candidate.status,
+                    status => bail!(
+                        "candidate '{candidate_id}' cannot be evaluated from status '{}'",
+                        status.as_str()
+                    ),
+                };
+                let operator_cases = self.store.list_eval_cases(true).await?;
+                if let Some(suite) = &self.benchmark_suite {
+                    for bench_case in &suite.cases {
+                        ensure!(
+                            !operator_cases.iter().any(|case| case.id == bench_case.id),
+                            "benchmark case id '{}' collides with an operator eval case",
+                            bench_case.id
+                        );
+                    }
+                }
+                let benchmark_tail = self
+                    .benchmark_suite
+                    .as_ref()
+                    .map(|suite| suite.cases.len())
+                    .unwrap_or(0);
+                let all_cases: Vec<EvolutionEvalCase> = operator_cases
+                    .iter()
+                    .cloned()
+                    .chain(
+                        self.benchmark_suite
+                            .iter()
+                            .flat_map(|suite| suite.cases.iter().cloned()),
+                    )
+                    .collect();
+                ensure!(!all_cases.is_empty(), "evolution eval suite is empty");
+                let baseline = self.policy_runtime.active().await.map(|policy| {
+                    (
+                        policy.candidate_id.clone(),
+                        policy.deployment_id.clone(),
+                        policy.prompt_patch.clone(),
+                    )
+                });
+                self.store
+                    .transition_candidate(
+                        candidate_id,
+                        expected_status,
+                        EvolutionCandidateStatus::Evaluating,
+                        "system:evolution-engine",
+                        serde_json::json!({"model": self.provider.model_name()}),
+                    )
+                    .await?;
+                let run = EvolutionEvalRun {
+                    id: new_evolution_id("evalrun"),
+                    candidate_id: candidate_id.to_string(),
+                    cases: all_cases,
+                    benchmark_tail,
+                    baseline,
+                    case_index: 0,
+                    baseline_outputs: BTreeMap::new(),
+                    candidate_outputs: BTreeMap::new(),
+                    response_bytes: 0,
+                };
+                self.store.upsert_eval_run(&run).await?;
+                run
+            }
+        };
+        let candidate = self
+            .store
+            .get_candidate(candidate_id)
+            .await?
+            .with_context(|| format!("evolution candidate '{candidate_id}' does not exist"))?;
+        let case = run
+            .cases
+            .get(run.case_index)
+            .context("eval run case index out of range")?;
+        let baseline_policy = run
+            .baseline
+            .as_ref()
+            .map(|(candidate_id, deployment_id, patch)| {
+                (candidate_id.as_str(), deployment_id.as_str(), patch)
+            });
+        let baseline = self
+            .shadow_complete_with_deadline(case, baseline_policy, deadline)
+            .await
+            .with_context(|| format!("baseline eval case '{}' failed", case.id))?;
+        run.response_bytes = run
+            .response_bytes
+            .checked_add(baseline.len())
+            .context("evolution response byte count overflowed")?;
+        ensure!(
+            run.response_bytes <= max_response_bytes,
+            "evolution response byte budget exceeded"
+        );
+        let candidate_output = self
+            .shadow_complete_with_deadline(
+                case,
+                Some((
+                    candidate.id.as_str(),
+                    "shadow-evaluation",
+                    &candidate.prompt_patch,
+                )),
+                deadline,
+            )
+            .await
+            .with_context(|| format!("candidate eval case '{}' failed", case.id))?;
+        run.response_bytes = run
+            .response_bytes
+            .checked_add(candidate_output.len())
+            .context("evolution response byte count overflowed")?;
+        ensure!(
+            run.response_bytes <= max_response_bytes,
+            "evolution response byte budget exceeded"
+        );
+        run.baseline_outputs.insert(case.id.clone(), baseline);
+        run.candidate_outputs
+            .insert(case.id.clone(), candidate_output);
+        run.case_index += 1;
+
+        if run.case_index < run.cases.len() {
+            let outcome = EvalStepOutcome::Progress {
+                completed_cases: run.case_index,
+                total_cases: run.cases.len(),
+                response_bytes: run.response_bytes,
+            };
+            self.store.upsert_eval_run(&run).await?;
+            return Ok(outcome);
+        }
+
+        let operator_len = run.cases.len() - run.benchmark_tail;
+        let benchmark_suite = if run.benchmark_tail > 0 {
+            self.benchmark_suite
+                .as_ref()
+                .map(|suite| EvolutionBenchmarkSuite {
+                    id: suite.id.clone(),
+                    version: suite.version.clone(),
+                    cases: run.cases[operator_len..].to_vec(),
+                })
+        } else {
+            None
+        };
+        let finalized = self
+            .finalize_shadow_evaluation(
+                &candidate,
+                &run.cases[..operator_len],
+                benchmark_suite.as_ref(),
+                ShadowEvalOutputs {
+                    baseline_outputs: run.baseline_outputs,
+                    candidate_outputs: run.candidate_outputs,
+                    baseline_candidate_id: run
+                        .baseline
+                        .as_ref()
+                        .map(|(candidate_id, ..)| candidate_id.clone()),
+                    response_bytes: run.response_bytes,
+                },
+            )
+            .await;
+        match finalized {
+            Ok((evaluation, response_bytes)) => {
+                self.store.clear_eval_run(candidate_id).await?;
+                Ok(EvalStepOutcome::Completed {
+                    evaluation: Box::new(evaluation),
+                    response_bytes,
+                })
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn shadow_complete_with_deadline(
