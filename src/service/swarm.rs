@@ -1500,21 +1500,39 @@ impl SwarmNodeHandler {
         self
     }
 
-    /// Model call with the per-node timeout; returns the same error kind the
-    /// in-process runner uses.
+    /// Model call under the goal's declared budget: each call reserves one
+    /// provider-call slot and caps the node timeout at the goal deadline —
+    /// `max_provider_calls`/`deadline_secs`/`max_response_bytes` are real
+    /// limits for swarm nodes, not just plan metadata. Budget exhaustion or
+    /// deadline overrun surfaces as a node-level failure (the item still
+    /// succeeds; the aggregate merges partial results).
     async fn complete(
         &self,
+        ctx: &WorkHandlerContext,
         messages: Vec<StoredMessage>,
         json_mode: bool,
         trajectory: &mut SwarmNodeTrajectory<'_>,
     ) -> Result<String, SwarmModelError> {
+        let reservation = ctx
+            .engine
+            .reserve_provider_call(&ctx.claim.attempt.goal_id)
+            .await
+            .map_err(SwarmModelError::Failure)?;
         let request = if json_mode {
             CompletionRequest::json(messages.clone())
         } else {
             CompletionRequest::from_messages(messages.clone())
         };
+        let deadline_ms = (reservation.deadline_at_unix - current_unix_timestamp_i64())
+            .max(1)
+            .saturating_mul(1000);
+        let node_timeout_ms = self
+            .settings
+            .max_node_timeout_ms
+            .max(1)
+            .min(deadline_ms.max(1) as u64);
         let result = match timeout(
-            Duration::from_millis(self.settings.max_node_timeout_ms.max(1)),
+            Duration::from_millis(node_timeout_ms),
             self.provider.complete(request),
         )
         .await
@@ -1524,6 +1542,16 @@ impl SwarmNodeHandler {
             Err(_) => Err(SwarmModelError::Timeout),
         };
         if let Ok(reply) = &result {
+            if let Err(error) = ctx
+                .engine
+                .record_provider_response_bytes(
+                    &ctx.claim.attempt.goal_id,
+                    u32::try_from(reply.len()).unwrap_or(u32::MAX),
+                )
+                .await
+            {
+                warn!(error = %error, "swarm node response accounting failed");
+            }
             trajectory
                 .log_frame(messages, json_mode, reply, self.provider.model_name())
                 .await;
@@ -1554,7 +1582,7 @@ impl SwarmNodeHandler {
                 role_name,
                 role_definition,
             );
-            match self.complete(messages, false, traj).await {
+            match self.complete(ctx, messages, false, traj).await {
                 Ok(answer) => swarm_node_outcome(&answer, "success", input),
                 Err(SwarmModelError::Timeout) => swarm_node_outcome("", "timeout", input),
                 Err(SwarmModelError::Failure(err)) => {
@@ -1647,6 +1675,7 @@ impl SwarmNodeHandler {
         }
         let merged = match self
             .complete(
+                ctx,
                 build_swarm_merge_messages(&input.history, &input.task, role_name, &child_json),
                 false,
                 traj,
@@ -1775,7 +1804,7 @@ impl SwarmNodeHandler {
                 input.depth,
                 self.settings.max_depth,
             );
-            match self.complete(planner_messages, true, traj).await {
+            match self.complete(ctx, planner_messages, true, traj).await {
                 Ok(reply) => {
                     if let Some(value) = parse_flexible_json_value(&reply)
                         && let Ok(plan) = serde_json::from_value::<SwarmNodePlanEnvelope>(value)
