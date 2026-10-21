@@ -3960,3 +3960,85 @@ async fn delayed_continuation_does_not_consume_the_attempt_budget() -> anyhow::R
     assert_eq!(outcome.evidence["resumed"], true);
     Ok(())
 }
+
+/// Orphaned audit rows: a crash leaves `agent_swarm_runs.status = running`
+/// while its durable goal is already terminal. The janitor mirrors the
+/// final DAG and closes the row; a live or goal-less run is untouched.
+#[tokio::test]
+async fn orphan_janitor_closes_runs_whose_goal_is_terminal() -> anyhow::Result<()> {
+    let temp = tempdir()?;
+    let database_url = format!("sqlite://{}", temp.path().join("swarm-orphan.db").display());
+    let memory = SqliteMemoryStore::new(&database_url).await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(
+        memory.clone(),
+    ))));
+    let provider = Arc::new(SwarmQueueProvider {
+        replies: Mutex::new(VecDeque::from([
+            "{\"use_swarm\":true}".to_string(),
+            "{\"mode\":\"answer\",\"answer\":\"done it\"}".to_string(),
+        ])),
+    });
+    let service = MessageService::new(provider, memory.clone(), 8)
+        .with_agent_swarm(AgentSwarmSettings {
+            enabled: true,
+            auto_detect: true,
+            reply_summary_enabled: false,
+            max_parallel: 1,
+            ..Default::default()
+        })
+        .with_loop_engine(Some(engine.clone()));
+    let _ = service
+        .handle(IncomingMessage {
+            channel: "telegram".to_string(),
+            session_id: "tg:1".to_string(),
+            user_id: "42".to_string(),
+            text: "拆分前后端任务".to_string(),
+            reply_target: None,
+        })
+        .await?;
+
+    // Find the run + goal; simulate a crash-orphan by flipping the row back
+    // to running (as if the process died before finish_agent_swarm_run).
+    let runs = memory.list_agent_swarm_runs("telegram", None, 10).await?;
+    assert_eq!(runs.len(), 1);
+    let run = &runs[0];
+    memory
+        .finish_agent_swarm_run(xiaomaolv::memory::FinishAgentSwarmRunRequest {
+            run_id: run.run_id.clone(),
+            channel: run.channel.clone(),
+            status: xiaomaolv::memory::AgentSwarmRunStatus::Running,
+            finished_at_unix: 0,
+            error: None,
+        })
+        .await?;
+    let goal = engine
+        .get_goal_by_request_id(&format!("swarm:{}", run.run_id))
+        .await?
+        .expect("swarm goal");
+    assert_eq!(goal.status, GoalStatus::Achieved);
+
+    // A second, genuinely-live run: no matching goal at all.
+    memory
+        .create_agent_swarm_run(xiaomaolv::memory::CreateAgentSwarmRunRequest {
+            run_id: "run-live".to_string(),
+            channel: "telegram".to_string(),
+            session_id: "tg:2".to_string(),
+            user_id: "u".to_string(),
+            root_task: "still running".to_string(),
+            status: xiaomaolv::memory::AgentSwarmRunStatus::Running,
+            started_at_unix: 0,
+        })
+        .await?;
+
+    let reaped = service.reap_orphaned_swarm_runs().await?;
+    assert_eq!(reaped, 1);
+    let runs = memory.list_agent_swarm_runs("telegram", None, 10).await?;
+    let closed = runs.iter().find(|r| r.run_id == run.run_id).unwrap();
+    assert_eq!(
+        closed.status,
+        xiaomaolv::memory::AgentSwarmRunStatus::Completed
+    );
+    let live = runs.iter().find(|r| r.run_id == "run-live").unwrap();
+    assert_eq!(live.status, xiaomaolv::memory::AgentSwarmRunStatus::Running);
+    Ok(())
+}

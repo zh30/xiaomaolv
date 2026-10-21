@@ -577,6 +577,15 @@ impl LoopEngine {
         self.store.upstream_outcomes(work_item_id).await
     }
 
+    /// Goal lookup by the durable admission `request_id` — the idempotent
+    /// admission key stamped at creation.
+    pub async fn get_goal_by_request_id(
+        &self,
+        request_id: &str,
+    ) -> anyhow::Result<Option<GoalRecord>> {
+        self.store.get_goal_by_request_id(request_id).await
+    }
+
     /// The work item's own latest committed outcome — read-only.
     pub async fn work_item_outcome(
         &self,

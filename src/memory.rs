@@ -1600,6 +1600,29 @@ impl SqliteMemoryStore {
         Ok(())
     }
 
+    /// Runs still marked `running` — used by the orphan sweeper that closes
+    /// audit rows whose durable goal finished while the process was down.
+    pub async fn list_running_agent_swarm_runs(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<AgentSwarmRunRecord>> {
+        let rows = sqlx::query(
+            "SELECT r.run_id, r.channel, r.session_id, r.user_id, r.root_task, r.status,
+                    r.started_at_unix, r.finished_at_unix, r.error, r.created_at, r.updated_at,
+                    (SELECT COUNT(*)
+                       FROM agent_swarm_nodes n
+                      WHERE n.channel = r.channel AND n.run_id = r.run_id) AS agent_count
+             FROM agent_swarm_runs r
+             WHERE r.status = 'running'
+             ORDER BY r.started_at_unix ASC LIMIT ?1",
+        )
+        .bind(i64::try_from(limit).unwrap_or(64))
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list running agent swarm runs")?;
+        rows.into_iter().map(agent_swarm_run_from_row).collect()
+    }
+
     pub async fn list_agent_swarm_runs(
         &self,
         channel: &str,
@@ -3506,6 +3529,12 @@ pub trait MemoryBackend: Send + Sync {
     ) -> anyhow::Result<Vec<AgentSwarmRunRecord>> {
         Ok(vec![])
     }
+    async fn list_running_agent_swarm_runs(
+        &self,
+        _limit: usize,
+    ) -> anyhow::Result<Vec<AgentSwarmRunRecord>> {
+        Ok(vec![])
+    }
     async fn load_agent_swarm_tree(
         &self,
         _req: AgentSwarmTreeRequest,
@@ -3833,6 +3862,13 @@ impl MemoryBackend for SqliteMemoryBackend {
         self.store
             .list_agent_swarm_runs(&req.channel, req.user_id.as_deref(), req.limit)
             .await
+    }
+
+    async fn list_running_agent_swarm_runs(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<AgentSwarmRunRecord>> {
+        self.store.list_running_agent_swarm_runs(limit).await
     }
 
     async fn load_agent_swarm_tree(
@@ -4390,6 +4426,13 @@ impl MemoryBackend for HybridSqliteZvecMemoryBackend {
         self.store
             .list_agent_swarm_runs(&req.channel, req.user_id.as_deref(), req.limit)
             .await
+    }
+
+    async fn list_running_agent_swarm_runs(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<AgentSwarmRunRecord>> {
+        self.store.list_running_agent_swarm_runs(limit).await
     }
 
     async fn load_agent_swarm_tree(

@@ -52,6 +52,10 @@ pub trait LoopStore: Send + Sync {
 
     async fn get_goal(&self, goal_id: &str) -> anyhow::Result<Option<GoalRecord>>;
 
+    /// Goal lookup by the durable admission `request_id` — the idempotent
+    /// admission key stamped at creation.
+    async fn get_goal_by_request_id(&self, request_id: &str) -> anyhow::Result<Option<GoalRecord>>;
+
     async fn list_goals(&self, limit: usize) -> anyhow::Result<Vec<GoalRecord>>;
 
     async fn list_goal_events(
@@ -542,6 +546,10 @@ impl SqliteLoopStore {
 
 #[async_trait]
 impl LoopStore for SqliteLoopStore {
+    async fn get_goal_by_request_id(&self, request_id: &str) -> anyhow::Result<Option<GoalRecord>> {
+        SqliteLoopStore::get_goal_by_request_id(self, request_id).await
+    }
+
     async fn create_goal(
         &self,
         request: CreateGoalRequest,
