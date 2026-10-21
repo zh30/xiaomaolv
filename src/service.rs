@@ -231,6 +231,7 @@ pub struct MessageService {
     evolution_policy_runtime: Option<EvolutionPolicyRuntime>,
     evolution_store: Option<Arc<dyn crate::harness::store::EvolutionStore>>,
     telegram_admission_store: Option<Arc<dyn crate::memory::TelegramAdmissionStore>>,
+    telegram_outbound_store: Option<Arc<dyn crate::memory::TelegramOutboundStore>>,
 }
 
 struct CompletionOutcome {
@@ -338,6 +339,7 @@ impl MessageService {
             evolution_policy_runtime: None,
             evolution_store: None,
             telegram_admission_store: None,
+            telegram_outbound_store: None,
         }
     }
 
@@ -426,6 +428,17 @@ impl MessageService {
         store: Arc<dyn crate::memory::TelegramAdmissionStore>,
     ) -> Self {
         self.telegram_admission_store = Some(store);
+        self
+    }
+
+    /// Enables the outbound-message ledger: sent bot messages are bound to
+    /// the session + send time so a later reply-marker resolves the exact
+    /// run that produced the answered message.
+    pub fn with_telegram_outbound_store(
+        mut self,
+        store: Arc<dyn crate::memory::TelegramOutboundStore>,
+    ) -> Self {
+        self.telegram_outbound_store = Some(store);
         self
     }
 

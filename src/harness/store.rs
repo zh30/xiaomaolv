@@ -115,6 +115,17 @@ pub trait HarnessStore: Send + Sync {
         Ok(None)
     }
 
+    /// Most recent trajectory finished for exactly `session_id` at or before
+    /// `before_unix` — used by outbound-message binding to name the run that
+    /// produced a specific bot message.
+    async fn latest_finished_trajectory_before(
+        &self,
+        _session_id: &str,
+        _before_unix: i64,
+    ) -> anyhow::Result<Option<TrajectoryRecord>> {
+        Ok(None)
+    }
+
     /// The user input that started a run — extracted from the earliest
     /// captured provider request frame. Seeded eval cases default to it.
     async fn trajectory_first_user_input(
@@ -306,6 +317,16 @@ impl HarnessStore for SqliteHarnessStore {
     ) -> anyhow::Result<Option<TrajectoryRecord>> {
         self.store
             .latest_finished_trajectory(session_prefix, min_finished_unix)
+            .await
+    }
+
+    async fn latest_finished_trajectory_before(
+        &self,
+        session_id: &str,
+        before_unix: i64,
+    ) -> anyhow::Result<Option<TrajectoryRecord>> {
+        self.store
+            .latest_finished_trajectory_before(session_id, before_unix)
             .await
     }
 

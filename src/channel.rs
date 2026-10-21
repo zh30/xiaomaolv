@@ -298,23 +298,36 @@ impl TelegramSender {
         reply_to_message_id: Option<i64>,
         text: &str,
     ) -> anyhow::Result<()> {
+        self.send_message_with_ids(chat_id, message_thread_id, reply_to_message_id, text)
+            .await?;
+        Ok(())
+    }
+
+    /// Sends the full text (split into Telegram parts as needed) and returns
+    /// every sent message id — the binding anchors for later reply-markers.
+    pub async fn send_message_with_ids(
+        &self,
+        chat_id: i64,
+        message_thread_id: Option<i64>,
+        reply_to_message_id: Option<i64>,
+        text: &str,
+    ) -> anyhow::Result<Vec<i64>> {
         let parts = render_telegram_text_parts(text, TELEGRAM_MAX_TEXT_CHARS);
-        if parts.is_empty() {
-            return Ok(());
-        }
+        let mut ids = Vec::with_capacity(parts.len());
         for (idx, part) in parts.iter().enumerate() {
             let part_reply_to = if idx == 0 { reply_to_message_id } else { None };
-            let _ = self
-                .send_rendered_message_with_id(
+            ids.push(
+                self.send_rendered_message_with_id(
                     chat_id,
                     message_thread_id,
                     part_reply_to,
                     part,
                     None,
                 )
-                .await?;
+                .await?,
+            );
         }
-        Ok(())
+        Ok(ids)
     }
 
     pub async fn send_message_with_id(
