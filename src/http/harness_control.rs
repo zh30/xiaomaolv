@@ -66,6 +66,11 @@ pub(super) fn router() -> Router<AppState> {
             get(list_artifacts).post(post_artifact),
         )
         .route("/v1/harness/artifacts/{id}", get(get_artifact))
+        .route("/v1/harness/swarm-runs", get(list_swarm_runs))
+        .route(
+            "/v1/harness/swarm-runs/{run_id}/nodes",
+            get(get_swarm_run_nodes),
+        )
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +101,48 @@ struct ListQuery {
 
 fn default_list_limit() -> usize {
     100
+}
+
+#[derive(Debug, Deserialize)]
+struct SwarmRunQuery {
+    channel: String,
+    #[serde(default)]
+    user_id: Option<String>,
+    #[serde(default = "default_list_limit")]
+    limit: usize,
+}
+
+/// `/v1/harness/swarm-runs?channel=...` — the `/agents` audit table over
+/// HTTP, so the console and external dashboards see swarm runs.
+async fn list_swarm_runs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SwarmRunQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    operator_context(&state, &headers).await?;
+    let service = state.runtime.read().await.service.clone();
+    let runs = service
+        .list_agent_swarm_runs(query.channel.clone(), query.user_id, query.limit)
+        .await
+        .map_err(internal)?;
+    Ok(Json(serde_json::json!({"runs": runs})))
+}
+
+/// `/v1/harness/swarm-runs/{run_id}/nodes?channel=...` — per-node audit rows
+/// mirrored from the durable DAG.
+async fn get_swarm_run_nodes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(run_id): axum::extract::Path<String>,
+    Query(query): Query<SwarmRunQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    operator_context(&state, &headers).await?;
+    let service = state.runtime.read().await.service.clone();
+    let nodes = service
+        .load_agent_swarm_tree(query.channel.clone(), run_id)
+        .await
+        .map_err(internal)?;
+    Ok(Json(serde_json::json!({"nodes": nodes})))
 }
 
 async fn list_goals(

@@ -368,3 +368,34 @@ async fn work_item_confirmation_resolve_over_http() {
     .await
     .assert_status(axum::http::StatusCode::CONFLICT);
 }
+
+/// `/v1/harness/swarm-runs` + `/nodes` — the `/agents` audit surface over
+/// operator-authenticated HTTP, so the console can render swarm runs.
+#[tokio::test]
+async fn swarm_runs_http_surface_is_operator_scoped() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let database_url = format!("sqlite://{}", temp.path().join("swarm-http.db").display());
+    let app = build_router(config(), &database_url, Some(Arc::new(HarnessHttpProvider)))
+        .await
+        .expect("router");
+    let server = TestServer::new(app).expect("server");
+
+    // No auth → rejected.
+    server
+        .get("/v1/harness/swarm-runs?channel=telegram")
+        .await
+        .assert_status_unauthorized();
+
+    // Operator key → empty list, well-formed.
+    let runs = operator(server.get("/v1/harness/swarm-runs?channel=telegram")).await;
+    runs.assert_status_ok();
+    let body: serde_json::Value = runs.json();
+    assert!(body["runs"].is_array());
+
+    // Nodes for a nonexistent run → empty nodes array, not an error.
+    let nodes =
+        operator(server.get("/v1/harness/swarm-runs/run-missing/nodes?channel=telegram")).await;
+    nodes.assert_status_ok();
+    let body: serde_json::Value = nodes.json();
+    assert_eq!(body["nodes"], serde_json::json!([]));
+}
