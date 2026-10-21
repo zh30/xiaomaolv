@@ -726,7 +726,7 @@ async fn build_runtime_handles(
             loop_engine.clone(),
             provider.clone(),
             evolution_engine.clone(),
-            outbound_sender,
+            outbound_sender.clone(),
         )?;
         // Register the durable swarm handler so goals orphaned by a restart
         // (or simply still queued) can be claimed by the runtime sweep
@@ -745,6 +745,7 @@ async fn build_runtime_handles(
                     reply_summary_enabled: config.agent.swarm.reply_summary_enabled,
                     audit_retention_days: config.agent.swarm.audit_retention_days,
                     durable_engine: config.agent.swarm.durable_engine,
+                    reply_sync_wait_ms: config.agent.swarm.reply_sync_wait_ms,
                 },
             );
             if config.agent.harness.enable_trajectory {
@@ -814,6 +815,7 @@ async fn build_runtime_handles(
         reply_summary_enabled: config.agent.swarm.reply_summary_enabled,
         audit_retention_days: config.agent.swarm.audit_retention_days,
         durable_engine: config.agent.swarm.durable_engine,
+        reply_sync_wait_ms: config.agent.swarm.reply_sync_wait_ms,
     })
     .with_harness_config(&config.agent.harness)
     .with_loop_engine(loop_config.enabled.then(|| loop_engine.clone()));
@@ -826,6 +828,7 @@ async fn build_runtime_handles(
     if let Some(metrics) = trajectory_metrics {
         service = service.with_trajectory_metrics(metrics);
     }
+    service = service.with_outbound_sender(outbound_sender);
     service = service.with_telegram_admission_store(Arc::new(memory_store.clone()));
     service = service.with_telegram_outbound_store(Arc::new(memory_store.clone()));
     let service = Arc::new(service);

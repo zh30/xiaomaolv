@@ -301,6 +301,9 @@ impl SqliteMemoryStore {
         .execute(&pool)
         .await
         .context("failed to initialize agent_swarm_runs started index")?;
+        // Deferred-delivery flag: a sync wait that timed out marks the run so
+        // the janitor sends the final answer when the goal goes terminal.
+        maybe_add_swarm_runs_column(&pool, "awaiting_reply INTEGER NOT NULL DEFAULT 0").await?;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS agent_swarm_nodes (
@@ -1623,6 +1626,49 @@ impl SqliteMemoryStore {
         rows.into_iter().map(agent_swarm_run_from_row).collect()
     }
 
+    /// Marks/unmarks a run whose synchronous reply window elapsed — the
+    /// janitor delivers the final answer asynchronously when set.
+    pub async fn set_swarm_run_awaiting_reply(
+        &self,
+        channel: &str,
+        run_id: &str,
+        awaiting: bool,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE agent_swarm_runs SET awaiting_reply = ?1, updated_at = unixepoch()
+             WHERE channel = ?2 AND run_id = ?3",
+        )
+        .bind(i64::from(awaiting))
+        .bind(channel)
+        .bind(run_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to set swarm awaiting_reply")?;
+        Ok(())
+    }
+
+    /// Runs flagged `awaiting_reply` whose answer still needs delivery.
+    pub async fn list_awaiting_reply_swarm_runs(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<AgentSwarmRunRecord>> {
+        let rows = sqlx::query(
+            "SELECT r.run_id, r.channel, r.session_id, r.user_id, r.root_task, r.status,
+                    r.started_at_unix, r.finished_at_unix, r.error, r.created_at, r.updated_at,
+                    (SELECT COUNT(*)
+                       FROM agent_swarm_nodes n
+                      WHERE n.channel = r.channel AND n.run_id = r.run_id) AS agent_count
+             FROM agent_swarm_runs r
+             WHERE r.awaiting_reply = 1
+             ORDER BY r.started_at_unix ASC LIMIT ?1",
+        )
+        .bind(i64::try_from(limit).unwrap_or(64))
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list awaiting-reply swarm runs")?;
+        rows.into_iter().map(agent_swarm_run_from_row).collect()
+    }
+
     pub async fn list_agent_swarm_runs(
         &self,
         channel: &str,
@@ -2501,6 +2547,21 @@ fn trajectory_tool_call_from_row(
         ok: ok != 0,
         duration_ms: duration_ms.max(0) as u64,
         iteration: iteration.max(0) as usize,
+    }
+}
+
+async fn maybe_add_swarm_runs_column(pool: &SqlitePool, column_def: &str) -> anyhow::Result<()> {
+    let sql = format!("ALTER TABLE agent_swarm_runs ADD COLUMN {column_def}");
+    match sqlx::query(&sql).execute(pool).await {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            let lower = err.to_string().to_ascii_lowercase();
+            if lower.contains("duplicate column name") {
+                Ok(())
+            } else {
+                Err(err).context("failed to alter agent_swarm_runs table")
+            }
+        }
     }
 }
 
@@ -3535,6 +3596,20 @@ pub trait MemoryBackend: Send + Sync {
     ) -> anyhow::Result<Vec<AgentSwarmRunRecord>> {
         Ok(vec![])
     }
+    async fn set_swarm_run_awaiting_reply(
+        &self,
+        _channel: &str,
+        _run_id: &str,
+        _awaiting: bool,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn list_awaiting_reply_swarm_runs(
+        &self,
+        _limit: usize,
+    ) -> anyhow::Result<Vec<AgentSwarmRunRecord>> {
+        Ok(vec![])
+    }
     async fn load_agent_swarm_tree(
         &self,
         _req: AgentSwarmTreeRequest,
@@ -3869,6 +3944,24 @@ impl MemoryBackend for SqliteMemoryBackend {
         limit: usize,
     ) -> anyhow::Result<Vec<AgentSwarmRunRecord>> {
         self.store.list_running_agent_swarm_runs(limit).await
+    }
+
+    async fn set_swarm_run_awaiting_reply(
+        &self,
+        channel: &str,
+        run_id: &str,
+        awaiting: bool,
+    ) -> anyhow::Result<()> {
+        self.store
+            .set_swarm_run_awaiting_reply(channel, run_id, awaiting)
+            .await
+    }
+
+    async fn list_awaiting_reply_swarm_runs(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<AgentSwarmRunRecord>> {
+        self.store.list_awaiting_reply_swarm_runs(limit).await
     }
 
     async fn load_agent_swarm_tree(
@@ -4433,6 +4526,24 @@ impl MemoryBackend for HybridSqliteZvecMemoryBackend {
         limit: usize,
     ) -> anyhow::Result<Vec<AgentSwarmRunRecord>> {
         self.store.list_running_agent_swarm_runs(limit).await
+    }
+
+    async fn set_swarm_run_awaiting_reply(
+        &self,
+        channel: &str,
+        run_id: &str,
+        awaiting: bool,
+    ) -> anyhow::Result<()> {
+        self.store
+            .set_swarm_run_awaiting_reply(channel, run_id, awaiting)
+            .await
+    }
+
+    async fn list_awaiting_reply_swarm_runs(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<AgentSwarmRunRecord>> {
+        self.store.list_awaiting_reply_swarm_runs(limit).await
     }
 
     async fn load_agent_swarm_tree(

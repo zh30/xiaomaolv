@@ -232,6 +232,9 @@ pub struct MessageService {
     evolution_store: Option<Arc<dyn crate::harness::store::EvolutionStore>>,
     telegram_admission_store: Option<Arc<dyn crate::memory::TelegramAdmissionStore>>,
     telegram_outbound_store: Option<Arc<dyn crate::memory::TelegramOutboundStore>>,
+    /// Outbound channel for deferred swarm replies (the janitor sends the
+    /// final answer after the sync reply window elapsed).
+    outbound_sender: Option<Arc<dyn crate::harness::loop_engine::OutboundSender>>,
 }
 
 struct CompletionOutcome {
@@ -340,6 +343,7 @@ impl MessageService {
             evolution_store: None,
             telegram_admission_store: None,
             telegram_outbound_store: None,
+            outbound_sender: None,
         }
     }
 
@@ -428,6 +432,16 @@ impl MessageService {
         store: Arc<dyn crate::memory::TelegramAdmissionStore>,
     ) -> Self {
         self.telegram_admission_store = Some(store);
+        self
+    }
+
+    /// Enables deferred delivery: the swarm janitor sends the final answer
+    /// when a run outlived the synchronous reply window.
+    pub fn with_outbound_sender(
+        mut self,
+        sender: Option<Arc<dyn crate::harness::loop_engine::OutboundSender>>,
+    ) -> Self {
+        self.outbound_sender = sender;
         self
     }
 
