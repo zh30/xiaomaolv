@@ -61,7 +61,7 @@ use crate::skills::{SkillRegistry, SkillRuntime, SkillRuntimeSelectionSettings};
 
 mod completion;
 mod delegates;
-mod swarm;
+pub mod swarm;
 mod time_query;
 
 use time_query::{

@@ -215,6 +215,7 @@ pub(crate) const ALLOWED_WORKFLOW_HANDLERS: &[&str] = &[
     "manual_gate",
     "channel_send",
     "wait",
+    "swarm_node",
 ];
 
 /// Actor prefix reserved for subsystem-driven (non-operator) loop-engine

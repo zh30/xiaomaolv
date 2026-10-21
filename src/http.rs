@@ -786,6 +786,7 @@ async fn build_runtime_handles(
         max_run_timeout_ms: config.agent.swarm.max_run_timeout_ms,
         reply_summary_enabled: config.agent.swarm.reply_summary_enabled,
         audit_retention_days: config.agent.swarm.audit_retention_days,
+        durable_engine: config.agent.swarm.durable_engine,
     })
     .with_harness_config(&config.agent.harness)
     .with_loop_engine(loop_config.enabled.then(|| loop_engine.clone()));
