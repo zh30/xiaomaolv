@@ -437,6 +437,32 @@ impl LoopWorker {
                     actor,
                 )
                 .await?;
+            // Operator visibility — a typo'd handler name parks forever even
+            // though requeue keeps retrying. One dedup'd signal per item.
+            if let Err(error) = self
+                .engine
+                .ingest_signal(
+                    super::signals::CreateSignalRequest {
+                        kind: super::signals::SignalKind::Manual,
+                        trust: super::signals::SignalTrust::Internal,
+                        source: "internal:blocked".to_string(),
+                        external_id: Some(format!("blocked:{}", claim.work_item.id)),
+                        content: format!(
+                            "goal {}: work item {} blocked — handler '{}' is not registered",
+                            claim.attempt.goal_id, claim.work_item.id, claim.work_item.handler
+                        ),
+                        metadata: std::collections::BTreeMap::from([
+                            ("goal_id".to_string(), claim.attempt.goal_id.clone()),
+                            ("work_item_id".to_string(), claim.work_item.id.clone()),
+                            ("handler".to_string(), claim.work_item.handler.clone()),
+                        ]),
+                    },
+                    actor,
+                )
+                .await
+            {
+                tracing::warn!(%error, "blocked work item signal ingest failed");
+            }
             return self.engine.resume_goal(&claim.attempt.goal_id, actor).await;
         };
         if handler.effect_class() != claim.work_item.effect {

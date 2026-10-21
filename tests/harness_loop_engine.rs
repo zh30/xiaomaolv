@@ -2302,6 +2302,18 @@ async fn missing_handler_blocks_then_requeues_when_registered() -> anyhow::Resul
         "the blocked attempt should record the missing-handler reason"
     );
 
+    // Operator visibility: the block lands a dedup'd internal signal so a
+    // typo'd handler name doesn't park silently forever.
+    let signals = engine.list_signals(16, None).await.expect("list signals");
+    assert!(
+        signals.iter().any(|signal| signal
+            .external_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("blocked:work_"))
+            && signal.content.contains("not registered")),
+        "blocked item should surface a triageable signal"
+    );
+
     // A later poll from a worker whose registry has the handler requeues the
     // item and the goal runs to completion.
     let worker = LoopWorker::with_builtins(engine.clone(), Arc::new(WorkerProvider), None, None)?;
