@@ -300,6 +300,14 @@ pub trait LoopStore: Send + Sync {
         actor: &str,
     ) -> anyhow::Result<ResumeReport>;
 
+    /// Latest committed (or reconciled) outcome per declared dependency of
+    /// the work item, keyed by dependency step id — the DAG dataflow a
+    /// dependent handler reads through `WorkHandlerContext.upstream`.
+    async fn upstream_outcomes(
+        &self,
+        work_item_id: &str,
+    ) -> anyhow::Result<std::collections::BTreeMap<String, WorkOutcome>>;
+
     /// Commits a phase boundary on the claimed work item while the attempt
     /// keeps running: the returned progress is injected into the next
     /// phase's `ctx.resume` and survives attempt death (a later attempt
@@ -2278,6 +2286,43 @@ impl LoopStore for SqliteLoopStore {
         self.resume_goal(&claim.attempt.goal_id, actor)
             .await?
             .context("goal disappeared after attempt deferral")
+    }
+
+    async fn upstream_outcomes(
+        &self,
+        work_item_id: &str,
+    ) -> anyhow::Result<std::collections::BTreeMap<String, WorkOutcome>> {
+        let rows = sqlx::query(
+            "SELECT wi.step_id, ranked.outcome_json FROM (
+                SELECT dep.depends_on_work_item_id AS dep_id,
+                       c.outcome_json AS outcome_json,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY dep.depends_on_work_item_id
+                           ORDER BY c.updated_at DESC, c.id DESC
+                       ) AS rn
+                FROM harness_work_item_dependencies dep
+                JOIN harness_checkpoints c
+                  ON c.work_item_id = dep.depends_on_work_item_id
+                WHERE dep.work_item_id = ?1
+                  AND c.phase IN ('committed', 'reconciled')
+                  AND c.outcome_json IS NOT NULL
+            ) ranked
+            JOIN harness_work_items wi ON wi.id = ranked.dep_id
+            WHERE ranked.rn = 1",
+        )
+        .bind(work_item_id)
+        .fetch_all(self.store.pool())
+        .await
+        .context("failed to load upstream outcomes")?;
+        let mut outcomes = std::collections::BTreeMap::new();
+        for row in rows {
+            let step_id: String = row.get("step_id");
+            let outcome_json: String = row.get("outcome_json");
+            let outcome: WorkOutcome = serde_json::from_str(&outcome_json)
+                .with_context(|| format!("invalid upstream outcome for step '{step_id}'"))?;
+            outcomes.insert(step_id, outcome);
+        }
+        Ok(outcomes)
     }
 
     async fn record_phase_progress(

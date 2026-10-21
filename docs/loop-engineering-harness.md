@@ -173,6 +173,13 @@ fresh worker process — resumes at `case_index` without redoing provider calls,
 phase reserves only the two calls it actually spends. The continuation state carries only
 the cursor metadata; the outputs themselves live in the store, not the token budget.
 
+A dependent step receives its declared dataflow through `WorkHandlerContext.upstream`: at
+claim time the worker loads the latest committed (or reconciled) checkpoint outcome of each
+declared dependency and hands the handler a `step_id -> WorkOutcome` map. Only declared
+dependencies are visible — a handler cannot reach for undeclared step outputs. The map is
+loaded once per attempt (dependencies are already committed before the item could claim), so
+every phase of a continued run sees the same upstream snapshot.
+
 Goal admission is idempotent on an optional `request_id` (1..=160 bytes, unique per
 `harness_goals`): retrying a create with the same key returns the already-admitted goal without
 writing a second `goal.created` event or re-planning. The signal-propose path uses

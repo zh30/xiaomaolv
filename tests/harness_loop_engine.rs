@@ -2777,3 +2777,133 @@ async fn phase_loop_is_bounded_by_continuation_budget() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// A dependent step reads its declared upstream's committed outcome through
+/// `ctx.upstream` keyed by step id — the DAG dataflow a fan-in handler (and
+/// eventually a swarm aggregation node) consumes.
+#[tokio::test]
+async fn dependent_step_reads_upstream_outcome_by_step_id() -> anyhow::Result<()> {
+    struct DagProbe;
+    #[async_trait]
+    impl WorkHandler for DagProbe {
+        fn name(&self) -> &'static str {
+            "provider_analysis"
+        }
+        fn effect_class(&self) -> EffectClass {
+            EffectClass::LocalWrite
+        }
+        async fn execute(&self, context: &WorkHandlerContext) -> anyhow::Result<WorkOutcome> {
+            match context.claim.work_item.step_id.as_str() {
+                "produce" => Ok(WorkOutcome {
+                    summary: "upstream-payload".to_string(),
+                    artifact_ids: Vec::new(),
+                    evidence: serde_json::json!({"secret": 42}),
+                    sleep_until_unix: None,
+                    continuation: None,
+                }),
+                "consume" => {
+                    let upstream = context
+                        .upstream
+                        .get("produce")
+                        .expect("upstream outcome for 'produce' was missing");
+                    anyhow::ensure!(
+                        upstream.summary == "upstream-payload",
+                        "unexpected upstream summary"
+                    );
+                    anyhow::ensure!(
+                        upstream.evidence["secret"] == 42,
+                        "upstream evidence did not arrive"
+                    );
+                    Ok(WorkOutcome {
+                        summary: format!("consumed:{}", upstream.summary),
+                        artifact_ids: Vec::new(),
+                        evidence: serde_json::Value::Null,
+                        sleep_until_unix: None,
+                        continuation: None,
+                    })
+                }
+                other => anyhow::bail!("unexpected step {other}"),
+            }
+        }
+    }
+
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "Run a produce/consume DAG".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            "operator:test",
+        )
+        .await?;
+    let step = |id: &str| WorkflowStep {
+        id: id.to_string(),
+        handler: "provider_analysis".to_string(),
+        effect: EffectClass::LocalWrite,
+        input: serde_json::json!({}),
+        retry: RetryPolicy {
+            max_attempts: 2,
+            backoff_secs: 0,
+        },
+    };
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![step("produce"), step("consume")],
+                    edges: vec![WorkflowEdge {
+                        from: "produce".to_string(),
+                        to: "consume".to_string(),
+                    }],
+                    budget: ExecutionBudget {
+                        max_provider_calls: 0,
+                        deadline_secs: 60,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+                    label: "review".to_string(),
+                }],
+            },
+            "planner:test",
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            "operator:test",
+        )
+        .await?;
+
+    let mut registry = WorkHandlerRegistry::default();
+    registry.register(Arc::new(DagProbe))?;
+    let worker = LoopWorker::with_registry(engine.clone(), registry, "worker:dag", 30)?;
+    // The goal parks in `verifying` after both steps — idle-loop errors are
+    // expected; assert on durable state.
+    let _ = worker.run_goal_until_idle(&goal.id, 4).await;
+
+    let report = engine.resume_goal(&goal.id, "operator:test").await?;
+    let consume = report
+        .work_items
+        .iter()
+        .find(|item| item.step_id == "consume")
+        .expect("consume item");
+    // The probe's ensure! chain ran inside the worker — succeeding means the
+    // upstream map carried the produce step's committed outcome.
+    assert_eq!(consume.status, WorkItemStatus::Succeeded);
+    let produce = report
+        .work_items
+        .iter()
+        .find(|item| item.step_id == "produce")
+        .expect("produce item");
+    assert_eq!(produce.status, WorkItemStatus::Succeeded);
+    Ok(())
+}

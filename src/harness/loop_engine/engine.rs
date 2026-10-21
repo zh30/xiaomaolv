@@ -568,6 +568,15 @@ impl LoopEngine {
         self.store.list_work_items(goal_id).await
     }
 
+    /// Latest committed outcome per declared dependency of the work item,
+    /// keyed by dependency step id — read-only, no event notification.
+    pub async fn upstream_outcomes(
+        &self,
+        work_item_id: &str,
+    ) -> anyhow::Result<std::collections::BTreeMap<String, WorkOutcome>> {
+        self.store.upstream_outcomes(work_item_id).await
+    }
+
     /// Commits a phase boundary while the attempt keeps running. The
     /// persisted progress is injected into the next phase's `ctx.resume` and
     /// survives attempt death — a crash after this call resumes from the

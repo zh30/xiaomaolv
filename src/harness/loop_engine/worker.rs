@@ -26,6 +26,10 @@ pub struct WorkHandlerContext {
     /// Committed phase progress handed to this attempt — `None` on the
     /// first phase, `Some` when resuming after a boundary or a crash.
     pub resume: Option<crate::harness::loop_engine::WorkPhaseProgress>,
+    /// Latest committed outcome per declared dependency, keyed by step id —
+    /// the declared DAG dataflow. Only the work item's own dependencies are
+    /// visible; a handler cannot reach for undeclared step outputs.
+    pub upstream: std::collections::BTreeMap<String, WorkOutcome>,
 }
 
 #[async_trait]
@@ -319,11 +323,27 @@ impl LoopWorker {
         let attempt_deadline = tokio::time::Instant::now()
             + Duration::from_secs(u64::from(claim.budget.deadline_secs));
         let mut resume = claim.work_item.progress.clone();
+        // Declared-dependency outcomes are loaded once per attempt — they
+        // are already committed before this item could be claimed, so the
+        // map is stable for the whole phase loop.
+        let upstream = self
+            .engine
+            .upstream_outcomes(&claim.work_item.id)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    work_item_id = %claim.work_item.id,
+                    "failed to load upstream outcomes; handler sees an empty map"
+                );
+                std::collections::BTreeMap::new()
+            });
         let outcome = loop {
             let context = WorkHandlerContext {
                 engine: self.engine.clone(),
                 claim: claim.clone(),
                 resume: resume.clone(),
+                upstream: upstream.clone(),
             };
             let execution =
                 tokio::time::timeout_at(attempt_deadline, handler.execute(&context)).await;
