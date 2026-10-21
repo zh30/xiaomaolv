@@ -710,6 +710,46 @@ async fn handle_telegram_goal_command(
         send_telegram_command_reply(sender, message, &lines.join("\n")).await?;
         return Ok(());
     }
+    if args
+        .first()
+        .is_some_and(|value| value == "pause" || value == "unpause")
+    {
+        let pausing = args.first().is_some_and(|v| v == "pause");
+        if args.len() < 2 {
+            send_telegram_command_reply(
+                sender,
+                message,
+                if pausing {
+                    "用法: /goal pause <goal_id> [原因]"
+                } else {
+                    "用法: /goal unpause <goal_id>"
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+        let goal_id = &args[1];
+        let reason = args.get(2..).map(|r| r.join(" ")).unwrap_or_default();
+        let result = if pausing {
+            engine.pause_goal(goal_id, &reason, &actor).await
+        } else {
+            engine.unpause_goal(goal_id, &actor).await
+        };
+        match result {
+            Ok(goal) => {
+                send_telegram_command_reply(
+                    sender,
+                    message,
+                    &format!("goal {} [{}]", goal.id, enum_label(&goal.status)),
+                )
+                .await?;
+            }
+            Err(error) => {
+                send_telegram_command_reply(sender, message, &format!("操作失败: {error}")).await?;
+            }
+        }
+        return Ok(());
+    }
     if args.first().is_some_and(|value| value == "cancel") {
         if args.len() < 3 {
             send_telegram_command_reply(sender, message, "用法: /goal cancel <goal_id> <原因>")

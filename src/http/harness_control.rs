@@ -33,6 +33,8 @@ pub(super) fn router() -> Router<AppState> {
         .route("/v1/harness/goals/{id}/approve", post(post_goal_approve))
         .route("/v1/harness/goals/{id}/resume", post(post_goal_resume))
         .route("/v1/harness/goals/{id}/cancel", post(post_goal_cancel))
+        .route("/v1/harness/goals/{id}/pause", post(post_goal_pause))
+        .route("/v1/harness/goals/{id}/unpause", post(post_goal_unpause))
         .route(
             "/v1/harness/goals/{id}/work-items",
             get(get_goal_work_items),
@@ -386,6 +388,53 @@ async fn post_goal_cancel(
     let (engine, actor) = operator_context(&state, &headers).await?;
     let goal = engine
         .cancel_goal(&goal_id, &request.reason, &actor)
+        .await
+        .map_err(|error| {
+            if error.to_string().contains("not found") {
+                ApiError::NotFound(error.to_string())
+            } else {
+                ApiError::Conflict(error.to_string())
+            }
+        })?;
+    Ok(Json(serde_json::json!({"goal": goal})))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct PauseGoalRequest {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// `POST /goals/{id}/pause` — operator hold; claims stop while in-flight
+/// attempts finish on their own.
+async fn post_goal_pause(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(goal_id): Path<String>,
+    Json(request): Json<PauseGoalRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (engine, actor) = operator_context(&state, &headers).await?;
+    let goal = engine
+        .pause_goal(&goal_id, request.reason.as_deref().unwrap_or(""), &actor)
+        .await
+        .map_err(|error| {
+            if error.to_string().contains("not found") {
+                ApiError::NotFound(error.to_string())
+            } else {
+                ApiError::Conflict(error.to_string())
+            }
+        })?;
+    Ok(Json(serde_json::json!({"goal": goal})))
+}
+
+async fn post_goal_unpause(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(goal_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (engine, actor) = operator_context(&state, &headers).await?;
+    let goal = engine
+        .unpause_goal(&goal_id, &actor)
         .await
         .map_err(|error| {
             if error.to_string().contains("not found") {
