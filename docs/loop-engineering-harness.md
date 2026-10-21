@@ -165,6 +165,14 @@ claimable again after the delay with progress carried forward (durable sleep + p
 Committed boundaries per item are capped at `MAX_PHASE_CONTINUES` (64) so a handler that
 never produces a terminal outcome is bounded, and a successful finish clears the progress.
 
+The `evolution_evaluate` handler is the reference consumer: each phase advances a durable
+`evolution_eval_runs` cursor by exactly one eval case (baseline + candidate pair). The run
+row freezes the suite snapshot and baseline policy at first contact, commits outputs per
+case, and is cleared when the last case finalizes the evaluation. A crashed attempt — or a
+fresh worker process — resumes at `case_index` without redoing provider calls, and each
+phase reserves only the two calls it actually spends. The continuation state carries only
+the cursor metadata; the outputs themselves live in the store, not the token budget.
+
 Goal admission is idempotent on an optional `request_id` (1..=160 bytes, unique per
 `harness_goals`): retrying a create with the same key returns the already-admitted goal without
 writing a second `goal.created` event or re-planning. The signal-propose path uses

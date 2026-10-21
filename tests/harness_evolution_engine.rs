@@ -1060,3 +1060,179 @@ async fn invalid_benchmark_suite_is_rejected_when_attaching() {
     };
     assert!(engine.with_benchmark_suite(invalid).is_err());
 }
+
+/// A resumable evaluation advances the durable run cursor one committed
+/// case at a time; the final step records the evaluation, promotes the
+/// candidate, and clears the cursor.
+#[tokio::test]
+async fn resumable_evaluation_advances_case_by_case_and_clears_cursor() -> anyhow::Result<()> {
+    use xiaomaolv::harness::evolution::EvalStepOutcome;
+
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let store = Arc::new(SqliteEvolutionStore::new(memory));
+    seed_eval_cases(&store).await?;
+    let provider = Arc::new(FakeEvolutionProvider::default());
+    let engine = EvolutionEngine::new(store.clone(), provider.clone(), gate_config()).await?;
+    let candidate = engine
+        .create_candidate(
+            "candidate wins",
+            "resumable evaluation",
+            vec![],
+            &EvolutionActor::System("test".to_string()),
+        )
+        .await?;
+
+    // Step 1 creates the run, commits the frozen suite + one case.
+    let step = engine
+        .run_evaluation_step(&candidate.id, 65_536, None)
+        .await?;
+    assert!(matches!(
+        step,
+        EvalStepOutcome::Progress {
+            completed_cases: 1,
+            total_cases: 3,
+            ..
+        }
+    ));
+    let run = store
+        .get_eval_run(&candidate.id)
+        .await?
+        .expect("committed eval run");
+    assert_eq!(run.case_index, 1);
+    assert_eq!(run.baseline_outputs.len(), 1);
+    assert_eq!(run.cases.len(), 3);
+    assert_eq!(
+        store
+            .get_candidate(&candidate.id)
+            .await?
+            .expect("candidate")
+            .status,
+        EvolutionCandidateStatus::Evaluating
+    );
+
+    // Step 2 advances without re-transitioning or freezing again.
+    let step = engine
+        .run_evaluation_step(&candidate.id, 65_536, None)
+        .await?;
+    assert!(matches!(
+        step,
+        EvalStepOutcome::Progress {
+            completed_cases: 2,
+            ..
+        }
+    ));
+
+    // Final step records the evaluation, promotes the candidate, clears the cursor.
+    let step = engine
+        .run_evaluation_step(&candidate.id, 65_536, None)
+        .await?;
+    let EvalStepOutcome::Completed {
+        evaluation,
+        response_bytes,
+    } = step
+    else {
+        panic!("final step should complete the evaluation");
+    };
+    assert_eq!(evaluation.decision, EvolutionPromotionDecision::Ready);
+    assert!(response_bytes > 0);
+    assert!(
+        store.get_eval_run(&candidate.id).await?.is_none(),
+        "completed runs clear their cursor"
+    );
+    assert_eq!(
+        store
+            .get_candidate(&candidate.id)
+            .await?
+            .expect("candidate")
+            .status,
+        EvolutionCandidateStatus::Ready
+    );
+    assert_eq!(provider.request_count(), 6, "3 cases x 2 outputs");
+    Ok(())
+}
+
+/// A crashed attempt resumes from the last committed case — a second engine
+/// on the same store attaches to the run row and evaluates only the
+/// remaining cases. A candidate parked in `evaluating` with no cursor is
+/// reset to failed and starts a fresh run.
+#[tokio::test]
+async fn resumable_evaluation_resumes_committed_cases_after_crash() -> anyhow::Result<()> {
+    use xiaomaolv::harness::evolution::EvalStepOutcome;
+
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let store = Arc::new(SqliteEvolutionStore::new(memory));
+    seed_eval_cases(&store).await?;
+    let engine1 = EvolutionEngine::new(
+        store.clone(),
+        Arc::new(FakeEvolutionProvider::default()),
+        gate_config(),
+    )
+    .await?;
+    let candidate = engine1
+        .create_candidate(
+            "candidate wins",
+            "resumable after crash",
+            vec![],
+            &EvolutionActor::System("test".to_string()),
+        )
+        .await?;
+    assert!(matches!(
+        engine1
+            .run_evaluation_step(&candidate.id, 65_536, None)
+            .await?,
+        EvalStepOutcome::Progress {
+            completed_cases: 1,
+            ..
+        }
+    ));
+    drop(engine1);
+
+    // "New process": a fresh engine on the same store attaches to the run —
+    // it re-commits nothing and only evaluates the remaining two cases.
+    let provider2 = Arc::new(FakeEvolutionProvider::default());
+    let engine2 = EvolutionEngine::new(store.clone(), provider2.clone(), gate_config()).await?;
+    assert!(matches!(
+        engine2
+            .run_evaluation_step(&candidate.id, 65_536, None)
+            .await?,
+        EvalStepOutcome::Progress {
+            completed_cases: 2,
+            ..
+        }
+    ));
+    assert_eq!(
+        provider2.request_count(),
+        2,
+        "resumed run did not redo case 1"
+    );
+    assert!(matches!(
+        engine2
+            .run_evaluation_step(&candidate.id, 65_536, None)
+            .await?,
+        EvalStepOutcome::Completed { .. }
+    ));
+
+    // Stale state: a candidate parked in `evaluating` with no run cursor
+    // (e.g. the row was cleared out-of-band) is reset and evaluated fresh.
+    let stale = engine2
+        .create_candidate(
+            "candidate wins",
+            "stale evaluating",
+            vec![],
+            &EvolutionActor::System("test".to_string()),
+        )
+        .await?;
+    engine2.run_evaluation_step(&stale.id, 65_536, None).await?;
+    store.clear_eval_run(&stale.id).await?;
+    assert!(
+        matches!(
+            engine2.run_evaluation_step(&stale.id, 65_536, None).await?,
+            EvalStepOutcome::Progress {
+                completed_cases: 1,
+                ..
+            }
+        ),
+        "stale evaluating candidates start a fresh run"
+    );
+    Ok(())
+}

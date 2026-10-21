@@ -2465,6 +2465,29 @@ async fn initialize_evolution_schema(pool: &SqlitePool) -> anyhow::Result<()> {
     .await
     .context("failed to initialize evolution feedback score index")?;
 
+    // In-flight shadow-evaluation cursor: one run per candidate holds the
+    // frozen eval-suite snapshot, the frozen baseline policy, and the
+    // committed per-case outputs — a crash mid-evaluation resumes from the
+    // last committed case instead of restarting the whole suite.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS evolution_eval_runs (
+            id TEXT PRIMARY KEY,
+            candidate_id TEXT NOT NULL UNIQUE,
+            cases_json TEXT NOT NULL,
+            benchmark_tail INTEGER NOT NULL DEFAULT 0,
+            baseline_json TEXT NOT NULL,
+            case_index INTEGER NOT NULL DEFAULT 0,
+            baseline_outputs_json TEXT NOT NULL DEFAULT '{}',
+            candidate_outputs_json TEXT NOT NULL DEFAULT '{}',
+            response_bytes INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );",
+    )
+    .execute(pool)
+    .await
+    .context("failed to initialize evolution_eval_runs table")?;
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS evolution_audit_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

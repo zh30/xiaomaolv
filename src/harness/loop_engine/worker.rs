@@ -6,12 +6,12 @@ use anyhow::{Context, ensure};
 use async_trait::async_trait;
 
 use crate::domain::{MessageRole, StoredMessage};
-use crate::harness::evolution::EvolutionEngine;
+use crate::harness::evolution::{EvalStepOutcome, EvolutionEngine};
 use crate::provider::{ChatProvider, CompletionRequest};
 
 use super::{
     ArtifactKind, EffectClass, GoalStatus, LoopEngine, PublishArtifactRequest, ResumeReport,
-    TrajectoryFrameCapture, TrajectoryFrameDraft, WorkClaim, WorkOutcome,
+    TrajectoryFrameCapture, TrajectoryFrameDraft, WorkClaim, WorkContinuation, WorkOutcome,
 };
 
 /// `last_error` prefix marking a work item that was blocked because its
@@ -911,21 +911,11 @@ impl WorkHandler for EvolutionEvaluateHandler {
             .get("candidate_id")
             .and_then(serde_json::Value::as_str)
             .context("evolution_evaluate requires input.candidate_id")?;
-        let eval_cases = self.evolution_engine.list_eval_cases(true).await?;
-        let required_calls = eval_cases
-            .len()
-            .checked_mul(2)
-            .context("evolution provider call count overflowed")?;
-        ensure!(required_calls > 0, "evolution eval suite is empty");
-        ensure!(
-            required_calls
-                <= usize::try_from(context.claim.budget.max_provider_calls)
-                    .context("invalid provider call budget")?,
-            "evolution evaluation requires {required_calls} provider calls but the workflow budget allows {}",
-            context.claim.budget.max_provider_calls
-        );
+        // Per-phase budget: one step evaluates exactly one case (baseline +
+        // candidate), so each phase reserves two provider calls — a crashed
+        // attempt no longer burns reservations for the whole suite.
         let mut deadline_at_unix = None;
-        for _ in 0..required_calls {
+        for _ in 0..2 {
             deadline_at_unix = Some(
                 context
                     .engine
@@ -943,14 +933,40 @@ impl WorkHandler for EvolutionEvaluateHandler {
         .context("invalid evolution deadline")?;
         let max_response_bytes = usize::try_from(context.claim.budget.max_response_bytes)
             .context("invalid evolution response byte budget")?;
-        let (evaluation, response_bytes) = self
+        let step = self
             .evolution_engine
-            .evaluate_candidate_bounded_until(
+            .run_evaluation_step(
                 candidate_id,
                 max_response_bytes,
-                tokio::time::Instant::now() + Duration::from_secs(remaining_secs),
+                Some(tokio::time::Instant::now() + Duration::from_secs(remaining_secs)),
             )
             .await?;
+        let (evaluation, response_bytes) = match step {
+            EvalStepOutcome::Progress {
+                completed_cases,
+                total_cases,
+                ..
+            } => {
+                return Ok(WorkOutcome {
+                    summary: format!("evolution evaluation {completed_cases}/{total_cases} cases"),
+                    artifact_ids: Vec::new(),
+                    evidence: serde_json::Value::Null,
+                    sleep_until_unix: None,
+                    continuation: Some(WorkContinuation {
+                        phase: "evaluating".to_string(),
+                        state: serde_json::json!({
+                            "completed_cases": completed_cases,
+                            "total_cases": total_cases,
+                        }),
+                        delay_secs: None,
+                    }),
+                });
+            }
+            EvalStepOutcome::Completed {
+                evaluation,
+                response_bytes,
+            } => (*evaluation, response_bytes),
+        };
         context
             .engine
             .record_provider_response_bytes(
@@ -988,7 +1004,6 @@ impl WorkHandler for EvolutionEvaluateHandler {
             evidence: serde_json::json!({
                 "candidate_id": candidate_id,
                 "evaluation_id": evaluation.id,
-                "provider_calls": required_calls,
                 "response_bytes": response_bytes,
             }),
             sleep_until_unix: None,
