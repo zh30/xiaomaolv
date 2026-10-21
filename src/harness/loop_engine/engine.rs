@@ -567,6 +567,19 @@ impl LoopEngine {
         self.store.unpause_goal(goal_id, actor).await
     }
 
+    /// Send a dead-ended goal back to planning — `plan_goal` accepts the
+    /// `replan` status and issues a fresh revision. `LoopStore::mark_goal_for_replan`.
+    pub async fn mark_goal_for_replan(
+        &self,
+        goal_id: &str,
+        reason: &str,
+        actor: &str,
+    ) -> anyhow::Result<GoalRecord> {
+        self.store
+            .mark_goal_for_replan(goal_id, reason, actor)
+            .await
+    }
+
     /// Operator stop for a live goal — see `LoopStore::cancel_goal`.
     pub async fn cancel_goal(
         &self,
