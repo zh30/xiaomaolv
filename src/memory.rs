@@ -3279,7 +3279,7 @@ impl AgentSwarmNodeExitStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSwarmRunRecord {
     pub run_id: String,
     pub channel: String,
@@ -3295,7 +3295,7 @@ pub struct AgentSwarmRunRecord {
     pub agent_count: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSwarmNodeRecord {
     pub agent_id: String,
     pub run_id: String,
