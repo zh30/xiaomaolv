@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, ensure};
 use async_trait::async_trait;
 use sqlx::{Row, SqlitePool};
+use tracing::warn;
 
 use crate::memory::SqliteMemoryStore;
 
@@ -2234,6 +2235,34 @@ impl LoopStore for SqliteLoopStore {
         )
         .await?;
         tx.commit().await?;
+
+        // A resolved gate leaves no operator work behind — the confirmation
+        // signal emitted at park time is triaged out so `/signals` only shows
+        // gates still awaiting a verdict.
+        let pending_signal: Option<String> = sqlx::query_scalar(
+            "SELECT s.id FROM harness_signals s
+             WHERE s.source = 'internal:confirmation' AND s.external_id = ?1
+               AND COALESCE(
+                   (SELECT e.status FROM harness_signal_events e
+                     WHERE e.signal_id = s.id
+                     ORDER BY e.sequence DESC LIMIT 1),
+                   'observed'
+               ) IN ('observed', 'triaged')
+             ORDER BY s.created_at DESC LIMIT 1",
+        )
+        .bind(format!("confirm:{work_item_id}"))
+        .fetch_optional(self.store.pool())
+        .await?;
+        if let Some(signal_id) = pending_signal {
+            let _ = ignore_signal(
+                self.store.pool(),
+                &signal_id,
+                "confirmation resolved",
+                actor,
+            )
+            .await;
+        }
+
         let updated = sqlx::query(
             "SELECT id, goal_id, status, step_id, handler, effect_class, input_json,
                     max_attempts, ordinal, created_at, progress_json
@@ -3074,7 +3103,7 @@ async fn refresh_goal_status_tx(
 
 async fn recover_goal_state(pool: &SqlitePool, goal_id: &str, actor: &str) -> anyhow::Result<()> {
     ensure_valid_id(goal_id, "goal id")?;
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM harness_goals WHERE id = ?1")
         .bind(goal_id)
         .fetch_one(&mut *tx)
@@ -3099,6 +3128,7 @@ async fn recover_goal_state(pool: &SqlitePool, goal_id: &str, actor: &str) -> an
         reconcile_checkpoint_tx(&mut tx, &checkpoint).await?;
         recovered += 1;
     }
+    let mut parked_items: Vec<String> = Vec::new();
 
     let now = unix_now();
     let expired = sqlx::query(
@@ -3138,6 +3168,9 @@ async fn recover_goal_state(pool: &SqlitePool, goal_id: &str, actor: &str) -> an
         // rerun unsafe (`replay_safe = 0` on the checkpoint).
         let parked =
             (effect == EffectClass::ExternalWrite && has_prepared != 0) || has_unsafe_prepared != 0;
+        if parked {
+            parked_items.push(work_item_id.clone());
+        }
         let (work_status, attempt_status, error, next_attempt_at) = if parked {
             (
                 "waiting_confirmation",
@@ -3221,6 +3254,28 @@ async fn recover_goal_state(pool: &SqlitePool, goal_id: &str, actor: &str) -> an
         .await?;
     }
     tx.commit().await?;
+
+    // Operator visibility: a parked confirmation is invisible until somebody
+    // opens /goal list or the console. Emit a dedup'd signal per parked item
+    // so `/signals` triage surfaces pending gates on Telegram too.
+    for work_item_id in parked_items {
+        let request = CreateSignalRequest {
+            kind: super::signals::SignalKind::Manual,
+            trust: super::signals::SignalTrust::Internal,
+            source: "internal:confirmation".to_string(),
+            external_id: Some(format!("confirm:{work_item_id}")),
+            content: format!(
+                "goal {goal_id}: work item {work_item_id} parked awaiting confirmation — an external effect may or may not have landed before the crash"
+            ),
+            metadata: BTreeMap::from([
+                ("goal_id".to_string(), goal_id.to_string()),
+                ("work_item_id".to_string(), work_item_id.clone()),
+            ]),
+        };
+        if let Err(error) = ingest_signal(pool, request, actor).await {
+            warn!(error = %error, work_item_id, "confirmation signal ingest failed");
+        }
+    }
     Ok(())
 }
 
