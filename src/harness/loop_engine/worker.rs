@@ -268,11 +268,31 @@ impl LoopWorker {
             {
                 tracing::warn!(%error, %goal_id, "blocked work item requeue failed");
             }
-            let Some(claim) = self
+            let claim = match self
                 .engine
                 .claim_goal_work(goal_id, &self.worker_id, self.lease_secs, &actor)
-                .await?
-            else {
+                .await
+            {
+                Ok(claim) => claim,
+                Err(error) => {
+                    // A mid-claim status flip (goal went verifying/canceled/
+                    // paused between polls) surfaces as "not dispatchable" —
+                    // that's a terminal signal, not a failure. Re-read and
+                    // return the report; keep propagating real errors.
+                    let report = self.engine.resume_goal(goal_id, &actor).await?;
+                    if is_terminal(report.goal.status)
+                        || report.goal.status == GoalStatus::Verifying
+                        || !error.to_string().contains("not dispatchable")
+                    {
+                        if !error.to_string().contains("not dispatchable") {
+                            return Err(error);
+                        }
+                        return Ok(report);
+                    }
+                    return Err(error);
+                }
+            };
+            let Some(claim) = claim else {
                 return self.engine.resume_goal(goal_id, &actor).await;
             };
             report = self.process_claim(claim, &actor).await?;

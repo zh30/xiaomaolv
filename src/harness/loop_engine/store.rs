@@ -285,6 +285,17 @@ pub trait LoopStore: Send + Sync {
     ) -> anyhow::Result<GoalRecord>;
     async fn unpause_goal(&self, goal_id: &str, actor: &str) -> anyhow::Result<GoalRecord>;
 
+    /// Replan entry: marks a dead-ended goal (`failed`/`canceled`/`rejected`/
+    /// `blocked`) `replan` and supersedes its open work items — a fresh
+    /// `plan_goal` + `approve` revision then reruns the goal with a clean
+    /// item set.
+    async fn mark_goal_for_replan(
+        &self,
+        goal_id: &str,
+        reason: &str,
+        actor: &str,
+    ) -> anyhow::Result<GoalRecord>;
+
     /// Operator verdict for a work item parked in `waiting_confirmation`.
     /// `confirmed` commits the prepared checkpoint with an operator-attested
     /// outcome; `retry` voids it and re-queues the item; `abandoned` voids it
@@ -809,6 +820,78 @@ impl LoopStore for SqliteLoopStore {
 
     async fn unpause_goal(&self, goal_id: &str, actor: &str) -> anyhow::Result<GoalRecord> {
         self.set_goal_paused(goal_id, false, None, actor).await
+    }
+
+    async fn mark_goal_for_replan(
+        &self,
+        goal_id: &str,
+        reason: &str,
+        actor: &str,
+    ) -> anyhow::Result<GoalRecord> {
+        ensure_valid_id(goal_id, "goal id")?;
+        let reason = reason.trim();
+        ensure!(
+            !reason.is_empty() && reason.len() <= 512,
+            "replan reason must be 1..=512 characters"
+        );
+        let now = unix_now();
+        let mut tx = self.store.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let status: String = sqlx::query_scalar("SELECT status FROM harness_goals WHERE id = ?1")
+            .bind(goal_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .context("goal not found")?;
+        ensure!(
+            matches!(
+                status.as_str(),
+                "failed" | "canceled" | "rejected" | "blocked"
+            ),
+            "goal cannot be replanned from status '{status}'"
+        );
+        // The previous revision's open items are superseded — `canceled`
+        // keeps them auditable but out of every dispatch/aggregate path.
+        sqlx::query(
+            "UPDATE harness_attempts
+             SET status = 'abandoned', finished_at = ?1, error = ?2
+             WHERE goal_id = ?3 AND status IN ('running', 'committing', 'waiting_confirmation')",
+        )
+        .bind(now)
+        .bind("superseded by replan".to_string())
+        .bind(goal_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE harness_work_items
+             SET status = 'canceled', lease_token = NULL, lease_until = NULL,
+                 next_attempt_at = NULL, last_error = ?1, updated_at = ?2
+             WHERE goal_id = ?3 AND status NOT IN ('succeeded', 'failed', 'canceled')",
+        )
+        .bind(format!("superseded by replan: {reason}"))
+        .bind(now)
+        .bind(goal_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE harness_goals SET status = 'replan', updated_at = unixepoch()
+             WHERE id = ?1",
+        )
+        .bind(goal_id)
+        .execute(&mut *tx)
+        .await?;
+        insert_event(
+            &mut tx,
+            goal_id,
+            "goal.replan",
+            actor,
+            &serde_json::json!({"reason": reason}).to_string(),
+        )
+        .await?;
+        tx.commit().await?;
+        let row = sqlx::query("SELECT * FROM harness_goals WHERE id = ?1")
+            .bind(goal_id)
+            .fetch_one(self.store.pool())
+            .await?;
+        decode_goal(row)
     }
 
     async fn list_goal_events(
@@ -1430,7 +1513,9 @@ impl LoopStore for SqliteLoopStore {
         .await
         .context("failed to bind goal approval")?;
         sqlx::query(
-            "INSERT INTO harness_goal_budget_usage
+            // Replan issues a fresh revision — replace so the new budget
+            // clock (started_at, deadline) resets for the rerun.
+            "INSERT OR REPLACE INTO harness_goal_budget_usage
              (goal_id, max_provider_calls, deadline_secs, max_response_bytes)
              VALUES (?1, ?2, ?3, ?4)",
         )
@@ -1602,13 +1687,16 @@ impl LoopStore for SqliteLoopStore {
                 .get("max_nodes")
                 .and_then(serde_json::Value::as_u64)
                 .context("swarm root step is missing a max_nodes budget")? as usize;
-        let existing_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM harness_work_items WHERE goal_id = ?1")
-                .bind(goal_id)
-                .fetch_one(&mut *tx)
-                .await?;
+        let existing_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM harness_work_items
+                 WHERE goal_id = ?1 AND status != 'canceled'",
+        )
+        .bind(goal_id)
+        .fetch_one(&mut *tx)
+        .await?;
         let max_ordinal: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(ordinal), -1) FROM harness_work_items WHERE goal_id = ?1",
+            "SELECT COALESCE(MAX(ordinal), -1) FROM harness_work_items
+             WHERE goal_id = ?1 AND status != 'canceled'",
         )
         .bind(goal_id)
         .fetch_one(&mut *tx)
@@ -1618,13 +1706,15 @@ impl LoopStore for SqliteLoopStore {
             "workflow extension exceeds the approved expansion budget"
         );
 
-        let existing_step_ids: BTreeSet<String> =
-            sqlx::query_scalar("SELECT step_id FROM harness_work_items WHERE goal_id = ?1")
-                .bind(goal_id)
-                .fetch_all(&mut *tx)
-                .await?
-                .into_iter()
-                .collect();
+        let existing_step_ids: BTreeSet<String> = sqlx::query_scalar(
+            "SELECT step_id FROM harness_work_items
+                 WHERE goal_id = ?1 AND status != 'canceled'",
+        )
+        .bind(goal_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .collect();
         let mut step_ids = existing_step_ids.clone();
         for step in &steps {
             ensure!(
@@ -3241,7 +3331,16 @@ async fn refresh_goal_status_tx(
                 SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
                 SUM(CASE WHEN status IN ('running', 'succeeded', 'waiting_confirmation')
                          THEN 1 ELSE 0 END) AS progressed
-         FROM harness_work_items WHERE goal_id = ?1",
+         FROM harness_work_items
+         WHERE goal_id = ?1
+           AND workflow_id = (
+               SELECT w.id FROM harness_workflows w
+                WHERE w.goal_id = harness_work_items.goal_id
+                  AND w.goal_revision = (
+                      SELECT MAX(goal_revision) FROM harness_goal_approvals
+                      WHERE goal_id = harness_work_items.goal_id
+                  )
+           )",
     )
     .bind(goal_id)
     .fetch_one(&mut **tx)

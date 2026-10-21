@@ -4734,3 +4734,137 @@ async fn paused_goal_stops_dispatching_until_unpaused() -> anyhow::Result<()> {
     assert!(events.iter().any(|e| e.event_type == "goal.unpaused"));
     Ok(())
 }
+
+/// Replan: a failed goal can be sent back to planning — old items are
+/// superseded (canceled, auditable), `plan_goal` accepts the `replan`
+/// status, and the fresh revision runs on a clean item set.
+#[tokio::test]
+async fn failed_goal_replans_into_a_fresh_revision() -> anyhow::Result<()> {
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let actor = "operator:test";
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                objective: "replan me".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            actor,
+        )
+        .await?;
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![WorkflowStep {
+                        id: "stalled".to_string(),
+                        handler: "wait".to_string(),
+                        effect: EffectClass::Pure,
+                        input: serde_json::json!({"until_unix": 4_000_000_000i64}),
+                        retry: RetryPolicy {
+                            max_attempts: 1,
+                            backoff_secs: 0,
+                        },
+                    }],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 0,
+                        deadline_secs: 3600,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+                    label: "gate".to_string(),
+                }],
+            },
+            actor,
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            actor,
+        )
+        .await?;
+    let provider = Arc::new(WorkerProvider);
+    let worker = LoopWorker::with_builtins(engine.clone(), provider.clone(), None, None)?;
+    engine
+        .cancel_goal(&goal.id, "giving up on v1", actor)
+        .await?;
+
+    let replanned = engine
+        .mark_goal_for_replan(&goal.id, "use a real handler", actor)
+        .await?;
+    assert_eq!(replanned.status, GoalStatus::Replan);
+    // The prior revision's items are all terminal — nothing open remains
+    // to leak into the next revision's dispatch or aggregate.
+    let items = engine.list_work_items(&goal.id).await?;
+    assert!(items.iter().all(|i| {
+        matches!(
+            i.status,
+            WorkItemStatus::Succeeded | WorkItemStatus::Failed | WorkItemStatus::Canceled
+        )
+    }));
+
+    // Fresh revision on the same goal.
+    let plan2 = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![WorkflowStep {
+                        id: "check".to_string(),
+                        handler: "self_test_suite".to_string(),
+                        effect: EffectClass::LocalWrite,
+                        input: serde_json::json!({"suite": "core"}),
+                        retry: RetryPolicy {
+                            max_attempts: 2,
+                            backoff_secs: 0,
+                        },
+                    }],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 0,
+                        deadline_secs: 3600,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+                    label: "gate".to_string(),
+                }],
+            },
+            actor,
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan2.goal.revision,
+                expected_plan_hash: plan2.plan_hash.clone(),
+            },
+            actor,
+        )
+        .await?;
+    assert!(
+        engine
+            .list_dispatchable_goal_ids(10)
+            .await?
+            .contains(&goal.id),
+        "replanned+approved goal re-enters dispatch"
+    );
+    let report = worker.run_goal_until_idle(&goal.id, 8).await?;
+    let fresh = report
+        .work_items
+        .iter()
+        .find(|i| i.step_id == "check")
+        .expect("new revision item ran");
+    assert_eq!(fresh.status, WorkItemStatus::Succeeded);
+    Ok(())
+}
