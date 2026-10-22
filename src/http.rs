@@ -45,7 +45,7 @@ use crate::memory::{
     HybridRetrievalOptions, HybridSqliteZvecMemoryBackend, MemoryBackend, SqliteMemoryBackend,
     SqliteMemoryStore, ZvecSidecarClient, ZvecSidecarConfig,
 };
-use crate::provider::{ChatProvider, ProviderRegistry};
+use crate::provider::{ChatProvider, FailoverProvider, ProviderRegistry};
 use crate::service::{
     AgentMcpSettings, AgentSkillsSettings, AgentSwarmSettings, CodeModeDiagnostics, MessageService,
 };
@@ -546,7 +546,31 @@ async fn build_runtime_handles(
                     config.app.default_provider
                 )
             })?;
-        provider_registry.build(&config.app.default_provider, provider_cfg)?
+        let primary = provider_registry.build(&config.app.default_provider, provider_cfg)?;
+
+        if config.app.provider_failovers.is_empty() {
+            primary
+        } else {
+            let mut chain: Vec<(String, Arc<dyn ChatProvider>)> =
+                vec![(config.app.default_provider.clone(), primary)];
+            for name in &config.app.provider_failovers {
+                let failover_cfg = config
+                    .providers
+                    .get(name)
+                    .with_context(|| format!("failover provider '{name}' not found in config"))?;
+                chain.push((name.clone(), provider_registry.build(name, failover_cfg)?));
+            }
+            info!(
+                chain = ?chain.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+                "provider failover chain configured"
+            );
+            Arc::new(FailoverProvider::new(
+                chain,
+                config.app.failover_failure_threshold,
+                Duration::from_secs(config.app.failover_cooldown_secs),
+                config.app.failover_on_4xx,
+            ))
+        }
     };
 
     let memory_store = SqliteMemoryStore::new(database_url).await?;

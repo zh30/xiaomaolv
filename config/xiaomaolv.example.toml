@@ -4,6 +4,11 @@ default_provider = "openai"
 locale = "${XIAOMAOLV_LOCALE:-en-US}"
 max_history = 16
 concurrency_limit = 128
+# Ordered providers tried after default_provider fails (5xx/timeout/429/401/403).
+# provider_failovers = ["backup"]
+# failover_failure_threshold = 3
+# failover_cooldown_secs = 60
+# failover_on_4xx = false
 # Optional: protects HTTP APIs and config state/save endpoints when set.
 api_key = "${XIAOMAOLV_APP_API_KEY:-}"
 
