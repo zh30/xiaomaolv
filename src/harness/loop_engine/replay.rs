@@ -207,7 +207,7 @@ pub(crate) async fn record_trajectory_frame(
 ) -> anyhow::Result<TrajectoryFrame> {
     let request_hash = request_hash(&draft.request_messages, draft.request_was_json)?;
     let response_hash = hash_serializable(&draft.response)?;
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let existing = sqlx::query(
         "SELECT id, trajectory_id, call_index, model, provider_fingerprint,
                 request_messages_json, request_was_json, request_hash, response,
@@ -353,7 +353,7 @@ fn decode_frame(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<TrajectoryFrame>
 }
 
 async fn persist_replay(pool: &SqlitePool, run: &ReplayRun, actor: &str) -> anyhow::Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query(
         "INSERT INTO harness_replay_runs
          (id, trajectory_id, mode, status, exact_replayable, live_tools_executed,

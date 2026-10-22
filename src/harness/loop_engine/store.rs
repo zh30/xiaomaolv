@@ -641,7 +641,7 @@ impl LoopStore for SqliteLoopStore {
         let mut tx = self
             .store
             .pool()
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .context("failed to start goal transaction")?;
         if let Some(request_id) = &request.request_id {

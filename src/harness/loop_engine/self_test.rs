@@ -242,7 +242,7 @@ async fn count_case(
 }
 
 async fn persist_run(pool: &SqlitePool, run: &SelfTestRun, actor: &str) -> anyhow::Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query(
         "INSERT INTO harness_self_test_runs
          (id, suite, status, started_at, finished_at, created_by)

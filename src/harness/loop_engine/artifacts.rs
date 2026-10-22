@@ -181,7 +181,7 @@ pub(crate) async fn publish_artifact(
     actor: &str,
 ) -> anyhow::Result<ArtifactPublishResult> {
     let content_hash = hash_serializable(&request.content)?;
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     if let Some(source_goal_id) = &request.source_goal_id {
         let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM harness_goals WHERE id = ?1")
             .bind(source_goal_id)
