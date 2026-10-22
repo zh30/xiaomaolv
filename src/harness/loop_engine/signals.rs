@@ -307,7 +307,7 @@ pub(crate) async fn ingest_signal(
     let fingerprint = hash_serializable(&request)?;
     let content_hash = hash_serializable(&request.content)?;
     let normalized_hash = normalized_signal_hash(request.kind, &request.content);
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let existing_id = if let Some(external_id) = &request.external_id {
         sqlx::query_scalar::<_, String>(
             "SELECT id FROM harness_signals
@@ -500,7 +500,7 @@ pub(crate) async fn ignore_signal(
         "signal cannot be ignored from status '{}'",
         signal.status.as_str()
     );
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     insert_signal_event_tx(
         &mut tx,
         signal_id,
@@ -521,7 +521,7 @@ pub(crate) async fn mark_signal_proposed(
     goal_id: &str,
     actor: &str,
 ) -> anyhow::Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM harness_signals WHERE id = ?1")
         .bind(signal_id)
         .fetch_one(&mut *tx)

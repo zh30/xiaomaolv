@@ -421,6 +421,7 @@ impl SqliteLoopStore {
     async fn get_goal_by_request_id(&self, request_id: &str) -> anyhow::Result<Option<GoalRecord>> {
         let row = sqlx::query(
             "SELECT id, objective, status, revision, source_signal_ids_json, created_by,
+                    internal_only,
                     created_at, updated_at
              FROM harness_goals WHERE request_id = ?1",
         )
@@ -462,6 +463,17 @@ impl SqliteLoopStore {
                 matches!(goal_status.as_str(), "approved" | "active"),
                 "goal is not dispatchable"
             );
+            if step_id.is_none() {
+                let internal_only: Option<i64> =
+                    sqlx::query_scalar("SELECT internal_only FROM harness_goals WHERE id = ?1")
+                        .bind(goal_id)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                ensure!(
+                    internal_only.unwrap_or(0) == 0,
+                    "internal_only goal is not claimable by a generic worker"
+                );
+            }
             let row = if let Some(step_id) = step_id {
                 sqlx::query(
                     "SELECT id, goal_id, workflow_id, status, step_id, handler, effect_class,
@@ -629,7 +641,7 @@ impl LoopStore for SqliteLoopStore {
         let mut tx = self
             .store
             .pool()
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .context("failed to start goal transaction")?;
         if let Some(request_id) = &request.request_id {
@@ -650,14 +662,15 @@ impl LoopStore for SqliteLoopStore {
         let inserted = sqlx::query(
             "INSERT INTO harness_goals
              (id, objective, status, revision, source_signal_ids_json, created_by,
-              request_id)
-             VALUES (?1, ?2, 'proposed', 1, ?3, ?4, ?5)",
+              request_id, internal_only)
+             VALUES (?1, ?2, 'proposed', 1, ?3, ?4, ?5, ?6)",
         )
         .bind(&id)
         .bind(request.objective.trim())
         .bind(source_signal_ids)
         .bind(actor)
         .bind(&request.request_id)
+        .bind(request.internal_only as i64)
         .execute(&mut *tx)
         .await;
         if let Err(error) = inserted {
@@ -684,6 +697,7 @@ impl LoopStore for SqliteLoopStore {
         ensure_valid_id(goal_id, "goal id")?;
         let row = sqlx::query(
             "SELECT id, objective, status, revision, source_signal_ids_json, created_by,
+                    internal_only,
                     created_at, updated_at
              FROM harness_goals WHERE id = ?1",
         )
@@ -698,6 +712,7 @@ impl LoopStore for SqliteLoopStore {
         let limit = limit.clamp(1, 500);
         sqlx::query(
             "SELECT id, objective, status, revision, source_signal_ids_json, created_by,
+                    internal_only,
                     created_at, updated_at
              FROM harness_goals ORDER BY updated_at DESC, id DESC LIMIT ?1",
         )
@@ -718,6 +733,7 @@ impl LoopStore for SqliteLoopStore {
             "SELECT g.id FROM harness_goals g
              JOIN harness_goal_budget_usage b ON b.goal_id = g.id
              WHERE g.status IN ('approved', 'active', 'blocked', 'verifying')
+               AND g.internal_only = 0
                AND b.started_at IS NOT NULL
                AND b.started_at + b.deadline_secs < ?1
              LIMIT ?2",
@@ -1024,6 +1040,7 @@ impl LoopStore for SqliteLoopStore {
         sqlx::query_scalar::<_, String>(
             "SELECT g.id FROM harness_goals g
              WHERE g.status IN ('approved', 'active', 'verifying')
+               AND g.internal_only = 0
                AND NOT EXISTS (
                    SELECT 1 FROM harness_goal_budget_usage b
                     WHERE b.goal_id = g.id
@@ -3129,6 +3146,23 @@ pub async fn initialize_loop_engine_schema(pool: &SqlitePool) -> anyhow::Result<
     .execute(pool)
     .await
     .context("failed to record loop engine schema version 3")?;
+    // Version 4: `internal_only` goals — projection mirrors (the legacy
+    // swarm mirror) that must not enter the runtime dispatch sweep.
+    if !column_exists(pool, "harness_goals", "internal_only").await? {
+        sqlx::query(
+            "ALTER TABLE harness_goals ADD COLUMN internal_only INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(pool)
+        .await
+        .context("failed to migrate harness_goals.internal_only")?;
+    }
+    sqlx::query(
+        "INSERT OR IGNORE INTO harness_schema_migrations (version, name)
+         VALUES (4, 'internal_only_goals')",
+    )
+    .execute(pool)
+    .await
+    .context("failed to record loop engine schema version 3")?;
     Ok(())
 }
 
@@ -3238,6 +3272,7 @@ fn decode_goal(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<GoalRecord> {
         created_by: row.try_get("created_by")?,
         created_at_unix: row.try_get("created_at")?,
         updated_at_unix: row.try_get("updated_at")?,
+        internal_only: row.try_get::<Option<i64>, _>("internal_only")?.unwrap_or(0) != 0,
     })
 }
 

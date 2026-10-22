@@ -199,6 +199,7 @@ async fn post_goal(
     let (goal, created) = engine
         .create_goal_admission(
             CreateGoalRequest {
+                internal_only: false,
                 objective: request.objective,
                 source_signal_ids: request.source_signal_ids,
                 request_id: request.request_id,

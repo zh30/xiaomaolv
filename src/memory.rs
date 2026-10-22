@@ -502,7 +502,7 @@ impl SqliteMemoryStore {
         lease_secs: i64,
     ) -> anyhow::Result<bool> {
         let now = unix_ts();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let inserted = sqlx::query(
             "INSERT OR IGNORE INTO telegram_admissions
              (update_id, status, kind, summary_json, attempts, lease_until)
@@ -645,7 +645,7 @@ impl SqliteMemoryStore {
         older_than_secs: i64,
     ) -> anyhow::Result<Vec<i64>> {
         let stale_before = unix_ts() - older_than_secs;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let stale: Vec<i64> = sqlx::query_scalar(
             "SELECT update_id FROM telegram_admissions
              WHERE status = 'processing' AND lease_until < ?1",
@@ -894,7 +894,7 @@ impl SqliteMemoryStore {
         // This avoids the complexity of building a single multi-row INSERT with functions
         let mut tx = self
             .pool
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .context("failed to begin telegram group alias tx")?;
 
@@ -1211,7 +1211,7 @@ impl SqliteMemoryStore {
     ) -> anyhow::Result<Vec<TelegramSchedulerJobRecord>> {
         let mut tx = self
             .pool
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .context("failed to begin scheduler tx")?;
 
@@ -1308,7 +1308,7 @@ impl SqliteMemoryStore {
     ) -> anyhow::Result<()> {
         let mut tx = self
             .pool
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .context("failed to begin scheduler complete tx")?;
         sqlx::query(
@@ -1372,7 +1372,7 @@ impl SqliteMemoryStore {
     ) -> anyhow::Result<()> {
         let mut tx = self
             .pool
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .context("failed to begin scheduler fail tx")?;
         sqlx::query(
@@ -1749,7 +1749,7 @@ impl SqliteMemoryStore {
     ) -> anyhow::Result<i64> {
         let mut tx = self
             .pool
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .context("failed to begin agent swarm cleanup tx")?;
 
@@ -2215,7 +2215,7 @@ impl SqliteMemoryStore {
     ) -> anyhow::Result<()> {
         let mut tx = self
             .pool
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .context("failed to begin finished-trajectory transaction")?;
         sqlx::query(
@@ -2600,7 +2600,7 @@ async fn ensure_trajectory_tool_calls_schema(pool: &SqlitePool) -> anyhow::Resul
     }
 
     let mut tx = pool
-        .begin()
+        .begin_with("BEGIN IMMEDIATE")
         .await
         .context("failed to start trajectory tool call migration")?;
     sqlx::query("ALTER TABLE mcp_trajectory_tool_calls RENAME TO mcp_trajectory_tool_calls_legacy")

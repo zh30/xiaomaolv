@@ -927,6 +927,10 @@ impl MessageService {
                     // Swarm retries of the same run admit the same goal
                     // instead of forking a second projection.
                     request_id: Some(format!("swarm:{run_id}")),
+                    // Mirror-only goals stay out of the dispatch sweep —
+                    // their items are claimed in-process. The durable path
+                    // keeps sweep visibility so orphaned runs get claimed.
+                    internal_only: !self.agent_swarm.durable_engine,
                 },
                 SWARM_LOOP_ACTOR,
             )
@@ -2332,6 +2336,29 @@ impl MessageService {
                 }
                 Err(error) => {
                     warn!(error = %error, run_id = %run.run_id, "deferred swarm reply send failed");
+                    // One dedup'd triage signal — a reply that keeps failing
+                    // is operator-visible instead of warn-log silent.
+                    if let Some(engine) = &self.loop_engine {
+                        let _ = engine
+                        .ingest_signal(
+                            crate::harness::loop_engine::CreateSignalRequest {
+                                kind: crate::harness::loop_engine::SignalKind::Manual,
+                                trust: crate::harness::loop_engine::SignalTrust::Internal,
+                                source: "internal:swarm-deliver".to_string(),
+                                external_id: Some(format!("swarm-deliver:{}", run.run_id)),
+                                content: format!(
+                                    "swarm run {}: deferred reply delivery failed on channel {}: {error}",
+                                    run.run_id, run.channel
+                                ),
+                                metadata: std::collections::BTreeMap::from([
+                                    ("run_id".to_string(), run.run_id.clone()),
+                                    ("channel".to_string(), run.channel.clone()),
+                                ]),
+                            },
+                            "internal:swarm",
+                        )
+                        .await;
+                    }
                 }
             }
         }

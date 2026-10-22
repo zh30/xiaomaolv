@@ -165,6 +165,7 @@ impl LoopEngine {
         let goal = self
             .create_goal(
                 CreateGoalRequest {
+                    internal_only: false,
                     objective: objective.to_string(),
                     source_signal_ids: vec![signal_id.to_string()],
                     request_id: Some(format!("signal:{signal_id}")),

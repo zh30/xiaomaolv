@@ -538,7 +538,7 @@ impl EvolutionStore for SqliteEvolutionStore {
         let mut tx = self
             .store
             .pool()
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .context("failed to start evolution candidate transaction")?;
         if let Some(parent_id) = &draft.parent_candidate_id {
@@ -662,7 +662,7 @@ impl EvolutionStore for SqliteEvolutionStore {
         let mut tx = self
             .store
             .pool()
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .context("failed to start evolution transition transaction")?;
         let result = sqlx::query(
@@ -723,7 +723,7 @@ impl EvolutionStore for SqliteEvolutionStore {
         let mut tx = self
             .store
             .pool()
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .context("failed to start evolution eval case transaction")?;
         if eval_case.enabled {
@@ -807,7 +807,7 @@ impl EvolutionStore for SqliteEvolutionStore {
         let mut tx = self
             .store
             .pool()
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .context("failed to start evolution evaluation transaction")?;
         let candidate_exists: i64 =
@@ -901,7 +901,7 @@ impl EvolutionStore for SqliteEvolutionStore {
         let mut tx = self
             .store
             .pool()
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .context("failed to start evolution feedback transaction")?;
         let trajectory_exists: i64 =
@@ -1056,7 +1056,7 @@ impl EvolutionStore for SqliteEvolutionStore {
         let mut tx = self
             .store
             .pool()
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .context("failed to start evolution activation transaction")?;
         acquire_runtime_state_write_lock(&mut tx).await?;
@@ -1244,7 +1244,7 @@ impl EvolutionStore for SqliteEvolutionStore {
         let mut tx = self
             .store
             .pool()
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .context("failed to start evolution rollback transaction")?;
         acquire_runtime_state_write_lock(&mut tx).await?;
@@ -1344,7 +1344,7 @@ impl EvolutionStore for SqliteEvolutionStore {
         let mut tx = self
             .store
             .pool()
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .context("failed to start evolution audit transaction")?;
         insert_audit_event(

@@ -46,6 +46,7 @@ async fn built_in_worker_dispatches_the_approved_dag_and_verifies_the_goal() -> 
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "Make loop recovery observable".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -133,6 +134,7 @@ async fn built_in_worker_runs_evolution_evaluation_with_persisted_budgets() -> a
     let goal = loop_engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "Evaluate a prompt candidate safely".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -329,6 +331,7 @@ async fn goal_survives_engine_restart_and_can_be_resumed() -> anyhow::Result<()>
     let created = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "Make recovery observable".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -397,6 +400,7 @@ async fn resume_reconciles_a_committed_checkpoint_without_replaying_the_effect()
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "Recover an interrupted evolution evaluation".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -524,6 +528,7 @@ async fn approval_is_bound_to_the_reviewed_workflow_hash() -> anyhow::Result<()>
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "Continuously self-test the harness".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -597,6 +602,7 @@ async fn manual_acceptance_requires_explicit_operator_evidence() -> anyhow::Resu
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "Require a human release decision".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -840,6 +846,7 @@ async fn swarm_crash_leaves_resumable_durable_state() -> anyhow::Result<()> {
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "agent swarm run run-crash: root task".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -985,6 +992,7 @@ async fn extend_workflow_enforces_internal_actor_manifest_and_budget() -> anyhow
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "Bounded dynamic expansion".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -1121,6 +1129,7 @@ async fn internal_auto_approval_is_bounded_by_policy() -> anyhow::Result<()> {
         let goal = engine
             .create_goal(
                 CreateGoalRequest {
+                    internal_only: false,
                     objective: objective.to_string(),
                     source_signal_ids: Vec::new(),
                     request_id: None,
@@ -1299,6 +1308,7 @@ async fn external_write_plan_rejected_when_disabled() -> anyhow::Result<()> {
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "Notify me externally".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -1323,6 +1333,7 @@ async fn external_write_plan_rejected_when_handler_not_allowlisted() -> anyhow::
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "Notify me externally".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -1377,6 +1388,7 @@ async fn channel_send_executes_and_commits_with_evidence() -> anyhow::Result<()>
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "Notify me externally".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -1452,6 +1464,7 @@ async fn channel_send_crash_before_commit_parks_item_without_resend() -> anyhow:
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "Notify me externally".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -1528,6 +1541,7 @@ async fn channel_send_dispatch_blocked_when_flag_off_on_worker() -> anyhow::Resu
     let goal = enabled
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "Notify me externally".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -1775,6 +1789,7 @@ async fn parked_channel_send(
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "Notify me externally".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -1961,6 +1976,7 @@ async fn resolve_rejects_non_parked_and_cross_goal_items() -> anyhow::Result<()>
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "Notify me externally".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -2071,6 +2087,7 @@ async fn unsafe_replay_prepared_checkpoint_parks_without_external_write() -> any
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "Probe ambiguous local effect".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -2187,6 +2204,7 @@ async fn safe_replay_prepared_checkpoint_retries_without_parking() -> anyhow::Re
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "Probe safe replay".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -2257,6 +2275,7 @@ async fn missing_handler_blocks_then_requeues_when_registered() -> anyhow::Resul
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "Run a blocked then requeued plan".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -2345,6 +2364,7 @@ async fn wait_step_defers_until_the_stored_deadline() -> anyhow::Result<()> {
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "Wait for a durable deadline".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -2451,6 +2471,7 @@ async fn goal_admission_deduplicates_request_id_and_notifies() -> anyhow::Result
     let mut notifications = engine.subscribe_events();
 
     let request = |objective: &str| CreateGoalRequest {
+        internal_only: false,
         objective: objective.to_string(),
         source_signal_ids: Vec::new(),
         request_id: Some("submission:goal-1".to_string()),
@@ -2491,6 +2512,7 @@ async fn consecutive_resumes_emit_a_single_event() -> anyhow::Result<()> {
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "Observe resume dedup".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -2620,6 +2642,7 @@ async fn phase_boundaries_commit_progress_then_continue_in_place() -> anyhow::Re
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "Run a two-phase probe".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -2678,6 +2701,7 @@ async fn committed_phase_progress_resumes_after_attempt_crash() -> anyhow::Resul
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "Resume a crashed phase run".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -2753,6 +2777,7 @@ async fn phase_loop_is_bounded_by_continuation_budget() -> anyhow::Result<()> {
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "Bound a runaway phase loop".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -2879,6 +2904,7 @@ async fn dependent_step_reads_upstream_outcome_by_step_id() -> anyhow::Result<()
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "Run a produce/consume DAG".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -3010,6 +3036,7 @@ async fn durable_swarm_run_delegates_and_merges_through_the_dag() -> anyhow::Res
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "ROOT TASK".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: Some("swarm:test-run".to_string()),
@@ -3128,6 +3155,7 @@ async fn durable_swarm_engine(
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "ROOT TASK".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -3302,6 +3330,7 @@ async fn durable_swarm_extension_budget_rejection_answers_directly() -> anyhow::
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "ROOT".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -3402,6 +3431,7 @@ async fn durable_swarm_depth_limit_forces_direct_answer() -> anyhow::Result<()> 
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "ROOT".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -3620,6 +3650,7 @@ async fn concurrent_workers_claim_sibling_items_in_parallel() -> anyhow::Result<
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "parallel".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -3733,6 +3764,7 @@ async fn orphaned_swarm_goal_resumes_once_swarm_handler_registers() -> anyhow::R
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "ROOT".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -3828,6 +3860,7 @@ async fn deferred_attempts_do_not_consume_the_attempt_budget() -> anyhow::Result
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "wait once".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -3938,6 +3971,7 @@ async fn delayed_continuation_does_not_consume_the_attempt_budget() -> anyhow::R
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "delay once".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -4111,6 +4145,7 @@ async fn swarm_node_honors_the_goal_provider_call_budget() -> anyhow::Result<()>
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "budget".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: Some("swarm:run-budget".to_string()),
@@ -4405,6 +4440,7 @@ async fn goal_past_execution_deadline_expires_and_stops_dispatching() -> anyhow:
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "expire me".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -4580,6 +4616,7 @@ async fn cancel_goal_stops_live_work_and_is_auditable() -> anyhow::Result<()> {
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "cancel me".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -4672,6 +4709,7 @@ async fn paused_goal_stops_dispatching_until_unpaused() -> anyhow::Result<()> {
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "pause me".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -4758,6 +4796,7 @@ async fn failed_goal_replans_into_a_fresh_revision() -> anyhow::Result<()> {
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "replan me".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -4891,6 +4930,7 @@ async fn proposed_goal_can_be_rejected_then_replanned() -> anyhow::Result<()> {
     let goal = engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: "maybe not".to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
@@ -4916,5 +4956,92 @@ async fn proposed_goal_can_be_rejected_then_replanned() -> anyhow::Result<()> {
         events.iter().any(|e| e.event_type == "goal.rejected"),
         "reject lands an auditable event"
     );
+    Ok(())
+}
+
+/// `internal_only` goals — projection mirrors like the legacy swarm mirror —
+/// stay out of the runtime dispatch sweep, while the in-process targeted
+/// claim path still works.
+#[tokio::test]
+async fn internal_only_goal_skips_dispatch_sweep_but_stays_claimable() -> anyhow::Result<()> {
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let actor = "operator:test";
+    let goal = engine
+        .create_goal(
+            CreateGoalRequest {
+                internal_only: true,
+                objective: "mirror-only goal".to_string(),
+                source_signal_ids: Vec::new(),
+                request_id: None,
+            },
+            actor,
+        )
+        .await?;
+    assert!(goal.internal_only);
+    let plan = engine
+        .plan_goal(
+            &goal.id,
+            PlanGoalRequest {
+                workflow: WorkflowSpec {
+                    steps: vec![WorkflowStep {
+                        id: "step".to_string(),
+                        handler: "self_test_suite".to_string(),
+                        effect: EffectClass::LocalWrite,
+                        input: serde_json::json!({"suite": "core"}),
+                        retry: RetryPolicy {
+                            max_attempts: 1,
+                            backoff_secs: 0,
+                        },
+                    }],
+                    edges: Vec::new(),
+                    budget: ExecutionBudget {
+                        max_provider_calls: 0,
+                        deadline_secs: 3600,
+                        max_response_bytes: 65_536,
+                    },
+                },
+                acceptance_criteria: vec![AcceptanceCriterion::ManualApproval {
+                    label: "gate".to_string(),
+                }],
+            },
+            actor,
+        )
+        .await?;
+    engine
+        .approve_goal(
+            &goal.id,
+            ApproveGoalRequest {
+                expected_goal_revision: plan.goal.revision,
+                expected_plan_hash: plan.plan_hash.clone(),
+            },
+            actor,
+        )
+        .await?;
+    // The runtime sweep never sees it...
+    assert!(
+        !engine
+            .list_dispatchable_goal_ids(10)
+            .await?
+            .contains(&goal.id),
+        "internal_only goal must not enter the dispatch list"
+    );
+    // ...and the generic claim path rejects it outright, not just the list.
+    let generic = engine
+        .claim_goal_work(&goal.id, "worker:generic", 30, actor)
+        .await;
+    assert!(
+        generic
+            .expect_err("generic claim on internal_only goal")
+            .to_string()
+            .contains("internal_only"),
+        "generic claim must be rejected, not just the dispatch list"
+    );
+    // ...but the in-process targeted claim still works.
+    let claim = engine
+        .claim_work_item(&goal.id, "step", "worker:internal", 30, actor)
+        .await?
+        .expect("targeted claim should succeed on an internal_only goal");
+    assert_eq!(claim.work_item.step_id, "step");
     Ok(())
 }
