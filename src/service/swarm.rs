@@ -239,6 +239,9 @@ impl MessageService {
             })
             .await
             .context("failed to create swarm run audit")?;
+        if let Some(engine) = &self.loop_engine {
+            engine.notify_swarm_run(&run_id);
+        }
 
         let shared = SwarmExecutionShared {
             run_id: run_id.clone(),
@@ -336,6 +339,11 @@ impl MessageService {
                 .await
         {
             warn!(error = %err, run_id = %run_id, "failed to finalize swarm run audit");
+        }
+        if run_status != AgentSwarmRunStatus::Running
+            && let Some(engine) = &self.loop_engine
+        {
+            engine.notify_swarm_run(&run_id);
         }
 
         self.finish_swarm_loop_projection(&shared, reply_text.as_deref(), run_error.as_deref())
@@ -2256,6 +2264,9 @@ impl MessageService {
                     },
                 })
                 .await;
+            if let Some(engine) = &self.loop_engine {
+                engine.notify_swarm_run(&run.run_id);
+            }
             reaped += 1;
         }
 

@@ -2500,7 +2500,10 @@ async fn goal_admission_deduplicates_request_id_and_notifies() -> anyhow::Result
     );
     // The commit notified subscribers carrying the goal id.
     let notified = notifications.recv().await?;
-    assert_eq!(notified, goal.id);
+    assert_eq!(
+        notified,
+        xiaomaolv::harness::loop_engine::EngineNotify::Goal(goal.id)
+    );
     Ok(())
 }
 

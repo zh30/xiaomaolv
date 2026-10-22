@@ -16,7 +16,7 @@ pub use domain::{
     RetryPolicy, WorkClaim, WorkContinuation, WorkItemRecord, WorkItemStatus, WorkOutcome,
     WorkPhaseProgress, WorkflowEdge, WorkflowSpec, WorkflowStep,
 };
-pub use engine::LoopEngine;
+pub use engine::{EngineNotify, LoopEngine};
 pub use replay::{
     ReplayCaseResult, ReplayMode, ReplayRun, ReplayStatus, TrajectoryFrame, TrajectoryFrameCapture,
     TrajectoryFrameDraft,
