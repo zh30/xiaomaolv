@@ -115,6 +115,35 @@ impl SqliteMemoryStore {
         .context("failed to initialize telegram_outbound_messages table")?;
 
         sqlx::query(
+            "CREATE TABLE IF NOT EXISTS telegram_outbound_queue (
+                id TEXT PRIMARY KEY,
+                channel TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                message_thread_id INTEGER,
+                reply_to_message_id INTEGER,
+                text TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at INTEGER NOT NULL,
+                last_error TEXT,
+                session_id TEXT,
+                created_at INTEGER NOT NULL,
+                sent_at INTEGER
+            );",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize telegram_outbound_queue table")?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_telegram_outbound_queue_due
+             ON telegram_outbound_queue(status, next_attempt_at);",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize telegram_outbound_queue index")?;
+
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS memory_chunks (
                 chunk_id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
@@ -3185,6 +3214,23 @@ pub struct TelegramSchedulerJobRecord {
 }
 
 #[derive(Debug, Clone)]
+pub struct TelegramOutboundQueueRecord {
+    pub id: String,
+    pub channel: String,
+    pub chat_id: i64,
+    pub message_thread_id: Option<i64>,
+    pub reply_to_message_id: Option<i64>,
+    pub text: String,
+    pub status: String,
+    pub attempts: i64,
+    pub next_attempt_at: i64,
+    pub last_error: Option<String>,
+    pub session_id: Option<String>,
+    pub created_at: i64,
+    pub sent_at: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
 pub struct CreateTelegramSchedulerJobRequest {
     pub job_id: String,
     pub channel: String,
@@ -5292,6 +5338,35 @@ pub struct TelegramOutboundRef {
 /// Durable outbound-message ledger so a user's reply-marker can be bound to
 /// the exact bot message it answered (and thereby the exact run).
 #[async_trait]
+/// Durable at-least-once queue for outbound telegram messages — the
+/// sender enqueues on failure and the janitor drains until delivered
+/// or dead (attempts cap). Distinct from `TelegramOutboundStore`, which
+/// only records sent message ids for reply threading.
+#[async_trait]
+pub trait TelegramOutboundQueueStore: Send + Sync {
+    async fn enqueue(&self, req: EnqueueTelegramOutboundRequest) -> anyhow::Result<()>;
+    async fn list_due(
+        &self,
+        channel: &str,
+        now_unix: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<TelegramOutboundQueueRecord>>;
+    async fn mark_sent(&self, id: &str) -> anyhow::Result<()>;
+    async fn mark_retry(&self, id: &str, error: &str, next_attempt_at: i64) -> anyhow::Result<()>;
+    async fn mark_dead(&self, id: &str, error: &str) -> anyhow::Result<()>;
+}
+
+#[derive(Debug, Clone)]
+pub struct EnqueueTelegramOutboundRequest {
+    pub channel: String,
+    pub chat_id: i64,
+    pub message_thread_id: Option<i64>,
+    pub reply_to_message_id: Option<i64>,
+    pub text: String,
+    pub session_id: Option<String>,
+}
+
+#[async_trait]
 pub trait TelegramOutboundStore: Send + Sync {
     async fn record(&self, chat_id: i64, message_id: i64, session_id: &str) -> anyhow::Result<()>;
     async fn session_for(
@@ -5299,6 +5374,114 @@ pub trait TelegramOutboundStore: Send + Sync {
         chat_id: i64,
         message_id: i64,
     ) -> anyhow::Result<Option<TelegramOutboundRef>>;
+}
+
+#[async_trait]
+impl TelegramOutboundQueueStore for SqliteMemoryStore {
+    async fn enqueue(&self, req: EnqueueTelegramOutboundRequest) -> anyhow::Result<()> {
+        static OUT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = format!(
+            "out_{}_{:04}",
+            unix_ts(),
+            OUT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 10_000
+        );
+        sqlx::query(
+            "INSERT INTO telegram_outbound_queue
+             (id, channel, chat_id, message_thread_id, reply_to_message_id, text,
+              status, attempts, next_attempt_at, last_error, session_id, created_at, sent_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0, unixepoch(), NULL, ?7, unixepoch(), NULL)",
+        )
+        .bind(id)
+        .bind(&req.channel)
+        .bind(req.chat_id)
+        .bind(req.message_thread_id)
+        .bind(req.reply_to_message_id)
+        .bind(&req.text)
+        .bind(&req.session_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to enqueue telegram outbound")?;
+        Ok(())
+    }
+
+    async fn list_due(
+        &self,
+        channel: &str,
+        now_unix: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<TelegramOutboundQueueRecord>> {
+        let rows = sqlx::query(
+            "SELECT id, channel, chat_id, message_thread_id, reply_to_message_id, text,
+                    status, attempts, next_attempt_at, last_error, session_id,
+                    created_at, sent_at
+             FROM telegram_outbound_queue
+             WHERE channel = ?1 AND status = 'pending' AND next_attempt_at <= ?2
+             ORDER BY created_at ASC LIMIT ?3",
+        )
+        .bind(channel)
+        .bind(now_unix)
+        .bind(i64::try_from(limit).context("limit")?)
+        .fetch_all(&self.pool)
+        .await?;
+        let records = rows
+            .iter()
+            .map(|row| TelegramOutboundQueueRecord {
+                id: row.get("id"),
+                channel: row.get("channel"),
+                chat_id: row.get("chat_id"),
+                message_thread_id: row.get("message_thread_id"),
+                reply_to_message_id: row.get("reply_to_message_id"),
+                text: row.get("text"),
+                status: row.get("status"),
+                attempts: row.get("attempts"),
+                next_attempt_at: row.get("next_attempt_at"),
+                last_error: row.get("last_error"),
+                session_id: row.get("session_id"),
+                created_at: row.get("created_at"),
+                sent_at: row.get("sent_at"),
+            })
+            .collect();
+        Ok(records)
+    }
+
+    async fn mark_sent(&self, id: &str) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE telegram_outbound_queue
+             SET status = 'sent', sent_at = unixepoch(), last_error = NULL
+             WHERE id = ?1",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn mark_retry(&self, id: &str, error: &str, next_attempt_at: i64) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE telegram_outbound_queue
+             SET attempts = attempts + 1, next_attempt_at = ?2, last_error = ?3
+             WHERE id = ?1",
+        )
+        .bind(id)
+        .bind(next_attempt_at)
+        .bind(error)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn mark_dead(&self, id: &str, error: &str) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE telegram_outbound_queue
+             SET status = 'dead', last_error = ?2
+             WHERE id = ?1",
+        )
+        .bind(id)
+        .bind(error)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 #[async_trait]

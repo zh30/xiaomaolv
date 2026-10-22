@@ -43,7 +43,7 @@ use crate::harness::trajectory::TrajectoryLogger;
 use crate::mcp::{McpConfigPaths, McpRegistry, McpRuntime};
 use crate::memory::{
     HybridRetrievalOptions, HybridSqliteZvecMemoryBackend, MemoryBackend, SqliteMemoryBackend,
-    SqliteMemoryStore, ZvecSidecarClient, ZvecSidecarConfig,
+    SqliteMemoryStore, TelegramOutboundQueueStore, ZvecSidecarClient, ZvecSidecarConfig,
 };
 use crate::provider::{ChatProvider, FailoverProvider, ProviderRegistry};
 use crate::service::{
@@ -106,6 +106,8 @@ impl From<ChannelPluginError> for ApiError {
 #[derive(Clone)]
 struct RuntimeHandles {
     service: Arc<MessageService>,
+    /// Raw telegram sender + queue store for the outbound retry janitor.
+    telegram_outbound_janitor: Option<(TelegramSender, Arc<dyn TelegramOutboundQueueStore>)>,
     channel_plugins: Arc<HashMap<String, Arc<dyn ChannelPlugin>>>,
     mcp_runtime: Arc<RwLock<McpRuntime>>,
     evolution_engine: Option<Arc<EvolutionEngine>>,
@@ -624,6 +626,7 @@ async fn build_runtime_handles(
         ))
         .with_external_write_policy(external_write_policy),
     );
+    let mut telegram_sender_for_janitor: Option<TelegramSender> = None;
     let outbound_sender: Option<Arc<dyn OutboundSender>> = loop_config
         .external_write_enabled
         .then(|| {
@@ -635,12 +638,20 @@ async fn build_runtime_handles(
                     telegram.enabled && !is_missing_required_value(&telegram.bot_token)
                 })
                 .map(|telegram| {
-                    Arc::new(ChannelOutboundSender::with_telegram(TelegramSender::new(
-                        telegram.bot_token.clone(),
-                    ))) as Arc<dyn OutboundSender>
+                    let sender = TelegramSender::new(telegram.bot_token.clone())
+                        .with_outbound_queue(Arc::new(memory_store.clone()));
+                    telegram_sender_for_janitor = Some(sender.clone());
+                    Arc::new(ChannelOutboundSender::with_telegram(sender))
+                        as Arc<dyn OutboundSender>
                 })
         })
         .flatten();
+    let telegram_outbound_janitor = telegram_sender_for_janitor.map(|s| {
+        (
+            s.without_queue_retry(),
+            Arc::new(memory_store.clone()) as Arc<dyn TelegramOutboundQueueStore>,
+        )
+    });
     let max_recent_turns = if config.memory.max_recent_turns == 0 {
         config.app.max_history
     } else {
@@ -863,6 +874,7 @@ async fn build_runtime_handles(
     let channel_plugins = load_channel_plugins(config, channel_registry)?;
     Ok(RuntimeHandles {
         service,
+        telegram_outbound_janitor,
         channel_plugins: Arc::new(channel_plugins),
         mcp_runtime,
         evolution_engine,
@@ -1193,6 +1205,64 @@ async fn start_channel_workers(
         });
         workers.push(ChannelWorker {
             name: "swarm-janitor".to_string(),
+            task,
+        });
+    }
+
+    // Telegram outbound queue drain — persisted retry rows are re-sent
+    // until delivered or dead. Only active when a telegram channel exists.
+    if let Some((sender, service_store)) = runtime.telegram_outbound_janitor.clone() {
+        let mut shutdown = shutdown_rx.clone();
+        let task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(15));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() { break; }
+                    }
+                    _ = ticker.tick() => {
+                        let now = chrono::Utc::now().timestamp();
+                        let due = match service_store.list_due("telegram", now, 16).await {
+                            Ok(due) => due,
+                            Err(err) => {
+                                warn!(%err, "outbound queue list_due failed");
+                                continue;
+                            }
+                        };
+                        for row in due {
+                            let sent = sender
+                                .send_message(
+                                    row.chat_id,
+                                    row.message_thread_id,
+                                    row.reply_to_message_id,
+                                    &row.text,
+                                )
+                                .await;
+                            match sent {
+                                Ok(()) => {
+                                    let _ = service_store.mark_sent(&row.id).await;
+                                }
+                                Err(err) => {
+                                    let err_text = err.to_string();
+                                    if row.attempts >= 48 {
+                                        let _ = service_store.mark_dead(&row.id, &err_text).await;
+                                        warn!(id = %row.id, "outbound row dead after retries");
+                                    } else {
+                                        let backoff = 10i64.saturating_mul(1i64 << row.attempts.min(8));
+                                        let _ = service_store
+                                            .mark_retry(&row.id, &err_text, now + backoff)
+                                            .await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        workers.push(ChannelWorker {
+            name: "telegram-outbound-janitor".to_string(),
             task,
         });
     }

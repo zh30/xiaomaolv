@@ -275,6 +275,9 @@ const TELEGRAM_MAX_TEXT_CHARS: usize = 4096;
 pub struct TelegramSender {
     client: Client,
     bot_token: String,
+    /// Durable retry queue — when a send fails, the text is persisted
+    /// and a janitor drains it later instead of losing the reply.
+    outbound_queue: Option<Arc<dyn crate::memory::TelegramOutboundQueueStore>>,
 }
 
 impl TelegramSender {
@@ -288,6 +291,47 @@ impl TelegramSender {
                 .build()
                 .expect("failed to build Telegram HTTP client"),
             bot_token,
+            outbound_queue: None,
+        }
+    }
+
+    pub fn with_outbound_queue(
+        mut self,
+        queue: Arc<dyn crate::memory::TelegramOutboundQueueStore>,
+    ) -> Self {
+        self.outbound_queue = Some(queue);
+        self
+    }
+
+    /// Janitor variant: retries mark the existing row instead of
+    /// enqueueing a fresh one for every failed re-attempt.
+    pub fn without_queue_retry(mut self) -> Self {
+        self.outbound_queue = None;
+        self
+    }
+
+    /// Persists a failed send for later delivery — fire-and-forget so the
+    /// caller's error path stays synchronous and unchanged.
+    async fn enqueue_failed(
+        &self,
+        chat_id: i64,
+        message_thread_id: Option<i64>,
+        reply_to_message_id: Option<i64>,
+        text: &str,
+    ) {
+        if let Some(queue) = &self.outbound_queue
+            && let Err(err) = queue
+                .enqueue(crate::memory::EnqueueTelegramOutboundRequest {
+                    channel: "telegram".to_string(),
+                    chat_id,
+                    message_thread_id,
+                    reply_to_message_id,
+                    text: text.to_string(),
+                    session_id: None,
+                })
+                .await
+        {
+            warn!(error = %err, "failed to persist outbound retry");
         }
     }
 
@@ -316,16 +360,32 @@ impl TelegramSender {
         let mut ids = Vec::with_capacity(parts.len());
         for (idx, part) in parts.iter().enumerate() {
             let part_reply_to = if idx == 0 { reply_to_message_id } else { None };
-            ids.push(
-                self.send_rendered_message_with_id(
+            match self
+                .send_rendered_message_with_id(
                     chat_id,
                     message_thread_id,
                     part_reply_to,
                     part,
                     None,
                 )
-                .await?,
-            );
+                .await
+            {
+                Ok(id) => ids.push(id),
+                Err(err) => {
+                    // Persist the UNDELIVERED remainder for the janitor —
+                    // parts already sent must not be re-delivered.
+                    let remaining: Vec<String> =
+                        parts[idx..].iter().map(|p| p.text.clone()).collect();
+                    self.enqueue_failed(
+                        chat_id,
+                        message_thread_id,
+                        if idx == 0 { reply_to_message_id } else { None },
+                        &remaining.join("\n\n"),
+                    )
+                    .await;
+                    return Err(err);
+                }
+            }
         }
         Ok(ids)
     }

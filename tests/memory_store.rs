@@ -364,3 +364,64 @@ async fn telegram_admission_sweep_fails_dead_leases() {
     // Re-sweeping is quiet.
     assert!(store.sweep_stale(0).await.expect("resweep").is_empty());
 }
+
+/// The outbound queue: enqueue → due listing → retry marks bump
+/// attempts/next_attempt → sent removes from due. Dead rows are
+/// terminal for the janitor.
+#[tokio::test]
+async fn telegram_outbound_queue_enqueue_retry_send_lifecycle() {
+    let store = SqliteMemoryStore::new("sqlite::memory:")
+        .await
+        .expect("store");
+    use xiaomaolv::memory::{EnqueueTelegramOutboundRequest, TelegramOutboundQueueStore};
+
+    store
+        .enqueue(EnqueueTelegramOutboundRequest {
+            channel: "telegram".to_string(),
+            chat_id: 42,
+            message_thread_id: Some(7),
+            reply_to_message_id: None,
+            text: "failed reply".to_string(),
+            session_id: Some("s1".to_string()),
+        })
+        .await
+        .expect("enqueue");
+
+    let due = store.list_due("telegram", i64::MAX, 8).await.expect("due");
+    assert_eq!(due.len(), 1);
+    let row = &due[0];
+    assert_eq!(row.chat_id, 42);
+    assert_eq!(row.status, "pending");
+    assert_eq!(row.attempts, 0);
+    let id = row.id.clone();
+
+    // Retry mark: attempts+1 and the next attempt deferred.
+    store
+        .mark_retry(&id, "timeout", 9_999)
+        .await
+        .expect("retry mark");
+    assert!(
+        store
+            .list_due("telegram", 100, 8)
+            .await
+            .expect("not yet due")
+            .is_empty()
+    );
+    let due = store
+        .list_due("telegram", 10_000, 8)
+        .await
+        .expect("due again");
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].attempts, 1);
+    assert_eq!(due[0].last_error.as_deref(), Some("timeout"));
+
+    // Sent removes from the queue permanently.
+    store.mark_sent(&id).await.expect("sent");
+    assert!(
+        store
+            .list_due("telegram", 10_000, 8)
+            .await
+            .expect("sent gone")
+            .is_empty()
+    );
+}
