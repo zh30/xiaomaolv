@@ -152,6 +152,19 @@ pub(super) async fn run_telegram_scheduler_loop(
 
         for job in claimed {
             let started_at_unix = current_unix_timestamp_i64();
+            // Fence the effect boundary: if our lease already expired the
+            // job belongs to whoever re-claimed it — delivering now would
+            // double-send while our completion is rightly rejected.
+            if let Some(until) = job.lease_until_unix
+                && until <= started_at_unix
+            {
+                warn!(
+                    channel = %channel_name,
+                    job_id = %job.job_id,
+                    "scheduler claim lease expired before execution — dropping stale claim"
+                );
+                continue;
+            }
             let execution: anyhow::Result<()> = async {
                 let policy =
                     resolve_scheduler_policy_for_job(&job, &scheduler_settings.default_timezone)?;
@@ -204,7 +217,7 @@ pub(super) async fn run_telegram_scheduler_loop(
                                     chat_id: job.chat_id,
                                     message_thread_id: job.message_thread_id,
                                 }),
-                                is_group_chat: false,
+                                is_group_chat: job.chat_id < 0,
                             })
                             .await
                             .context("failed to generate scheduler agent output")?;
@@ -212,6 +225,13 @@ pub(super) async fn run_telegram_scheduler_loop(
                     }
                 };
 
+                // Re-fence immediately before the external effect: an
+                // expired lease means a fresher worker owns the job.
+                if let Some(until) = job.lease_until_unix
+                    && until <= current_unix_timestamp_i64()
+                {
+                    bail!("scheduler lease expired before send — job owned by a new claim");
+                }
                 sender
                     .send_message(job.chat_id, job.message_thread_id, None, &outbound_text)
                     .await

@@ -1172,6 +1172,39 @@ async fn start_channel_workers(
         });
     }
 
+    // Hybrid memory sidecar outbox drain — always-on when the backend can
+    // drift; a no-op for sqlite-only since reconcile returns Ok(0).
+    {
+        let service = runtime.service.clone();
+        let mut shutdown = shutdown_rx.clone();
+        let task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(30));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() { break; }
+                    }
+                    _ = ticker.tick() => {
+                        match service.reconcile_memory_sidecar(32).await {
+                            Ok(n) if n > 0 => {
+                                info!(delivered = n, "reconciled sidecar outbox")
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                warn!(%error, "sidecar outbox reconcile failed")
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        workers.push(ChannelWorker {
+            name: "sidecar-reconciler".to_string(),
+            task,
+        });
+    }
+
     if runtime.loop_self_test_interval_secs > 0 {
         let engine = runtime.loop_engine.clone();
         let interval_secs = runtime.loop_self_test_interval_secs;

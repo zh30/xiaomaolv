@@ -4,9 +4,12 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::{Json, Router};
+use std::sync::atomic::{AtomicBool, Ordering};
 use xiaomaolv::domain::{IncomingMessage, MessageRole};
+
 use xiaomaolv::memory::{
-    HybridSqliteZvecMemoryBackend, SqliteMemoryStore, ZvecSidecarClient, ZvecSidecarConfig,
+    HybridSqliteZvecMemoryBackend, MemoryBackend, MemoryWriteRequest, SqliteMemoryStore,
+    ZvecSidecarClient, ZvecSidecarConfig,
 };
 use xiaomaolv::provider::{ChatProvider, CompletionRequest};
 use xiaomaolv::service::{AgentMcpSettings, MessageService};
@@ -314,6 +317,93 @@ async fn hybrid_backend_falls_back_to_local_keyword_memory_when_sidecar_unavaila
         "expected local keyword memory fallback to inject relevant context, got: {}",
         out.text
     );
+}
+
+/// The sidecar upsert is fire-and-forget behind a persisted outbox: a
+/// failed write leaves a replay row, and the reconciler drains it once
+/// the sidecar recovers.
+#[tokio::test]
+async fn hybrid_backend_replays_outbox_after_sidecar_recovery() {
+    let healthy = Arc::new(AtomicBool::new(false));
+    let healthy_server = healthy.clone();
+    let app = Router::new().route(
+        "/v1/memory/upsert",
+        post(|State(healthy_flag): State<Arc<AtomicBool>>| async move {
+            if healthy_flag.load(Ordering::SeqCst) {
+                (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+            } else {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({ "error": "down" })),
+                )
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let server_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app.with_state(healthy_server)).await;
+    });
+
+    let store = SqliteMemoryStore::new("sqlite::memory:")
+        .await
+        .expect("store");
+    let sidecar = ZvecSidecarClient::new(ZvecSidecarConfig {
+        endpoint: format!("http://{addr}"),
+        collection: "agent_memory_v1".to_string(),
+        query_topk: 20,
+        request_timeout_secs: 3,
+        upsert_path: "/v1/memory/upsert".to_string(),
+        query_path: "/v1/memory/query".to_string(),
+        auth_bearer_token: None,
+    });
+    let backend = HybridSqliteZvecMemoryBackend::new(store.clone(), sidecar);
+
+    backend
+        .append(MemoryWriteRequest {
+            session_id: "s-outbox".to_string(),
+            user_id: "u-outbox".to_string(),
+            channel: "telegram".to_string(),
+            message: xiaomaolv::domain::StoredMessage {
+                role: MessageRole::User,
+                content: "remember this after recovery".to_string(),
+            },
+        })
+        .await
+        .expect("append while sidecar down");
+
+    // Wait for the fire-and-forget upsert to fail and mark the outbox row.
+    let mut pending = vec![];
+    for _ in 0..50 {
+        pending = store.list_sidecar_outbox(8).await.expect("list outbox");
+        if !pending.is_empty() && pending[0].2 > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(pending.len(), 1, "failed upsert must leave an outbox row");
+    assert!(pending[0].2 > 0, "attempt counter must record the failure");
+
+    // Sidecar recovers — the reconciler delivers the pending doc.
+    healthy.store(true, Ordering::SeqCst);
+    let delivered = backend
+        .reconcile_sidecar_outbox(8)
+        .await
+        .expect("reconcile");
+    assert_eq!(delivered, 1);
+    assert!(
+        store
+            .list_sidecar_outbox(8)
+            .await
+            .expect("outbox after")
+            .is_empty()
+    );
+
+    server_task.abort();
+    let _ = server_task.await;
 }
 
 async fn mock_upsert(Json(_payload): Json<serde_json::Value>) -> Json<serde_json::Value> {
