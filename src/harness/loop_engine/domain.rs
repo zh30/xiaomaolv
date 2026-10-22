@@ -550,6 +550,11 @@ pub struct CreateGoalRequest {
     /// duplicate.
     #[serde(default)]
     pub request_id: Option<String>,
+    /// Internal-projection goals (e.g. the legacy swarm mirror) stay out of
+    /// the runtime dispatch sweep — their items are claimed in-process via
+    /// targeted `claim_work_item`, never by `claim_goal_work`.
+    #[serde(default)]
+    pub internal_only: bool,
 }
 
 impl CreateGoalRequest {
@@ -590,6 +595,9 @@ pub struct GoalRecord {
     pub created_by: String,
     pub created_at_unix: i64,
     pub updated_at_unix: i64,
+    /// `internal_only` goals are projection mirrors: excluded from the
+    /// dispatch sweep but still claimable via targeted in-process claims.
+    pub internal_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

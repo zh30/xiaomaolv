@@ -927,6 +927,10 @@ impl MessageService {
                     // Swarm retries of the same run admit the same goal
                     // instead of forking a second projection.
                     request_id: Some(format!("swarm:{run_id}")),
+                    // Mirror-only goals stay out of the dispatch sweep —
+                    // their items are claimed in-process. The durable path
+                    // keeps sweep visibility so orphaned runs get claimed.
+                    internal_only: !self.agent_swarm.durable_engine,
                 },
                 SWARM_LOOP_ACTOR,
             )

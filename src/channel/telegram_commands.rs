@@ -922,6 +922,7 @@ async fn handle_telegram_goal_command(
     let created = match engine
         .create_goal(
             CreateGoalRequest {
+                internal_only: false,
                 objective: objective.to_string(),
                 source_signal_ids: Vec::new(),
                 request_id: None,
