@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
@@ -276,8 +276,13 @@ pub struct TelegramSender {
     client: Client,
     bot_token: String,
     /// Durable retry queue — when a send fails, the text is persisted
-    /// and a janitor drains it later instead of losing the reply.
-    outbound_queue: Option<Arc<dyn crate::memory::TelegramOutboundQueueStore>>,
+    /// and a janitor drains it later instead of losing the reply. Shared
+    /// slot so the runtime may attach the store after construction
+    /// (`ChannelPlugin::attach_outbound_queue`).
+    outbound_queue: Arc<RwLock<Option<Arc<dyn crate::memory::TelegramOutboundQueueStore>>>>,
+    /// Base of the Bot API — overridable for self-hosted telegram-bot-api
+    /// servers or test mocks. Defaults to the official endpoint.
+    api_base_url: String,
 }
 
 impl TelegramSender {
@@ -291,22 +296,41 @@ impl TelegramSender {
                 .build()
                 .expect("failed to build Telegram HTTP client"),
             bot_token,
-            outbound_queue: None,
+            outbound_queue: Arc::new(RwLock::new(None)),
+            api_base_url: "https://api.telegram.org".to_string(),
         }
     }
 
+    pub fn with_api_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.api_base_url = base_url.into().trim_end_matches('/').to_string();
+        self
+    }
+
+    fn api_url(&self, method: &str) -> String {
+        format!("{}/bot{}/{}", self.api_base_url, self.bot_token, method)
+    }
+
     pub fn with_outbound_queue(
-        mut self,
+        self,
         queue: Arc<dyn crate::memory::TelegramOutboundQueueStore>,
     ) -> Self {
-        self.outbound_queue = Some(queue);
+        self.set_outbound_queue(queue);
         self
+    }
+
+    /// Attaches (or swaps) the durable retry queue on a live sender —
+    /// used by `ChannelPlugin::attach_outbound_queue` after the plugin
+    /// tree is built.
+    pub fn set_outbound_queue(&self, queue: Arc<dyn crate::memory::TelegramOutboundQueueStore>) {
+        if let Ok(mut slot) = self.outbound_queue.write() {
+            *slot = Some(queue);
+        }
     }
 
     /// Janitor variant: retries mark the existing row instead of
     /// enqueueing a fresh one for every failed re-attempt.
     pub fn without_queue_retry(mut self) -> Self {
-        self.outbound_queue = None;
+        self.outbound_queue = Arc::new(RwLock::new(None));
         self
     }
 
@@ -319,7 +343,8 @@ impl TelegramSender {
         reply_to_message_id: Option<i64>,
         text: &str,
     ) {
-        if let Some(queue) = &self.outbound_queue
+        let queue = self.outbound_queue.read().ok().and_then(|g| g.clone());
+        if let Some(queue) = queue
             && let Err(err) = queue
                 .enqueue(crate::memory::EnqueueTelegramOutboundRequest {
                     channel: "telegram".to_string(),
@@ -438,7 +463,7 @@ impl TelegramSender {
         rendered: &TelegramRenderedText,
         reply_markup: Option<&Value>,
     ) -> anyhow::Result<i64> {
-        let url = format!("https://api.telegram.org/bot{}/sendMessage", self.bot_token);
+        let url = self.api_url("sendMessage");
         let mut payload = serde_json::json!({ "chat_id": chat_id, "text": rendered.text });
         if let Some(thread_id) = message_thread_id {
             payload["message_thread_id"] = serde_json::json!(thread_id);
@@ -496,8 +521,8 @@ impl TelegramSender {
             .context("empty telegram message text for draft")?;
 
         let url = format!(
-            "https://api.telegram.org/bot{}/sendMessageDraft",
-            self.bot_token
+            "{}/bot{}/sendMessageDraft",
+            self.api_base_url, self.bot_token
         );
         let payload = send_message_draft_payload(
             chat_id,
@@ -539,10 +564,7 @@ impl TelegramSender {
         chat_id: i64,
         message_thread_id: Option<i64>,
     ) -> anyhow::Result<()> {
-        let url = format!(
-            "https://api.telegram.org/bot{}/sendChatAction",
-            self.bot_token
-        );
+        let url = format!("{}/bot{}/sendChatAction", self.api_base_url, self.bot_token);
         let payload = typing_action_payload(chat_id, message_thread_id);
 
         let response = self
@@ -577,8 +599,8 @@ impl TelegramSender {
         text: Option<&str>,
     ) -> anyhow::Result<()> {
         let url = format!(
-            "https://api.telegram.org/bot{}/answerCallbackQuery",
-            self.bot_token
+            "{}/bot{}/answerCallbackQuery",
+            self.api_base_url, self.bot_token
         );
         let mut payload = serde_json::json!({
             "callback_query_id": callback_query_id,
@@ -615,8 +637,8 @@ impl TelegramSender {
 
     pub async fn set_my_short_description(&self, short_description: &str) -> anyhow::Result<()> {
         let url = format!(
-            "https://api.telegram.org/bot{}/setMyShortDescription",
-            self.bot_token
+            "{}/bot{}/setMyShortDescription",
+            self.api_base_url, self.bot_token
         );
         let payload = short_description_payload(short_description);
         let response = self
@@ -650,10 +672,7 @@ impl TelegramSender {
         commands: &[(&str, &str)],
         all_private_chats: bool,
     ) -> anyhow::Result<()> {
-        let url = format!(
-            "https://api.telegram.org/bot{}/setMyCommands",
-            self.bot_token
-        );
+        let url = format!("{}/bot{}/setMyCommands", self.api_base_url, self.bot_token);
         let mut payload = serde_json::json!({
             "commands": commands
                 .iter()
@@ -702,7 +721,7 @@ impl TelegramSender {
     }
 
     async fn get_me_profile(&self) -> anyhow::Result<TelegramBotProfile> {
-        let url = format!("https://api.telegram.org/bot{}/getMe", self.bot_token);
+        let url = self.api_url("getMe");
         let response = self
             .client
             .get(url)
@@ -754,8 +773,8 @@ impl TelegramSender {
         rendered: &TelegramRenderedText,
     ) -> anyhow::Result<()> {
         let url = format!(
-            "https://api.telegram.org/bot{}/editMessageText",
-            self.bot_token
+            "{}/bot{}/editMessageText",
+            self.api_base_url, self.bot_token
         );
         let mut payload = serde_json::json!({
             "chat_id": chat_id,
@@ -962,6 +981,11 @@ pub trait ChannelPlugin: Send + Sync {
     ) -> anyhow::Result<Option<ChannelWorker>> {
         Ok(None)
     }
+
+    /// Offers the durable outbound retry store — channels that support
+    /// queued delivery (telegram) attach it to their sender; others may
+    /// ignore the hook.
+    fn attach_outbound_queue(&self, _queue: Arc<dyn crate::memory::TelegramOutboundQueueStore>) {}
 
     fn mode(&self) -> Option<&'static str> {
         None
@@ -1358,7 +1382,23 @@ impl ChannelFactory for TelegramChannelFactory {
             .clamp(1, 1024);
 
         Ok(Arc::new(TelegramChannelPlugin {
-            sender: TelegramSender::new(bot_token.clone()),
+            sender: {
+                let mut s = TelegramSender::new(bot_token.clone());
+                if let Some(base) = config
+                    .settings
+                    .get("api_base_url")
+                    .filter(|v| !v.trim().is_empty())
+                {
+                    s = s.with_api_base_url(base);
+                }
+                s
+            },
+            api_base_url: config
+                .settings
+                .get("api_base_url")
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| v.trim_end_matches('/').to_string())
+                .unwrap_or_else(|| "https://api.telegram.org".to_string()),
             bot_token,
             polling_timeout_secs,
             streaming_enabled,
@@ -1407,6 +1447,7 @@ impl ChannelFactory for TelegramChannelFactory {
 
 struct TelegramChannelPlugin {
     sender: TelegramSender,
+    api_base_url: String,
     bot_token: String,
     polling_timeout_secs: u64,
     streaming_enabled: bool,
@@ -1519,6 +1560,10 @@ async fn resolve_bot_user_id_with_cache(
 
 #[async_trait]
 impl ChannelPlugin for TelegramChannelPlugin {
+    fn attach_outbound_queue(&self, queue: Arc<dyn crate::memory::TelegramOutboundQueueStore>) {
+        self.sender.set_outbound_queue(queue);
+    }
+
     async fn handle_inbound(
         &self,
         _ctx: ChannelContext,
@@ -1628,6 +1673,7 @@ impl ChannelPlugin for TelegramChannelPlugin {
         let polling_diag_state = self.polling_diag_state.clone();
         let worker_name = format!("{channel_name}-polling");
 
+        let api_base_url = self.api_base_url.clone();
         let task = tokio::spawn(async move {
             info!(channel = %channel_name, "telegram polling worker started");
             let mut scheduler_task = if scheduler_settings.enabled {
@@ -1666,7 +1712,7 @@ impl ChannelPlugin for TelegramChannelPlugin {
                 diag.worker_started_at_unix = Some(current_unix_timestamp());
             }
 
-            if let Err(err) = delete_telegram_webhook(&client, &bot_token).await {
+            if let Err(err) = delete_telegram_webhook(&client, &bot_token, &api_base_url).await {
                 warn!(channel = %channel_name, error = %err, "failed to delete webhook before polling");
             }
 
@@ -1740,7 +1786,7 @@ impl ChannelPlugin for TelegramChannelPlugin {
                         }
                         continue;
                     }
-                    result = fetch_telegram_updates(&client, &bot_token, offset, timeout_secs) => result,
+                    result = fetch_telegram_updates(&client, &bot_token, &api_base_url, offset, timeout_secs) => result,
                 };
 
                 match updates_result {

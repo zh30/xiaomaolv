@@ -626,24 +626,29 @@ async fn build_runtime_handles(
         ))
         .with_external_write_policy(external_write_policy),
     );
-    let mut telegram_sender_for_janitor: Option<TelegramSender> = None;
+    // The retry-enabled telegram sender exists whenever a telegram channel
+    // does — reply delivery must not depend on the external_write gate.
+    let telegram_sender_for_janitor: Option<TelegramSender> = config
+        .channels
+        .telegram
+        .as_ref()
+        .filter(|telegram| telegram.enabled && !is_missing_required_value(&telegram.bot_token))
+        .map(|telegram| {
+            let mut sender = TelegramSender::new(telegram.bot_token.clone())
+                .with_outbound_queue(Arc::new(memory_store.clone()));
+            if let Some(base) = &telegram.api_base_url
+                && !base.trim().is_empty()
+            {
+                sender = sender.with_api_base_url(base);
+            }
+            sender
+        });
     let outbound_sender: Option<Arc<dyn OutboundSender>> = loop_config
         .external_write_enabled
         .then(|| {
-            config
-                .channels
-                .telegram
-                .as_ref()
-                .filter(|telegram| {
-                    telegram.enabled && !is_missing_required_value(&telegram.bot_token)
-                })
-                .map(|telegram| {
-                    let sender = TelegramSender::new(telegram.bot_token.clone())
-                        .with_outbound_queue(Arc::new(memory_store.clone()));
-                    telegram_sender_for_janitor = Some(sender.clone());
-                    Arc::new(ChannelOutboundSender::with_telegram(sender))
-                        as Arc<dyn OutboundSender>
-                })
+            telegram_sender_for_janitor.clone().map(|sender| {
+                Arc::new(ChannelOutboundSender::with_telegram(sender)) as Arc<dyn OutboundSender>
+            })
         })
         .flatten();
     let telegram_outbound_janitor = telegram_sender_for_janitor.map(|s| {
@@ -872,6 +877,10 @@ async fn build_runtime_handles(
     let service = Arc::new(service);
 
     let channel_plugins = load_channel_plugins(config, channel_registry)?;
+    let outbound_queue: Arc<dyn TelegramOutboundQueueStore> = Arc::new(memory_store.clone());
+    for plugin in channel_plugins.values() {
+        plugin.attach_outbound_queue(outbound_queue.clone());
+    }
     Ok(RuntimeHandles {
         service,
         telegram_outbound_janitor,
@@ -1377,6 +1386,11 @@ fn load_channel_plugins(
 
         let mut settings = HashMap::new();
         settings.insert("bot_token".to_string(), telegram.bot_token.clone());
+        if let Some(base) = &telegram.api_base_url
+            && !base.trim().is_empty()
+        {
+            settings.insert("api_base_url".to_string(), base.clone());
+        }
         if let Some(username) = &telegram.bot_username
             && !username.trim().is_empty()
         {

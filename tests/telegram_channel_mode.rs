@@ -61,6 +61,7 @@ fn test_config() -> AppConfig {
                 rate_limit_per_minute: 0,
             },
             telegram: Some(TelegramChannelConfig {
+                api_base_url: None,
                 enabled: true,
                 bot_token: "fake-token".to_string(),
                 bot_username: None,
