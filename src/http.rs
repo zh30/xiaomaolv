@@ -3156,6 +3156,17 @@ struct EvolutionReasonRequest {
     reason: String,
 }
 
+/// Fans an evolution mutation out to the live console stream. No-op when
+/// the loop engine is disabled — broadcast send is free with no receivers.
+async fn notify_evolution(state: &AppState, entity_id: &str) {
+    state
+        .runtime
+        .read()
+        .await
+        .loop_engine
+        .notify_evolution(entity_id);
+}
+
 async fn get_evolution_status(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3234,6 +3245,7 @@ async fn post_evolution_candidate(
         )
         .await
         .map_err(evolution_bad_request)?;
+    notify_evolution(&state, &candidate.id).await;
     Ok(Json(EvolutionCandidateResponse { candidate }))
 }
 
@@ -3248,6 +3260,7 @@ async fn post_evolution_evaluate(
         .evaluate_candidate(&id)
         .await
         .map_err(internal_err("evolution evaluation failed"))?;
+    notify_evolution(&state, &id).await;
     Ok(Json(EvolutionEvaluationResponse { evaluation }))
 }
 
@@ -3264,6 +3277,7 @@ async fn post_evolution_approve(
         .approve_candidate(&id, &actor, &payload.reason)
         .await
         .map_err(evolution_bad_request)?;
+    notify_evolution(&state, &candidate.id).await;
     Ok(Json(EvolutionCandidateResponse { candidate }))
 }
 
@@ -3280,6 +3294,7 @@ async fn post_evolution_abandon_evaluation(
         .abandon_evaluation(&id, &actor, &payload.reason)
         .await
         .map_err(evolution_bad_request)?;
+    notify_evolution(&state, &candidate.id).await;
     Ok(Json(EvolutionCandidateResponse { candidate }))
 }
 
@@ -3296,6 +3311,7 @@ async fn post_evolution_activate(
         .activate_candidate(&id, &actor, &payload.reason)
         .await
         .map_err(evolution_bad_request)?;
+    notify_evolution(&state, &deployment.id).await;
     Ok(Json(EvolutionDeploymentResponse { deployment }))
 }
 
@@ -3325,6 +3341,7 @@ async fn post_evolution_eval_case(
         .upsert_eval_case(eval_case.clone(), &actor)
         .await
         .map_err(evolution_bad_request)?;
+    notify_evolution(&state, &eval_case.id).await;
     Ok(Json(EvolutionEvalCaseResponse { eval_case }))
 }
 
@@ -3371,6 +3388,7 @@ async fn post_seed_eval_case(
         )
         .await
         .map_err(evolution_bad_request)?;
+    notify_evolution(&state, &eval_case.id).await;
     Ok(Json(EvolutionEvalCaseResponse { eval_case }))
 }
 
@@ -3400,6 +3418,7 @@ async fn post_evolution_feedback(
         .record_feedback(draft, &actor)
         .await
         .map_err(evolution_bad_request)?;
+    notify_evolution(&state, &feedback.id.to_string()).await;
     Ok(Json(EvolutionFeedbackResponse { feedback }))
 }
 
@@ -3433,6 +3452,7 @@ async fn post_evolution_cycle(
             internal_err("self-evolution cycle failed")(err)
         }
     })?;
+    notify_evolution(&state, &cycle.candidate.id).await;
     Ok(Json(EvolutionCycleResponse { cycle }))
 }
 
@@ -3448,6 +3468,7 @@ async fn post_evolution_rollback(
         .rollback_active(&actor, &payload.reason)
         .await
         .map_err(evolution_bad_request)?;
+    notify_evolution(&state, &rollback.rolled_back_deployment_id).await;
     Ok(Json(EvolutionRollbackResponse { rollback }))
 }
 

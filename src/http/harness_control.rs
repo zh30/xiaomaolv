@@ -407,6 +407,7 @@ async fn get_events_stream(
                     EngineNotify::Goal(id) => ("loop", id),
                     EngineNotify::Signal(id) => ("signal", id),
                     EngineNotify::Swarm(id) => ("swarm", id),
+                    EngineNotify::Evolution(id) => ("evolution", id),
                 };
                 let sse = Event::default()
                     .event(kind)

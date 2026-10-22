@@ -436,11 +436,12 @@ function handleLiveSse(chunk) {
   const relevant =
     (ev === "loop" && state.tab === "goals") ||
     (ev === "signal" && state.tab === "signals") ||
-    (ev === "swarm" && state.tab === "swarm");
+    (ev === "swarm" && state.tab === "swarm") ||
+    (ev === "evolution" && state.tab === "evolution");
   if (relevant) scheduleRefresh();
   // An open detail re-renders only when its own entity changed.
   if (state.sel && id === state.sel &&
-      (ev === "loop" || ev === "signal" || ev === "swarm")) {
+      (ev === "loop" || ev === "signal" || ev === "swarm" || ev === "evolution")) {
     scheduleSelectRow();
   }
   // A swarm work-item event also lives under the goal id — mirror it into
