@@ -23,6 +23,9 @@ pub enum EngineNotify {
     Goal(String),
     Signal(String),
     Swarm(String),
+    /// Evolution candidate/deployment lifecycle — carries the candidate or
+    /// deployment id so the console's evolution view live-updates.
+    Evolution(String),
 }
 
 pub struct LoopEngine {
@@ -79,6 +82,14 @@ impl LoopEngine {
     /// live-update the swarm view.
     pub fn notify_swarm_run(&self, run_id: &str) {
         let _ = self.event_tx.send(EngineNotify::Swarm(run_id.to_string()));
+    }
+
+    /// Evolution lifecycle transitions — emitted by the evolution control
+    /// routes after candidate/deployment mutations.
+    pub fn notify_evolution(&self, entity_id: &str) {
+        let _ = self
+            .event_tx
+            .send(EngineNotify::Evolution(entity_id.to_string()));
     }
 
     pub async fn create_goal(
