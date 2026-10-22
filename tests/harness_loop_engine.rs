@@ -753,6 +753,7 @@ async fn swarm_run_projects_a_durable_goal_tree_and_verifies_it() -> anyhow::Res
             user_id: "42".to_string(),
             text: "请拆分前后端任务并协作完成".to_string(),
             reply_target: None,
+            is_group_chat: false,
         })
         .await?;
     assert!(reply.text.contains("merged swarm answer"));
@@ -3557,6 +3558,7 @@ async fn durable_swarm_service_run_achieves_goal_via_artifact() -> anyhow::Resul
             user_id: "42".to_string(),
             text: "请拆分前后端任务并协作完成".to_string(),
             reply_target: None,
+            is_group_chat: false,
         })
         .await?;
     assert!(reply.text.contains("merged swarm answer"));
@@ -4070,6 +4072,7 @@ async fn orphan_janitor_closes_runs_whose_goal_is_terminal() -> anyhow::Result<(
             user_id: "42".to_string(),
             text: "拆分前后端任务".to_string(),
             reply_target: None,
+            is_group_chat: false,
         })
         .await?;
 
@@ -4285,6 +4288,7 @@ async fn janitor_delivers_deferred_reply_when_goal_is_terminal() -> anyhow::Resu
             user_id: "42".to_string(),
             text: "拆分任务".to_string(),
             reply_target: None,
+            is_group_chat: false,
         })
         .await?;
 
@@ -4376,6 +4380,7 @@ async fn slow_swarm_reply_defers_then_janitor_delivers() -> anyhow::Result<()> {
             user_id: "42".to_string(),
             text: "拆分任务".to_string(),
             reply_target: None,
+            is_group_chat: false,
         })
         .await?;
     assert!(
@@ -4595,6 +4600,7 @@ async fn deferred_reply_skips_channels_the_sender_cannot_reach() -> anyhow::Resu
             user_id: "42".to_string(),
             text: "拆分任务".to_string(),
             reply_target: None,
+            is_group_chat: false,
         })
         .await?;
     assert_eq!(reply.text, "多智能体任务仍在后台运行。");
@@ -4962,6 +4968,39 @@ async fn proposed_goal_can_be_rejected_then_replanned() -> anyhow::Result<()> {
 /// `internal_only` goals — projection mirrors like the legacy swarm mirror —
 /// stay out of the runtime dispatch sweep, while the in-process targeted
 /// claim path still works.
+/// Group chats never auto-fire swarm unless `group_enabled` — the
+/// classifier call itself must not even happen.
+#[tokio::test]
+async fn swarm_skips_group_chats_unless_group_enabled() -> anyhow::Result<()> {
+    let provider = Arc::new(SwarmQueueProvider {
+        replies: Mutex::new(VecDeque::from(["plain reply".to_string()])),
+    });
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let service =
+        MessageService::new(provider.clone(), memory, 8).with_agent_swarm(AgentSwarmSettings {
+            enabled: true,
+            auto_detect: true,
+            group_enabled: false,
+            ..Default::default()
+        });
+    let reply = service
+        .handle(IncomingMessage {
+            channel: "telegram".to_string(),
+            session_id: "tg:1".to_string(),
+            user_id: "42".to_string(),
+            text: "请拆分前后端任务并协作完成".to_string(),
+            reply_target: None,
+            is_group_chat: true,
+        })
+        .await?;
+    assert_eq!(reply.text, "plain reply");
+    assert!(
+        provider.replies.lock().expect("replies mutex").is_empty(),
+        "the classifier call never fired — the only provider call was the reply"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn internal_only_goal_skips_dispatch_sweep_but_stays_claimable() -> anyhow::Result<()> {
     let memory = SqliteMemoryStore::new("sqlite::memory:").await?;

@@ -58,6 +58,7 @@ async fn service_generates_reply_and_persists_messages() {
             user_id: "u1".to_string(),
             text: "ping".to_string(),
             reply_target: None,
+            is_group_chat: false,
         })
         .await
         .expect("handle message");
@@ -94,6 +95,7 @@ async fn service_output_verification_revises_once_before_persisting() {
             user_id: "u1".to_string(),
             text: "ping".to_string(),
             reply_target: None,
+            is_group_chat: false,
         })
         .await
         .expect("handle message");
@@ -131,6 +133,7 @@ async fn service_output_verification_blocks_invalid_non_streaming_reply_before_p
             user_id: "u1".to_string(),
             text: r#"{"server":"s","tool":"t","arguments":{}}"#.to_string(),
             reply_target: None,
+            is_group_chat: false,
         })
         .await
         .expect("handle message");
@@ -176,6 +179,7 @@ async fn service_output_verification_without_llm_uses_deterministic_revision() {
             user_id: "u1".to_string(),
             text: "ping".to_string(),
             reply_target: None,
+            is_group_chat: false,
         })
         .await
         .expect("handle message");
@@ -207,6 +211,7 @@ async fn service_observe_persists_user_message_without_assistant_reply() {
             user_id: "u2".to_string(),
             text: "just watching".to_string(),
             reply_target: None,
+            is_group_chat: false,
         })
         .await
         .expect("observe message");

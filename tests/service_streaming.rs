@@ -101,6 +101,7 @@ async fn service_streams_reply_and_persists_final_message() {
                 user_id: "u-stream".to_string(),
                 text: "stream please".to_string(),
                 reply_target: None,
+                is_group_chat: false,
             },
             &mut sink,
         )
@@ -143,6 +144,7 @@ async fn service_streaming_verifies_swarm_reply_before_delivery() {
                 user_id: "u-stream".to_string(),
                 text: "please coordinate this".to_string(),
                 reply_target: None,
+                is_group_chat: false,
             },
             &mut sink,
         )
@@ -182,6 +184,7 @@ async fn service_streaming_verifies_plain_reply_before_delivery_when_output_exit
                 user_id: "u-stream".to_string(),
                 text: "stream please".to_string(),
                 reply_target: None,
+                is_group_chat: false,
             },
             &mut sink,
         )
@@ -237,6 +240,7 @@ async fn service_streaming_verifies_time_fast_path_before_delivery_when_output_e
                 user_id: "u-stream".to_string(),
                 text: "现在几点？".to_string(),
                 reply_target: None,
+                is_group_chat: false,
             },
             &mut sink,
         )

@@ -491,6 +491,7 @@ async fn dispatch_telegram_reply(config: ReplyDispatchConfig<'_>) -> anyhow::Res
             chat_id: meta.chat_id,
             message_thread_id: meta.message_thread_id,
         }),
+        is_group_chat: meta.is_group,
     };
 
     let typing_sender = sender.clone();

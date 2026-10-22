@@ -60,6 +60,7 @@ impl ChannelPlugin for JsonWebhookChannel {
                 user_id: user_id.to_string(),
                 text: text.to_string(),
                 reply_target: None,
+                is_group_chat: false,
             })
             .await
             .map_err(ChannelPluginError::internal)?;

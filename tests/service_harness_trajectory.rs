@@ -269,6 +269,7 @@ fn incoming(session_id: &str) -> IncomingMessage {
         user_id: "user-1".to_string(),
         text: "please use the agent harness".to_string(),
         reply_target: None,
+        is_group_chat: false,
     }
 }
 
@@ -662,6 +663,7 @@ async fn mcp_loop_agent_run_finishes_once_on_parse_error_recovery() {
             user_id: "user-parse".to_string(),
             text: "use a tool".to_string(),
             reply_target: None,
+            is_group_chat: false,
         })
         .await
         .expect("parse recovery should still return a final response");

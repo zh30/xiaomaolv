@@ -180,6 +180,7 @@ fn incoming(session_id: &str) -> IncomingMessage {
         user_id: "user-eval".to_string(),
         text: "run the harness eval".to_string(),
         reply_target: None,
+        is_group_chat: false,
     }
 }
 

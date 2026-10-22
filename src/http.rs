@@ -746,6 +746,7 @@ async fn build_runtime_handles(
                     audit_retention_days: config.agent.swarm.audit_retention_days,
                     durable_engine: config.agent.swarm.durable_engine,
                     reply_sync_wait_ms: config.agent.swarm.reply_sync_wait_ms,
+                    group_enabled: config.agent.swarm.group_enabled,
                 },
             );
             if config.agent.harness.enable_trajectory {
@@ -816,6 +817,7 @@ async fn build_runtime_handles(
         audit_retention_days: config.agent.swarm.audit_retention_days,
         durable_engine: config.agent.swarm.durable_engine,
         reply_sync_wait_ms: config.agent.swarm.reply_sync_wait_ms,
+        group_enabled: config.agent.swarm.group_enabled,
     })
     .with_harness_config(&config.agent.harness)
     .with_loop_engine(loop_config.enabled.then(|| loop_engine.clone()));
@@ -2808,6 +2810,7 @@ async fn post_message(
             user_id: req.user_id,
             text: req.text,
             reply_target: None,
+            is_group_chat: false,
         })
         .await
         .map_err(internal_err("failed to process message"))?;

@@ -196,6 +196,7 @@ pub(super) async fn process_group_message(
                     user_id,
                     text: prep.model_input_text,
                     reply_target: None,
+                    is_group_chat: true,
                 })
                 .await
                 .with_context(|| {

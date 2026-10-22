@@ -33,6 +33,9 @@ pub struct AgentSwarmSettings {
     /// per-channel processing means a long sync wait head-blocks updates.
     /// `0` means always defer — the run only ever answers asynchronously.
     pub reply_sync_wait_ms: u64,
+    /// Swarm runs are expensive — auto-detect fires only in private chats
+    /// unless this is enabled. Group messages keep the normal reply path.
+    pub group_enabled: bool,
 }
 
 impl Default for AgentSwarmSettings {
@@ -49,6 +52,7 @@ impl Default for AgentSwarmSettings {
             audit_retention_days: 30,
             durable_engine: true,
             reply_sync_wait_ms: 45_000,
+            group_enabled: false,
         }
     }
 }
@@ -204,6 +208,11 @@ impl MessageService {
         history: &[StoredMessage],
     ) -> anyhow::Result<Option<String>> {
         if !self.agent_swarm.enabled {
+            return Ok(None);
+        }
+        // Group chats stay on the normal reply path by default — a swarm run
+        // is multiple provider calls, so group activation is explicit opt-in.
+        if incoming.is_group_chat && !self.agent_swarm.group_enabled {
             return Ok(None);
         }
 

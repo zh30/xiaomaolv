@@ -204,6 +204,7 @@ pub(super) async fn run_telegram_scheduler_loop(
                                     chat_id: job.chat_id,
                                     message_thread_id: job.message_thread_id,
                                 }),
+                                is_group_chat: false,
                             })
                             .await
                             .context("failed to generate scheduler agent output")?;

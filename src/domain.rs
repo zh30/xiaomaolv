@@ -47,6 +47,10 @@ pub struct IncomingMessage {
     pub user_id: String,
     pub text: String,
     pub reply_target: Option<ReplyTarget>,
+    /// True when the inbound message came from a group chat — expensive
+    /// handlers (swarm auto-detect) gate on it.
+    #[serde(default)]
+    pub is_group_chat: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
