@@ -16,7 +16,15 @@ use super::{
     SignalRecord, SignalStatus, SignalTrust, TrajectoryFrame, TrajectoryFrameDraft,
 };
 
-#[derive(Clone)]
+/// Broadcast payload for committed mutations — the global event stream
+/// fans these out to console views; per-goal SSE filters on `Goal`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineNotify {
+    Goal(String),
+    Signal(String),
+    Swarm(String),
+}
+
 pub struct LoopEngine {
     store: Arc<dyn LoopStore>,
     external_write_policy: ExternalWritePolicy,
@@ -24,7 +32,7 @@ pub struct LoopEngine {
     /// `goal_id` of a committed mutation so watchers re-read instead of
     /// polling. Losing a notification is harmless — consumers keep a slow
     /// fallback poll and the monotonic `sequence` cursor still drives them.
-    event_tx: tokio::sync::broadcast::Sender<String>,
+    event_tx: tokio::sync::broadcast::Sender<EngineNotify>,
 }
 
 impl LoopEngine {
@@ -48,16 +56,29 @@ impl LoopEngine {
         &self.external_write_policy
     }
 
-    /// Subscribes to goal-mutation notifications. Receivers get the affected
-    /// `goal_id` for every committed change that may have produced events;
-    /// lagged receivers should fall back to a bounded poll.
-    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<String> {
+    /// Subscribes to committed-mutation notifications — goal mutations,
+    /// signal lifecycle, and swarm run transitions. Receivers use the
+    /// payload as a wake-up hint; the durable tables remain source of truth.
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<EngineNotify> {
         self.event_tx.subscribe()
     }
 
     fn notify(&self, goal_id: &str) {
         // No receivers (or a full channel) is not an error.
-        let _ = self.event_tx.send(goal_id.to_string());
+        let _ = self.event_tx.send(EngineNotify::Goal(goal_id.to_string()));
+    }
+
+    fn notify_signal(&self, signal_id: &str) {
+        let _ = self
+            .event_tx
+            .send(EngineNotify::Signal(signal_id.to_string()));
+    }
+
+    /// Swarm run lifecycle events — the service emits these at run
+    /// create/finish/awaiting-reply/janitor transitions so the console can
+    /// live-update the swarm view.
+    pub fn notify_swarm_run(&self, run_id: &str) {
+        let _ = self.event_tx.send(EngineNotify::Swarm(run_id.to_string()));
     }
 
     pub async fn create_goal(
@@ -115,7 +136,9 @@ impl LoopEngine {
     ) -> anyhow::Result<SignalIngestResult> {
         request.validate()?;
         validate_actor(actor)?;
-        self.store.ingest_signal(request, actor).await
+        let result = self.store.ingest_signal(request, actor).await?;
+        self.notify_signal(&result.signal.id);
+        Ok(result)
     }
 
     pub async fn get_signal(&self, signal_id: &str) -> anyhow::Result<Option<SignalRecord>> {
@@ -137,7 +160,9 @@ impl LoopEngine {
         actor: &str,
     ) -> anyhow::Result<SignalRecord> {
         validate_actor(actor)?;
-        self.store.ignore_signal(signal_id, reason, actor).await
+        let signal = self.store.ignore_signal(signal_id, reason, actor).await?;
+        self.notify_signal(&signal.id);
+        Ok(signal)
     }
 
     pub async fn propose_goal_from_signal(
@@ -176,6 +201,7 @@ impl LoopEngine {
         self.store
             .mark_signal_proposed(signal_id, &goal.id, actor)
             .await?;
+        self.notify_signal(signal_id);
         Ok(goal)
     }
 

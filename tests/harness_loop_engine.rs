@@ -2500,7 +2500,46 @@ async fn goal_admission_deduplicates_request_id_and_notifies() -> anyhow::Result
     );
     // The commit notified subscribers carrying the goal id.
     let notified = notifications.recv().await?;
-    assert_eq!(notified, goal.id);
+    assert_eq!(
+        notified,
+        xiaomaolv::harness::loop_engine::EngineNotify::Goal(goal.id)
+    );
+    Ok(())
+}
+
+/// Signal ingest + lifecycle transitions broadcast `EngineNotify::Signal`
+/// so the global event stream can live-update the signals view.
+#[tokio::test]
+async fn signal_lifecycle_notifies_subscribers() -> anyhow::Result<()> {
+    let memory = SqliteMemoryStore::new("sqlite::memory:").await?;
+    let engine = Arc::new(LoopEngine::new(Arc::new(SqliteLoopStore::new(memory))));
+    let mut notifications = engine.subscribe_events();
+    let result = engine
+        .ingest_signal(
+            CreateSignalRequest {
+                kind: SignalKind::Manual,
+                trust: SignalTrust::Internal,
+                source: "internal:test".to_string(),
+                external_id: Some("sig-1".to_string()),
+                content: "ping".to_string(),
+                metadata: std::collections::BTreeMap::new(),
+            },
+            "operator:test",
+        )
+        .await?;
+    let sig_id = result.signal.id.clone();
+    assert_eq!(
+        notifications.recv().await?,
+        xiaomaolv::harness::loop_engine::EngineNotify::Signal(sig_id.clone())
+    );
+    let signal = engine
+        .ignore_signal(&sig_id, "not relevant", "operator:test")
+        .await?;
+    assert_eq!(signal.status, SignalStatus::Ignored);
+    assert_eq!(
+        notifications.recv().await?,
+        xiaomaolv::harness::loop_engine::EngineNotify::Signal(sig_id)
+    );
     Ok(())
 }
 

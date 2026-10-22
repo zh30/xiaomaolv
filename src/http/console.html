@@ -88,6 +88,7 @@ textarea { width: 100%; min-height: 120px; }
   <input id="actor" placeholder="actor label" />
   <button id="ping" class="primary">connect</button>
   <span id="conn" class="dot"></span><span id="connLabel" class="muted small">offline</span>
+  <span id="liveDot" class="dot"></span><span id="liveLabel" class="muted small">live: off</span>
 </header>
 <nav id="tabs">
   <button data-tab="goals" class="active">goals</button>
@@ -114,6 +115,9 @@ const state = {
   tab: "goals",
   sel: null,
   stream: null,
+  live: null,          // AbortController for the global /events/stream
+  liveTimer: null,     // reconnect backoff
+  refreshTimer: null,  // view-invalidation debounce
 };
 $("#base").value = state.base;
 $("#key").value = state.key;
@@ -368,6 +372,97 @@ function handleSse(chunk) {
   div.innerHTML = `<span class="muted small">#${esc(id)}</span> ${chip(ev)} <span class="small">${esc(data.slice(0, 300))}</span>`;
   log.appendChild(div);
   log.scrollTop = log.scrollHeight;
+}
+
+// ---------- Live operator stream ----------
+// One background fetch against /v1/harness/events/stream; each committed
+// mutation arrives as {kind, id} and invalidates the view that actually
+// renders it — lists refresh on a 400ms debounce, an open detail
+// re-renders only when its own entity changed.
+function liveLabel(state_) {
+  const el = $("#liveDot");
+  if (el) { el.className = "dot " + (state_ === "live" ? "ok" : state_ === "conn" ? "warn" : ""); }
+  const lbl = $("#liveLabel");
+  if (lbl) lbl.textContent = state_;
+}
+function stopLive() {
+  if (state.live) { state.live.abort(); state.live = null; }
+  if (state.liveTimer) { clearTimeout(state.liveTimer); state.liveTimer = null; }
+  liveLabel("off");
+}
+async function startLive() {
+  stopLive();
+  const ctl = new AbortController();
+  state.live = ctl;
+  const headers = { "x-harness-actor": state.actor };
+  if (state.key) headers["Authorization"] = "Bearer " + state.key;
+  liveLabel("conn");
+  try {
+    const res = await fetch(`${state.base}/v1/harness/events/stream`, { headers, signal: ctl.signal });
+    if (!res.ok || !res.body) throw new Error(`live stream failed: ${res.status}`);
+    liveLabel("live");
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        const chunk = buf.slice(0, idx); buf = buf.slice(idx + 2);
+        handleLiveSse(chunk);
+      }
+    }
+  } catch (e) {
+    if (!ctl.signal.aborted) liveLabel("reconnecting");
+  }
+  // Reconnect with a short backoff unless we were stopped deliberately.
+  if (!ctl.signal.aborted && state.live === ctl) {
+    state.live = null;
+    state.liveTimer = setTimeout(startLive, 3000);
+  }
+}
+function handleLiveSse(chunk) {
+  let ev = "message", data = "";
+  for (const line of chunk.split("\n")) {
+    if (line.startsWith("event:")) ev = line.slice(6).trim();
+    else if (line.startsWith("data:")) data += line.slice(5).trim();
+  }
+  if (!data || ev === "harness-keepalive") return;
+  if (ev === "harness.catchup") { invalidateAll(); return; }
+  let id = null;
+  try { id = JSON.parse(data).id; } catch {}
+  const relevant =
+    (ev === "loop" && state.tab === "goals") ||
+    (ev === "signal" && state.tab === "signals") ||
+    (ev === "swarm" && state.tab === "swarm");
+  if (relevant) scheduleRefresh();
+  // An open detail re-renders only when its own entity changed.
+  if (state.sel && id === state.sel &&
+      (ev === "loop" || ev === "signal" || ev === "swarm")) {
+    scheduleSelectRow();
+  }
+  // A swarm work-item event also lives under the goal id — mirror it into
+  // the swarm view by refreshing the detail if it is open.
+  if (ev === "loop" && state.tab === "swarm" && state.sel) scheduleSelectRow();
+}
+function scheduleRefresh() {
+  if (state.refreshTimer) return;
+  state.refreshTimer = setTimeout(() => {
+    state.refreshTimer = null;
+    refresh();
+  }, 400);
+}
+function scheduleSelectRow() {
+  clearTimeout(state._selTimer);
+  state._selTimer = setTimeout(() => {
+    if (state.sel) selectRow(state.sel);
+  }, 400);
+}
+function invalidateAll() {
+  scheduleRefresh();
+  if (state.sel) scheduleSelectRow();
 }
 
 // ---------- Signals ----------
@@ -862,6 +957,7 @@ $("#ping").addEventListener("click", async () => {
     $("#conn").className = "dot ok";
     $("#connLabel").textContent = "connected";
     refresh();
+    startLive();
   } catch (e) {
     $("#conn").className = "dot err";
     $("#connLabel").textContent = e.message;
@@ -870,6 +966,7 @@ $("#ping").addEventListener("click", async () => {
 });
 if (state.key) { saveCreds(); $("#ping").click(); }
 else refresh();
+
 </script>
 </body>
 </html>

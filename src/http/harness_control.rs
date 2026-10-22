@@ -11,6 +11,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 
+use crate::harness::loop_engine::EngineNotify;
 use crate::harness::loop_engine::{
     ApproveGoalRequest, ConfirmationResolution, CreateGoalRequest, CreateSignalRequest, LoopEngine,
     PlanGoalRequest, PublishArtifactRequest, SignalStatus, SignalTrust,
@@ -25,6 +26,7 @@ pub(super) fn router() -> Router<AppState> {
         .route("/v1/harness/goals", get(list_goals).post(post_goal))
         .route("/v1/harness/goals/{id}", get(get_goal))
         .route("/v1/harness/goals/{id}/events", get(get_goal_events))
+        .route("/v1/harness/events/stream", get(get_events_stream))
         .route(
             "/v1/harness/goals/{id}/events/stream",
             get(get_goal_event_stream),
@@ -304,7 +306,7 @@ struct GoalEventStreamState {
     /// Committed-mutation notifications from the engine. The stream still
     /// re-reads `harness_events` on every wake — the notification is only a
     /// wake-up signal, the `sequence` cursor remains the source of truth.
-    notifications: tokio::sync::broadcast::Receiver<String>,
+    notifications: tokio::sync::broadcast::Receiver<EngineNotify>,
 }
 
 async fn get_goal_event_stream(
@@ -356,7 +358,7 @@ async fn get_goal_event_stream(
                         let wake = async {
                             loop {
                                 match state.notifications.recv().await {
-                                    Ok(goal) if goal == state.goal_id => break,
+                                    Ok(EngineNotify::Goal(goal)) if goal == state.goal_id => break,
                                     Ok(_) => continue,
                                     Err(
                                         tokio::sync::broadcast::error::RecvError::Lagged(_)
@@ -378,6 +380,49 @@ async fn get_goal_event_stream(
             }
         },
     );
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("harness-keepalive"),
+    ))
+}
+
+/// Global operator event stream — every committed mutation (goal
+/// lifecycle, signal ingest/status, swarm run transitions) fans out as a
+/// lightweight `{kind, id}` notification so console views can invalidate
+/// and re-fetch the rows they actually render. The durable tables stay
+/// the source of truth; dropped notifications only mean a stale view
+/// until the next event or keep-alive poll.
+async fn get_events_stream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let (engine, _) = operator_context(&state, &headers).await?;
+    let notifications = engine.subscribe_events();
+    let stream = futures::stream::unfold(notifications, |mut rx| async move {
+        match rx.recv().await {
+            Ok(notify) => {
+                let (kind, id) = match notify {
+                    EngineNotify::Goal(id) => ("loop", id),
+                    EngineNotify::Signal(id) => ("signal", id),
+                    EngineNotify::Swarm(id) => ("swarm", id),
+                };
+                let sse = Event::default()
+                    .event(kind)
+                    .data(serde_json::json!({"id": id}).to_string());
+                Some((Ok(sse), rx))
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                // The receiver fell behind — tell the client to do a
+                // full refresh instead of replaying the backlog.
+                let sse = Event::default()
+                    .event("harness.catchup")
+                    .data(r#"{"reason":"lagged"}"#);
+                Some((Ok(sse), rx))
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
+        }
+    });
     Ok(Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
