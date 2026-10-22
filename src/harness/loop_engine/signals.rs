@@ -515,6 +515,40 @@ pub(crate) async fn ignore_signal(
         .context("ignored signal disappeared")
 }
 
+/// `observed -> triaged` — an operator bookmark meaning "seen, still
+/// deciding". Idempotent on already-triaged signals so repeated clicks
+/// are cheap.
+pub(crate) async fn triage_signal(
+    pool: &SqlitePool,
+    signal_id: &str,
+    actor: &str,
+) -> anyhow::Result<SignalRecord> {
+    let signal = get_signal(pool, signal_id)
+        .await?
+        .context("signal not found")?;
+    if signal.status == SignalStatus::Triaged {
+        return Ok(signal);
+    }
+    ensure!(
+        signal.status == SignalStatus::Observed,
+        "signal cannot be triaged from status '{}'",
+        signal.status.as_str()
+    );
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    insert_signal_event_tx(
+        &mut tx,
+        signal_id,
+        SignalStatus::Triaged,
+        actor,
+        serde_json::json!({}),
+    )
+    .await?;
+    tx.commit().await?;
+    get_signal(pool, signal_id)
+        .await?
+        .context("triaged signal disappeared")
+}
+
 pub(crate) async fn mark_signal_proposed(
     pool: &SqlitePool,
     signal_id: &str,

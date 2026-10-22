@@ -31,7 +31,7 @@ use super::self_test::{
 };
 use super::signals::{
     CreateSignalRequest, SignalIngestResult, SignalRecord, SignalStatus, get_signal, ignore_signal,
-    ingest_signal, initialize_signal_schema, list_signals, mark_signal_proposed,
+    ingest_signal, initialize_signal_schema, list_signals, mark_signal_proposed, triage_signal,
 };
 
 #[async_trait]
@@ -94,6 +94,9 @@ pub trait LoopStore: Send + Sync {
         reason: &str,
         actor: &str,
     ) -> anyhow::Result<SignalRecord>;
+
+    /// `observed -> triaged` — an operator bookmark ("seen, deciding").
+    async fn triage_signal(&self, signal_id: &str, actor: &str) -> anyhow::Result<SignalRecord>;
 
     async fn mark_signal_proposed(
         &self,
@@ -1092,6 +1095,10 @@ impl LoopStore for SqliteLoopStore {
         actor: &str,
     ) -> anyhow::Result<()> {
         mark_signal_proposed(self.store.pool(), signal_id, goal_id, actor).await
+    }
+
+    async fn triage_signal(&self, signal_id: &str, actor: &str) -> anyhow::Result<SignalRecord> {
+        triage_signal(self.store.pool(), signal_id, actor).await
     }
 
     async fn run_self_tests(&self, suite: &str, actor: &str) -> anyhow::Result<SelfTestRun> {

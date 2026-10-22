@@ -165,6 +165,20 @@ impl LoopEngine {
         Ok(signal)
     }
 
+    /// `observed -> triaged` — an operator bookmark meaning "seen, still
+    /// deciding". Keeps the signals inbox clean without committing to a
+    /// verdict.
+    pub async fn triage_signal(
+        &self,
+        signal_id: &str,
+        actor: &str,
+    ) -> anyhow::Result<SignalRecord> {
+        validate_actor(actor)?;
+        let signal = self.store.triage_signal(signal_id, actor).await?;
+        self.notify_signal(&signal.id);
+        Ok(signal)
+    }
+
     pub async fn propose_goal_from_signal(
         &self,
         signal_id: &str,

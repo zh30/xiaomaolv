@@ -502,6 +502,7 @@ async function signalDetail(id) {
     <h2>content</h2><pre>${esc(s.content)}</pre>
     <div class="toolbar">
       <input id="sigObjective" class="grow" placeholder="goal objective…" ${open ? "" : "disabled"} />
+      <button data-act="triage" ${s.status === "observed" ? "" : "disabled"}>triage</button>
       <button data-act="propose" ${open ? "" : "disabled"}>propose goal</button>
       <input id="sigReason" placeholder="ignore reason" ${open ? "" : "disabled"} />
       <button data-act="ignore" class="danger" ${open ? "" : "disabled"}>ignore</button>
@@ -899,6 +900,10 @@ async function act(id, action, btn) {
         const g = await api(`/v1/harness/signals/${encodeURIComponent(id)}/propose-goal`, {
           method: "POST", body: { objective } });
         toast("goal " + short(g.id) + " proposed"); break;
+      }
+      case "triage": {
+        await api(`/v1/harness/signals/${encodeURIComponent(id)}/triage`, { method: "POST" });
+        toast("triaged"); break;
       }
       case "ignore": {
         const reason = $("#sigReason").value.trim() || "operator dismissed";
