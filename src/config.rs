@@ -188,6 +188,20 @@ pub struct AppSettings {
     pub concurrency_limit: usize,
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Ordered provider names tried after `default_provider` fails.
+    /// Empty = single-provider mode (no failover).
+    #[serde(default)]
+    pub provider_failovers: Vec<String>,
+    /// Consecutive failures that open a provider's circuit.
+    #[serde(default = "default_failover_failure_threshold")]
+    pub failover_failure_threshold: u32,
+    /// How long an open circuit stays out of rotation.
+    #[serde(default = "default_failover_cooldown_secs")]
+    pub failover_cooldown_secs: u64,
+    /// Whether 4xx request-shape errors fail over too (default false —
+    /// every provider would reject the same request anyway).
+    #[serde(default)]
+    pub failover_on_4xx: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -821,6 +835,14 @@ fn default_telegram_scheduler_require_confirm() -> bool {
 
 fn default_telegram_scheduler_max_jobs_per_owner() -> usize {
     64
+}
+
+fn default_failover_failure_threshold() -> u32 {
+    3
+}
+
+fn default_failover_cooldown_secs() -> u64 {
+    60
 }
 
 fn default_memory_backend() -> String {

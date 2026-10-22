@@ -24,6 +24,10 @@ impl ChatProvider for HarnessHttpProvider {
 fn config() -> AppConfig {
     let mut config = AppConfig {
         app: AppSettings {
+            provider_failovers: vec![],
+            failover_failure_threshold: 3,
+            failover_cooldown_secs: 60,
+            failover_on_4xx: false,
             bind: "127.0.0.1:0".to_string(),
             default_provider: "test".to_string(),
             locale: "en-US".to_string(),
