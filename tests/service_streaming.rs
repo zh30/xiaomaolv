@@ -221,6 +221,7 @@ async fn service_streaming_verifies_time_fast_path_before_delivery_when_output_e
             enabled: true,
             max_iterations: 1,
             max_tool_result_chars: 4000,
+            call_timeout_secs: 120,
         },
         20,
         0,

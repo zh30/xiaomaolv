@@ -77,6 +77,7 @@ async fn service_with_verification(
         backend,
         Some(runtime),
         AgentMcpSettings {
+            call_timeout_secs: 120,
             enabled: true,
             max_iterations: 3,
             max_tool_result_chars: 1,

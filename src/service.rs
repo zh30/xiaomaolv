@@ -76,6 +76,10 @@ pub struct AgentMcpSettings {
     pub enabled: bool,
     pub max_iterations: usize,
     pub max_tool_result_chars: usize,
+    /// Per-call ceiling for MCP tools in the auto loop — independent of
+    /// the server's own `timeout_secs` so a misconfigured/hung tool
+    /// cannot stall a whole turn.
+    pub call_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +148,7 @@ impl Default for AgentMcpSettings {
             enabled: true,
             max_iterations: 4,
             max_tool_result_chars: 4000,
+            call_timeout_secs: 120,
         }
     }
 }

@@ -70,6 +70,7 @@ async fn active_evolution_policy_is_injected_into_normal_and_streaming_runs() {
         None,
         AgentMcpSettings {
             enabled: false,
+            call_timeout_secs: 120,
             ..Default::default()
         },
         20,

@@ -781,6 +781,7 @@ async fn build_runtime_handles(
             enabled: config.agent.mcp_enabled,
             max_iterations: config.agent.mcp_max_iterations,
             max_tool_result_chars: config.agent.mcp_max_tool_result_chars,
+            call_timeout_secs: config.agent.mcp_call_timeout_secs,
         },
         max_recent_turns,
         config.memory.max_semantic_memories,

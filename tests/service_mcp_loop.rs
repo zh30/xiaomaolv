@@ -76,6 +76,7 @@ async fn service_with_harness(
             enabled: true,
             max_iterations: 3,
             max_tool_result_chars: 4000,
+            call_timeout_secs: 120,
         },
         20,
         0,
