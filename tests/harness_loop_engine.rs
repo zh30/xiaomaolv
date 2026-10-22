@@ -5026,6 +5026,17 @@ async fn internal_only_goal_skips_dispatch_sweep_but_stays_claimable() -> anyhow
             .contains(&goal.id),
         "internal_only goal must not enter the dispatch list"
     );
+    // ...and the generic claim path rejects it outright, not just the list.
+    let generic = engine
+        .claim_goal_work(&goal.id, "worker:generic", 30, actor)
+        .await;
+    assert!(
+        generic
+            .expect_err("generic claim on internal_only goal")
+            .to_string()
+            .contains("internal_only"),
+        "generic claim must be rejected, not just the dispatch list"
+    );
     // ...but the in-process targeted claim still works.
     let claim = engine
         .claim_work_item(&goal.id, "step", "worker:internal", 30, actor)

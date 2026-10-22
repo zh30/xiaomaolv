@@ -463,6 +463,17 @@ impl SqliteLoopStore {
                 matches!(goal_status.as_str(), "approved" | "active"),
                 "goal is not dispatchable"
             );
+            if step_id.is_none() {
+                let internal_only: Option<i64> =
+                    sqlx::query_scalar("SELECT internal_only FROM harness_goals WHERE id = ?1")
+                        .bind(goal_id)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                ensure!(
+                    internal_only.unwrap_or(0) == 0,
+                    "internal_only goal is not claimable by a generic worker"
+                );
+            }
             let row = if let Some(step_id) = step_id {
                 sqlx::query(
                     "SELECT id, goal_id, workflow_id, status, step_id, handler, effect_class,
