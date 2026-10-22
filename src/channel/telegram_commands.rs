@@ -1148,8 +1148,7 @@ async fn handle_telegram_signals_command(
                     sender,
                     message,
                     &format!(
-                        "信号已标记为待审。
-signal_id={}\nstatus={}",
+                        "信号已标记为待审。\nsignal_id={}\nstatus={}",
                         signal.id,
                         signal.status.as_str()
                     ),
