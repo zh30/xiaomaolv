@@ -263,7 +263,11 @@ they require a configured operator key and `loop_engine.enabled = true`.
 
 | Method | Route | Purpose |
 |---|---|---|
-| `GET/POST` | `/v1/harness/goals` | List goals or create/auto-plan one; optional `request_id` makes admission idempotent |
+| `GET/POST` | `/v1/harness/goals` | List goals (`?request_id=` resolves one by admission key) or create/auto-plan one; `request_id` makes admission idempotent |
+| `POST` | `/v1/harness/goals/{id}/pause` `/unpause` | Reversible operator hold — paused goals are not claimed |
+| `POST` | `/v1/harness/goals/{id}/cancel` | Terminal stop; in-flight attempts abandon (fencing rejects stale commits) |
+| `POST` | `/v1/harness/goals/{id}/reject` | Pre-dispatch verdict on `review_ready`/`planning` goals |
+| `POST` | `/v1/harness/goals/{id}/replan` | Failed/cancelled goals get a fresh revision; superseded items are cancelled |
 | `GET` | `/v1/harness/goals/{id}` | Read durable goal state |
 | `POST` | `/v1/harness/goals/{id}/plan` | Store a validated Dynamic Workflow revision |
 | `POST` | `/v1/harness/goals/{id}/approve` | Approve the immutable revision/hash |
@@ -271,11 +275,17 @@ they require a configured operator key and `loop_engine.enabled = true`.
 | `GET` | `/v1/harness/goals/{id}/work-items` | List durable work items for a goal |
 | `POST` | `/v1/harness/goals/{goal_id}/work-items/{work_item_id}/resolve-confirmation` | Operator verdict for a `waiting_confirmation` item |
 | `GET` | `/v1/harness/goals/{id}/events` | Cursor-based durable event snapshot |
+| `GET` | `/v1/harness/goals/{id}/attempts` | Claim/fencing/void-vs-abandoned audit |
+| `GET` | `/v1/harness/goals/{id}/checkpoints` | Effect audit — prepared/committed/reconciled/voided + idempotency + replay_safe |
+| `GET` | `/v1/harness/swarm-runs` | Agent-swarm run audit rows (channel-scoped) |
+| `GET` | `/v1/harness/swarm-runs/{id}/nodes` | Mirrored node telemetry for one run |
+| `GET` | `/v1/harness/events/stream` | Global SSE — every committed mutation as `{kind,id}`; `harness.catchup` on lag |
 | `GET` | `/v1/harness/goals/{id}/events/stream` | SSE event stream for Desktop; commit-driven push with monotonic `sequence` cursor (5 s fallback poll) |
 | `POST` | `/v1/harness/goals/{id}/verify/manual` | Record a named manual criterion and re-verify |
 | `GET` | `/v1/harness/signals` | List signals; `?status=observed|triaged|proposed|ignored` filters by triage state |
 | `POST` | `/v1/harness/signals` | Ingest one external/authenticated signal with the scoped key |
 | `GET` | `/v1/harness/signals/{id}` | Read one signal and its current triage status |
+| `POST` | `/v1/harness/signals/{id}/triage` | `observed → triaged` bookmark ("seen, deciding") |
 | `POST` | `/v1/harness/signals/{id}/propose-goal` | Convert a pending signal into a proposed goal |
 | `POST` | `/v1/harness/signals/{id}/ignore` | Mark a pending signal ignored with an operator reason |
 | `POST` | `/v1/harness/self-tests/{suite}` | Run a bounded read-only suite (`core`) |
@@ -284,6 +294,15 @@ they require a configured operator key and `loop_engine.enabled = true`.
 | `POST` | `/v1/harness/trajectories/{id}/replay/structural` | Replay structure without live tools |
 | `GET/POST` | `/v1/harness/artifacts` | List or publish immutable typed artifacts |
 | `GET` | `/v1/harness/artifacts/{id}` | Read a typed artifact |
+
+Swarm runs map to durable goals under `internal:swarm` admission (`request_id` =
+`swarm:{run_id}`) — `GET /v1/harness/goals?request_id=swarm:{run_id}` resolves the run back to
+its DAG. Legacy mirror projections mark `internal_only = 1` so the runtime dispatch sweep and
+generic claim skip them while targeted claims still work. Swarm auto-detect is private-chat
+only unless `agent.swarm.group_enabled = true` — group activation is opt-in because a run
+costs multiple provider calls. `agent.swarm.reply_sync_wait_ms` caps the synchronous reply
+window; longer runs return an ack and the janitor delivers the final answer via the outbound
+sender once the goal is terminal (channels the sender cannot reach fall through to failure).
 
 Signal ingestion is the only route family that uses the scoped ingestion key:
 
@@ -309,11 +328,12 @@ detection (Jaccard >= 0.9 against the 128 most recent same-source/kind signals).
 user, developer, trajectory, replay, manual, and self-test signals all use the same immutable
 model.
 
-Signal triage is a small lifecycle: `observed` (or `triaged`) -> `proposed` via the
-propose-goal route, or -> `ignored` with a required operator reason. `proposed` and `ignored`
-are terminal for both transitions — an ignored signal cannot be proposed, and a proposed
-signal cannot be proposed again or ignored. Over Telegram, `/signals` lists pending signals and
-`/signal <id> [ignore <reason> | goal <objective>]` reviews, rejects, or converts one.
+Signal triage is a small lifecycle: `observed` -> `triaged` (operator bookmark: seen, still
+deciding) -> `proposed` via the propose-goal route, or -> `ignored` with a required operator
+reason. `proposed` and `ignored` are terminal for all transitions — an ignored signal cannot
+be proposed or triaged again, and a proposed signal cannot be proposed again or ignored. Over
+Telegram, `/signals` lists pending signals and `/signal <id> [triage | ignore <reason> | goal
+<objective>]` reviews, bookmarks, rejects, or converts one.
 
 Supported signal kinds are `trajectory`, `user_feedback`, `developer_feedback`, `community`,
 `self_test`, `session_replay`, and `manual`; trust levels are `internal`, `authenticated`, and
@@ -323,11 +343,13 @@ Supported signal kinds are `trajectory`, `user_feedback`, `developer_feedback`, 
 The HTTP resources plus monotonic goal-event cursor are the supported Desktop contract. Desktop
 business logic does not live in the server core. `GET /console` serves an embedded single-file
 operator dashboard over this contract: it authenticates with the same `app.api_key` bearer plus
-`x-harness-actor` header, renders goals/signals/artifacts/trajectories/self-tests/evolution,
-drives the existing plan/approve/resume/verify/propose/ignore/evolution POST routes, and reads
-the goal SSE stream via a fetch reader (native `EventSource` cannot send the Authorization
-header). The page adds no backend semantics; a native Desktop shell can consume the same
-contract later.
+`x-harness-actor` header, renders goals/signals/artifacts/trajectories/self-tests/evolution/swarm,
+drives the existing plan/approve/resume/verify/propose/triage/ignore/evolution POST routes, and
+keeps the global `/v1/harness/events/stream` fetch open (native `EventSource` cannot send the
+Authorization header): committed goal/signal/swarm/evolution mutations push `{kind,id}`
+notifications that invalidate the matching view on a 400 ms debounce; a `Lagged` receiver emits
+a `harness.catchup` event that triggers a full refresh. The page adds no backend semantics; a
+native Desktop shell can consume the same contract later.
 
 ## Self-test and Session Replay
 
