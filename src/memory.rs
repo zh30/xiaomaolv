@@ -138,6 +138,20 @@ impl SqliteMemoryStore {
         .context("failed to initialize memory_chunks session index")?;
 
         sqlx::query(
+            "CREATE TABLE IF NOT EXISTS memory_sidecar_outbox (
+                chunk_id TEXT PRIMARY KEY,
+                doc_json TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                created_at INTEGER NOT NULL,
+                last_attempt_at INTEGER
+            );",
+        )
+        .execute(&pool)
+        .await
+        .context("failed to initialize memory_sidecar_outbox table")?;
+
+        sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_memory_chunks_scope_created
              ON memory_chunks(user_id, channel, created_at DESC);",
         )
@@ -830,6 +844,83 @@ impl SqliteMemoryStore {
         .execute(&self.pool)
         .await
         .context("failed to upsert memory chunk")?;
+        Ok(())
+    }
+
+    /// Atomically persists a chunk and its pending sidecar upsert so a
+    /// crash can never leave a chunk without the outbox row the
+    /// reconciler would replay.
+    pub async fn append_chunk_and_outbox(
+        &self,
+        chunk: MemoryChunkRecord,
+        doc_json: &str,
+    ) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query(
+            "INSERT OR REPLACE INTO memory_chunks
+             (chunk_id, session_id, user_id, channel, role, text, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .bind(&chunk.chunk_id)
+        .bind(&chunk.session_id)
+        .bind(&chunk.user_id)
+        .bind(&chunk.channel)
+        .bind(chunk.role.as_str())
+        .bind(&chunk.text)
+        .bind(chunk.created_at)
+        .execute(&mut *tx)
+        .await
+        .context("failed to upsert memory chunk")?;
+        sqlx::query(
+            "INSERT OR REPLACE INTO memory_sidecar_outbox
+             (chunk_id, doc_json, attempts, last_error, created_at, last_attempt_at)
+             VALUES (?1, ?2, 0, NULL, unixepoch(), NULL)",
+        )
+        .bind(&chunk.chunk_id)
+        .bind(doc_json)
+        .execute(&mut *tx)
+        .await
+        .context("failed to queue sidecar outbox row")?;
+        tx.commit().await.context("chunk+outbox commit")?;
+        Ok(())
+    }
+
+    pub async fn delete_sidecar_outbox(&self, chunk_id: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM memory_sidecar_outbox WHERE chunk_id = ?1")
+            .bind(chunk_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_sidecar_outbox(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(String, String, i64)>> {
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT chunk_id, doc_json, attempts FROM memory_sidecar_outbox
+             ORDER BY created_at ASC LIMIT ?1",
+        )
+        .bind(i64::try_from(limit).context("limit")?)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    pub async fn bump_sidecar_outbox_attempt(
+        &self,
+        chunk_id: &str,
+        error: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE memory_sidecar_outbox
+             SET attempts = attempts + 1, last_error = ?2, last_attempt_at = unixepoch()
+             WHERE chunk_id = ?1",
+        )
+        .bind(chunk_id)
+        .bind(error)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -3635,6 +3726,13 @@ pub trait MemoryBackend: Send + Sync {
     ) -> anyhow::Result<i64> {
         Ok(0)
     }
+
+    /// Replays pending sidecar outbox rows — the hybrid backend overrides
+    /// this; sqlite-only has no sidecar to drift. Returns the number of
+    /// rows successfully delivered (deleted from the outbox).
+    async fn reconcile_sidecar_outbox(&self, _limit: usize) -> anyhow::Result<usize> {
+        Ok(0)
+    }
     async fn insert_trajectory_tool_call(
         &self,
         _trajectory_id: &str,
@@ -4219,38 +4317,85 @@ impl MemoryBackend for HybridSqliteZvecMemoryBackend {
         let created_at = unix_ts();
         let chunk_id = stable_chunk_id(&req, created_at);
 
-        self.store
-            .append_chunk(MemoryChunkRecord {
-                chunk_id: chunk_id.clone(),
-                session_id: req.session_id.clone(),
-                user_id: req.user_id.clone(),
-                channel: req.channel.clone(),
-                role: req.message.role.clone(),
-                text: req.message.content.clone(),
-                created_at,
-            })
-            .await
-            .context("failed to append memory chunk in hybrid backend")?;
-
         let sidecar = self.sidecar.clone();
         let doc = SidecarMemoryDoc {
-            id: chunk_id,
-            text: req.message.content,
+            id: chunk_id.clone(),
+            text: req.message.content.clone(),
             role: req.message.role.as_str().to_string(),
-            session_id: req.session_id,
-            user_id: req.user_id,
-            channel: req.channel,
+            session_id: req.session_id.clone(),
+            user_id: req.user_id.clone(),
+            channel: req.channel.clone(),
             created_at,
             importance: 0.5,
         };
+        let doc_json = serde_json::to_string(&doc).context("serialize sidecar doc")?;
 
+        // Chunk + outbox row commit in one transaction — the sidecar write
+        // that follows may fail or the process may die mid-flight, but the
+        // reconciler will always replay from this row.
+        self.store
+            .append_chunk_and_outbox(
+                MemoryChunkRecord {
+                    chunk_id: chunk_id.clone(),
+                    session_id: req.session_id.clone(),
+                    user_id: req.user_id.clone(),
+                    channel: req.channel.clone(),
+                    role: req.message.role.clone(),
+                    text: req.message.content.clone(),
+                    created_at,
+                },
+                &doc_json,
+            )
+            .await
+            .context("failed to append memory chunk + outbox in hybrid backend")?;
+
+        let store = self.store.clone();
         tokio::spawn(async move {
-            if let Err(err) = sidecar.upsert(doc).await {
-                warn!(error = %err, "failed to upsert memory into zvec sidecar");
+            match sidecar.upsert(doc).await {
+                Ok(()) => {
+                    let _ = store.delete_sidecar_outbox(&chunk_id).await;
+                }
+                Err(err) => {
+                    let err = err.to_string();
+                    warn!(error = %err, "failed to upsert memory into zvec sidecar");
+                    let _ = store.bump_sidecar_outbox_attempt(&chunk_id, &err).await;
+                }
             }
         });
 
         Ok(())
+    }
+
+    async fn reconcile_sidecar_outbox(&self, limit: usize) -> anyhow::Result<usize> {
+        let pending = self.store.list_sidecar_outbox(limit).await?;
+        let mut delivered = 0usize;
+        for (chunk_id, doc_json, _attempts) in pending {
+            let doc: SidecarMemoryDoc = match serde_json::from_str(&doc_json) {
+                Ok(doc) => doc,
+                Err(err) => {
+                    let err = format!("corrupt outbox doc: {err}");
+                    let _ = self
+                        .store
+                        .bump_sidecar_outbox_attempt(&chunk_id, &err)
+                        .await;
+                    continue;
+                }
+            };
+            match self.sidecar.upsert(doc).await {
+                Ok(()) => {
+                    let _ = self.store.delete_sidecar_outbox(&chunk_id).await;
+                    delivered += 1;
+                }
+                Err(err) => {
+                    let err = err.to_string();
+                    let _ = self
+                        .store
+                        .bump_sidecar_outbox_attempt(&chunk_id, &err)
+                        .await;
+                }
+            }
+        }
+        Ok(delivered)
     }
 
     async fn load_context(&self, req: MemoryContextRequest) -> anyhow::Result<Vec<StoredMessage>> {
@@ -5029,7 +5174,7 @@ struct SidecarUpsertRequest {
     docs: Vec<SidecarMemoryDoc>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SidecarMemoryDoc {
     id: String,
     text: String,

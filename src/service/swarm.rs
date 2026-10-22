@@ -2207,6 +2207,13 @@ impl MessageService {
     /// Reaps swarm runs orphaned by a crash: the run row is still `running`
     /// but its durable goal already reached a terminal status — mirror the
     /// final audit rows and close the run so `/agents` reflects reality.
+    /// Drains the persisted sidecar outbox — pending vector upserts that
+    /// failed (or were cut off by a restart) are replayed until the
+    /// sidecar accepts them. No-op on non-hybrid backends.
+    pub async fn reconcile_memory_sidecar(&self, limit: usize) -> anyhow::Result<usize> {
+        self.memory.reconcile_sidecar_outbox(limit).await
+    }
+
     pub async fn reap_orphaned_swarm_runs(&self) -> anyhow::Result<usize> {
         let Some(engine) = self.loop_engine.clone() else {
             return Ok(0);

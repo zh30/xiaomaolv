@@ -165,6 +165,82 @@ async fn scheduler_store_claims_due_jobs_and_completes_once_job() {
     assert_eq!(future.next_run_at_unix, Some(now + 600));
 }
 
+/// A job whose lease expires gets re-claimed by a fresher worker; the
+/// stale worker's completion must be rejected by the lease fence so the
+/// re-claimed run owns the state transition (delivery itself is also
+/// gated on the lease in the channel worker).
+#[tokio::test]
+async fn scheduler_store_reclaims_expired_lease_and_rejects_stale_completion() {
+    let store = SqliteMemoryStore::new("sqlite::memory:")
+        .await
+        .expect("init store");
+    let now = 1_800_000_000_i64;
+
+    store
+        .create_telegram_scheduler_job(CreateTelegramSchedulerJobRequest {
+            job_id: "leaseable".to_string(),
+            channel: "telegram".to_string(),
+            chat_id: -10008,
+            message_thread_id: None,
+            owner_user_id: 101,
+            status: TelegramSchedulerJobStatus::Active,
+            task_kind: TelegramSchedulerTaskKind::Reminder,
+            payload: "到点提醒".to_string(),
+            schedule_kind: TelegramSchedulerScheduleKind::Once,
+            timezone: "Asia/Shanghai".to_string(),
+            run_at_unix: Some(now - 10),
+            cron_expr: None,
+            policy_json: None,
+            next_run_at_unix: Some(now - 10),
+            max_runs: Some(1),
+        })
+        .await
+        .expect("create job");
+
+    let first = store
+        .claim_due_telegram_scheduler_jobs("telegram", now, 10, 5, "lease-old")
+        .await
+        .expect("first claim");
+    assert_eq!(first.len(), 1);
+    // The old lease (5s) expired — a new claim takes the job.
+    let second = store
+        .claim_due_telegram_scheduler_jobs("telegram", now + 10, 10, 30, "lease-new")
+        .await
+        .expect("re-claim after expiry");
+    assert_eq!(second.len(), 1);
+
+    let stale = store
+        .complete_telegram_scheduler_job_run(CompleteTelegramSchedulerJobRunRequest {
+            channel: "telegram".to_string(),
+            chat_id: -10008,
+            job_id: "leaseable".to_string(),
+            lease_token: "lease-old".to_string(),
+            started_at_unix: now,
+            finished_at_unix: now + 1,
+            next_run_at_unix: None,
+            mark_completed: true,
+        })
+        .await;
+    assert!(
+        stale.is_err(),
+        "stale lease completion must be fenced, got {stale:?}"
+    );
+
+    let owned = store
+        .complete_telegram_scheduler_job_run(CompleteTelegramSchedulerJobRunRequest {
+            channel: "telegram".to_string(),
+            chat_id: -10008,
+            job_id: "leaseable".to_string(),
+            lease_token: "lease-new".to_string(),
+            started_at_unix: now + 10,
+            finished_at_unix: now + 11,
+            next_run_at_unix: None,
+            mark_completed: true,
+        })
+        .await;
+    assert!(owned.is_ok(), "current lease completion must succeed");
+}
+
 #[tokio::test]
 async fn scheduler_store_upserts_and_clears_pending_intent() {
     let store = SqliteMemoryStore::new("sqlite::memory:")
