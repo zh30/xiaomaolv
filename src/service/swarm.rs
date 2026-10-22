@@ -2437,5 +2437,10 @@ impl MessageService {
                 })
                 .await;
         }
+        // Node rows just changed — let the live console refresh the view
+        // instead of waiting for the fallback poll.
+        if let Some(engine) = &self.loop_engine {
+            engine.notify_swarm_run(run_id);
+        }
     }
 }

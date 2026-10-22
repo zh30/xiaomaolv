@@ -62,6 +62,7 @@ pub(super) fn router() -> Router<AppState> {
             "/v1/harness/signals/{id}/propose-goal",
             post(post_signal_propose_goal),
         )
+        .route("/v1/harness/signals/{id}/triage", post(post_signal_triage))
         .route("/v1/harness/signals/{id}/ignore", post(post_signal_ignore))
         .route("/v1/harness/self-tests/{suite}", post(post_self_test))
         .route("/v1/harness/self-test-runs/{id}", get(get_self_test_run))
@@ -747,6 +748,25 @@ async fn post_signal_propose_goal(
 #[derive(Debug, Deserialize)]
 struct IgnoreSignalRequest {
     reason: String,
+}
+
+async fn post_signal_triage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(signal_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (engine, actor) = operator_context(&state, &headers).await?;
+    let signal = engine
+        .triage_signal(&signal_id, &actor)
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("not found") {
+                ApiError::NotFound(e.to_string())
+            } else {
+                conflict(e)
+            }
+        })?;
+    Ok(Json(serde_json::json!({"signal": signal})))
 }
 
 async fn post_signal_ignore(

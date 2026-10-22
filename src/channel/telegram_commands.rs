@@ -1142,6 +1142,25 @@ async fn handle_telegram_signals_command(
     }
 
     match args[1].as_str() {
+        "triage" => match engine.triage_signal(signal_id, &actor).await {
+            Ok(signal) => {
+                send_telegram_command_reply(
+                    sender,
+                    message,
+                    &format!(
+                        "信号已标记为待审。
+signal_id={}\nstatus={}",
+                        signal.id,
+                        signal.status.as_str()
+                    ),
+                )
+                .await?;
+            }
+            Err(error) => {
+                send_telegram_command_reply(sender, message, &format!("标记信号失败: {error}"))
+                    .await?;
+            }
+        },
         "ignore" => {
             let reason = args[2..].join(" ");
             if reason.trim().is_empty() {
@@ -1230,7 +1249,7 @@ async fn handle_telegram_signals_command(
             send_telegram_command_reply(
                 sender,
                 message,
-                "用法:\n/signals\n/signal <id>\n/signal <id> ignore <原因>\n/signal <id> goal <目标描述>",
+                "用法:\n/signals\n/signal <id>\n/signal <id> triage\n/signal <id> ignore <原因>\n/signal <id> goal <目标描述>",
             )
             .await?;
         }

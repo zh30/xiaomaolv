@@ -2532,6 +2532,13 @@ async fn signal_lifecycle_notifies_subscribers() -> anyhow::Result<()> {
         notifications.recv().await?,
         xiaomaolv::harness::loop_engine::EngineNotify::Signal(sig_id.clone())
     );
+    // observed -> triaged bookmark before the verdict.
+    let signal = engine.triage_signal(&sig_id, "operator:test").await?;
+    assert_eq!(signal.status, SignalStatus::Triaged);
+    assert_eq!(
+        notifications.recv().await?,
+        xiaomaolv::harness::loop_engine::EngineNotify::Signal(sig_id.clone())
+    );
     let signal = engine
         .ignore_signal(&sig_id, "not relevant", "operator:test")
         .await?;
