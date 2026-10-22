@@ -98,6 +98,7 @@ async fn always_mode_skill_is_injected() {
             user_id: "u1".to_string(),
             text: "hello".to_string(),
             reply_target: None,
+            is_group_chat: false,
         })
         .await
         .expect("handle");
@@ -130,6 +131,7 @@ async fn semantic_mode_skill_matches_query() {
             user_id: "u2".to_string(),
             text: "calendar reminder scheduling".to_string(),
             reply_target: None,
+            is_group_chat: false,
         })
         .await
         .expect("handle");
@@ -162,6 +164,7 @@ async fn off_mode_skill_is_not_injected() {
             user_id: "u3".to_string(),
             text: "hello".to_string(),
             reply_target: None,
+            is_group_chat: false,
         })
         .await
         .expect("handle");

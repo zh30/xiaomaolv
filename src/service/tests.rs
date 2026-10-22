@@ -641,6 +641,7 @@ async fn handle_stream_supports_mcp_tool_loop() {
                 user_id: "u1".to_string(),
                 text: "请调用工具并给我最终结论".to_string(),
                 reply_target: None,
+                is_group_chat: false,
             },
             &mut sink,
         )
@@ -688,6 +689,7 @@ async fn handle_stream_supports_multi_iteration_mcp_tool_loop() {
                 user_id: "u1".to_string(),
                 text: "请连续调用两次工具后再回答".to_string(),
                 reply_target: None,
+                is_group_chat: false,
             },
             &mut sink,
         )
@@ -732,6 +734,7 @@ async fn handle_stream_supports_fenced_json_tool_call() {
                 user_id: "u1".to_string(),
                 text: "请用 fenced json 发起工具调用".to_string(),
                 reply_target: None,
+                is_group_chat: false,
             },
             &mut sink,
         )
@@ -776,6 +779,7 @@ async fn handle_stream_continues_after_mcp_tool_error() {
                 user_id: "u1".to_string(),
                 text: "请调用一个不存在的工具后继续回答".to_string(),
                 reply_target: None,
+                is_group_chat: false,
             },
             &mut sink,
         )
@@ -819,6 +823,7 @@ async fn handle_stream_parses_tool_call_even_when_provider_emits_no_deltas() {
                 user_id: "u1".to_string(),
                 text: "即使没有delta也要完成工具调用".to_string(),
                 reply_target: None,
+                is_group_chat: false,
             },
             &mut sink,
         )
@@ -852,6 +857,7 @@ async fn handle_uses_builtin_time_fast_path_without_provider_call() {
             user_id: "u1".to_string(),
             text: "现在美国时间是几点？".to_string(),
             reply_target: None,
+            is_group_chat: false,
         })
         .await
         .expect("fast time query should bypass provider");
@@ -885,6 +891,7 @@ async fn handle_stream_uses_builtin_time_fast_path_without_provider_call() {
                 user_id: "u1".to_string(),
                 text: "今天星期几？".to_string(),
                 reply_target: None,
+                is_group_chat: false,
             },
             &mut sink,
         )

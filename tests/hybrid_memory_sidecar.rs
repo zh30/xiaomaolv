@@ -94,6 +94,7 @@ async fn hybrid_backend_merges_sidecar_memories_into_context() {
             user_id: "u1".to_string(),
             text: "给我一个 rust 记忆".to_string(),
             reply_target: None,
+            is_group_chat: false,
         })
         .await
         .expect("service handle");
@@ -149,6 +150,7 @@ async fn hybrid_backend_supports_legacy_search_endpoint_and_content_field() {
             user_id: "u-legacy".to_string(),
             text: "legacy memory".to_string(),
             reply_target: None,
+            is_group_chat: false,
         })
         .await
         .expect("service handle");
@@ -205,6 +207,7 @@ async fn hybrid_backend_can_send_bearer_token_to_sidecar() {
             user_id: "u-auth".to_string(),
             text: "auth memory".to_string(),
             reply_target: None,
+            is_group_chat: false,
         })
         .await
         .expect("service handle");
@@ -248,6 +251,7 @@ async fn hybrid_backend_falls_back_to_recent_context_when_sidecar_unavailable() 
             user_id: "u2".to_string(),
             text: "hello".to_string(),
             reply_target: None,
+            is_group_chat: false,
         })
         .await
         .expect("service handle");
@@ -288,6 +292,7 @@ async fn hybrid_backend_falls_back_to_local_keyword_memory_when_sidecar_unavaila
             user_id: "u-local".to_string(),
             text: "Rust trait object 支持动态分发".to_string(),
             reply_target: None,
+            is_group_chat: false,
         })
         .await
         .expect("seed first turn");
@@ -299,6 +304,7 @@ async fn hybrid_backend_falls_back_to_local_keyword_memory_when_sidecar_unavaila
             user_id: "u-local".to_string(),
             text: "trait object 是什么".to_string(),
             reply_target: None,
+            is_group_chat: false,
         })
         .await
         .expect("second turn");

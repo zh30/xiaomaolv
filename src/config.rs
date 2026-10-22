@@ -434,6 +434,10 @@ pub struct AgentSwarmConfig {
     /// janitor once the goal is terminal). `0` = always asynchronous.
     #[serde(default = "default_agent_swarm_reply_sync_wait_ms")]
     pub reply_sync_wait_ms: u64,
+    /// Swarm activation in group chats is opt-in — a run is multiple
+    /// provider calls, so group-triggered auto-detect defaults to off.
+    #[serde(default)]
+    pub group_enabled: bool,
 }
 
 impl Default for AgentSwarmConfig {
@@ -450,6 +454,7 @@ impl Default for AgentSwarmConfig {
             audit_retention_days: default_agent_swarm_audit_retention_days(),
             durable_engine: default_agent_swarm_durable_engine(),
             reply_sync_wait_ms: default_agent_swarm_reply_sync_wait_ms(),
+            group_enabled: false,
         }
     }
 }

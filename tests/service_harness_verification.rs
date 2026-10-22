@@ -105,6 +105,7 @@ fn incoming(session_id: &str) -> IncomingMessage {
         user_id: "user-1".to_string(),
         text: "please use a tool".to_string(),
         reply_target: None,
+        is_group_chat: false,
     }
 }
 
