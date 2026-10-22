@@ -184,6 +184,7 @@ function rawBlock(obj) {
 }
 function stopStream() {
   if (state.stream) { state.stream.abort(); state.stream = null; }
+  if (state.swarmTimer) { clearTimeout(state.swarmTimer); state.swarmTimer = null; }
 }
 
 // ---------- Goals ----------
@@ -588,6 +589,11 @@ async function swarmDetail(id) {
     api(`/v1/harness/swarm-runs/${encodeURIComponent(id)}/nodes?channel=${encodeURIComponent(ch)}`),
   ]);
   const run = (runs.runs || []).find((r) => r.run_id === id) || { run_id: id };
+  // The durable goal for this run admits under request_id `swarm:{run_id}` —
+  // look it up so the operator can jump from run telemetry to the DAG.
+  const goalLookup = await api(`/v1/harness/goals?request_id=${encodeURIComponent("swarm:" + id)}`)
+    .catch(() => ({ goals: [] }));
+  const linkedGoal = (goalLookup.goals || [])[0];
   const nodeRows = (nodes.nodes || []).map((n) => `
     <tr>
       <td>${esc(n.nickname || n.agent_id)}</td><td class="muted small">${esc(n.role_name || "")}</td>
@@ -595,6 +601,14 @@ async function swarmDetail(id) {
       <td class="muted small">${esc((n.summary || "").slice(0, 90))}</td>
       <td class="muted small">${esc(n.error || "")}</td>
     </tr>`).join("");
+  // Auto-refresh while the run is in flight — the operator does not have
+  // to keep clicking to watch a 90s run finish.
+  if (run.status === "running" || run.awaiting_reply) {
+    if (state.swarmTimer) clearTimeout(state.swarmTimer);
+    state.swarmTimer = setTimeout(() => {
+      if (state.tab === "swarm" && state.sel === id) selectRow(id);
+    }, 4000);
+  }
   return `<h2>swarm ${esc(short(run.run_id))}</h2>
     ${detailKv([
       ["channel", esc(run.channel || "")],
@@ -605,6 +619,9 @@ async function swarmDetail(id) {
       ["awaiting reply", esc(String(run.awaiting_reply ?? false))],
       ["started / finished", esc(ts(run.started_at_unix) + " → " + ts(run.finished_at_unix))],
       ["error", esc(run.error || "—")],
+      ["goal", linkedGoal
+        ? `<a href="#" data-goal="${esc(linkedGoal.id)}">${esc(short(linkedGoal.id))}</a> ${chip(linkedGoal.status)}`
+        : "—"],
     ])}
     <h3>nodes (${(nodes.nodes || []).length})</h3>
     <table><tr><th>agent</th><th>role</th><th>depth</th><th>exit</th><th>output</th><th>error</th></tr>
@@ -705,8 +722,23 @@ async function selectRow(id, tr) {
 function bindRight(id) {
   $("#right").querySelectorAll("[data-act]").forEach((b) =>
     b.addEventListener("click", () => act(id, b.dataset.act, b)));
+  $("#right").querySelectorAll("[data-goal]").forEach((a) =>
+    a.addEventListener("click", (e) => {
+      e.preventDefault();
+      jumpToGoal(a.dataset.goal);
+    }));
   $("#right").querySelectorAll("[data-conf]").forEach((b) =>
     b.addEventListener("click", () => resolveConfirmation(id, b.dataset.wid, b.dataset.conf, b)));
+}
+async function jumpToGoal(goalId) {
+  state.tab = "goals";
+  document
+    .querySelectorAll("#tabs button")
+    .forEach((x) => x.classList.toggle("active", x.dataset.tab === "goals"));
+  await refresh();
+  // Re-select after the list re-rendered so the row highlight matches.
+  const row = document.querySelector(`tr.row[data-id="${CSS.escape(goalId)}"]`);
+  await selectRow(goalId, row);
 }
 async function resolveConfirmation(goalId, workItemId, resolution, btn) {
   const reason = document.querySelector(`.confReason[data-wid="${workItemId}"]`)?.value.trim();

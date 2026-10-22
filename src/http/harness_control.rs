@@ -107,6 +107,10 @@ struct ListQuery {
     /// Optional signal status filter; ignored by non-signal list endpoints.
     #[serde(default)]
     status: Option<SignalStatus>,
+    /// Look up a single goal by its idempotent admission request_id —
+    /// e.g. `swarm:{run_id}` maps a swarm run back to its durable goal.
+    #[serde(default)]
+    request_id: Option<String>,
 }
 
 fn default_list_limit() -> usize {
@@ -186,6 +190,15 @@ async fn list_goals(
     Query(query): Query<ListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (engine, _) = operator_context(&state, &headers).await?;
+    if let Some(request_id) = query.request_id.as_deref() {
+        let goal = engine
+            .get_goal_by_request_id(request_id)
+            .await
+            .map_err(internal)?;
+        return Ok(Json(
+            serde_json::json!({"goals": goal.map(|g| vec![g]).unwrap_or_default()}),
+        ));
+    }
     let goals = engine.list_goals(query.limit).await.map_err(internal)?;
     Ok(Json(serde_json::json!({"goals": goals})))
 }
