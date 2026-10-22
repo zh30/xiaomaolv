@@ -26,7 +26,8 @@ impl MessageService {
             content: mcp_prompt,
         });
 
-        let protocol = ToolProtocol::new(tools.clone(), self.agent_mcp.max_tool_result_chars);
+        let protocol = ToolProtocol::new(tools.clone(), self.agent_mcp.max_tool_result_chars)
+            .with_call_timeout_secs(self.agent_mcp.call_timeout_secs);
         let max_iterations = self.agent_mcp.max_iterations.max(1);
         let mut verification_retry_used = false;
         let mut tool_calls = Vec::new();
@@ -360,7 +361,8 @@ impl MessageService {
             content: mcp_prompt,
         });
 
-        let protocol = ToolProtocol::new(tools.clone(), self.agent_mcp.max_tool_result_chars);
+        let protocol = ToolProtocol::new(tools.clone(), self.agent_mcp.max_tool_result_chars)
+            .with_call_timeout_secs(self.agent_mcp.call_timeout_secs);
         let max_iterations = self.agent_mcp.max_iterations.max(1);
         let mut verification_retry_used = false;
         let mut tool_calls = Vec::new();

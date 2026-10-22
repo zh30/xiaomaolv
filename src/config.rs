@@ -401,6 +401,10 @@ pub struct AgentConfig {
     pub mcp_max_iterations: usize,
     #[serde(default = "default_agent_mcp_max_tool_result_chars")]
     pub mcp_max_tool_result_chars: usize,
+    /// Per-tool-call ceiling in the auto loop — caps a hung/misconfigured
+    /// tool regardless of the server's own timeout_secs.
+    #[serde(default = "default_agent_mcp_call_timeout_secs")]
+    pub mcp_call_timeout_secs: u64,
     #[serde(default = "default_agent_skills_enabled")]
     pub skills_enabled: bool,
     #[serde(default = "default_agent_skills_max_selected")]
@@ -666,6 +670,7 @@ impl Default for AgentConfig {
             mcp_enabled: default_agent_mcp_enabled(),
             mcp_max_iterations: default_agent_mcp_max_iterations(),
             mcp_max_tool_result_chars: default_agent_mcp_max_tool_result_chars(),
+            mcp_call_timeout_secs: default_agent_mcp_call_timeout_secs(),
             skills_enabled: default_agent_skills_enabled(),
             skills_max_selected: default_agent_skills_max_selected(),
             skills_max_prompt_chars: default_agent_skills_max_prompt_chars(),
@@ -923,6 +928,10 @@ fn default_agent_mcp_enabled() -> bool {
 
 fn default_agent_mcp_max_iterations() -> usize {
     4
+}
+
+fn default_agent_mcp_call_timeout_secs() -> u64 {
+    120
 }
 
 fn default_agent_mcp_max_tool_result_chars() -> usize {

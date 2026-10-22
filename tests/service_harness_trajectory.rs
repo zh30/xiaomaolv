@@ -424,6 +424,7 @@ async fn mcp_stream_recovery_records_every_provider_completion_in_order() {
             enabled: true,
             max_iterations: 2,
             max_tool_result_chars: 4000,
+            call_timeout_secs: 120,
         },
         20,
         0,
@@ -476,6 +477,7 @@ async fn mcp_provider_error_finishes_trajectory_as_internal_error() {
             enabled: true,
             max_iterations: 1,
             max_tool_result_chars: 4000,
+            call_timeout_secs: 120,
         },
     )
     .await
@@ -523,6 +525,7 @@ async fn code_mode_direct_success_records_finished_trajectory_and_tool_call() {
             enabled: true,
             max_iterations: 1,
             max_tool_result_chars: 4000,
+            call_timeout_secs: 120,
         },
     )
     .await
@@ -582,6 +585,7 @@ async fn code_mode_stream_sink_failure_finishes_trajectory_as_internal_error() {
             enabled: true,
             max_iterations: 1,
             max_tool_result_chars: 4000,
+            call_timeout_secs: 120,
         },
     )
     .await
@@ -645,6 +649,7 @@ async fn mcp_loop_agent_run_finishes_once_on_parse_error_recovery() {
             enabled: true,
             max_iterations: 2,
             max_tool_result_chars: 4000,
+            call_timeout_secs: 120,
         },
         8,
         0,

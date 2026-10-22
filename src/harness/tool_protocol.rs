@@ -1,4 +1,6 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use tokio::time::timeout;
 
 use serde_json::Value;
 
@@ -35,6 +37,7 @@ pub struct ToolExecutionEnvelope {
 pub struct ToolProtocol {
     tools: Vec<McpToolInfo>,
     max_result_chars: usize,
+    call_timeout: Duration,
 }
 
 impl ToolProtocol {
@@ -42,7 +45,16 @@ impl ToolProtocol {
         Self {
             tools,
             max_result_chars,
+            call_timeout: Duration::from_secs(120),
         }
+    }
+
+    /// Per-call ceiling — the mcp auto loop sets this from
+    /// `agent_mcp.call_timeout_secs` so a hung/misconfigured server
+    /// cannot stall a turn on its own `timeout_secs`.
+    pub fn with_call_timeout_secs(mut self, secs: u64) -> Self {
+        self.call_timeout = Duration::from_secs(secs.max(1));
+        self
     }
 
     pub fn parse_reply(&self, reply: &str) -> ToolProposal {
@@ -78,9 +90,20 @@ impl ToolProtocol {
         iteration: usize,
     ) -> anyhow::Result<ToolExecutionEnvelope> {
         let started = Instant::now();
-        let result = runtime
-            .call_tool(&call.server, &call.tool, call.arguments.clone())
-            .await;
+        let result = timeout(
+            self.call_timeout,
+            runtime.call_tool(&call.server, &call.tool, call.arguments.clone()),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "mcp tool call timed out after {}s: {}::{}",
+                self.call_timeout.as_secs(),
+                call.server,
+                call.tool
+            )
+        })
+        .and_then(|r| r);
         let duration_ms = started.elapsed().as_millis() as u64;
 
         Ok(match result {

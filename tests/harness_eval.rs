@@ -170,6 +170,7 @@ fn default_mcp(max_iterations: usize) -> AgentMcpSettings {
         enabled: true,
         max_iterations,
         max_tool_result_chars: 4000,
+        call_timeout_secs: 120,
     }
 }
 
