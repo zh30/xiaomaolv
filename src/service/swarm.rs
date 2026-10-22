@@ -2336,6 +2336,29 @@ impl MessageService {
                 }
                 Err(error) => {
                     warn!(error = %error, run_id = %run.run_id, "deferred swarm reply send failed");
+                    // One dedup'd triage signal — a reply that keeps failing
+                    // is operator-visible instead of warn-log silent.
+                    if let Some(engine) = &self.loop_engine {
+                        let _ = engine
+                        .ingest_signal(
+                            crate::harness::loop_engine::CreateSignalRequest {
+                                kind: crate::harness::loop_engine::SignalKind::Manual,
+                                trust: crate::harness::loop_engine::SignalTrust::Internal,
+                                source: "internal:swarm-deliver".to_string(),
+                                external_id: Some(format!("swarm-deliver:{}", run.run_id)),
+                                content: format!(
+                                    "swarm run {}: deferred reply delivery failed on channel {}: {error}",
+                                    run.run_id, run.channel
+                                ),
+                                metadata: std::collections::BTreeMap::from([
+                                    ("run_id".to_string(), run.run_id.clone()),
+                                    ("channel".to_string(), run.channel.clone()),
+                                ]),
+                            },
+                            "internal:swarm",
+                        )
+                        .await;
+                    }
                 }
             }
         }
