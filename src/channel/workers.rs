@@ -372,10 +372,11 @@ pub(super) async fn run_telegram_scheduler_loop(
 pub(super) async fn fetch_telegram_updates(
     client: &Client,
     bot_token: &str,
+    api_base_url: &str,
     offset: i64,
     timeout_secs: u64,
 ) -> anyhow::Result<Vec<TelegramPollUpdate>> {
-    let url = format!("https://api.telegram.org/bot{bot_token}/getUpdates");
+    let url = format!("{api_base_url}/bot{bot_token}/getUpdates");
     let response = client
         .post(url)
         .json(&serde_json::json!({
@@ -418,8 +419,9 @@ pub(super) async fn fetch_telegram_updates(
 pub(super) async fn delete_telegram_webhook(
     client: &Client,
     bot_token: &str,
+    api_base_url: &str,
 ) -> anyhow::Result<()> {
-    let url = format!("https://api.telegram.org/bot{bot_token}/deleteWebhook");
+    let url = format!("{api_base_url}/bot{bot_token}/deleteWebhook");
     client
         .post(url)
         .json(&serde_json::json!({ "drop_pending_updates": false }))

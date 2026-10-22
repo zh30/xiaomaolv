@@ -243,6 +243,11 @@ pub struct TelegramChannelConfig {
     pub enabled: bool,
     pub bot_token: String,
     pub bot_username: Option<String>,
+    /// Bot API base — defaults to the official endpoint. Point at a
+    /// self-hosted telegram-bot-api server (larger uploads, local mode)
+    /// or a test mock.
+    #[serde(default)]
+    pub api_base_url: Option<String>,
     #[serde(default = "default_polling_timeout_secs")]
     pub polling_timeout_secs: u64,
     #[serde(default = "default_telegram_streaming_enabled")]
