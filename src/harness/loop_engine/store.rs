@@ -733,6 +733,7 @@ impl LoopStore for SqliteLoopStore {
             "SELECT g.id FROM harness_goals g
              JOIN harness_goal_budget_usage b ON b.goal_id = g.id
              WHERE g.status IN ('approved', 'active', 'blocked', 'verifying')
+               AND g.internal_only = 0
                AND b.started_at IS NOT NULL
                AND b.started_at + b.deadline_secs < ?1
              LIMIT ?2",
